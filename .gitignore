@@ -2,3 +2,4 @@
 .DS_Store
 /build
 /docs/source/examples/network_model/out
+/src/public_transportation.egg-info
