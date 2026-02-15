@@ -1,0 +1,10 @@
+{
+  "title": "Small multi-line PT case study",
+  "description": "Synthetic 3-line network with transfers at Central (C), morning-only timetable, for assignment model testing.",
+  "timezone": "Europe/Zurich",
+  "cost_unit": "minutes",
+  "sources": ["synthetic"],
+  "extra": {
+    "notes": "Stops and times are synthetic. Designed for testing transfers and multiple departures per line."
+  }
+}
