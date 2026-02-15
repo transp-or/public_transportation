@@ -3,3 +3,4 @@
 /build
 /docs/source/examples/network_model/out
 /src/public_transportation.egg-info
+/src/public_transportation/__pycache__
