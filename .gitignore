@@ -4,3 +4,9 @@
 /docs/source/examples/network_model/out
 /src/public_transportation.egg-info
 /src/public_transportation/__pycache__
+/src/public_transportation/assignment/__pycache__
+/src/public_transportation/domain/__pycache__
+/src/public_transportation/viz/__pycache__
+/tests/__pycache__
+/tests/assignment/__pycache__
+/tests/domain/__pycache__
