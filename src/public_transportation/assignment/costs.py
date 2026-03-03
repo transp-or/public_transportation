@@ -11,24 +11,18 @@ Key points
   All cost coefficients are fixed and provided by the user via AssignmentConfig.
 - Link costs depend on link type:
 
-  1) Ride links:
-       cost = in-vehicle travel time (minutes)
-
-  2) Transfer links:
-       cost = beta_transfer * transfer_time (minutes)
-
-  3) Access links (centroid -> event):
-       cost = beta_early * early_minutes + beta_late * late_minutes,
-       where early/late are computed relative to the desired departure interval [a_t, b_t]
-       for the corresponding OD group.
+  1) Ride links (event_dep -> event_arr): cost = in-vehicle travel time (minutes)
+  2) Transfer links (event_arr -> event_dep, inter-line): cost = beta_transfer * waiting_time (minutes)
+  3) Access links (centroid-in -> event_dep): cost = beta_early * max(0, a - tau) + beta_late * max(0, tau - b)
+     where [a, b] is the centroid-in node's own departure interval (time bin) and tau is the departure-event time.
+     Since centroid-in nodes are duplicated per time bin, costs are group-independent.
+  4) Egress links (event_arr -> centroid-out): cost = 0
+  5) Dwell/continue links (event_arr -> event_dep, same trip at same stop): cost = dwell time (minutes)
 
 Important
 ---------
-Access-link costs depend on the *desired departure interval*.
-Therefore they are computed **per OD-group** (destination + time-bin) because
-within a group all OD records share the same time window.
-
-Ride/transfer costs are group-independent and can be precomputed once.
+Access-link costs depend on the *departure-time interval bounds* [a, b] of the centroid-in node.
+With centroid-in nodes duplicated per time bin, access penalties are group-independent.
 
 Capacity penalties (future extension)
 -------------------------------------
@@ -40,25 +34,24 @@ zero penalties.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 
 from .config import AssignmentConfig
 from .jax_graph_types import JaxGraph
+from .graph_sentinels import (
+    LINK_TYPE_RIDE,
+    LINK_TYPE_TRANSFER,
+    LINK_TYPE_ACCESS,
+    LINK_TYPE_EGRESS,
+    LINK_TYPE_DWELL,
+)
 
-if TYPE_CHECKING:  # pragma: no cover
-    from .build_od_groups import ODGroups
 
 
 Array = jnp.ndarray
-
-
-# Link-type codes (must match build_time_expanded.py)
-LINK_RIDE = 0
-LINK_TRANSFER = 1
-LINK_ACCESS = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,11 +64,15 @@ class CostParts:
     :param is_access: Boolean mask for access links, shape (num_links,).
     :param is_ride: Boolean mask for ride links, shape (num_links,).
     :param is_transfer: Boolean mask for transfer links, shape (num_links,).
+    :param is_egress: Boolean mask for egress links, shape (num_links,).
+    :param is_dwell: Boolean mask for dwell/continue links, shape (num_links,).
     """
     base_cost: Array
     is_access: Array
     is_ride: Array
     is_transfer: Array
+    is_egress: Array
+    is_dwell: Array
 
 
 def precompute_base_costs(graph: JaxGraph, config: AssignmentConfig) -> CostParts:
@@ -84,7 +81,9 @@ def precompute_base_costs(graph: JaxGraph, config: AssignmentConfig) -> CostPart
 
     - Ride: travel_time
     - Transfer: beta_transfer * travel_time
-    - Access: 0 here (handled later per group)
+    - Access: 0 here (schedule-deviation penalty handled later per group)
+    - Egress: 0
+    - Dwell: dwell_time (minutes)
 
     :param graph: Time-expanded JAX graph.
     :param config: Assignment configuration (coefficients).
@@ -93,67 +92,91 @@ def precompute_base_costs(graph: JaxGraph, config: AssignmentConfig) -> CostPart
     config.validate()
 
     lt = graph.link_type
-    is_ride = lt == LINK_RIDE
-    is_transfer = lt == LINK_TRANSFER
-    is_access = lt == LINK_ACCESS
+    is_ride = lt == LINK_TYPE_RIDE
+    is_transfer = lt == LINK_TYPE_TRANSFER
+    is_access = lt == LINK_TYPE_ACCESS
+    is_egress = lt == LINK_TYPE_EGRESS
+    is_dwell = lt == LINK_TYPE_DWELL
 
     # travel_time is in minutes (float)
+    # - ride links: in-vehicle travel time
+    # - transfer links: waiting time weighted by beta_transfer
+    # - dwell links: dwell time (same units as travel_time)
     base_cost = jnp.where(is_ride, graph.travel_time, 0.0)
     base_cost = jnp.where(is_transfer, config.beta_transfer * graph.travel_time, base_cost)
-    # access links: keep at 0.0 (penalty added later)
+    base_cost = jnp.where(is_dwell, graph.travel_time, base_cost)
+    # access links: keep at 0.0 (penalty added later, per OD-group)
+    # egress links: keep at 0.0 (can be made configurable later)
 
     return CostParts(
         base_cost=base_cost,
         is_access=is_access,
         is_ride=is_ride,
         is_transfer=is_transfer,
+        is_egress=is_egress,
+        is_dwell=is_dwell,
     )
 
 
-def _access_penalty_for_group(
+
+def _access_penalty(
     *,
     graph: JaxGraph,
     cost_parts: CostParts,
     config: AssignmentConfig,
-    a_min: float,
-    b_min: float,
 ) -> Array:
     """
-    Compute access-link penalties for a specific desired departure interval [a_min, b_min].
-
-    For an access link from centroid -> event node at time tau (minutes):
-      early = max(0, a_min - tau)
-      late  = max(0, tau - b_min)
-      penalty = beta_early * early + beta_late * late
-
+    Compute access-link penalties using the centroid-in node's own interval.
+    This uses graph.node_bin_start_min and graph.node_bin_end_min (in minutes) for the tail node of each access link.
     All non-access links receive 0 penalty.
-
-    :param graph: JAX graph.
-    :param cost_parts: Precomputed masks.
-    :param config: Configuration.
-    :param a_min: Interval lower bound in minutes.
-    :param b_min: Interval upper bound in minutes.
-    :return: Penalty per link, shape (num_links,).
     """
-    # Access link head is an event node with a meaningful node_time (minutes)
-    # graph.node_time is currently stored in the builder only indirectly via topological order.
-    # We reconstruct event time by using head node time from a cached node_time array.
-    #
-    # In the first implementation, JaxGraph does NOT yet carry node_time. For access penalties,
-    # we require it. The builder should provide it; until then, we raise a clear error.
-    if getattr(graph, "node_time", None) is None:
-        raise ValueError(
-            "JaxGraph is missing `node_time` (minutes). "
-            "Update build_time_expanded.py / jax_graph_types.py to store node_time "
-            "so access-link schedule-deviation penalties can be computed."
+    # Check required fields
+    if not (hasattr(graph, "node_bin_start_min") and hasattr(graph, "node_bin_end_min")):
+        raise RuntimeError(
+            "Graph is missing node_bin_start_min/node_bin_end_min. "
+            "These are required for group-independent access penalties."
         )
+    access_link_idx = jnp.where(cost_parts.is_access, size=graph.num_links, fill_value=-1)[0]
+    access_link_idx = access_link_idx[access_link_idx >= 0]
+    pen_all = jnp.zeros((graph.num_links,), dtype=graph.node_time.dtype)
+    def _compute_and_scatter(pen_vec: Array) -> Array:
+        tau = graph.node_time[graph.head[access_link_idx]]  # minutes at head node for access links
+        a = graph.node_bin_start_min[graph.tail[access_link_idx]]
+        b = graph.node_bin_end_min[graph.tail[access_link_idx]]
+        early = jnp.maximum(0.0, a - tau)
+        late = jnp.maximum(0.0, tau - b)
+        pen = config.beta_early * early + config.beta_late * late
+        return pen_vec.at[access_link_idx].set(pen)
+    pen_all = jax.lax.cond(
+        access_link_idx.size > 0,
+        _compute_and_scatter,
+        lambda p: p,
+        pen_all,
+    )
+    return pen_all
 
-    tau = graph.node_time[graph.head]  # minutes at event node (for access links)
-    early = jnp.maximum(0.0, a_min - tau)
-    late = jnp.maximum(0.0, tau - b_min)
-    pen = config.beta_early * early + config.beta_late * late
 
-    return jnp.where(cost_parts.is_access, pen, 0.0)
+
+def link_costs(
+    *,
+    graph: JaxGraph,
+    cost_parts: CostParts,
+    config: AssignmentConfig,
+) -> Array:
+    """
+    Compute effective link costs (group-independent).
+
+    Returns generalized costs in minutes, including:
+    - base costs (ride/transfer/dwell)
+    - access schedule-deviation penalties using the centroid-in node's interval
+    """
+    config.validate()
+    access_pen = _access_penalty(
+        graph=graph,
+        cost_parts=cost_parts,
+        config=config,
+    )
+    return cost_parts.base_cost + access_pen
 
 
 def link_costs_for_group(
@@ -161,41 +184,163 @@ def link_costs_for_group(
     graph: JaxGraph,
     cost_parts: CostParts,
     config: AssignmentConfig,
-    a_min: float,
-    b_min: float,
-    theta: float,
+    od_groups: Any,
+    group_index: int,
 ) -> Array:
     """
-    Compute effective link costs for one OD group (destination + time-bin).
+    [DEPRECATED] Compute effective link costs for one OD group.
+    This function is deprecated now that centroid-in nodes are duplicated per time bin.
+    Group-dependent costs are no longer needed; use `link_costs()` instead.
+    """
+    # Ignore od_groups and group_index, call group-independent version.
+    return link_costs(graph=graph, cost_parts=cost_parts, config=config)
 
-    The returned costs are generalized costs in minutes, including:
-    - base costs (ride/transfer)
-    - access schedule-deviation penalties for the group's desired departure interval
 
-    Capacity penalties are not included in the first implementation.
-
-    :param graph: Time-expanded JAX graph.
-    :param cost_parts: Precomputed base costs and masks.
-    :param config: Assignment configuration.
-    :param a_min: Desired departure interval lower bound (minutes).
-    :param b_min: Desired departure interval upper bound (minutes).
-    :param theta: Dispersion parameter of the route-choice logit (minutes). Not used directly
-        in costs, but validated here for numerical stability (theta > 0).
-    :return: Effective link costs, shape (num_links,).
+# Backward compatibility shim for interval-based API
+def link_costs_for_interval(
+    *,
+    graph: JaxGraph,
+    cost_parts: CostParts,
+    config: AssignmentConfig,
+    bin_start_min: float,
+    bin_end_min: float,
+) -> Array:
+    """
+    Legacy helper: prefer `link_costs()` (group-independent).
+    If the graph exposes node_bin_start_min/node_bin_end_min, interval is encoded on centroid-in nodes.
+    Otherwise, falls back to legacy computation with explicit interval.
     """
     config.validate()
-    if theta <= 0.0:
-        raise ValueError("theta must be positive.")
-
-    access_pen = _access_penalty_for_group(
-        graph=graph,
-        cost_parts=cost_parts,
-        config=config,
-        a_min=a_min,
-        b_min=b_min,
+    if hasattr(graph, "node_bin_start_min") and hasattr(graph, "node_bin_end_min"):
+        # Interval is encoded per centroid-in node; use group-independent costs
+        return link_costs(graph=graph, cost_parts=cost_parts, config=config)
+    # Legacy fallback: compute access penalties for the provided interval
+    access_link_idx = jnp.where(cost_parts.is_access, size=graph.num_links, fill_value=-1)[0]
+    access_link_idx = access_link_idx[access_link_idx >= 0]
+    pen_all = jnp.zeros((graph.num_links,), dtype=graph.node_time.dtype)
+    def _compute_and_scatter(pen_vec: Array) -> Array:
+        tau = graph.node_time[graph.head[access_link_idx]]  # minutes at head node for access links
+        a = float(bin_start_min)
+        b = float(bin_end_min)
+        early = jnp.maximum(0.0, a - tau)
+        late = jnp.maximum(0.0, tau - b)
+        pen = config.beta_early * early + config.beta_late * late
+        return pen_vec.at[access_link_idx].set(pen)
+    pen_all = jax.lax.cond(
+        access_link_idx.size > 0,
+        _compute_and_scatter,
+        lambda p: p,
+        pen_all,
     )
-
+    access_pen = pen_all
     return cost_parts.base_cost + access_pen
+
+
+def typical_cost_scale_from_assignment(
+    *,
+    graph: JaxGraph,
+    link_flow: Array,
+    link_cost: Array,
+    demand_total: float | None = None,
+    eps: float = 1.0e-12,
+) -> float:
+    """Compute a single typical generalized-cost scale (minutes) from an assignment output.
+
+    Purpose
+    -------
+    This helper is intended to provide an order-of-magnitude scale for choosing a prior
+    on the logit dispersion parameter ``theta``.
+
+    Rationale
+    ---------
+    The logit routing model uses ``exp(-C/\theta)``. Therefore, the magnitude of ``theta``
+    should be comparable to typical *differences* in generalized costs along reasonable
+    paths. A practical, robust proxy is the *average generalized cost experienced per
+    passenger* under a reference demand (e.g., a prior OD matrix).
+
+    Definition
+    ----------
+    Let ``x_\ell`` be the predicted flow on link ``\ell`` and ``c_\ell`` its generalized
+    cost (minutes). We define
+
+        scale = (\sum_\ell x_\ell c_\ell) / D,
+
+    where ``D`` is the total number of passengers.
+
+    By default, ``D`` is inferred from the total flow on ACCESS links (each passenger
+    boards exactly once in the current assignment model). Alternatively, the caller may
+    pass ``demand_total`` (e.g., ``sum(od_values)``).
+
+    Notes
+    -----
+    - This function is meant to be called *once* outside the inner inference loop.
+      It is not jitted and may perform device-to-host transfers when returning a Python
+      float.
+    - If the model later introduces opt-out or multi-boarding semantics, the default
+      inference of ``D`` from ACCESS links must be revisited; in that case pass
+      ``demand_total`` explicitly.
+
+    Parameters
+    ----------
+    graph:
+        The time-expanded graph (used only to identify ACCESS links).
+    link_flow:
+        Predicted link flows, shape ``(num_links,)``.
+    link_cost:
+        Per-link generalized costs in minutes, shape ``(num_links,)``.
+        This should be the same cost vector used by the assignment for the given run.
+    demand_total:
+        Optional total demand (passengers). If provided, it overrides the default
+        ACCESS-flow-based inference.
+    eps:
+        Small positive constant to avoid division by zero.
+
+    Returns
+    -------
+    float
+        Typical generalized-cost scale in minutes.
+
+    Raises
+    ------
+    ValueError
+        If the inferred or provided total demand is non-positive.
+    """
+    lf = jnp.asarray(link_flow)
+    lc = jnp.asarray(link_cost)
+
+    if lf.ndim != 1 or lc.ndim != 1:
+        raise ValueError(f"link_flow and link_cost must be 1D arrays, got {lf.shape} and {lc.shape}.")
+    if lf.shape[0] != int(graph.num_links) or lc.shape[0] != int(graph.num_links):
+        raise ValueError(
+            "link_flow/link_cost length must match graph.num_links: "
+            f"got {lf.shape[0]} and {lc.shape[0]} vs {int(graph.num_links)}."
+        )
+
+    # Total generalized cost experienced (minutes * passengers)
+    total_cost = jnp.sum(lf * lc)
+
+    # Total passengers.
+    if demand_total is None:
+        # In the current model each passenger contributes exactly one ACCESS link.
+        is_access = jnp.asarray(graph.link_type) == LINK_TYPE_ACCESS
+        total_demand = jnp.sum(jnp.where(is_access, lf, jnp.asarray(0.0, dtype=lf.dtype)))
+    else:
+        total_demand = jnp.asarray(float(demand_total), dtype=lf.dtype)
+
+    # Guard against degenerate cases.
+    total_demand = jnp.maximum(total_demand, jnp.asarray(0.0, dtype=lf.dtype))
+
+    # Convert to Python float for convenience.
+    scale = total_cost / jnp.maximum(total_demand, jnp.asarray(eps, dtype=lf.dtype))
+    scale_f = float(jax.device_get(scale))
+
+    if scale_f <= 0.0:
+        raise ValueError(
+            "Typical cost scale is non-positive. "
+            "Check that link flows are positive and that demand_total is correctly specified."
+        )
+
+    return scale_f
 
 
 @jax.jit

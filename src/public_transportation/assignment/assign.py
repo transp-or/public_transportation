@@ -1,72 +1,198 @@
-"""
-High-level assignment interface: OD demand -> link flows (JAX).
+"""High-level assignment interface (JAX): OD demand -> link flows.
 
-This module glues together:
+Pipeline:
+- Build a time-expanded DAG from a Scenario.
+- Build ODGroups (group by destination; centroid-in nodes are duplicated per time bin).
+- Precompute group-independent link costs.
+- For each destination group, run Dial-style DP to obtain link flows.
 
-- building the time-expanded graph (from the domain Scenario),
-- grouping OD records (to enable efficient evaluation),
-- computing link costs (including access schedule-deviation penalties),
-- running Dial-style backward/forward DP to obtain link flows.
+Contracts:
+- Scenario provides timetable, stops, time_bins, and demand.
+- ODGroups provides:
+    - group_dest_node: (num_groups,) destination centroid-out node indices
+    - group_link_mask: (num_groups, num_links) boolean enabled-link mask per group
+    - od_origin_node: (num_od,) origin centroid-in node per OD record
+    - group_od_index_padded: (num_groups, max_group_size) OD indices per group (padded)
+    - group_od_mask: (num_groups, max_group_size) mask for valid OD indices
+- link_costs(graph, cost_parts, config) returns (num_links,) generalized costs in minutes.
 
-Scope of the first implementation
----------------------------------
-- Deterministic, differentiable Dial-style assignment on a time-expanded DAG.
-- Parameters to be estimated: OD demand vector (and optionally theta).
-- All other coefficients (transfer penalty, early/late penalties, etc.) are fixed
-  and provided by the user via AssignmentConfig.
-- Opt-out alternative is NOT implemented in the first version.
-- Capacity penalties are NOT implemented in the first version.
-
-Performance notes
------------------
-This implementation is correct and modular, and already JAX-friendly.
-However, it uses a Python loop over OD groups. This is usually fine because
-the number of groups (destination x time-bin) is modest compared to the number
-of OD records. If needed later, we can vmap/scan over groups for more speed.
-
-Contracts (IMPORTANT)
----------------------
-- The Scenario must contain: stops, time_bins, demand, timetable (trips + stop_times).
-- build_time_expanded(...) must produce a JaxGraph with:
-    - node_time (minutes)  (needed for access penalties)
-    - CSR adjacency: out_start (num_nodes+1) and out_links (num_links) (needed for fast DP)
-    - tail/head/link_type/travel_time arrays
-- build_od_groups(...) must produce ODGroups describing how to:
-    - map each OD-demand record to a group,
-    - inject demand into centroid nodes for each group,
-    - identify the destination node for the group.
+Note: the OD grouping is an internal performance detail; scripts should not handle it.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-
 import jax
 import jax.numpy as jnp
+from jax import lax
+from functools import partial
 
 from public_transportation.domain.scenario import Scenario
 
-from .config import AssignmentConfig
-from .jax_graph_types import JaxGraph
-from .build_time_expanded import build_jax_graph as build_time_expanded_graph
 from .build_od_groups import ODGroups, build_od_groups
-from .costs import precompute_base_costs, link_costs_for_group, CostParts
+from .build_time_expanded import build_jax_graph as build_time_expanded_graph
+from .config import AssignmentConfig
+
+from .costs import CostParts, precompute_base_costs, link_costs
+
 from .dial_dp import run_dial_for_destination
+from .jax_graph_types import JaxGraph
+from .graph_sentinels import NODE_KIND_CENTROID_OUT, NODE_KIND_EVENT_ARR, LINK_TYPE_EGRESS, LINK_TYPE_ACCESS
 
 Array = jnp.ndarray
 
+BIG_M_COST = 1.0e6
+
+# --------------------------------------------------------------------------------------
+# JAX helpers (jit/scan-friendly core)
+# --------------------------------------------------------------------------------------
+
+def _dest_absorption_masks(
+    *,
+    graph: JaxGraph,
+    dest_node: Array,
+) -> tuple[Array, Array]:
+    """Compute masks for destination absorption.
+
+    Returns:
+        keep_if_dest_arrival: links that are allowed to leave destination ARR nodes
+        disallowed_dest_outgoing: all other outgoing links from destination ARR nodes
+
+    Pure array logic; JIT-safe.
+    """
+    dest_stop_idx = graph.node_stop_index[dest_node]
+    is_dest_arrival_node = (
+        (graph.node_kind == NODE_KIND_EVENT_ARR)
+        & (graph.node_stop_index == dest_stop_idx)
+    )
+    tail_is_dest_arrival = is_dest_arrival_node[graph.tail]
+    keep_if_dest_arrival = (
+        (graph.link_type == LINK_TYPE_EGRESS)
+        & (graph.head == dest_node)
+    )
+    disallowed_dest_outgoing = tail_is_dest_arrival & (~keep_if_dest_arrival)
+    return keep_if_dest_arrival, disallowed_dest_outgoing
+
+
+def _initial_node_flow_for_group(
+    *,
+    num_nodes: int,
+    od_values: Array,
+    od_origin_node: Array,
+    group_od_index_padded: Array,
+    group_od_mask: Array,
+    group_index: Array,
+) -> Array:
+    """JIT-safe construction of y0 for one destination group.
+
+    This avoids Python slicing / int() coercions by relying on padded group indices.
+
+    Expected shapes:
+      - group_od_index_padded: (num_groups, max_group_size) int
+      - group_od_mask:        (num_groups, max_group_size) bool
+      - od_origin_node:       (num_od,) int
+      - od_values:            (num_od,) float
+
+    Returns:
+      - y0: (num_nodes,) with OD flows injected at centroid-in origin nodes.
+    """
+    od_idx = group_od_index_padded[group_index]
+    m = group_od_mask[group_index]
+
+    # Make indices safe for masked entries.
+    od_idx_safe = jnp.where(m, od_idx, jnp.zeros_like(od_idx))
+
+    origin_nodes = od_origin_node[od_idx_safe]
+    flows = od_values[od_idx_safe]
+
+    origin_nodes_safe = jnp.where(m, origin_nodes, jnp.zeros_like(origin_nodes))
+    flows_safe = jnp.where(m, flows, jnp.zeros_like(flows))
+
+    y0 = jnp.zeros((num_nodes,), dtype=od_values.dtype)
+    y0 = y0.at[origin_nodes_safe].add(flows_safe)
+    return y0
+
+
+@partial(jax.jit, static_argnames=("return_group_link_flows",))
+def _assign_core(
+    *,
+    graph: JaxGraph,
+    od_values: Array,
+    base_link_cost: Array,
+    theta: float,
+    # ODGroups fields passed explicitly (avoid passing a Python object to jit)
+    group_dest_node: Array,
+    group_link_mask: Array,
+    od_origin_node: Array,
+    group_od_index_padded: Array,
+    group_od_mask: Array,
+    return_group_link_flows: bool,
+) -> tuple[Array, Array | None]:
+    """JIT-friendly assignment core.
+
+    Returns:
+      - total_link_flow: (num_links,)
+      - group_link_flow: (num_groups, num_links) if requested else None
+
+    All validation must remain outside this function.
+    """
+    num_groups = group_dest_node.shape[0]
+    num_links = graph.num_links
+
+    def step(total, g):
+        dest_node = group_dest_node[g]
+        enabled_link_mask = jnp.asarray(group_link_mask[g], dtype=bool)
+
+        # Destination absorption masks
+        _, disallowed = _dest_absorption_masks(graph=graph, dest_node=dest_node)
+        enabled_link_mask = enabled_link_mask & (~disallowed)
+
+        # Costs: base costs with BIG-M on disallowed links
+        c = jnp.where(
+            disallowed,
+            jnp.asarray(BIG_M_COST, dtype=base_link_cost.dtype),
+            base_link_cost,
+        )
+
+        y0 = _initial_node_flow_for_group(
+            num_nodes=graph.num_nodes,
+            od_values=od_values,
+            od_origin_node=od_origin_node,
+            group_od_index_padded=group_od_index_padded,
+            group_od_mask=group_od_mask,
+            group_index=g,
+        )
+
+        dial_res = run_dial_for_destination(
+            graph=graph,
+            link_cost=c,
+            dest_node=dest_node,
+            theta=theta,
+            initial_node_flow=y0,
+            enabled_link_mask=enabled_link_mask,
+        )
+
+        total = total + dial_res.link_flow
+        return total, dial_res.link_flow
+
+    init_total = jnp.zeros((num_links,), dtype=od_values.dtype)
+    total_flow, per_group = lax.scan(step, init_total, jnp.arange(num_groups))
+
+    if return_group_link_flows:
+        return total_flow, per_group
+    return total_flow, None
 
 @dataclass(frozen=True, slots=True)
 class AssignmentArtifacts:
-    """
-    Precomputed artifacts for repeated assignment evaluations.
+    """Precomputed artifacts for repeated assignment evaluations.
 
     :param graph: Time-expanded graph in JAX arrays.
     :param od_groups: OD grouping structure used to inject demand per group.
     :param cost_parts: Precomputed group-independent cost components.
     :param config: Assignment configuration used to build these artifacts.
     """
+
     graph: JaxGraph
     od_groups: ODGroups
     cost_parts: CostParts
@@ -75,16 +201,21 @@ class AssignmentArtifacts:
 
 @dataclass(frozen=True, slots=True)
 class AssignmentResult:
-    """
-    Output of one assignment evaluation.
+    """Output of one assignment evaluation.
 
     :param theta: Dispersion parameter used (minutes).
     :param link_flow: Total flow on each link (summed across all groups), shape (num_links,).
+    :param link_cost: Base per-link generalized costs in minutes, shape (num_links,).
+        Important: this is the group-independent base cost vector (ride/transfer/access penalties).
+        Per-destination absorption safeguards (BIG_M on disallowed links) are applied inside the
+        group loop and are not meaningful to report as a single global vector.
     :param group_link_flow: Optional per-group link flows, shape (num_groups, num_links).
         This is None by default to save memory.
     """
+
     theta: float
     link_flow: Array
+    link_cost: Array
     group_link_flow: Array | None
 
 
@@ -92,17 +223,8 @@ def prepare_assignment(
     scenario: Scenario,
     config: AssignmentConfig,
 ) -> AssignmentArtifacts:
-    """
-    Build and validate everything that is invariant across OD-demand evaluations.
+    """Build and validate everything that is invariant across OD-demand evaluations."""
 
-    Typical usage:
-        artifacts = prepare_assignment(scenario, config)
-        res = assign(od_vector, artifacts)
-
-    :param scenario: Domain Scenario.
-    :param config: AssignmentConfig (fixed coefficients).
-    :return: AssignmentArtifacts.
-    """
     config.validate()
 
     if scenario.timetable is None:
@@ -111,10 +233,11 @@ def prepare_assignment(
     # Build JAX graph representation (immutable arrays)
     graph = build_time_expanded_graph(scenario=scenario, config=config)
 
-    # Build OD groups (destination x time-bin, etc.)
+    # Build OD groups (group by destination; centroid-in nodes are duplicated per time bin).
+    # NOTE: build_od_groups must accept the `graph` keyword.
     od_groups = build_od_groups(scenario=scenario, graph=graph)
 
-    # Precompute base costs (ride/transfer) and masks
+    # Precompute base costs (ride/transfer)
     cost_parts = precompute_base_costs(graph, config)
 
     return AssignmentArtifacts(
@@ -125,62 +248,13 @@ def prepare_assignment(
     )
 
 
-def _theta_value(
-    theta: float | None,
-    config: AssignmentConfig,
-) -> float:
-    """
-    Resolve theta to use.
-
-    :param theta: Optional theta passed by the user.
-    :param config: AssignmentConfig (default theta and bounds).
-    :return: Theta value to use.
-    """
+def _theta_value(theta: float | None, config: AssignmentConfig) -> float:
+    """Resolve theta to use."""
     th = float(config.theta_default if theta is None else theta)
     if th <= 0.0:
         raise ValueError("theta must be positive.")
-    theta_min = getattr(config, "theta_min", None)
-    if theta_min is not None:
-        th = max(th, float(theta_min))
+    th = max(th, float(config.theta_min))
     return th
-
-
-def _build_initial_node_flow_for_group(
-    *,
-    graph: JaxGraph,
-    od_groups: ODGroups,
-    group_index: int,
-    od_values: Array,
-) -> Array:
-    """
-    Construct the node inflow vector y0 for one group.
-
-    This function delegates almost all logic to ODGroups, because the mapping
-    depends on how you decide to represent OD demand and groups.
-
-    Expected ODGroups API
-    ---------------------
-    ODGroups should provide a method:
-
-        make_initial_node_flow(group_index: int, od_values: Array, num_nodes: int) -> Array
-
-    returning a vector y0 of shape (num_nodes,) with demand injected at centroid nodes.
-
-    :param graph: JaxGraph.
-    :param od_groups: ODGroups.
-    :param group_index: Group id in [0, num_groups).
-    :param od_values: OD-demand vector (JAX), interpretation defined by ODGroups.
-    :return: Initial node flow vector y0, shape (num_nodes,).
-    """
-    if not hasattr(od_groups, "make_initial_node_flow"):
-        raise ValueError(
-            "ODGroups is missing method `make_initial_node_flow(group_index, od_values, num_nodes)`."
-        )
-    return od_groups.make_initial_node_flow(
-        group_index=group_index,
-        od_values=od_values,
-        num_nodes=graph.num_nodes,
-    )
 
 
 def assign(
@@ -190,19 +264,7 @@ def assign(
     theta: float | None = None,
     return_group_link_flows: bool = False,
 ) -> AssignmentResult:
-    """
-    Evaluate the assignment model for a given OD-demand vector.
-
-    :param od_values: OD-demand parameters as a JAX array.
-        The exact layout is defined by ODGroups. The simplest convention is
-        to store one value per demand record in scenario.demand, in the same order.
-    :param artifacts: Precomputed AssignmentArtifacts from prepare_assignment(...).
-    :param theta: Optional logit dispersion parameter (minutes). If None,
-        uses artifacts.config.theta_default.
-    :param return_group_link_flows: If True, also return per-group link flows
-        (can be large; useful for debugging).
-    :return: AssignmentResult with total link flows.
-    """
+    """Evaluate the assignment model for a given OD-demand vector."""
     graph = artifacts.graph
     od_groups = artifacts.od_groups
     cost_parts = artifacts.cost_parts
@@ -210,68 +272,124 @@ def assign(
 
     th = _theta_value(theta, config)
 
-    num_links = graph.num_links
-    num_groups = od_groups.num_groups
+    od_values = jnp.asarray(od_values)
+    if od_values.ndim != 1:
+        raise ValueError(f"od_values must be a 1D array, got shape {od_values.shape}.")
 
-    total_link_flow = jnp.zeros((num_links,), dtype=jnp.asarray(od_values).dtype)
-
-    group_link_flow = (
-        jnp.zeros((num_groups, num_links), dtype=total_link_flow.dtype)
-        if return_group_link_flows
-        else None
+    # ------------------------------------------------------------------
+    # Base generalized link costs (group-independent)
+    # ------------------------------------------------------------------
+    base_link_cost = link_costs(
+        graph=graph,
+        cost_parts=cost_parts,
+        config=config,
     )
-
-    # NOTE: Python loop over groups. Usually OK because num_groups is modest.
-    # If we need to push further, we can vmap/scan once ODGroups exposes
-    # fully vectorized group injection arrays.
-    for g in range(int(num_groups)):
-        # Group metadata
-        if not hasattr(od_groups, "dest_node"):
-            raise ValueError("ODGroups must provide `dest_node` array of shape (num_groups,).")
-        if not hasattr(od_groups, "a_min") or not hasattr(od_groups, "b_min"):
-            raise ValueError("ODGroups must provide `a_min` and `b_min` arrays of shape (num_groups,).")
-
-        dest_node = int(od_groups.dest_node[g])
-        a_min = float(od_groups.a_min[g])
-        b_min = float(od_groups.b_min[g])
-
-        # Costs for this group (access penalties depend on [a_min, b_min])
-        c = link_costs_for_group(
-            graph=graph,
-            cost_parts=cost_parts,
-            config=config,
-            a_min=a_min,
-            b_min=b_min,
-            theta=th,
+    base_link_cost = jnp.asarray(base_link_cost, dtype=od_values.dtype)
+    if base_link_cost.shape != (int(graph.num_links),):
+        raise ValueError(
+            f"link_costs returned shape {base_link_cost.shape}, expected {(int(graph.num_links),)}."
         )
 
-        # Initial node flow for this group
-        y0 = _build_initial_node_flow_for_group(
-            graph=graph,
-            od_groups=od_groups,
-            group_index=g,
-            od_values=od_values,
+    # Validate ODGroups fields (outside JIT)
+    try:
+        group_dest_node = od_groups.group_dest_node
+    except AttributeError as e:
+        raise ValueError("ODGroups is missing required field `group_dest_node` for assignment.") from e
+
+    try:
+        group_link_mask = od_groups.group_link_mask
+    except AttributeError as e:
+        raise ValueError("ODGroups is missing required field `group_link_mask` (num_groups, num_links).") from e
+
+    try:
+        od_origin_node = od_groups.od_origin_node
+    except AttributeError as e:
+        raise ValueError("ODGroups is missing required field `od_origin_node` (num_od,).") from e
+
+    try:
+        group_od_index_padded = od_groups.group_od_index_padded
+    except AttributeError as e:
+        raise ValueError(
+            "ODGroups is missing required field `group_od_index_padded` (num_groups, max_group_size)."
+        ) from e
+
+    try:
+        group_od_mask = od_groups.group_od_mask
+    except AttributeError as e:
+        raise ValueError(
+            "ODGroups is missing required field `group_od_mask` (num_groups, max_group_size)."
+        ) from e
+
+    if group_dest_node.ndim != 1:
+        raise ValueError(f"ODGroups.group_dest_node must be 1D, got shape {group_dest_node.shape}.")
+
+    if int(jnp.min(group_dest_node)) < 0 or int(jnp.max(group_dest_node)) >= int(graph.num_nodes):
+        raise ValueError("ODGroups.group_dest_node contains invalid node indices.")
+
+    num_groups = int(group_dest_node.shape[0])
+    if group_link_mask.shape != (num_groups, int(graph.num_links)):
+        raise ValueError(
+            "ODGroups.group_link_mask has wrong shape: "
+            f"got {group_link_mask.shape}, expected {(num_groups, int(graph.num_links))}."
         )
 
-        # Dial backward/forward pass for this destination
-        dial_res = run_dial_for_destination(
-            graph=graph,
-            link_cost=c,
-            dest_node=dest_node,
-            theta=th,
-            initial_node_flow=y0,
+    if od_origin_node.ndim != 1:
+        raise ValueError(f"ODGroups.od_origin_node must be 1D, got shape {od_origin_node.shape}.")
+
+    if group_od_index_padded.ndim != 2 or group_od_mask.ndim != 2:
+        raise ValueError(
+            "ODGroups.group_od_index_padded and ODGroups.group_od_mask must be 2D arrays. "
+            f"Got shapes {group_od_index_padded.shape} and {group_od_mask.shape}."
         )
 
-        total_link_flow = total_link_flow + dial_res.link_flow
-        if group_link_flow is not None:
-            group_link_flow = group_link_flow.at[g].set(dial_res.link_flow)
+    if group_od_index_padded.shape != group_od_mask.shape:
+        raise ValueError(
+            "ODGroups.group_od_index_padded and ODGroups.group_od_mask must have the same shape. "
+            f"Got {group_od_index_padded.shape} vs {group_od_mask.shape}."
+        )
+
+    if group_od_index_padded.shape[0] != num_groups:
+        raise ValueError(
+            "ODGroups.group_od_index_padded first dimension must match num_groups. "
+            f"Got {group_od_index_padded.shape[0]} vs num_groups={num_groups}."
+        )
+
+    # Validate destination node kinds (outside JIT)
+    kinds = jnp.asarray(graph.node_kind)[jnp.asarray(group_dest_node, dtype=jnp.int32)]
+    if not bool(jnp.all(kinds == NODE_KIND_CENTROID_OUT)):
+        bad = jnp.where(kinds != NODE_KIND_CENTROID_OUT, size=1, fill_value=-1)[0]
+        bad = int(bad[0]) if int(bad[0]) >= 0 else -1
+        if bad >= 0:
+            dn = int(jnp.asarray(group_dest_node)[bad])
+            raise ValueError(
+                f"group_dest_node[{bad}]={dn} must be a destination centroid-out node "
+                f"(expected node_kind=NODE_KIND_CENTROID_OUT, got node_kind={int(graph.node_kind[dn])}). "
+                "This indicates OD grouping is inconsistent with the current graph; "
+                "rebuild ODGroups using build_od_groups(..., graph=graph)."
+            )
+
+    # ------------------------------------------------------------------
+    # JIT-friendly core: scan over groups
+    # ------------------------------------------------------------------
+    total_link_flow, group_link_flow = _assign_core(
+        graph=graph,
+        od_values=od_values,
+        base_link_cost=base_link_cost,
+        theta=th,
+        group_dest_node=jnp.asarray(group_dest_node),
+        group_link_mask=jnp.asarray(group_link_mask),
+        od_origin_node=jnp.asarray(od_origin_node),
+        group_od_index_padded=jnp.asarray(group_od_index_padded),
+        group_od_mask=jnp.asarray(group_od_mask),
+        return_group_link_flows=return_group_link_flows,
+    )
 
     return AssignmentResult(
         theta=th,
         link_flow=total_link_flow,
+        link_cost=base_link_cost,
         group_link_flow=group_link_flow,
     )
-
 
 def assign_from_scenario(
     scenario: Scenario,
@@ -281,19 +399,8 @@ def assign_from_scenario(
     theta: float | None = None,
     return_group_link_flows: bool = False,
 ) -> AssignmentResult:
-    """
-    Convenience wrapper: prepare artifacts and assign in one call.
+    """Convenience wrapper: prepare artifacts and assign in one call."""
 
-    This is handy for small tests, but for calibration/inference you should
-    call prepare_assignment(...) once and reuse the artifacts.
-
-    :param scenario: Domain Scenario.
-    :param od_values: OD-demand vector.
-    :param config: AssignmentConfig.
-    :param theta: Optional theta override.
-    :param return_group_link_flows: Whether to return per-group flows.
-    :return: AssignmentResult.
-    """
     artifacts = prepare_assignment(scenario, config)
     return assign(
         od_values,
