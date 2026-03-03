@@ -12,13 +12,5 @@ The domain layer remains dependency-light and does not include plotting code.
 from .plot_scenario import BackgroundMapOptions, RenderOptions, RenderOutputs, render_scenario
 from .map_trips import plot_network_map
 from .demand_map import DemandMapSummary, plot_demand_map
-
-__all__ = [
-    "BackgroundMapOptions",
-    "RenderOptions",
-    "RenderOutputs",
-    "render_scenario",
-    "plot_network_map",
-    "plot_demand_map",
-    "DemandMapSummary",
-]
+from .time_expanded_report import write_time_expanded_report_html, write_time_expanded_report_from_assignment
+from .inference_comparison_report import write_od_theta_comparison_report_html
