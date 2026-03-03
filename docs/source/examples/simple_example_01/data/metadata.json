@@ -1,0 +1,19 @@
+{
+  "title": "examples_01_equal_probability",
+  "description": "One OD pair (O->D), two lines (L1,L2), two buses per line (4 trips). All in-vehicle times identical => equal split (25 each) for total demand 100.",
+  "timezone": "Europe/Zurich",
+  "cost_unit": "minutes",
+  "extra": {
+    "units": {
+      "time": "seconds_from_midnight",
+      "generalized_cost": "minutes"
+    },
+    "files": {
+      "stops": "stops.csv",
+      "trips": "trips.csv",
+      "stop_times": "stop_times.csv",
+      "time_bins": "time_bins.csv",
+      "demand": "demand.csv"
+    }
+  }
+}
