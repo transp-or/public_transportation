@@ -12,7 +12,7 @@ class Timetable:
     """
     Container for timetable data.
 
-    This is intentionally minimal: trips + stop_times.
+    This is intentionally minimal: trips + stop_times (+ optional line references via Trip.line_ref).
     It is domain-level (file/GUI friendly) and will later be compiled
     into an efficient time-expanded network representation.
 
@@ -22,7 +22,7 @@ class Timetable:
     trips: list[Trip]
     stop_times: list[StopTime]
 
-    def validate(self, *, known_stop_ids: set[str] | None = None) -> ValidationReport:
+    def validate(self, *, known_stop_ids: set[str] | None = None, known_line_ids: set[str] | None = None) -> ValidationReport:
         """
         Validate internal consistency of the timetable.
 
@@ -30,10 +30,12 @@ class Timetable:
         - unique trip ids
         - stop_times reference existing trips
         - (optionally) stop_times reference existing stops
-        - per trip: sequences unique
-        - per trip: times nondecreasing with sequence (arrival and departure)
+        - (optionally) trips reference existing lines
+        - per trip: sequences unique (only for stop_times with valid integer sequence)
+        - per trip: times nondecreasing with sequence (only for stop_times with valid parsed times)
 
         :param known_stop_ids: Optional set of stop_ids to validate references.
+        :param known_line_ids: Optional set of line_ids to validate Trip.line_ref references.
         :return: ValidationReport.
         """
         rep = ValidationReport(issues=[])
@@ -60,6 +62,20 @@ class Timetable:
                         suggestion="Ensure trip_id is unique.",
                     ))
                 seen.add(tid)
+
+        # trips reference lines (optional)
+        if known_line_ids is not None:
+            for t in self.trips:
+                if t.line_ref is None:
+                    continue
+                if t.line_ref not in known_line_ids:
+                    rep.add(Issue(
+                        severity=Severity.ERROR,
+                        code="TRIP_LINE_UNKNOWN",
+                        message=f"Trip {t.trip_id!r} references unknown line_id: {t.line_ref!r}.",
+                        location=f"timetable.trips[trip_id={t.trip_id!r}].line_ref",
+                        suggestion="Ensure line_id exists in scenario metadata, or leave line_ref unset.",
+                    ))
 
         # stop_times reference trips and stops
         for k, st in enumerate(self.stop_times):
@@ -89,8 +105,34 @@ class Timetable:
             if tid not in trip_id_set:
                 continue
 
-            # Sequence uniqueness
-            seqs = [s.sequence for s in sts]
+            # Keep only stop_times with a valid integer sequence for sequence-based checks.
+            sts_with_seq: list[StopTime] = []
+            sts_missing_seq: list[StopTime] = []
+            for s in sts:
+                seq = getattr(s, "sequence", None)
+                if isinstance(seq, int):
+                    sts_with_seq.append(s)
+                else:
+                    sts_missing_seq.append(s)
+
+            # If any sequences are missing/unparseable, we cannot fully validate ordering.
+            if sts_missing_seq:
+                rep.add(Issue(
+                    severity=Severity.WARNING,
+                    code="STOPTIME_SEQUENCE_MISSING",
+                    message=(
+                        f"Trip {tid!r} has stop_times with missing/unparseable sequence; "
+                        "sequence-based consistency checks are partial."
+                    ),
+                    location=f"timetable.stop_times.trip[{tid}]",
+                    suggestion=(
+                        "Ensure the CSV 'sequence' column contains integers and is not swapped with 'stop_id'."
+                    ),
+                    context={"count_missing_sequence": len(sts_missing_seq), "count_total": len(sts)},
+                ))
+
+            # Sequence uniqueness (only among stop_times with valid sequence)
+            seqs = [s.sequence for s in sts_with_seq]
             if len(set(seqs)) != len(seqs):
                 rep.add(Issue(
                     severity=Severity.ERROR,
@@ -100,29 +142,66 @@ class Timetable:
                     suggestion="Ensure (trip_id, sequence) is unique.",
                 ))
 
-            # Sort by sequence and check nondecreasing times
-            sts_sorted = sorted(sts, key=lambda s: s.sequence)
-            prev_dep = None
+            # Sort by sequence and check nondecreasing times.
+            # This is only meaningful when arrival/departure are successfully parsed.
+            sts_sorted = sorted(sts_with_seq, key=lambda s: s.sequence)
+
+            prev_dep: int | None = None
+            prev_seq: int | None = None
             for s in sts_sorted:
-                arr = s.arrival.seconds_from_midnight
-                dep = s.departure.seconds_from_midnight
-                if prev_dep is not None and arr < prev_dep:
+                arr_obj = getattr(s, "arrival", None)
+                dep_obj = getattr(s, "departure", None)
+
+                arr_s = getattr(arr_obj, "seconds_from_midnight", None)
+                dep_s = getattr(dep_obj, "seconds_from_midnight", None)
+
+                # If either time is missing/unparseable, skip monotonic checks for this row.
+                if not isinstance(arr_s, (int, float)) or not isinstance(dep_s, (int, float)):
+                    rep.add(Issue(
+                        severity=Severity.WARNING,
+                        code="STOPTIME_TIME_MISSING",
+                        message=(
+                            f"Trip {tid!r} has stop_times with missing/unparseable arrival/departure; "
+                            "time monotonicity checks are partial."
+                        ),
+                        location=f"timetable.stop_times.trip[{tid}]",
+                        suggestion="Fix time encoding in stop_times.csv (arrival/departure).",
+                        context={
+                            "sequence": s.sequence,
+                            "arrival": getattr(arr_obj, "__str__", lambda: str(arr_obj))(),
+                            "departure": getattr(dep_obj, "__str__", lambda: str(dep_obj))(),
+                        },
+                    ))
+                    prev_seq = s.sequence
+                    continue
+
+                arr_i = int(arr_s)
+                dep_i = int(dep_s)
+
+                if prev_dep is not None and arr_i < prev_dep:
                     rep.add(Issue(
                         severity=Severity.ERROR,
                         code="STOPTIME_TIME_NONMONOTONE",
                         message=f"Trip {tid!r} times are not nondecreasing with sequence.",
                         location=f"timetable.stop_times.trip[{tid}]",
-                        context={"prev_departure_s": prev_dep, "arrival_s": arr},
+                        context={
+                            "prev_sequence": prev_seq,
+                            "sequence": s.sequence,
+                            "prev_departure_s": prev_dep,
+                            "arrival_s": arr_i,
+                        },
                         suggestion="Check stop ordering or time encoding (after-midnight service, etc.).",
                     ))
-                prev_dep = dep
 
-            # Minimum length
+                prev_dep = dep_i
+                prev_seq = s.sequence
+
+            # Minimum length: only consider stop_times with valid sequence.
             if len(sts_sorted) < 2:
                 rep.add(Issue(
                     severity=Severity.WARNING,
                     code="TRIP_TOO_SHORT",
-                    message=f"Trip {tid!r} has fewer than 2 stop_times.",
+                    message=f"Trip {tid!r} has fewer than 2 stop_times with a valid sequence.",
                     location=f"timetable.stop_times.trip[{tid}]",
                     suggestion="A trip should have at least 2 stops to generate ride links.",
                 ))
