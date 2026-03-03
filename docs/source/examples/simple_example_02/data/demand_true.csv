@@ -1,0 +1,7 @@
+origin_stop_id,dest_stop_id,time_bin_id,flow
+A,B,t0,10
+A,B,t1,50
+A,B,t2,10
+C,D,t0,10
+C,D,t1,10
+C,D,t2,50
