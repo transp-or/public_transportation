@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta
+from time import perf_counter
 from typing import Any, Literal
 
 import jax
@@ -9,6 +11,10 @@ from .guides import make_autoguide
 from .model_blackbox import LogLikFn, LogPriorFn, make_blackbox_model
 from .results import VIResult
 
+
+def _format_duration(seconds: float) -> str:
+    """Format a duration in seconds as a compact human-readable string."""
+    return str(timedelta(seconds=int(round(max(seconds, 0.0)))))
 
 def run_vi(
     *,
@@ -80,6 +86,10 @@ def run_vi(
 
     svi_state = svi.init(key)
 
+    start_time = perf_counter()
+    last_log_time = start_time
+    last_log_step = 0
+
     losses: list[float] = []
     for step in range(num_steps):
         svi_state, loss = svi.update(svi_state)
@@ -87,12 +97,32 @@ def run_vi(
         losses.append(loss_val)
 
         if logger is not None and (step % log_every == 0 or step == num_steps - 1):
+            now = perf_counter()
+            completed_steps = step + 1
+            elapsed_total = now - start_time
+            avg_time_per_step = elapsed_total / completed_steps
+
+            interval_steps = completed_steps - last_log_step
+            interval_elapsed = now - last_log_time
+            recent_time_per_step = interval_elapsed / max(interval_steps, 1)
+
+            remaining_steps = num_steps - completed_steps
+            blended_time_per_step = (
+                0.3 * avg_time_per_step + 0.7 * recent_time_per_step
+            )
+            eta_seconds = remaining_steps * blended_time_per_step
+
             logger.info(
-                "VI step %d/%d — ELBO loss: %.6f",
-                step + 1,
+                "VI step %d/%d — ELBO loss: %.6f — elapsed: %s — ETA: %s",
+                completed_steps,
                 num_steps,
                 loss_val,
+                _format_duration(elapsed_total),
+                _format_duration(eta_seconds),
             )
+
+            last_log_time = now
+            last_log_step = completed_steps
 
     params = svi.get_params(svi_state)
 
@@ -103,6 +133,15 @@ def run_vi(
         sample_shape=(num_posterior_draws,),
     )["theta"]
 
+    posterior_samples_theta = np.asarray(theta_samples, dtype=float)
+    posterior_mean = np.mean(posterior_samples_theta, axis=0)
+    posterior_sd = np.std(posterior_samples_theta, axis=0, ddof=1)
+    posterior_q05 = np.quantile(posterior_samples_theta, 0.05, axis=0)
+    posterior_q50 = np.quantile(posterior_samples_theta, 0.50, axis=0)
+    posterior_q95 = np.quantile(posterior_samples_theta, 0.95, axis=0)
+    runtime_seconds = perf_counter() - start_time
+    timestamp = datetime.now().isoformat(timespec="seconds")
+
     return VIResult(
         guide=guide,
         dim=dim,
@@ -110,5 +149,17 @@ def run_vi(
         svi_state=svi_state,
         params=params,
         losses=np.asarray(losses, dtype=float),
-        posterior_samples_theta=np.asarray(theta_samples),
+        posterior_samples_theta=posterior_samples_theta,
+        seed=seed,
+        num_steps=num_steps,
+        learning_rate=learning_rate,
+        lowrank_rank=lowrank_rank,
+        num_posterior_draws=num_posterior_draws,
+        runtime_seconds=float(runtime_seconds),
+        timestamp=timestamp,
+        posterior_mean=posterior_mean,
+        posterior_sd=posterior_sd,
+        posterior_q05=posterior_q05,
+        posterior_q50=posterior_q50,
+        posterior_q95=posterior_q95,
     )

@@ -23,6 +23,7 @@ Constraints:
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import jax.numpy as jnp
@@ -32,7 +33,13 @@ from public_transportation.assignment import AssignmentConfig
 from public_transportation.assignment.assign import _assign_core, assign, prepare_assignment
 from public_transportation.assignment.costs import link_costs
 from public_transportation.assignment.id_manager import AssignmentIDManager
-from public_transportation.bayesian_estimation import run_vi
+from public_transportation.bayesian_estimation import (
+    build_vi_report_data,
+    compute_all_diagnostics,
+    generate_vi_report_html,
+    run_vi,
+    save_vi_result,
+)
 from public_transportation.domain import Scenario
 from public_transportation.measurement import (
     apply_mapping_spec,
@@ -199,6 +206,10 @@ print(f"Mapping report written to: {mapping_report_path}")
 #   u in R, theta = exp(u)            (positivity guaranteed)
 num_od = int(od_values.shape[0])
 f0 = jnp.asarray(od_values, dtype=jnp.float32)
+parameter_names = [
+    f"log-deviation {r.origin_stop_id}->{r.dest_stop_id} / {r.time_bin_id}"
+    for r in scenario.demand.records
+] + ["log(theta)"]
 
 # Precompute base link costs once (inference will reuse it)
 base_link_cost = jnp.asarray(
@@ -315,12 +326,31 @@ vi = run_vi(
     logprior=logprior,
     guide="auto_diag",
     use_base_normal_correction=True,  # logprior is absolute in theta_vec space
-    num_steps=4000,
+    num_steps=1000,
     learning_rate=1e-2,
     seed=0,
     num_posterior_draws=1000,
     logger=logger,
 )
+
+# -----------------------------------------------------------------------------
+# 6) Save VI results and generate report
+# -----------------------------------------------------------------------------
+run_dir = DATA / datetime.now().strftime("vi_run_%Y%m%d_%H%M%S")
+run_dir.mkdir(parents=True, exist_ok=True)
+
+# Save VI result (core object)
+save_vi_result(vi, run_dir / "vi")
+
+
+# Generate report
+diagnostics = compute_all_diagnostics(vi, parameter_names=parameter_names)
+report_data = build_vi_report_data(vi, diagnostics)
+
+report_path = run_dir / "vi_report.html"
+generate_vi_report_html(report_data, report_path)
+
+print(f"VI report written to: {report_path}")
 
 samples = vi.posterior_samples_theta  # shape (S, dim)
 z_s = samples[:, :num_od]
@@ -328,6 +358,10 @@ u_s = samples[:, num_od]
 theta_s = np.exp(u_s)
 
 f_s = np.asarray(f0)[None, :] * np.exp(z_s)
+
+# (optional but useful) save OD posterior samples
+np.save(run_dir / "theta_samples.npy", samples)
+np.save(run_dir / "od_samples.npy", f_s)
 
 print()
 print("Posterior summary (VI samples)")
@@ -337,6 +371,7 @@ print(f"Total OD flow: mean={f_s.sum(axis=1).mean():.6g}, sd={f_s.sum(axis=1).st
 
 # Optional: write posterior means back to console in scenario order
 f_mean = f_s.mean(axis=0)
+np.save(run_dir / "od_mean.npy", f_mean)
 print()
 print("OD posterior mean (scenario order):")
 for k, r in enumerate(scenario.demand.records):

@@ -8,16 +8,18 @@ dynamic = ["version"]
 description = "Tools for public transportation modeling and analysis"
 authors = [{name = "Michel Bierlaire"}]
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11,<3.13"
 
 dependencies = [
     "numpy",
     "pandas",
-    "jax",
-    "jaxlib",
-    "numpyro",
+    "numpyro==0.20.1",
+    "jax==0.8.1",
+    "jaxlib==0.8.1",
     "matplotlib",
+    "icecream>=2.2.0",
 ]
+
 
 [project.optional-dependencies]
 dev = [
