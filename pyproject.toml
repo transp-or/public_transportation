@@ -17,7 +17,6 @@ dependencies = [
     "jax==0.8.1",
     "jaxlib==0.8.1",
     "matplotlib",
-    "icecream>=2.2.0",
 ]
 
 
