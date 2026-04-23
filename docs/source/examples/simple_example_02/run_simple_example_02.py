@@ -37,6 +37,7 @@ from public_transportation.bayesian_estimation import (
     build_vi_report_data,
     compute_all_diagnostics,
     generate_vi_report_html,
+    generate_vi_report_plots,
     run_vi,
     save_vi_result,
 )
@@ -326,7 +327,7 @@ vi = run_vi(
     logprior=logprior,
     guide="auto_diag",
     use_base_normal_correction=True,  # logprior is absolute in theta_vec space
-    num_steps=1000,
+    num_steps=300,
     learning_rate=1e-2,
     seed=0,
     num_posterior_draws=1000,
@@ -343,14 +344,29 @@ run_dir.mkdir(parents=True, exist_ok=True)
 save_vi_result(vi, run_dir / "vi")
 
 
-# Generate report
+# Generate report diagnostics and plots
 diagnostics = compute_all_diagnostics(vi, parameter_names=parameter_names)
-report_data = build_vi_report_data(vi, diagnostics)
+figures_dir = run_dir / "figures"
+figure_files = generate_vi_report_plots(
+    vi,
+    figures_dir,
+    diagnostics=diagnostics,
+    parameter_names=parameter_names,
+)
+
+report_data = build_vi_report_data(
+    vi,
+    diagnostics,
+    figure_files=figure_files,
+)
 
 report_path = run_dir / "vi_report.html"
 generate_vi_report_html(report_data, report_path)
 
 print(f"VI report written to: {report_path}")
+
+print(f"VI report figures written to: {figures_dir}")
+print(f"Generated figure files: {figure_files}")
 
 samples = vi.posterior_samples_theta  # shape (S, dim)
 z_s = samples[:, :num_od]

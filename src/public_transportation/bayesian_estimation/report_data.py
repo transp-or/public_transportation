@@ -9,6 +9,7 @@ from .results import VIResult
 def build_vi_report_data(
     result: VIResult,
     diagnostics: dict[str, Any] | None = None,
+    figure_files: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """
     Build a structured, human-readable report data dictionary from a VIResult.
@@ -27,6 +28,8 @@ def build_vi_report_data(
     """
     if diagnostics is None:
         diagnostics = compute_all_diagnostics(result)
+    if figure_files is None:
+        figure_files = {}
 
     metadata = diagnostics["metadata"]
     optimization = diagnostics["optimization"]
@@ -37,8 +40,14 @@ def build_vi_report_data(
         posterior=posterior,
     )
 
-    optimization_section = _build_optimization_section(optimization)
-    posterior_section = _build_posterior_section(posterior)
+    optimization_section = _build_optimization_section(
+        optimization,
+        figure_files,
+    )
+    posterior_section = _build_posterior_section(
+        posterior,
+        figure_files,
+    )
     recommendations = _build_recommendations(
         metadata=metadata,
         optimization=optimization,
@@ -104,7 +113,10 @@ def _build_executive_summary(
     return summary
 
 
-def _build_optimization_section(optimization: dict[str, Any]) -> dict[str, Any]:
+def _build_optimization_section(
+    optimization: dict[str, Any],
+    figure_files: dict[str, str],
+) -> dict[str, Any]:
     """
     Build the optimization section of the report.
     """
@@ -179,18 +191,23 @@ def _build_optimization_section(optimization: dict[str, Any]) -> dict[str, Any]:
                 "title": "Loss trajectory",
                 "kind": "loss_curve",
                 "description": "Evolution of the ELBO loss over optimization iterations.",
+                "file": figure_files.get("loss_curve"),
             },
             {
                 "id": "loss_curve_recent",
                 "title": "Loss trajectory (final iterations)",
                 "kind": "loss_curve_recent",
                 "description": "Zoom on the most recent part of the optimization to assess stabilization.",
+                "file": figure_files.get("loss_curve_recent"),
             },
         ],
     }
 
 
-def _build_posterior_section(posterior: dict[str, Any]) -> dict[str, Any]:
+def _build_posterior_section(
+    posterior: dict[str, Any],
+    figure_files: dict[str, str],
+) -> dict[str, Any]:
     """
     Build the variational posterior section of the report.
     """
@@ -284,12 +301,14 @@ def _build_posterior_section(posterior: dict[str, Any]) -> dict[str, Any]:
                 "title": "Posterior uncertainty ranking",
                 "kind": "posterior_sd_rank",
                 "description": "Posterior standard deviations sorted from largest to smallest.",
+                "file": figure_files.get("posterior_sd_rank"),
             },
             {
                 "id": "posterior_intervals_top",
                 "title": "Intervals for most uncertain parameters",
                 "kind": "posterior_intervals_top",
                 "description": "Posterior medians and 90% intervals for the most uncertain parameters.",
+                "file": figure_files.get("posterior_intervals_top"),
             },
         ],
     }

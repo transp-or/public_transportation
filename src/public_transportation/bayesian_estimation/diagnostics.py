@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import Any
-from icecream import ic
 import numpy as np
 
 from .results import VIResult
@@ -279,7 +278,6 @@ def compute_all_diagnostics(
     dict
         Dictionary with optimization and posterior sections.
     """
-    ic(parameter_names)
     optimization = compute_optimization_diagnostics(
         result=result,
         recent_fraction=recent_fraction,

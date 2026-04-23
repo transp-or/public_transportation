@@ -349,27 +349,36 @@ def _render_table(table: dict[str, Any]) -> str:
 
 
 def _render_figure_placeholder(figure: dict[str, Any]) -> str:
-    """
-    Render a figure placeholder.
-
-    This first version does not embed actual figures yet. It reserves the
-    structure for future integration with generated plot files.
-    """
+    """Render either an embedded figure or a placeholder."""
     title = _escape(figure.get("title", "Figure"))
     description = _escape(figure.get("description", ""))
     kind = _escape(figure.get("kind", ""))
+    file_path = figure.get("file")
 
     kind_html = f'<p class="muted">Figure type: <code>{kind}</code></p>' if kind else ""
+
+    image_html = ""
+    if file_path:
+        image_html = (
+            f'<div><img src="{_escape(file_path)}" alt="{title}" '
+            'style="max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 6px;" /></div>'
+        )
+
+    fallback_html = ""
+    if not file_path:
+        fallback_html = (
+            '<p class="muted">Figure rendering can be added here when plot files become available.</p>'
+        )
 
     return f"""
     <div class="figure-box">
       <div class="figure-title">{title}</div>
       <p>{description}</p>
       {kind_html}
-      <p class="muted">Figure rendering can be added here when plot files become available.</p>
+      {image_html}
+      {fallback_html}
     </div>
     """
-
 
 def _escape(value: Any) -> str:
     """Escape arbitrary content for safe HTML rendering."""
