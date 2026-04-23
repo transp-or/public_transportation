@@ -14,3 +14,14 @@
 /src/public_transportation/inference/__pycache__
 /src/public_transportation/measurement/__pycache__
 /src/public_transportation/measurement/mapping/__pycache__
+*.aux
+*.dvi
+*.fdb_latexmk
+*.fls
+docs/reports/count_data.log
+docs/reports/count_data.out
+*.ps
+*.bbl
+*.blg
+docs/reports/traffic_assignment.log
+docs/reports/traffic_assignment.out
