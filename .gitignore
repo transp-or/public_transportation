@@ -25,3 +25,4 @@ docs/reports/count_data.out
 *.blg
 docs/reports/traffic_assignment.log
 docs/reports/traffic_assignment.out
+src/public_transportation/bayesian_estimation.zip
