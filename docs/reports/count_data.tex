@@ -1,0 +1,232 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{geometry}
+\geometry{margin=2.5cm}
+
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{amsmath}
+
+\title{Interface for Observed Passenger Flow Data\\
+for Schedule-Based Assignment Models}
+\author{Michel Bierlaire \and Evangelos Paschalidis}
+\date{April 23, 2026}
+
+\begin{document}
+\maketitle
+
+\section{Purpose}
+
+This document specifies a \textbf{standard interface} for providing observed
+passenger flow data to be used in the estimation and validation of a
+schedule-based public transport assignment model.
+
+The objective is to allow analysts to provide observed flows in a way that is:
+\begin{itemize}
+    \item consistent with the \textbf{scenario representation} (stops, trips, timetable),
+    \item independent of \textbf{internal assignment indexing conventions},
+    \item flexible enough to support different types of observations,
+    \item robust to \textbf{missing data} and heterogeneous measurement systems,
+    \item easily extendable to likelihood-based estimation.
+\end{itemize}
+
+This interface describes only the \emph{data format}.  
+The mapping between observations and model outputs, as well as the likelihood
+specification, will be handled by separate components.
+
+\section{Design principles}
+
+\subsection{Separation from assignment internals}
+
+The assignment algorithm operates on time-expanded graphs and internal link
+indices. These indices must remain \emph{internal} to the model implementation.
+Analysts providing data should not need to know them.
+
+Therefore, observations are expressed exclusively in terms of:
+\begin{itemize}
+    \item scenario-level identifiers (stop, line, trip),
+    \item timetable times,
+    \item measurement metadata.
+\end{itemize}
+
+\subsection{Event-based timing}
+
+Time bins in the scenario represent desired departure times and are not tied
+to timetable events. Observations of passenger flows, however, are associated
+with \textbf{events in the timetable} (arrivals, departures, vehicle loads).
+
+Hence:
+\begin{itemize}
+    \item All observed flows are linked to timetable events.
+    \item Time is expressed as clock time (\texttt{HH:MM:SS}).
+    \item Observations refer to time windows on the service day.
+\end{itemize}
+
+\subsection{Partial and heterogeneous data}
+
+Not every link in the network has data. Observations may include:
+\begin{itemize}
+    \item vehicle load counts,
+    \item boarding counts,
+    \item alighting counts,
+    \item aggregated measurements.
+\end{itemize}
+
+The interface must therefore:
+\begin{itemize}
+    \item allow missing data naturally,
+    \item support multiple measurement methods,
+    \item remain simple for analysts to fill in.
+\end{itemize}
+
+\subsection{Separation of data and statistical assumptions}
+
+The data file should contain \emph{observations only}.  
+It should not include statistical parameters such as variances or weights.
+
+Instead, each observation is tagged with a \texttt{method\_id}.  
+The likelihood wrapper will interpret this identifier and assign the appropriate
+measurement model.
+
+\section{File format}
+
+Observed flows are provided in a table file:
+\begin{itemize}
+    \item \texttt{observations.csv} (recommended), or
+    \item Parquet with identical schema.
+\end{itemize}
+
+Each row represents one measurement.
+
+\section{Columns}
+
+\subsection{Identification and metadata}
+
+\begin{longtable}{p{4cm}p{3cm}p{8cm}}
+\toprule
+Column & Type & Description \\
+\midrule
+\texttt{obs\_id} & string & Unique identifier of the observation. \\
+\texttt{method\_id} & string & Identifier of measurement method or sensor. \\
+\texttt{obs\_type} & string & Type of observation. Currently: \texttt{instant\_load}. \\
+\texttt{value} & float & Observed passenger count. Must be $\ge 0$. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Time window}
+
+\begin{longtable}{p{4cm}p{3cm}p{8cm}}
+\toprule
+Column & Type & Description \\
+\midrule
+\texttt{time\_start} & HH:MM:SS & Start of observation window. \\
+\texttt{time\_end} & HH:MM:SS & End of observation window (exclusive). \\
+\bottomrule
+\end{longtable}
+
+Interpretation: the measurement refers to timetable events within
+$[\texttt{time\_start},\texttt{time\_end})$.
+
+If an observation is instantaneous, a short window (e.g.\ 30--60s) should be used.
+
+\subsection{Location and event}
+
+Each observation must identify where in the timetable it applies.
+
+\subsubsection*{Trip-based mode (preferred)}
+
+\begin{longtable}{p{4cm}p{3cm}p{8cm}}
+\toprule
+Column & Type & Description \\
+\midrule
+\texttt{trip\_id} & string & Trip identifier from the timetable. \\
+\texttt{stop\_id} & string & Stop identifier. \\
+\texttt{event} & string & \texttt{ARR} or \texttt{DEP}. \\
+\bottomrule
+\end{longtable}
+
+\subsubsection*{Line-based mode (aggregate)}
+
+Used when trip identity is unknown.
+
+\begin{longtable}{p{4cm}p{3cm}p{8cm}}
+\toprule
+Column & Type & Description \\
+\midrule
+\texttt{line\_id} & string & Line identifier. \\
+\texttt{stop\_id} & string & Stop identifier. \\
+\texttt{event} & string & \texttt{ARR} or \texttt{DEP}. \\
+\bottomrule
+\end{longtable}
+
+\textbf{Rule:} exactly one of \texttt{trip\_id} or \texttt{line\_id} must be provided.
+
+\subsection{Optional metadata}
+
+\begin{longtable}{p{4cm}p{3cm}p{8cm}}
+\toprule
+Column & Type & Description \\
+\midrule
+\texttt{campaign\_id} & string & Measurement campaign. \\
+\texttt{source} & string & Sensor or file source. \\
+\texttt{notes} & string & Free-text notes. \\
+\texttt{stop\_sequence} & int & Optional disambiguation if a trip visits a stop multiple times. \\
+\bottomrule
+\end{longtable}
+
+\section{Instantaneous load semantics}
+
+For \texttt{obs\_type = instant\_load}, the value represents observed onboard
+passengers near a timetable event.
+
+The exact interpretation (e.g.\ load after departure vs.\ before arrival) is
+defined by the measurement method and handled by the mapping layer.
+
+\section{Validation rules}
+
+The loader should verify:
+
+\begin{itemize}
+    \item \texttt{obs\_id} unique.
+    \item \texttt{value} $\ge 0$.
+    \item Valid time format \texttt{HH:MM:SS}.
+    \item \texttt{time\_end} $>$ \texttt{time\_start}.
+    \item \texttt{stop\_id} exists in scenario.
+    \item \texttt{trip\_id} or \texttt{line\_id} exists.
+    \item Exactly one of them is provided.
+    \item \texttt{event} in \{\texttt{ARR}, \texttt{DEP}\}.
+\end{itemize}
+
+\section{Example}
+
+\begin{verbatim}
+obs_id,method_id,obs_type,value,time_start,time_end,trip_id,line_id,stop_id,event
+L001,APC_V1,instant_load,37,08:00:00,08:02:00,T12,,A,DEP
+L002,APC_V1,instant_load,22,08:10:00,08:12:00,T12,,B,ARR
+L101,MANUAL_V1,instant_load,18,17:30:00,17:45:00,,L1,C,DEP
+\end{verbatim}
+
+\section{Future extensions}
+
+The interface is designed to support:
+\begin{itemize}
+    \item boarding counts,
+    \item alighting counts,
+    \item link flows,
+    \item likelihood-based estimation.
+\end{itemize}
+
+Mapping from observations to model quantities will be handled by
+dedicated mapper components, using:
+\begin{itemize}
+    \item the scenario,
+    \item the assignment outputs,
+    \item the \texttt{method\_id}.
+\end{itemize}
+
+
+
+\end{document}

@@ -1,0 +1,685 @@
+\documentclass[12pt,a4paper]{article}
+
+\usepackage{michel}
+\usepackage{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{bm}
+\geometry{left=2cm, top=1.5cm, right=2cm, bottom=1.5cm}
+
+\usepackage[dcucite,abbr]{harvard}
+\harvardparenthesis{none}
+\harvardyearparenthesis{round}
+
+\title{Passenger Assignment Model in a Public Transportation Network}
+\author{Michel Bierlaire \and Evangelos Paschalidis}
+\date{April 23, 2026}
+
+\newtheorem{definition}{Definition}
+\newtheorem{assumption}{Assumption}
+
+\begin{document}
+\maketitle
+
+
+\section{Introduction}
+
+This document describes the modeling assumptions, mathematical formulation, and inference components implemented in the software. It is intended as technical documentation for users and developers of the package.
+
+The objective of this software is to infer an aggregate representation of public transportation demand from operational data. The demand is characterized by a flow for each origin--destination (OD) pair and each desired departure time interval.
+
+The software follows four main steps:
+\begin{enumerate}
+\item Develop a detailed network representation of the public transportation system.
+\item Formulate an assignment model that maps an OD matrix to passenger flows on the network.
+\item Define measurement equations linking model outputs to observed data, yielding a likelihood function.
+  \item Use Bayesian inference (current baseline implementation: NumPyro with variational inference) to approximate the posterior distribution of the OD matrix.
+\end{enumerate}
+
+\section{Modeling Elements}
+
+The following sections document the mathematical objects and modeling assumptions used internally by the software.
+
+\subsection{Spatial Representation}
+
+Let $\mathcal{S}$ denote the set of stops in the area of interest. Each stop can act as an origin, a destination, or a transfer location.
+
+\begin{definition}[OD pair]
+An origin--destination pair is a tuple
+\[
+q = (s_o, s_d) \in \mathcal{Q} = \mathcal{S} \times \mathcal{S}.
+\]
+\end{definition}
+
+\subsection{Temporal Representation}
+
+The analysis period is partitioned into a set $\mathcal{T}$ of departure time intervals. Each interval represents a desired departure time window.
+
+\begin{definition}[Departure time interval]
+Each time bin $t\in\mathcal{T}$ corresponds to a closed interval
+\[
+[a_t,b_t]\subset\mathbb{R},
+\qquad a_t<b_t,
+\]
+where $a_t$ and $b_t$ denote the start and end time (in minutes) of the
+desired departure interval.
+\end{definition}
+
+For each departure interval $t\in\mathcal{T}$, the desired departure window is the
+interval $[a_t,b_t]$. 
+
+\begin{definition}[OD demand]
+For each OD pair $q \in \mathcal{Q}$ and departure time interval $t \in \mathcal{T}$, let
+\[
+f_q^t \ge 0
+\]
+denote the number of passengers wishing to depart during interval $t$ from origin $s_o$ to destination $s_d$.
+\end{definition}
+
+The full demand vector is denoted by
+\[
+\bm{f} = \{ f_q^t : q \in \mathcal{Q},\; t \in \mathcal{T} \}.
+\]
+
+\subsection{Baseline demand and deviation parameterization (Bayesian layer)}
+
+The model assumes that the analyst can provide an \emph{a-priori} demand matrix
+$\bm f^{(0)}=\{f_{q}^{t,(0)}\}$, aligned with the OD/time-bin indexing of the scenario.
+Rather than placing a prior directly on the demand levels $\bm f$, we parameterize demand
+in terms of \emph{log-deviations} from $\bm f^{(0)}$. This improves numerical stability,
+facilitates weakly informative priors, and makes the role of prior information explicit.
+
+\paragraph{Modeling choice (log-deviation).}
+For each OD/time-bin cell, introduce a latent deviation $\delta_q^t\in\mathbb{R}$ and define
+the demand used by the assignment as
+\[
+f_q^t
+=
+f_{q}^{t,(0)}\exp(\delta_q^t).
+\]
+This transformation guarantees $f_q^t\ge 0$ whenever $f_{q}^{t,(0)}\ge 0$ and preserves the baseline
+structure up to multiplicative adjustments.
+
+\paragraph{Zero baseline cells.}
+If $f_{q}^{t,(0)}=0$, then $f_q^t=0$ for all values of $\delta_q^t$.
+Therefore, OD cells that are zero in the baseline
+matrix remain structurally zero during inference.
+In order to allow strictly positive deviations from zero, a small but non zero seed value must be provided: $f_{q}^{t,(0)}=\varepsilon>0$.
+
+
+\paragraph{Prior scale.}
+The deviations are assumed independent and normally distributed:
+\[
+\delta_q^t \sim \mathcal{N}(0,\sigma_z^2).
+\]
+The parameter $\sigma_z>0$ controls the strength of regularization.
+Small values of $\sigma_z$ constrain demand to remain close to the baseline, while large values allow
+substantial multiplicative deviations.
+In the current version of the software, $\sigma_z$ is a fixed
+hyperparameter.
+
+
+\paragraph{Separation of responsibilities.}
+The assignment procedure is treated as a deterministic mapping
+\[
+(\bm f,\theta)\longmapsto \bm x(\bm f;\theta)
+\]
+and remains agnostic to priors and baseline information. The construction of $\bm f$ from
+$\bm f^{(0)}$ and $\bm\delta$ is performed in the \emph{Bayesian layer} (implemented using NumPyro and
+stochastic variational inference), which: (i) reads the baseline $\bm f^{(0)}$ provided by the user,
+(ii) draws deviations $\bm\delta$ from a prior distribution, and (iii) computes $\bm f$ using the
+expression above before invoking the assignment. This design avoids introducing additional indexing
+conventions and keeps the assignment module independent of the inference engine.
+
+
+\paragraph{Desired departure interval and admissible boarding window.}
+For each OD pair $q\in\mathcal{Q}$ and departure time interval $t\in\mathcal{T}$,
+we associate the desired departure \emph{interval} $[a_t,b_t]$ and an admissible
+schedule-deviation window of half-width $\Delta_{\max}^{\mathrm{access}}>0$
+(user-defined, e.g.\ 15 minutes).
+
+
+\paragraph{Admissible access links.}
+An access link is included in the graph \emph{only if} the departure time $\tau$ is not too far
+from the desired interval, namely
+\[
+\tau \in \bigl[a_t-\Delta_{\max}^{\mathrm{access}},\; b_t+\Delta_{\max}^{\mathrm{access}}\bigr],
+\]
+where $\tau$ denote the actual departure time (in minutes) of a
+boarding at the origin stop. As described later, the boarding is
+modeled by a link, that is included if the distance from $\tau$ to the
+interval $[a_t,b_t]$ does not exceed
+$\Delta_{\max}^{\mathrm{access}}$.
+
+\paragraph{Schedule-deviation penalty.}
+When the access link is included, its generalized cost is defined by a (possibly asymmetric)
+piecewise-linear penalty with a \emph{flat} (zero-penalty) region inside the interval:
+\[
+c_{\mathrm{access}}(\tau;t)
+=
+\beta_{\mathrm{early}}\;\max\!\bigl(0,\,a_t-\tau\bigr)
++
+\beta_{\mathrm{late}}\;\max\!\bigl(0,\,\tau-b_t\bigr),
+\]
+where $\beta_{\mathrm{early}}\ge 0$ and $\beta_{\mathrm{late}}\ge 0$ are user-defined coefficients.
+Therefore,
+\[
+c_{\mathrm{access}}(\tau;t)=0
+\quad\text{whenever}\quad \tau\in[a_t,b_t],
+\]
+and penalties apply only to departures strictly earlier than $a_t$ or strictly later than $b_t$.
+
+Note that the thresholds $\Delta_{\max}^{\mathrm{access}}$ and $\Delta_{\max}^{\mathrm{transfer}}$
+are fixed configuration parameters; the assignment is differentiable w.r.t.\ costs and OD flows
+given a fixed graph.
+
+\paragraph{Implementation note (departure interval as OD/time-bin data).}
+Although centroid-in nodes are not time-tagged in the graph, the desired departure
+\emph{interval} $[a_t,b_t]$ remains an attribute of the OD/time-bin pair. In computations,
+the access-link penalty is evaluated by combining the interval bounds $(a_t,b_t)$ with the
+clock time $\tau$ of the \emph{departure event node} reached by that access link. This yields
+a zero penalty for departures within $[a_t,b_t]$ and an early/late penalty based on the
+nearest bound otherwise, without introducing backward-in-time links in the acyclic
+time-expanded network.
+
+\subsection{Network Representation}
+
+The public transportation system is represented as a directed
+time-expanded graph. All timetable times (arrival/departure event times) are expressed in minutes on the same time axis as the departure-time intervals.
+
+A key modeling choice is (i) the separation of each stop centroid into two
+distinct nodes (an origin \emph{centroid-in} and a destination \emph{centroid-out}),
+and (ii) the split of each timetable event into an \emph{arrival} and a
+\emph{departure} node. This second split prevents ill-defined instantaneous
+moves (e.g., transferring or boarding at the exact same time as arrival) and
+ensures that all links respect a strict chronological (or lexicographic) order,
+so that the resulting time-expanded network is acyclic.
+
+\begin{definition}[Nodes]
+The node set consists of three families of nodes:
+\begin{itemize}
+  \item \textbf{Centroid-in nodes (non time-tagged, indexed by departure interval):}
+      for each stop $s\in\mathcal{S}$ and for each departure interval $t\in\mathcal{T}$,
+      a node
+      \[
+      (s,t)^{\mathrm{in}}
+      \]
+      used as a demand-injection handle for passengers departing from stop $s$
+      with desired departure interval $t$. These nodes do not correspond to a physical
+      time instant; they are placed \emph{before all event nodes} in the topological
+      order (conceptually at $-\infty$). The interval index $t$ is used only to
+      (i) select admissible boarding events through the access-window rule, and
+      (ii) compute schedule-deviation penalties.
+  \item \textbf{Centroid-out nodes (non time-tagged):} for each stop $s\in\mathcal{S}$,
+      a node $s^{\mathrm{out}}$ representing the point where passengers arriving at stop
+      $s$ exit the network. These nodes are not associated with a physical time; they
+      are placed \emph{after all event nodes} in the topological order (conceptually
+      at $+\infty$) so that the global graph remains acyclic.
+  \item \textbf{Timetable event nodes (trip-specific, split into arrival and departure):}
+      for each stop $s$, each scheduled arrival time $\tau^{\mathrm{arr}}$ and departure time
+      $\tau^{\mathrm{dep}}$ associated with a given vehicle run (trip), we create two nodes
+      \[
+      (s,\tau^{\mathrm{arr}})^{\mathrm{arr}}
+      \qquad\text{and}\qquad
+      (s,\tau^{\mathrm{dep}})^{\mathrm{dep}}.
+      \]
+      These nodes are \emph{trip-specific}: if two trips serve the same stop at the same
+      clock time, they still correspond to different event nodes.
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Lines and event-to-line mapping]
+Let $\mathcal{L}$ denote the set of public transport lines. Each timetable event node
+(arrival or departure) is associated with exactly one operated line, captured by the mapping
+\[
+\lambda:\mathcal{V}^{\mathrm{event}}\rightarrow\mathcal{L},
+\qquad v\mapsto \lambda(v),
+\]
+where $\mathcal{V}^{\mathrm{event}}$ is the set of timetable event nodes.
+In practice, $\lambda(v)$ is derived from the timetable: event nodes created from a given
+trip inherit the line identifier of that trip. Therefore, for a given trip at stop $s$,
+the corresponding arrival and departure nodes share the same line label.
+\end{definition}
+
+Centroid-in nodes are not time-tagged: they are placed before all timetable
+event nodes (conceptually at $-\infty$) so that access links can connect to
+departure events that occur either before or after the desired departure window
+without violating acyclicity. Centroid-out nodes are not time-tagged and
+are placed after all event nodes (conceptually at $+\infty$), preserving a global
+topological order.
+
+\paragraph{Remark.}
+The separation of centroid-in and centroid-out nodes is essential for the
+validity of the forward dynamic-programming loading algorithm. Without
+this separation, egress links could break the acyclic structure and violate the topological order implied by time.
+
+\begin{definition}[Links]
+The link set $\mathcal{A}$ contains the following link types:
+\begin{enumerate}
+\item \textbf{Access links (time-windowed):}
+      for an OD pair $q=(s_o,s_d)$ and departure interval $t$, access links connect the
+      origin centroid-in node $(s_o,t)^{\mathrm{in}}$ to \emph{selected}
+      \emph{departure} event nodes at the origin stop,
+      \[
+      (s_o,t)^{\mathrm{in}} \rightarrow (s_o,\tau)^{\mathrm{dep}},
+      \]
+only for departure times $\tau$ satisfying
+\[
+\tau \in \bigl[a_t-\Delta_{\max}^{\mathrm{access}},\; b_t+\Delta_{\max}^{\mathrm{access}}\bigr].
+\]
+
+\item \textbf{Ride links:}
+      for each trip, ride links connect a departure event at the current stop to an
+      arrival event at the next stop,
+      \[
+      (s_i,\tau_i^{\mathrm{dep}})^{\mathrm{dep}} \rightarrow (s_{i+1},\tau_{i+1}^{\mathrm{arr}})^{\mathrm{arr}}.
+      \]
+
+\item \textbf{Dwell/continue links (within-trip at a stop):}
+      for each trip and each stop event, a dwell link connects the arrival and departure
+      nodes at the same stop,
+      \[
+      (s,\tau^{\mathrm{arr}})^{\mathrm{arr}} \rightarrow (s,\tau^{\mathrm{dep}})^{\mathrm{dep}}.
+      \]
+      In the implementation, strictly positive dwell time is enforced by regularizing
+      timetable records where arrival equals departure (using a small minimum dwell time).
+
+\item \textbf{Transfer links (inter-line, time-windowed):}
+      transfer links connect an \emph{arrival} event node to a later \emph{departure} event node
+      at the same stop and represent waiting and switching \emph{between different lines}. A transfer link
+      \[
+      (s,\tau_1)^{\mathrm{arr}} \rightarrow (s,\tau_2)^{\mathrm{dep}},
+      \qquad\text{with}\qquad \tau_2>\tau_1
+      \]
+      is included only if
+      \begin{enumerate}
+      \item the two event nodes belong to \emph{different lines}, and
+      \item the waiting time satisfies $\tau_2-\tau_1 \le \Delta_{\max}^{\mathrm{transfer}}$.
+      \end{enumerate}
+      No transfer links are created between events of the same line. In particular,
+      transfer links are never created for $\tau_2=\tau_1$.
+
+\item \textbf{Egress links (global graph, destination-gated by masking):}
+      the global graph contains egress links from every arrival event node at stop $s$
+      to the centroid-out node $s^{\mathrm{out}}$:
+      \[
+      (s,\tau)^{\mathrm{arr}} \rightarrow s^{\mathrm{out}}.
+      \]
+      For a given OD pair $q=(s_o,s_d)$, only the destination centroid-out node $s_d^{\mathrm{out}}$
+      is enabled as a terminal node; all other egress options are disabled by a destination-dependent mask.
+\end{enumerate}
+\end{definition}
+
+Each link $\ell\in\mathcal{A}$ is associated with:
+\begin{itemize}
+\item a generalized cost $c_\ell$,
+\item a capacity $u_\ell$ for ride links (stored in the data structure, not yet used in costs).
+\end{itemize}
+
+\begin{assumption}[Acyclic time-expanded network]
+All links in the time-expanded network are consistent with a strict
+topological order. All \emph{event-to-event} links strictly increase
+clock time. In addition, centroid-in nodes $(s,t)^{\mathrm{in}}$ are
+placed \emph{before} all event nodes (conceptually at $-\infty$), and
+centroid-out nodes $s^{\mathrm{out}}$ are placed \emph{after} all event
+nodes (conceptually at $+\infty$). With this convention, access and
+egress links always respect the global ordering.
+
+With the event split, feasible movements follow the pattern
+\[
+(s,t)^{\mathrm{in}}
+\rightarrow (s,\tau)^{\mathrm{dep}}
+\rightarrow (s',\tau')^{\mathrm{arr}}
+\rightarrow (s',\tau'')^{\mathrm{dep}}
+\rightarrow \cdots
+\rightarrow (s_d,\bar{\tau})^{\mathrm{arr}}
+\rightarrow s_d^{\mathrm{out}}.
+\]
+Transfer links satisfy $\tau_2>\tau_1$ and dwell links are enforced to be strictly forward in time
+through a minimum dwell regularization. Therefore the directed graph is acyclic and admits
+a topological ordering, which allows value functions and flows to be computed using dynamic programming.
+\end{assumption}
+
+\subsection{Generalized Cost}
+
+Each passenger seeks to minimize a generalized cost that includes:
+\begin{itemize}
+\item in-vehicle travel time (ride links),
+\item waiting and transfer time (transfer links) and dwell time at stops (dwell/continue links),
+\item transfer disutility through coefficient $\beta_{\mathrm{transfer}}$,
+\item early/late departure penalty relative to the desired departure \emph{interval} (access links; zero penalty within $[a_t,b_t]$).
+\end{itemize}
+
+For a path $p$, the generalized cost is
+\[
+C(p) = \sum_{\ell \in p} c_\ell.
+\]
+
+\subsubsection{Link-type-specific cost formulation}
+
+The generalized cost of each link depends on its type. All coefficients
+appearing below are fixed user-defined parameters.
+
+\paragraph{Ride links.}
+For a ride link $\ell$ representing the movement of a vehicle between two
+stops, connecting a departure event to a subsequent arrival event,
+\[
+(s_i,\tau_i^{\mathrm{dep}})^{\mathrm{dep}} \rightarrow (s_{i+1},\tau_{i+1}^{\mathrm{arr}})^{\mathrm{arr}},
+\]
+the generalized cost is equal to the in-vehicle travel time:
+\[
+c_\ell = \tau_{i+1}^{\mathrm{arr}} - \tau_i^{\mathrm{dep}} .
+\]
+
+\paragraph{Dwell/continue links.}
+For a dwell/continue link at a stop,
+\[
+(s,\tau^{\mathrm{arr}})^{\mathrm{arr}} \rightarrow (s,\tau^{\mathrm{dep}})^{\mathrm{dep}},
+\]
+the generalized cost is the dwell time at the stop:
+\[
+c_\ell = \tau^{\mathrm{dep}} - \tau^{\mathrm{arr}} .
+\]
+
+\paragraph{Transfer links (inter-line, bounded waiting).}
+Consider a transfer link $\ell:(s,\tau_1)^{\mathrm{arr}}\rightarrow(s,\tau_2)^{\mathrm{dep}}$
+with $\tau_2>\tau_1$.
+Such a link is included only if (i) the two events correspond to \emph{different lines}
+and (ii) the waiting time $\tau_2-\tau_1$ does not exceed the user-defined threshold
+$\Delta_{\max}^{\mathrm{transfer}}$.
+When included, its generalized cost is
+\[
+c_\ell = \beta_{\mathrm{transfer}}\,(\tau_2-\tau_1),
+\]
+where $\beta_{\mathrm{transfer}}>0$ is a user-defined coefficient.
+
+\paragraph{Access links (bounded schedule deviation with a flat region).}
+Consider an access link from the centroid-in node $(s_o,t)^{\mathrm{in}}$
+to an origin \emph{departure} event node $(s_o,\tau)^{\mathrm{dep}}$.
+The link is included only if
+\[
+\tau \in \bigl[a_t-\Delta_{\max}^{\mathrm{access}},\; b_t+\Delta_{\max}^{\mathrm{access}}\bigr].
+\]
+When included, its generalized cost is
+\[
+c_\ell
+=
+\beta_{\mathrm{early}}\max(0,a_t-\tau)
++
+\beta_{\mathrm{late}}\max(0,\tau-b_t),
+\]
+with user-defined coefficients $\beta_{\mathrm{early}}\ge 0$ and $\beta_{\mathrm{late}}\ge 0$.
+
+\paragraph{Egress links to centroids.}
+For an egress link $\ell:(s,\tau)^{\mathrm{arr}}\rightarrow s^{\mathrm{out}}$, we set $c_\ell=0$.
+
+\paragraph{Interpretation of cost coefficients.}
+All time quantities in the model are measured in minutes. Travelers may perceive these minutes differently
+depending on context. The coefficients $\beta_{\mathrm{transfer}}$, $\beta_{\mathrm{early}}$ and
+$\beta_{\mathrm{late}}$ act as perception weights converting physical time into generalized cost.
+These coefficients are fixed and specified by the user; they are not estimated within the inference procedure.
+Only the OD demand and optionally the dispersion parameter $\theta$ are estimated.
+
+\section{Assignment Model}
+
+\subsection{Input}
+
+The input is the OD vector $\bm{f}$ (scenario order), which is injected through centroid-in nodes.
+
+\subsection{Assignment Procedure}
+
+The classical assignment procedure based on deterministic shortest paths is not differentiable with respect to link costs and is therefore not well
+suited for gradient-based calibration methods. We adopt a differentiable assignment model inspired by the logit-based
+approach of \citeasnoun{dial1971probabilistic}, adapted to the acyclic time-expanded public transportation network.
+
+\subsection{Differentiable Dial-style assignment}
+
+Let $\bm{f}$ denote the OD demand. For each OD pair $q$ and departure interval $t$, passengers choose routes
+according to a logit model defined on the time-expanded network.
+
+\subsubsection{Capacity constraints (current status)}
+
+Although ride links are associated with nominal capacities $u_\ell$ in the data structure, the current
+implementation does not incorporate capacity-dependent penalties into generalized costs. All assignment computations
+are therefore performed without congestion or overload effects.
+
+Introducing capacity-aware penalties while preserving differentiability (e.g., using smooth overload functions such
+as softplus penalties) is a natural future extension, but it is not part of the current version of the software.
+
+
+\subsubsection{Logit routing model}
+
+Passengers are assumed to choose routes according to a logit model with dispersion parameter $\theta>0$.
+For any path $p$,
+\[
+\Pr(p) \propto \exp\!\left(-\frac{C(p)}{\theta}\right),
+\qquad
+C(p)=\sum_{\ell\in p}c_\ell.
+\]
+When $\theta$ is small, flows concentrate on lowest-cost paths.
+When $\theta$ is large, flows spread across multiple attractive alternatives.
+
+\paragraph{Computational and behavioral motivation.}
+The logit formulation admits an efficient dynamic-programming implementation on the acyclic time-expanded network.
+It is differentiable with respect to generalized costs and, consequently, with respect to OD demand.
+This property is essential when the assignment model is embedded in gradient-based calibration and variational inference.
+
+\subsubsection{Differentiable dynamic programming formulation}
+
+Fix an OD pair $q=(s_o,s_d)$ and a departure interval $t$. The \emph{terminal} node is the destination centroid-out node
+$s_d^{\mathrm{out}}$, and the value function is initialized as
+\[
+V(s_d^{\mathrm{out}})=0.
+\]
+
+For any other node $i$, let $\mathcal{A}^+_q(i)$ denote the set of outgoing links that are enabled for the destination group.
+We define
+\[
+V(i)
+=
+-\theta\log
+\sum_{\ell=(i\to j)\in\mathcal{A}^+_q(i)}
+\exp\!\left(-\frac{c_\ell + V(j)}{\theta}\right).
+\]
+This recursion is evaluated in reverse topological order using a numerically stable \texttt{logsumexp} formulation.
+
+The probability that a passenger located at node $i$ chooses link $\ell=(i\to j)$ is
+\[
+P_\ell(i)
+=
+\frac{
+\exp\!\left(-\frac{c_\ell + V(j)}{\theta}\right)
+}{
+  \sum_{(i\to k)\in\mathcal{A}^+_q(i)}
+\exp\!\left(-\frac{c_{ik}+V(k)}{\theta}\right)
+}.
+\]
+
+\subsubsection{Flow propagation}
+
+Fix an OD pair $q=(s_o,s_d)$ and a departure time interval $t\in\mathcal{T}$.
+The corresponding demand $f_q^t$ is injected at the origin centroid-in node $(s_o,t)^{\mathrm{in}}$.
+
+Let $y_i$ denote the flow reaching node $i$ during the forward pass. Initialization is
+\[
+y_{(s_o,t)^{\mathrm{in}}}=f_q^t,
+\qquad
+y_i=0 \quad \text{for all } i \neq (s_o,t)^{\mathrm{in}}.
+\]
+Given transition probabilities $P_\ell(i)$ on outgoing links $\ell=(i\to j)$, link flows are
+\[
+x_\ell = y_i\, P_\ell(i),
+\qquad \ell=(i\to j),
+\]
+and node flows are propagated in topological order by
+\[
+y_j \leftarrow y_j + x_\ell,
+\qquad \ell=(i\to j).
+\]
+
+\paragraph{Destination gating.}
+The global graph contains egress links for all stops, but for a given OD pair $q=(s_o,s_d)$
+the model enables only egress links leading to $s_d^{\mathrm{out}}$ via a destination-dependent mask.
+
+\paragraph{Batched evaluation.}
+For computational efficiency, value functions and flow propagation are computed in batches for OD groups sharing the same destination
+(and, depending on the implementation, the same departure interval), enabling vectorized evaluation with JAX.
+
+\subsubsection{Opt-out alternative (future extension)}
+
+In a general formulation, an opt-out alternative can be introduced for each OD pair and departure interval. In the first implementation,
+opt-out alternatives are not included: all demand is assumed to be assigned to the public transportation network.
+
+\subsection{Implementation notes for fast JAX evaluation}
+
+The time-expanded network is fixed across evaluations. All graph connectivity data are precomputed once and stored as immutable arrays:
+a topological ordering of nodes; compressed representations of outgoing adjacency; and, for each link, tail/head indices and link type.
+
+The backward recursion for the value function and forward propagation for flows are implemented using JAX primitives such as
+\texttt{logsumexp} and scan-like passes over the topological order. Variable out-degrees are handled through CSR-like adjacency
+and/or padded adjacency with masks, enabling compilation with \texttt{jit}.
+
+\subsubsection{Deterministic indexing requirement}
+Reproducibility of inference results requires that the indexing of nodes, links, and OD cells remain strictly deterministic across runs.
+Graph construction, link ordering, and OD indexing must therefore follow fixed ordering conventions (e.g., sorted iteration and deterministic
+array construction). Any change in indexing invalidates stored inference outputs, as the Bayesian layer relies on a fixed mapping between
+parameters and link indices.
+
+\section{Measurement Model and Likelihood}
+
+Let $Y$ denote observed data (e.g., passenger counts on selected links, or aggregates derived from them).
+Operational measurements are available only for a subset of quantities. Let $\mathcal{M}$ denote the index set of available measurements.
+For each $m\in\mathcal{M}$ we denote by $Y_m$ the observed count.
+
+\paragraph{Predicted measurement from the assignment model.}
+The assignment model produces link flows $\bm{x}(\bm f;\theta)=\{x_\ell(\bm f;\theta):\ell\in\mathcal{A}\}$.
+A deterministic mapping associates each measurement $m$ with a subset of links $\mathcal{A}_m\subseteq\mathcal{A}$,
+so that the model-predicted quantity is the sum of the corresponding link flows:
+\[
+\lambda_m(\bm f;\theta)
+=
+\sum_{\ell\in\mathcal{A}_m} x_\ell(\bm f;\theta).
+\]
+In the current version of the software, aggregation weights are implicitly equal to one.
+
+
+\paragraph{Asymmetric counting device (undercounting).}
+The counting device is asymmetric: it is more likely to \emph{miss} passengers than to count passengers that are not present.
+We model this by introducing a detection rate $\rho\in(0,1]$ such that the expected observed count is
+\[
+\mu_m(\bm f;\theta,\rho) = \rho\,\lambda_m(\bm f;\theta).
+\]
+
+\paragraph{Negative binomial likelihood.}
+Conditionally on $(\bm f,\theta,\rho,r)$, the observations are assumed independent and
+\[
+Y_m \mid \bm f,\theta,\rho,r \;\sim\; \text{NegBin}\!\bigl(r,\,p_m(\bm f;\theta,\rho,r)\bigr),
+\qquad m\in\mathcal{M},
+\]
+where $r>0$ is a dispersion parameter and the success probability $p_m$ is defined so that
+$\mathbb{E}[Y_m]=\mu_m(\bm f;\theta,\rho)$:
+\[
+p_m(\bm f;\theta,\rho,r)
+=
+\frac{r}{r+\mu_m(\bm f;\theta,\rho)}
+=
+\frac{r}{r+\rho\,\lambda_m(\bm f;\theta)}.
+\]
+Hence, for $y\in\mathbb{N}_0$,
+\[
+\Pr(Y_m=y\mid \bm f,\theta,\rho,r)
+=
+\frac{\Gamma(y+r)}{\Gamma(r)\,y!}
+\left(1-p_m(\bm f;\theta,\rho,r)\right)^y
+\left(p_m(\bm f;\theta,\rho,r)\right)^r.
+\]
+
+\paragraph{Fixed measurement parameters.}
+In the current version of the software, the detection rate $\rho$ and the dispersion parameter $r$ are treated as fixed, user-specified
+hyperparameters and are not estimated within the Bayesian inference procedure.
+ Only the OD demand vector and optionally the dispersion
+parameter $\theta$ are inferred. Joint estimation of $(\rho,r)$ is a possible future extension.
+
+\paragraph{Likelihood and normalization.}
+The likelihood is the product over observed measurements:
+\[
+\mathcal{L}\bigl(\{Y_m\}_{m\in\mathcal{M}}\mid \bm f,\theta,\rho,r\bigr)
+=
+\prod_{m\in\mathcal{M}}
+\Pr\!\left(Y_m=y_m^{\mathrm{obs}} \mid \bm f,\theta,\rho,r\right).
+\]
+The corresponding log-likelihood is
+\[
+\ell(\bm f,\theta,\rho,r)
+=
+\sum_{m\in\mathcal{M}}
+\left[
+\log\Gamma\!\left(y_m^{\mathrm{obs}}+r\right)
+-\log\Gamma(r)
+-\log\!\left(y_m^{\mathrm{obs}}!\right)
++r\log p_m(\bm f;\theta,\rho,r)
++y_m^{\mathrm{obs}}\log\!\left(1-p_m(\bm f;\theta,\rho,r)\right)
+\right].
+\]
+For posterior computations, terms constant with respect to $(\bm f,\theta)$ may be dropped.
+
+\paragraph{Alternative observation models (future extension).}
+Other likelihood choices (e.g., Gaussian noise on counts or Poisson models) may be implemented in the future,
+but the current baseline implementation uses the negative binomial likelihood described above.
+
+\section{Bayesian Inference via Variational Inference}
+
+Let $\bm{\delta}$ denote the vector of log-deviations and $\theta$ the dispersion parameter of the route choice model.
+The posterior distribution is proportional to
+\[
+p(\bm{\delta},\theta \mid Y)
+\propto
+\mathcal{L}(Y \mid \bm{\delta},\theta)\,
+p(\bm{\delta})\,p(\theta).
+\]
+
+Exact Bayesian inference is computationally intractable for high-dimensional OD vectors.
+The current implementation therefore uses \emph{stochastic variational inference} (SVI) as implemented in NumPyro.
+
+\paragraph{Variational approximation.}
+The posterior is approximated by a parametric distribution $q_\phi(\bm{\delta},\theta)$.
+The parameters $\phi$ are chosen to maximize the \emph{Evidence Lower Bound} (ELBO):
+\[
+\mathrm{ELBO}(\phi)
+=
+\mathbb{E}_{q_\phi}
+\left[
+\log p(Y,\bm{\delta},\theta)
+-
+\log q_\phi(\bm{\delta},\theta)
+\right].
+\]
+Maximizing the ELBO is equivalent to minimizing $\mathrm{KL}(q_\phi \,\|\, p)$ between the variational approximation and the true posterior.
+
+\paragraph{Guide family.}
+The baseline implementation uses Gaussian variational families in an unconstrained parameter space
+(e.g., diagonal or low-rank approximations), and optimization is performed using stochastic gradients (Adam).
+
+\paragraph{Prior on $\theta$.}
+The dispersion parameter $\theta$ is strictly positive. In practice, inference is performed in an unconstrained space
+(e.g., via a log-transformation), and a weakly informative prior is used to avoid degenerate values (e.g., extremely small $\theta$).
+The exact prior family is configurable in the NumPyro implementation.
+
+\paragraph{Alternative inference engines.}
+Markov chain Monte Carlo methods could be used in principle, but they are computationally expensive in high-dimensional OD settings.
+Support for alternative probabilistic programming frameworks (e.g., PyMC) may be considered in the future; the present baseline is NumPyro+SVI.
+
+\section{Discussion}
+
+This software framework combines timetable information and operational counts to infer OD demand and quantify uncertainty,
+while using a differentiable assignment model compatible with gradient-based inference.
+
+Planned extensions of the software include incorporating capacity effects in a
+differentiable manner, estimating additional measurement parameters
+(e.g., $\rho$ and $r$), supporting weighted measurement aggregations,
+and adding opt-out alternatives.
+
+
+\bibliographystyle{dcu}
+\bibliography{transpor}
+
+\end{document}
