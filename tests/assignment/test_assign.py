@@ -4,53 +4,43 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
-import pytest
 import jax.numpy as jnp
+import pytest
 
 from public_transportation.assignment.assign import (
-    prepare_assignment,
     assign,
     assign_from_scenario,
+    prepare_assignment,
 )
 from public_transportation.assignment.config import AssignmentConfig
-
-
-# -------------------------
-# Tiny stubs for isolation
-# -------------------------
+from public_transportation.assignment.graph_sentinels import NODE_KIND_CENTROID_OUT
 
 
 @dataclass(frozen=True)
 class _DummyGraph:
     num_nodes: int
     num_links: int
+    node_kind: jnp.ndarray
 
 
 class _DummyODGroups:
-    def __init__(self, *, num_groups: int, dest_node: list[int], a_min: list[float], b_min: list[float]) -> None:
-        self.num_groups = int(num_groups)
-        self.dest_node = jnp.asarray(dest_node, dtype=jnp.int32)
-        self.a_min = jnp.asarray(a_min, dtype=jnp.float32)
-        self.b_min = jnp.asarray(b_min, dtype=jnp.float32)
-
-    def make_initial_node_flow(self, *, group_index: int, od_values: jnp.ndarray, num_nodes: int) -> jnp.ndarray:
-        # Inject a single scalar per group into node 0 (centroid), purely for testing.
-        y0 = jnp.zeros((num_nodes,), dtype=jnp.asarray(od_values).dtype)
-        return y0.at[0].set(od_values[group_index])
-
-
-@dataclass(frozen=True)
-class _DummyDialResult:
-    link_flow: jnp.ndarray
-
-
-# -------------------------
-# Helpers
-# -------------------------
+    def __init__(
+        self,
+        *,
+        group_dest_node: list[int],
+        group_link_mask: list[list[bool]],
+        od_origin_node: list[int],
+        group_od_index_padded: list[list[int]],
+        group_od_mask: list[list[bool]],
+    ) -> None:
+        self.group_dest_node = jnp.asarray(group_dest_node, dtype=jnp.int32)
+        self.group_link_mask = jnp.asarray(group_link_mask, dtype=jnp.bool_)
+        self.od_origin_node = jnp.asarray(od_origin_node, dtype=jnp.int32)
+        self.group_od_index_padded = jnp.asarray(group_od_index_padded, dtype=jnp.int32)
+        self.group_od_mask = jnp.asarray(group_od_mask, dtype=jnp.bool_)
 
 
 def _scenario_with_timetable() -> Any:
-    # We only need scenario.timetable non-None for prepare_assignment() to pass the guard.
     return SimpleNamespace(timetable=object())
 
 
@@ -58,231 +48,491 @@ def _scenario_without_timetable() -> Any:
     return SimpleNamespace(timetable=None)
 
 
-# -------------------------
-# prepare_assignment
-# -------------------------
+def _centroid_out_graph(
+    *,
+    num_nodes: int,
+    num_links: int,
+    dest_nodes: list[int],
+) -> _DummyGraph:
+    node_kind = jnp.zeros((num_nodes,), dtype=jnp.int32)
+    for node in dest_nodes:
+        node_kind = node_kind.at[node].set(NODE_KIND_CENTROID_OUT)
+    return _DummyGraph(num_nodes=num_nodes, num_links=num_links, node_kind=node_kind)
+
+
+def _valid_od_groups(*, num_links: int) -> _DummyODGroups:
+    return _DummyODGroups(
+        group_dest_node=[1],
+        group_link_mask=[[True] * num_links],
+        od_origin_node=[0],
+        group_od_index_padded=[[0]],
+        group_od_mask=[[True]],
+    )
 
 
 def test_prepare_assignment_requires_timetable(monkeypatch):
-    # Avoid any accidental calls into real builders
-    monkeypatch.setattr("public_transportation.assignment.assign.build_time_expanded_graph", lambda **kw: None)
-    monkeypatch.setattr("public_transportation.assignment.assign.build_od_groups", lambda **kw: None)
-    monkeypatch.setattr("public_transportation.assignment.assign.precompute_base_costs", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "public_transportation.assignment.assign.build_time_expanded_graph",
+        lambda **kw: None,
+    )
+    monkeypatch.setattr(
+        "public_transportation.assignment.assign.build_od_groups",
+        lambda **kw: None,
+    )
+    monkeypatch.setattr(
+        "public_transportation.assignment.assign.precompute_base_costs",
+        lambda *a, **k: None,
+    )
 
-    cfg = AssignmentConfig()
     with pytest.raises(ValueError, match="Scenario\\.timetable is required"):
-        prepare_assignment(_scenario_without_timetable(), cfg)
+        prepare_assignment(_scenario_without_timetable(), AssignmentConfig())
 
 
 def test_prepare_assignment_calls_builders_and_returns_artifacts(monkeypatch):
-    graph = _DummyGraph(num_nodes=3, num_links=4)
-    od_groups = _DummyODGroups(num_groups=2, dest_node=[1, 2], a_min=[0.0, 10.0], b_min=[5.0, 20.0])
+    graph = _centroid_out_graph(num_nodes=3, num_links=4, dest_nodes=[1, 2])
+    od_groups = _DummyODGroups(
+        group_dest_node=[1, 2],
+        group_link_mask=[
+            [True, True, True, True],
+            [True, True, True, True],
+        ],
+        od_origin_node=[0, 0],
+        group_od_index_padded=[[0], [1]],
+        group_od_mask=[[True], [True]],
+    )
     cost_parts = SimpleNamespace(name="cost_parts")
-
-    called = {"graph": 0, "groups": 0, "cost_parts": 0}
+    calls = {"graph": 0, "groups": 0, "cost_parts": 0}
 
     def _build_graph(*, scenario, config):
-        called["graph"] += 1
+        calls["graph"] += 1
+        assert scenario.timetable is not None
+        assert isinstance(config, AssignmentConfig)
         return graph
 
-    def _build_groups(*, scenario, graph):
-        called["groups"] += 1
-        assert graph is graph  # same object
+    def _build_groups(*, scenario, graph: _DummyGraph):
+        calls["groups"] += 1
+        assert scenario.timetable is not None
         return od_groups
 
     def _precompute(graph_in, config_in):
-        called["cost_parts"] += 1
+        calls["cost_parts"] += 1
         assert graph_in is graph
+        assert isinstance(config_in, AssignmentConfig)
         return cost_parts
 
-    monkeypatch.setattr("public_transportation.assignment.assign.build_time_expanded_graph", _build_graph)
-    monkeypatch.setattr("public_transportation.assignment.assign.build_od_groups", _build_groups)
-    monkeypatch.setattr("public_transportation.assignment.assign.precompute_base_costs", _precompute)
+    monkeypatch.setattr(
+        "public_transportation.assignment.assign.build_time_expanded_graph",
+        _build_graph,
+    )
+    monkeypatch.setattr(
+        "public_transportation.assignment.assign.build_od_groups",
+        _build_groups,
+    )
+    monkeypatch.setattr(
+        "public_transportation.assignment.assign.precompute_base_costs",
+        _precompute,
+    )
 
     cfg = AssignmentConfig()
-    arts = prepare_assignment(_scenario_with_timetable(), cfg)
+    artifacts = prepare_assignment(_scenario_with_timetable(), cfg)
 
-    assert arts.graph is graph
-    assert arts.od_groups is od_groups
-    assert arts.cost_parts is cost_parts
-    assert arts.config is cfg
-    assert called == {"graph": 1, "groups": 1, "cost_parts": 1}
-
-
-# -------------------------
-# assign: theta logic
-# -------------------------
+    assert artifacts.graph is graph
+    assert artifacts.od_groups is od_groups
+    assert artifacts.cost_parts is cost_parts
+    assert artifacts.config is cfg
+    assert calls == {"graph": 1, "groups": 1, "cost_parts": 1}
 
 
 def test_assign_rejects_nonpositive_theta(monkeypatch):
-    # Minimal artifacts
-    graph = _DummyGraph(num_nodes=2, num_links=3)
-    od_groups = _DummyODGroups(num_groups=1, dest_node=[1], a_min=[0.0], b_min=[1.0])
-    cost_parts = SimpleNamespace()
-
-    # Stubs
-    monkeypatch.setattr("public_transportation.assignment.assign.link_costs_for_group", lambda **kw: jnp.zeros((3,)))
-    monkeypatch.setattr(
-        "public_transportation.assignment.assign.run_dial_for_destination",
-        lambda **kw: _DummyDialResult(link_flow=jnp.zeros((3,))),
+    graph = _centroid_out_graph(num_nodes=2, num_links=3, dest_nodes=[1])
+    od_groups = _valid_od_groups(num_links=graph.num_links)
+    artifacts = SimpleNamespace(
+        graph=graph,
+        od_groups=od_groups,
+        cost_parts=SimpleNamespace(),
+        config=AssignmentConfig(),
     )
 
-    cfg = AssignmentConfig()
-    # Some projects have theta_min; if it doesn't exist, we still test theta<=0 rejection.
-    arts = SimpleNamespace(graph=graph, od_groups=od_groups, cost_parts=cost_parts, config=cfg)
+    monkeypatch.setattr(
+        "public_transportation.assignment.assign.link_costs",
+        lambda **kw: jnp.zeros((graph.num_links,), dtype=jnp.float32),
+    )
 
     with pytest.raises(ValueError, match="theta must be positive"):
-        assign(jnp.array([1.0]), arts, theta=0.0)
+        assign(jnp.asarray([1.0], dtype=jnp.float32), artifacts, theta=0.0)
 
 
 def test_assign_uses_default_theta_when_none(monkeypatch):
-    graph = _DummyGraph(num_nodes=2, num_links=2)
-    od_groups = _DummyODGroups(num_groups=1, dest_node=[1], a_min=[0.0], b_min=[1.0])
+    graph = _centroid_out_graph(num_nodes=2, num_links=2, dest_nodes=[1])
+    od_groups = _valid_od_groups(num_links=graph.num_links)
     cost_parts = SimpleNamespace()
+    seen: dict[str, Any] = {}
 
-    seen: dict[str, float] = {}
-
-    def _costs_for_group(*, theta, **kw):
-        seen["theta_in_costs"] = float(theta)
+    def _link_costs(*, graph, cost_parts, config):
+        seen["link_costs_graph"] = graph
+        seen["link_costs_cost_parts"] = cost_parts
+        seen["link_costs_config"] = config
         return jnp.zeros((graph.num_links,), dtype=jnp.float32)
 
-    def _dial(*, theta, **kw):
-        seen["theta_in_dial"] = float(theta)
-        return _DummyDialResult(link_flow=jnp.ones((graph.num_links,), dtype=jnp.float32))
+    def _assign_core(**kw):
+        seen.update(kw)
+        return jnp.ones((graph.num_links,), dtype=jnp.float32), None
 
-    monkeypatch.setattr("public_transportation.assignment.assign.link_costs_for_group", _costs_for_group)
-    monkeypatch.setattr("public_transportation.assignment.assign.run_dial_for_destination", _dial)
+    monkeypatch.setattr("public_transportation.assignment.assign.link_costs", _link_costs)
+    monkeypatch.setattr("public_transportation.assignment.assign._assign_core", _assign_core)
 
     cfg = AssignmentConfig(theta_default=7.5)
-    arts = SimpleNamespace(graph=graph, od_groups=od_groups, cost_parts=cost_parts, config=cfg)
+    artifacts = SimpleNamespace(
+        graph=graph,
+        od_groups=od_groups,
+        cost_parts=cost_parts,
+        config=cfg,
+    )
 
-    res = assign(jnp.array([3.0], dtype=jnp.float32), arts, theta=None)
+    result = assign(jnp.asarray([3.0], dtype=jnp.float32), artifacts)
 
-    assert res.theta == pytest.approx(7.5)
-    assert seen["theta_in_costs"] == pytest.approx(7.5)
-    assert seen["theta_in_dial"] == pytest.approx(7.5)
-    assert res.link_flow.shape == (graph.num_links,)
-    assert jnp.all(res.link_flow == 1.0)
-    assert res.group_link_flow is None
-
-
-# -------------------------
-# assign: aggregation over groups + return_group_link_flows
-# -------------------------
+    assert result.theta == pytest.approx(7.5)
+    assert seen["theta"] == pytest.approx(7.5)
+    assert seen["link_costs_graph"] is graph
+    assert seen["link_costs_cost_parts"] is cost_parts
+    assert seen["link_costs_config"] is cfg
+    assert jnp.all(result.link_flow == 1.0)
+    assert result.group_link_flow is None
 
 
-def test_assign_sums_group_link_flows_and_can_return_per_group(monkeypatch):
-    graph = _DummyGraph(num_nodes=3, num_links=4)
-    od_groups = _DummyODGroups(num_groups=2, dest_node=[1, 2], a_min=[0.0, 10.0], b_min=[5.0, 20.0])
-    cost_parts = SimpleNamespace()
+def test_assign_clamps_theta_to_theta_min(monkeypatch):
+    graph = _centroid_out_graph(num_nodes=2, num_links=2, dest_nodes=[1])
+    od_groups = _valid_od_groups(num_links=graph.num_links)
+    seen: dict[str, Any] = {}
 
-    # Make group g produce link_flow = (g+1) * [1,2,3,4]
+    monkeypatch.setattr(
+        "public_transportation.assignment.assign.link_costs",
+        lambda **kw: jnp.zeros((graph.num_links,), dtype=jnp.float32),
+    )
+
+    def _assign_core(**kw):
+        seen.update(kw)
+        return jnp.zeros((graph.num_links,), dtype=jnp.float32), None
+
+    monkeypatch.setattr("public_transportation.assignment.assign._assign_core", _assign_core)
+
+    cfg = AssignmentConfig(theta_default=5.0, theta_min=0.5)
+    artifacts = SimpleNamespace(
+        graph=graph,
+        od_groups=od_groups,
+        cost_parts=SimpleNamespace(),
+        config=cfg,
+    )
+
+    result = assign(jnp.asarray([1.0], dtype=jnp.float32), artifacts, theta=0.1)
+
+    assert result.theta == pytest.approx(0.5)
+    assert seen["theta"] == pytest.approx(0.5)
+
+
+def test_assign_passes_current_od_group_arrays_to_core(monkeypatch):
+    graph = _centroid_out_graph(num_nodes=3, num_links=4, dest_nodes=[1, 2])
+    od_groups = _DummyODGroups(
+        group_dest_node=[1, 2],
+        group_link_mask=[
+            [True, False, True, True],
+            [False, True, True, True],
+        ],
+        od_origin_node=[0, 0, 0],
+        group_od_index_padded=[[0, 1], [2, 0]],
+        group_od_mask=[[True, True], [True, False]],
+    )
+    seen: dict[str, Any] = {}
+    base_cost = jnp.arange(graph.num_links, dtype=jnp.float32)
+
+    monkeypatch.setattr(
+        "public_transportation.assignment.assign.link_costs",
+        lambda **kw: base_cost,
+    )
+
+    def _assign_core(**kw):
+        seen.update(kw)
+        return jnp.arange(graph.num_links, dtype=jnp.float32), None
+
+    monkeypatch.setattr("public_transportation.assignment.assign._assign_core", _assign_core)
+
+    artifacts = SimpleNamespace(
+        graph=graph,
+        od_groups=od_groups,
+        cost_parts=SimpleNamespace(),
+        config=AssignmentConfig(),
+    )
+
+    result = assign(jnp.asarray([10.0, 20.0, 30.0], dtype=jnp.float32), artifacts)
+
+    assert result.link_cost.shape == (graph.num_links,)
+    assert jnp.allclose(result.link_cost, base_cost)
+    assert seen["group_dest_node"].shape == (2,)
+    assert seen["group_link_mask"].shape == (2, graph.num_links)
+    assert seen["od_origin_node"].shape == (3,)
+    assert seen["group_od_index_padded"].shape == (2, 2)
+    assert seen["group_od_mask"].shape == (2, 2)
+    assert bool(seen["return_group_link_flows"]) is False
+
+
+def test_assign_can_return_group_link_flows(monkeypatch):
+    graph = _centroid_out_graph(num_nodes=3, num_links=4, dest_nodes=[1, 2])
+    od_groups = _DummyODGroups(
+        group_dest_node=[1, 2],
+        group_link_mask=[
+            [True, True, True, True],
+            [True, True, True, True],
+        ],
+        od_origin_node=[0, 0],
+        group_od_index_padded=[[0], [1]],
+        group_od_mask=[[True], [True]],
+    )
     base = jnp.arange(1, graph.num_links + 1, dtype=jnp.float32)
+    group_link_flow = jnp.vstack([base, 2.0 * base])
+    total_link_flow = jnp.sum(group_link_flow, axis=0)
 
-    def _costs_for_group(*, a_min, b_min, **kw):
-        # Verify a_min/b_min pass-through from ODGroups
-        assert (a_min, b_min) in {(0.0, 5.0), (10.0, 20.0)}
-        return jnp.zeros((graph.num_links,), dtype=jnp.float32)
+    monkeypatch.setattr(
+        "public_transportation.assignment.assign.link_costs",
+        lambda **kw: jnp.zeros((graph.num_links,), dtype=jnp.float32),
+    )
 
-    def _dial(*, initial_node_flow, dest_node, **kw):
-        # Determine g from the injected demand: we inject od_values[g] into node 0.
-        g_val = float(initial_node_flow[0])
-        # In this test, od_values is [0.0, 1.0] so g_val identifies group.
-        g = 0 if g_val == 0.0 else 1
-        return _DummyDialResult(link_flow=(g + 1) * base)
+    def _assign_core(**kw):
+        assert bool(kw["return_group_link_flows"])
+        return total_link_flow, group_link_flow
 
-    monkeypatch.setattr("public_transportation.assignment.assign.link_costs_for_group", _costs_for_group)
-    monkeypatch.setattr("public_transportation.assignment.assign.run_dial_for_destination", _dial)
+    monkeypatch.setattr("public_transportation.assignment.assign._assign_core", _assign_core)
 
-    cfg = AssignmentConfig(theta_default=5.0)
-    arts = SimpleNamespace(graph=graph, od_groups=od_groups, cost_parts=cost_parts, config=cfg)
+    artifacts = SimpleNamespace(
+        graph=graph,
+        od_groups=od_groups,
+        cost_parts=SimpleNamespace(),
+        config=AssignmentConfig(),
+    )
 
-    od_values = jnp.array([0.0, 1.0], dtype=jnp.float32)
+    result = assign(
+        jnp.asarray([0.0, 1.0], dtype=jnp.float32),
+        artifacts,
+        return_group_link_flows=True,
+    )
 
-    res = assign(od_values, arts, return_group_link_flows=True)
-
-    # total = 1*base + 2*base = 3*base
-    assert jnp.allclose(res.link_flow, 3.0 * base)
-    assert res.group_link_flow is not None
-    assert res.group_link_flow.shape == (od_groups.num_groups, graph.num_links)
-    assert jnp.allclose(res.group_link_flow[0], 1.0 * base)
-    assert jnp.allclose(res.group_link_flow[1], 2.0 * base)
-
-
-# -------------------------
-# assign: contract checks for ODGroups API
-# -------------------------
+    assert jnp.allclose(result.link_flow, total_link_flow)
+    assert result.group_link_flow is not None
+    assert result.group_link_flow.shape == (2, graph.num_links)
+    assert jnp.allclose(result.group_link_flow, group_link_flow)
 
 
-def test_assign_requires_od_groups_dest_node_and_time_bounds(monkeypatch):
-    graph = _DummyGraph(num_nodes=2, num_links=1)
-    cfg = AssignmentConfig()
-    cost_parts = SimpleNamespace()
+def test_assign_rejects_non_vector_od_values(monkeypatch):
+    graph = _centroid_out_graph(num_nodes=2, num_links=2, dest_nodes=[1])
+    od_groups = _valid_od_groups(num_links=graph.num_links)
+
+    monkeypatch.setattr(
+        "public_transportation.assignment.assign.link_costs",
+        lambda **kw: jnp.zeros((graph.num_links,), dtype=jnp.float32),
+    )
+
+    artifacts = SimpleNamespace(
+        graph=graph,
+        od_groups=od_groups,
+        cost_parts=SimpleNamespace(),
+        config=AssignmentConfig(),
+    )
+
+    with pytest.raises(ValueError, match="od_values must be a 1D array"):
+        assign(jnp.ones((1, 1), dtype=jnp.float32), artifacts)
+
+
+def test_assign_rejects_missing_group_link_mask(monkeypatch):
+    graph = _centroid_out_graph(num_nodes=2, num_links=1, dest_nodes=[1])
 
     class _BadGroups:
-        num_groups = 1
+        group_dest_node = jnp.asarray([1], dtype=jnp.int32)
 
-        def make_initial_node_flow(self, *, group_index, od_values, num_nodes):
-            return jnp.zeros((num_nodes,))
-
-    arts = SimpleNamespace(graph=graph, od_groups=_BadGroups(), cost_parts=cost_parts, config=cfg)
-
-    monkeypatch.setattr("public_transportation.assignment.assign.link_costs_for_group", lambda **kw: jnp.zeros((1,)))
     monkeypatch.setattr(
-        "public_transportation.assignment.assign.run_dial_for_destination",
-        lambda **kw: _DummyDialResult(link_flow=jnp.zeros((1,))),
+        "public_transportation.assignment.assign.link_costs",
+        lambda **kw: jnp.zeros((graph.num_links,), dtype=jnp.float32),
     )
 
-    with pytest.raises(ValueError, match="ODGroups must provide `dest_node`"):
-        assign(jnp.array([1.0]), arts)
-
-
-def test_assign_requires_make_initial_node_flow(monkeypatch):
-    graph = _DummyGraph(num_nodes=2, num_links=1)
-    cfg = AssignmentConfig()
-    cost_parts = SimpleNamespace()
-
-    class _GroupsNoMethod:
-        num_groups = 1
-        dest_node = jnp.asarray([1], dtype=jnp.int32)
-        a_min = jnp.asarray([0.0], dtype=jnp.float32)
-        b_min = jnp.asarray([1.0], dtype=jnp.float32)
-
-    arts = SimpleNamespace(graph=graph, od_groups=_GroupsNoMethod(), cost_parts=cost_parts, config=cfg)
-
-    monkeypatch.setattr("public_transportation.assignment.assign.link_costs_for_group", lambda **kw: jnp.zeros((1,)))
-    monkeypatch.setattr(
-        "public_transportation.assignment.assign.run_dial_for_destination",
-        lambda **kw: _DummyDialResult(link_flow=jnp.zeros((1,))),
+    artifacts = SimpleNamespace(
+        graph=graph,
+        od_groups=_BadGroups(),
+        cost_parts=SimpleNamespace(),
+        config=AssignmentConfig(),
     )
 
-    with pytest.raises(ValueError, match=r"ODGroups is missing method `make_initial_node_flow"):
-        assign(jnp.array([1.0]), arts)
+    with pytest.raises(ValueError, match="group_link_mask"):
+        assign(jnp.asarray([1.0], dtype=jnp.float32), artifacts)
 
 
-# -------------------------
-# assign_from_scenario
-# -------------------------
+@pytest.mark.parametrize(
+    "missing_field, expected_message",
+    [
+        ("od_origin_node", "od_origin_node"),
+        ("group_od_index_padded", "group_od_index_padded"),
+        ("group_od_mask", "group_od_mask"),
+    ],
+)
+def test_assign_rejects_missing_current_od_group_fields(
+    monkeypatch,
+    missing_field: str,
+    expected_message: str,
+):
+    graph = _centroid_out_graph(num_nodes=2, num_links=1, dest_nodes=[1])
+    od_groups = _valid_od_groups(num_links=graph.num_links)
+    delattr(od_groups, missing_field)
+
+    monkeypatch.setattr(
+        "public_transportation.assignment.assign.link_costs",
+        lambda **kw: jnp.zeros((graph.num_links,), dtype=jnp.float32),
+    )
+
+    artifacts = SimpleNamespace(
+        graph=graph,
+        od_groups=od_groups,
+        cost_parts=SimpleNamespace(),
+        config=AssignmentConfig(),
+    )
+
+    with pytest.raises(ValueError, match=expected_message):
+        assign(jnp.asarray([1.0], dtype=jnp.float32), artifacts)
+
+
+def test_assign_rejects_invalid_destination_node_index(monkeypatch):
+    graph = _centroid_out_graph(num_nodes=2, num_links=1, dest_nodes=[1])
+    od_groups = _DummyODGroups(
+        group_dest_node=[2],
+        group_link_mask=[[True]],
+        od_origin_node=[0],
+        group_od_index_padded=[[0]],
+        group_od_mask=[[True]],
+    )
+
+    monkeypatch.setattr(
+        "public_transportation.assignment.assign.link_costs",
+        lambda **kw: jnp.zeros((graph.num_links,), dtype=jnp.float32),
+    )
+
+    artifacts = SimpleNamespace(
+        graph=graph,
+        od_groups=od_groups,
+        cost_parts=SimpleNamespace(),
+        config=AssignmentConfig(),
+    )
+
+    with pytest.raises(ValueError, match="group_dest_node contains invalid node indices"):
+        assign(jnp.asarray([1.0], dtype=jnp.float32), artifacts)
+
+
+def test_assign_rejects_destination_that_is_not_centroid_out(monkeypatch):
+    graph = _centroid_out_graph(num_nodes=2, num_links=1, dest_nodes=[])
+    od_groups = _valid_od_groups(num_links=graph.num_links)
+
+    monkeypatch.setattr(
+        "public_transportation.assignment.assign.link_costs",
+        lambda **kw: jnp.zeros((graph.num_links,), dtype=jnp.float32),
+    )
+
+    artifacts = SimpleNamespace(
+        graph=graph,
+        od_groups=od_groups,
+        cost_parts=SimpleNamespace(),
+        config=AssignmentConfig(),
+    )
+
+    with pytest.raises(ValueError, match="must be a destination centroid-out node"):
+        assign(jnp.asarray([1.0], dtype=jnp.float32), artifacts)
+
+
+def test_assign_rejects_group_link_mask_wrong_shape(monkeypatch):
+    graph = _centroid_out_graph(num_nodes=2, num_links=3, dest_nodes=[1])
+    od_groups = _DummyODGroups(
+        group_dest_node=[1],
+        group_link_mask=[[True, True]],
+        od_origin_node=[0],
+        group_od_index_padded=[[0]],
+        group_od_mask=[[True]],
+    )
+
+    monkeypatch.setattr(
+        "public_transportation.assignment.assign.link_costs",
+        lambda **kw: jnp.zeros((graph.num_links,), dtype=jnp.float32),
+    )
+
+    artifacts = SimpleNamespace(
+        graph=graph,
+        od_groups=od_groups,
+        cost_parts=SimpleNamespace(),
+        config=AssignmentConfig(),
+    )
+
+    with pytest.raises(ValueError, match="group_link_mask has wrong shape"):
+        assign(jnp.asarray([1.0], dtype=jnp.float32), artifacts)
+
+
+def test_assign_rejects_group_od_index_and_mask_shape_mismatch(monkeypatch):
+    graph = _centroid_out_graph(num_nodes=2, num_links=1, dest_nodes=[1])
+    od_groups = _DummyODGroups(
+        group_dest_node=[1],
+        group_link_mask=[[True]],
+        od_origin_node=[0],
+        group_od_index_padded=[[0, 0]],
+        group_od_mask=[[True]],
+    )
+
+    monkeypatch.setattr(
+        "public_transportation.assignment.assign.link_costs",
+        lambda **kw: jnp.zeros((graph.num_links,), dtype=jnp.float32),
+    )
+
+    artifacts = SimpleNamespace(
+        graph=graph,
+        od_groups=od_groups,
+        cost_parts=SimpleNamespace(),
+        config=AssignmentConfig(),
+    )
+
+    with pytest.raises(ValueError, match="must have the same shape"):
+        assign(jnp.asarray([1.0], dtype=jnp.float32), artifacts)
+
+
+def test_assign_rejects_link_cost_wrong_shape(monkeypatch):
+    graph = _centroid_out_graph(num_nodes=2, num_links=3, dest_nodes=[1])
+    od_groups = _valid_od_groups(num_links=graph.num_links)
+
+    monkeypatch.setattr(
+        "public_transportation.assignment.assign.link_costs",
+        lambda **kw: jnp.zeros((2,), dtype=jnp.float32),
+    )
+
+    artifacts = SimpleNamespace(
+        graph=graph,
+        od_groups=od_groups,
+        cost_parts=SimpleNamespace(),
+        config=AssignmentConfig(),
+    )
+
+    with pytest.raises(ValueError, match="link_costs returned shape"):
+        assign(jnp.asarray([1.0], dtype=jnp.float32), artifacts)
 
 
 def test_assign_from_scenario_calls_prepare_and_assign(monkeypatch):
     scenario = _scenario_with_timetable()
     cfg = AssignmentConfig()
+    expected = SimpleNamespace(theta=5.0, link_flow=jnp.asarray([1.0]), group_link_flow=None)
 
-    dummy_res = SimpleNamespace(theta=5.0, link_flow=jnp.array([1.0]), group_link_flow=None)
-
-    def _prep(scenario_in, config_in):
+    def _prepare(scenario_in, config_in):
         assert scenario_in is scenario
         assert config_in is cfg
-        return "ARTS"
+        return "ARTIFACTS"
 
     def _assign(od_values, artifacts, **kwargs):
-        assert artifacts == "ARTS"
-        assert jnp.allclose(od_values, jnp.array([2.0]))
-        return dummy_res
+        assert artifacts == "ARTIFACTS"
+        assert jnp.allclose(od_values, jnp.asarray([2.0]))
+        assert kwargs == {"theta": None, "return_group_link_flows": False}
+        return expected
 
-    monkeypatch.setattr("public_transportation.assignment.assign.prepare_assignment", _prep)
+    monkeypatch.setattr("public_transportation.assignment.assign.prepare_assignment", _prepare)
     monkeypatch.setattr("public_transportation.assignment.assign.assign", _assign)
 
-    res = assign_from_scenario(scenario, jnp.array([2.0]), cfg)
-    assert res is dummy_res
+    result = assign_from_scenario(scenario, jnp.asarray([2.0]), cfg)
+
+    assert result is expected
