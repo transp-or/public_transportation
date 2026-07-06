@@ -1,4 +1,4 @@
-xorigin_stop_id,dest_stop_id,time_bin_id,flow
+origin_stop_id,dest_stop_id,time_bin_id,flow
 A,B,t0,1
 A,B,t1,1
 A,B,t2,1
