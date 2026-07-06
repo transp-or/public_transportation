@@ -27,3 +27,5 @@ docs/reports/traffic_assignment.log
 docs/reports/traffic_assignment.out
 src/public_transportation/bayesian_estimation.zip
 /archives/bayesian_estimation_old
+src/public_transportation/estimation/bayesian/__pycache__/__init__.cpython-312.pyc
+*.pyc
