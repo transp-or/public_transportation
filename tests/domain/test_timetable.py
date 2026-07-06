@@ -16,12 +16,12 @@ def _find(rep, code: str):
     return [iss for iss in rep.issues if iss.code == code]
 
 
-def _mk_trip(trip_id: str = "TR1", *, headsign: str = "X", line_id: str = "L1", direction_id: int = 0,
+def _mk_trip(trip_id: str = "TR1", *, headsign: str = "X", line_ref: str = "L1", direction_id: int = 0,
              capacity: int = 50) -> Trip:
     # Trip is validated inside Timetable.validate(), so keep it "obviously valid".
     return Trip(
         trip_id=trip_id,
-        line_id=line_id,
+        line_ref=line_ref,
         direction_id=direction_id,
         headsign=headsign,
         capacity=capacity,
@@ -52,9 +52,9 @@ def _mk_st(
 def test_valid_timetable_has_no_issues():
     trips = [_mk_trip("TR1"), _mk_trip("TR2", direction_id=1)]
     stop_times = [
-        _mk_st("TR1", "A", 1, 8 * 3600, 8 * 3600),
+        _mk_st("TR1", "A", 1, 8 * 3600, 8 * 3600 + 1),
         _mk_st("TR1", "B", 2, 8 * 3600 + 300, 8 * 3600 + 360),
-        _mk_st("TR2", "B", 1, 9 * 3600, 9 * 3600),
+        _mk_st("TR2", "B", 1, 9 * 3600, 9 * 3600 + 1),
         _mk_st("TR2", "A", 2, 9 * 3600 + 300, 9 * 3600 + 330),
     ]
     tt = Timetable(trips=trips, stop_times=stop_times)
@@ -73,8 +73,8 @@ def test_duplicate_trip_id_is_error_and_reported_per_duplicate():
     tt = Timetable(
         trips=[_mk_trip("TR1"), _mk_trip("TR1")],
         stop_times=[
-            _mk_st("TR1", "A", 1, 0, 0),
-            _mk_st("TR1", "B", 2, 60, 60),
+            _mk_st("TR1", "A", 1, 0, 1),
+            _mk_st("TR1", "B", 2, 60, 61),
         ],
     )
 
@@ -95,8 +95,8 @@ def test_stop_time_unknown_trip_is_error():
     tt = Timetable(
         trips=[_mk_trip("TR1")],
         stop_times=[
-            _mk_st("TR1", "A", 1, 0, 0),
-            _mk_st("NOPE", "B", 1, 60, 60),
+            _mk_st("TR1", "A", 1, 0, 1),
+            _mk_st("NOPE", "B", 1, 60, 61),
         ],
     )
 
@@ -112,8 +112,8 @@ def test_stop_time_unknown_stop_is_error_when_known_stop_ids_provided():
     tt = Timetable(
         trips=[_mk_trip("TR1")],
         stop_times=[
-            _mk_st("TR1", "A", 1, 0, 0),
-            _mk_st("TR1", "ZZZ", 2, 60, 60),
+            _mk_st("TR1", "A", 1, 0, 1),
+            _mk_st("TR1", "ZZZ", 2, 60, 61),
         ],
     )
 
@@ -129,8 +129,8 @@ def test_known_stop_ids_none_skips_stop_reference_check():
     tt = Timetable(
         trips=[_mk_trip("TR1")],
         stop_times=[
-            _mk_st("TR1", "A", 1, 0, 0),
-            _mk_st("TR1", "UNKNOWN_STOP", 2, 60, 60),
+            _mk_st("TR1", "A", 1, 0, 1),
+            _mk_st("TR1", "UNKNOWN_STOP", 2, 60, 61),
         ],
     )
 
@@ -148,8 +148,8 @@ def test_duplicate_sequence_within_trip_is_error():
     tt = Timetable(
         trips=[_mk_trip("TR1")],
         stop_times=[
-            _mk_st("TR1", "A", 1, 0, 0),
-            _mk_st("TR1", "B", 1, 60, 60),  # duplicate seq
+            _mk_st("TR1", "A", 1, 0, 1),
+            _mk_st("TR1", "B", 1, 60, 61),  # duplicate seq
         ],
     )
 
@@ -194,7 +194,7 @@ def test_trip_too_short_is_warning_for_one_stop_time():
     tt = Timetable(
         trips=[_mk_trip("TR1")],
         stop_times=[
-            _mk_st("TR1", "A", 1, 0, 0),
+            _mk_st("TR1", "A", 1, 0, 1),
         ],
     )
 
@@ -210,7 +210,7 @@ def test_trip_too_short_not_reported_for_unknown_trip_only():
     tt = Timetable(
         trips=[_mk_trip("TR1")],
         stop_times=[
-            _mk_st("UNKNOWN", "A", 1, 0, 0),
+            _mk_st("UNKNOWN", "A", 1, 0, 1),
         ],
     )
 
@@ -231,8 +231,8 @@ def test_multiple_issues_accumulate():
         stop_times=[
             _mk_st("TR1", "A", 1, 8 * 3600, 8 * 3600 + 120),
             _mk_st("TR1", "B", 2, 8 * 3600 + 60, 8 * 3600 + 90),   # nonmonotone
-            _mk_st("TR1", "B", 2, 8 * 3600 + 300, 8 * 3600 + 300), # duplicate sequence too
-            _mk_st("NOPE", "ZZZ", 1, 0, 0),                        # unknown trip and stop
+            _mk_st("TR1", "B", 2, 8 * 3600 + 300, 8 * 3600 + 301), # duplicate sequence too
+            _mk_st("NOPE", "ZZZ", 1, 0, 1),                        # unknown trip and stop
         ],
     )
 

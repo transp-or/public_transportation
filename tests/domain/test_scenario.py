@@ -38,6 +38,7 @@ def _mk_scenario(
     return Scenario(
         metadata=Metadata(title="Test scenario"),
         stops=stops if stops is not None else [],
+        lines=[],
         time_bins=time_bins if time_bins is not None else [],
         demand=demand if demand is not None else ODDemand(records=[]),
         timetable=None,

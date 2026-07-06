@@ -19,7 +19,7 @@ def _mk_st(
     stop_id: str = "A",
     seq: int = 1,
     arr_s: int = 0,
-    dep_s: int = 0,
+    dep_s: int = 1,
 ) -> StopTime:
     return StopTime(
         trip_id=trip_id,
@@ -36,7 +36,7 @@ def _mk_st(
 
 
 def test_valid_stop_time_has_no_issues():
-    st = _mk_st(arr_s=100, dep_s=100)
+    st = _mk_st(arr_s=100, dep_s=101)
     rep = st.validate()
     assert rep.issues == []
 
@@ -90,15 +90,15 @@ def test_sequence_must_be_positive():
 
 
 # ---------------------------------------------------------
-# departure before arrival
+# departure not strictly after arrival
 # ---------------------------------------------------------
 
 
-def test_departure_before_arrival_is_error():
+def test_departure_not_after_arrival_is_error():
     st = _mk_st(arr_s=500, dep_s=400, seq=2, trip_id="TR1")
     rep = st.validate()
 
-    issues = _find(rep, "STOPTIME_DEPART_BEFORE_ARRIVE")
+    issues = _find(rep, "STOPTIME_DEPART_NOT_AFTER_ARRIVE")
     assert len(issues) == 1
 
     iss = issues[0]
@@ -130,7 +130,7 @@ def test_multiple_issues_all_reported():
     assert "STOPTIME_TRIP_EMPTY" in codes
     assert "STOPTIME_STOP_EMPTY" in codes
     assert "STOPTIME_SEQUENCE_NONPOSITIVE" in codes
-    assert "STOPTIME_DEPART_BEFORE_ARRIVE" in codes
+    assert "STOPTIME_DEPART_NOT_AFTER_ARRIVE" in codes
 
     # exactly 4 issues expected
     assert len(rep.issues) == 4
