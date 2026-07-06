@@ -48,7 +48,7 @@ import matplotlib.pyplot as plt
 import jax.numpy as jnp
 import numpyro.distributions as dist
 
-from public_transportation.bayesian_estimation import run_vi, recommend_vi_defaults, Array
+from public_transportation.estimation.bayesian import run_vi, recommend_vi_defaults
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("public_transportation.vi")
