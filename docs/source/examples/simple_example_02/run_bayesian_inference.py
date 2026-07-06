@@ -21,24 +21,20 @@ Workflow (minimal):
 
 from __future__ import annotations
 
-from pathlib import Path
 import logging
+from pathlib import Path
 
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
 
-from public_transportation.domain import Scenario
 from public_transportation.assignment import AssignmentConfig
 from public_transportation.assignment.assign import prepare_assignment
 from public_transportation.assignment.id_manager import AssignmentIDManager
-
-from public_transportation.measurement import read_measurements_csv, build_mapping_spec_strict
-from public_transportation.inference.priors import build_f0_from_scenario_demand
-from public_transportation.inference.assignment_adapter import build_assignment_inputs
+from public_transportation.domain import Scenario
+from public_transportation.estimation.bayesian.config import VIConfig
 from public_transportation.inference.pipeline import ODThetaEstimationRequest, estimate_od_theta_vi
-
-from public_transportation.bayesian_estimation.config import VIConfig
-
+from public_transportation.inference.priors import build_f0_from_scenario_demand
+from public_transportation.measurement import build_mapping_spec_strict, read_measurements_csv
 
 DATA = Path(__file__).resolve().parent / "data"
 
