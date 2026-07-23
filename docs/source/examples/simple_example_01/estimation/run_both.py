@@ -1,5 +1,5 @@
 """
-Run both Bayesian VI and maximum-likelihood estimation for simple_example_02.
+Run both Bayesian VI and maximum-likelihood estimation for simple_example_01.
 
 Reads:
     ../data/
@@ -17,7 +17,6 @@ import shutil
 import tempfile
 from pathlib import Path
 from time import perf_counter
-from typing import Any
 
 import jax.numpy as jnp
 import numpy as np
@@ -25,15 +24,11 @@ import numpy as np
 from public_transportation.assignment import AssignmentConfig
 from public_transportation.assignment.assign import prepare_assignment
 from public_transportation.assignment.id_manager import AssignmentIDManager
-from public_transportation.domain import Scenario
+from public_transportation.domain import Scenario, read_fixed_demand_csv
 from public_transportation.estimation.bayesian.config import VIConfig
 from public_transportation.estimation.maximum_likelihood import MLConfig, run_ml
-from public_transportation.inference.assignment_adapter import build_assignment_inputs
-from public_transportation.inference.likelihood import (
-    loglikelihood_from_link_flow,
-    prepare_likelihood_inputs,
-)
-from public_transportation.inference.model import make_forward_inputs, forward_model
+from public_transportation.inference.maximum_likelihood_pipeline import build_od_theta_ml_problem
+from public_transportation.inference.od_parameter_layout import build_od_parameter_layout
 from public_transportation.inference.pipeline import (
     ODThetaEstimationRequest,
     estimate_od_theta_vi,
@@ -138,6 +133,8 @@ def main() -> None:
 
     with prepare_scenario_folder() as scenario_dir:
         scenario = Scenario.from_folder(Path(scenario_dir))
+        fixed_demand = read_fixed_demand_csv(DATA / "fixed_demand.csv", scenario=scenario)
+        od_layout = build_od_parameter_layout(scenario=scenario, fixed_demand=fixed_demand)
 
         rep = scenario.validate()
         if rep.issues:
@@ -181,6 +178,7 @@ def main() -> None:
             y_obs=jnp.asarray(msr.y_obs, dtype=jnp.float32),
             mapping_spec=msr.spec,
             baseline_theta=float(baseline_theta),
+            od_layout=od_layout,
             estimate_theta=estimate_theta,
             fixed_theta=fixed_theta,
             sigma_z=float(sigma_z),
@@ -203,99 +201,33 @@ def main() -> None:
         vi_theta_mean = float(vi_result.theta_mean)
         vi_total_flow_samples = vi_result.f_samples.sum(axis=1)
 
-        assignment_inputs = build_assignment_inputs(artifacts=artifacts)
-        forward_inputs = make_forward_inputs(f0=f0, spec=msr.spec)
-        prepared_likelihood = prepare_likelihood_inputs(
-            y_obs=jnp.asarray(msr.y_obs, dtype=jnp.float32),
-            spec=msr.spec,
-        )
-
-        num_od = int(f0.shape[0])
-        dim = num_od + 1 if estimate_theta else num_od
-        mu_u = float(np.log(baseline_theta))
-
-        data: dict[str, Any] = {
-            "rho": jnp.asarray(rho, dtype=jnp.float32).reshape(()),
-            "r_nb": jnp.asarray(nb_dispersion, dtype=jnp.float32).reshape(()),
-        }
-
-        def split_theta(theta_vec: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray | None, jnp.ndarray]:
-            z = theta_vec[:num_od]
-            if estimate_theta:
-                u = jnp.clip(theta_vec[num_od], -u_clip, u_clip)
-                return z, u, jnp.exp(u)
-
-            assert fixed_theta is not None
-            theta = jnp.asarray(float(fixed_theta), dtype=theta_vec.dtype).reshape(())
-            return z, None, theta
-
-        def loglik(theta_vec: jnp.ndarray, data_: dict[str, Any]) -> jnp.ndarray:
-            z, _, theta = split_theta(theta_vec)
-            z = jnp.clip(z, -z_clip, z_clip)
-
-            out = forward_model(
-                inputs=forward_inputs,
-                z=z,
-                theta=theta,
-                rho=data_["rho"],
-                assignment_inputs=assignment_inputs,
-            )
-
-            ll = loglikelihood_from_link_flow(
-                link_flow=out.link_flow,
-                prepared=prepared_likelihood,
-                theta=theta,
-                rho=data_["rho"],
-                r=data_["r_nb"],
-            )
-            return jnp.where(jnp.isfinite(ll), ll, -jnp.inf)
-
-        def logprior(theta_vec: jnp.ndarray) -> jnp.ndarray:
-            z, u, _ = split_theta(theta_vec)
-            z = jnp.clip(z, -z_clip, z_clip)
-
-            lp = normal_logpdf(z, 0.0, sigma_z).sum()
-            if estimate_theta:
-                assert u is not None
-                lp = lp + normal_logpdf(u, mu_u, sigma_u).sum()
-            return lp
+        ml_problem = build_od_theta_ml_problem(vi_request)
 
         ml_cfg = MLConfig(
             method="BFGS",
             maxiter=1000,
             gtol=1.0e-6,
-            prior_weight=1.0,
+            prior_weight=0.0,
             compute_hessian=True,
             log_every=10,
         )
 
-        theta0 = jnp.zeros((dim,), dtype=jnp.float32)
-        if estimate_theta:
-            theta0 = theta0.at[num_od].set(mu_u)
-
         print("Running maximum likelihood...")
         t0 = perf_counter()
         ml_result = run_ml(
-            dim=dim,
-            data=data,
-            loglik=loglik,
-            logprior=logprior,
-            theta0=theta0,
+            dim=ml_problem.dim,
+            data=ml_problem.data,
+            loglik=ml_problem.loglik,
+            logprior=ml_problem.logprior,
+            theta0=ml_problem.theta0,
             config=ml_cfg,
             logger=logger,
         )
         ml_time_s = perf_counter() - t0
 
-        ml_z_hat = np.asarray(ml_result.theta_hat[:num_od], dtype=float)
-        if estimate_theta:
-            ml_u_hat = float(ml_result.theta_hat[num_od])
-            ml_theta_hat = float(np.exp(ml_u_hat))
-        else:
-            assert fixed_theta is not None
-            ml_u_hat = float(np.log(fixed_theta))
-            ml_theta_hat = float(fixed_theta)
-
-        ml_f_hat = np.asarray(f0, dtype=float) * np.exp(ml_z_hat)
+        ml_f_hat, ml_theta_hat = ml_problem.decode(ml_result.theta_hat)
+        ml_z_hat = np.asarray(ml_result.theta_hat[: ml_problem.num_free_od], dtype=float)
+        ml_u_hat = float(np.log(ml_theta_hat))
 
         vi_total_flow_mean = float(vi_total_flow_samples.mean())
         vi_total_flow_sd = float(vi_total_flow_samples.std())
@@ -320,6 +252,8 @@ def main() -> None:
         print()
         print("Comparison of Bayesian VI and ML")
         print("--------------------------------")
+        for line in vi_result.runtime_profile.format_lines():
+            print(line)
         print(f"estimate theta: {estimate_theta}")
         if not estimate_theta:
             print(f"fixed theta: {fixed_theta:.6g}")
@@ -354,6 +288,21 @@ def main() -> None:
             fingerprint=str(idm.fingerprint),
             fingerprint_payload_json=idm.fingerprint_payload_json,
             f0=np.asarray(f0, dtype=float),
+            num_od_total=od_layout.num_od_total,
+            num_free_od=od_layout.num_free,
+            num_fixed_od=od_layout.num_fixed,
+            free_od_indices=np.asarray(od_layout.free_od_indices, dtype=np.int64),
+            fixed_od_indices=np.asarray(od_layout.fixed_od_indices, dtype=np.int64),
+            fixed_od_values=np.asarray(od_layout.fixed_od_values, dtype=float),
+            od_layout_fingerprint=od_layout.fingerprint,
+            od_layout_payload_json=od_layout.fingerprint_payload_json,
+            compact_layout_fingerprint=vi_result.compact_layout_fingerprint,
+            compact_layout_payload_json=vi_result.compact_layout_payload_json,
+            **{
+                f"runtime_{key}": value
+                for key, value in vi_result.runtime_profile.as_dict().items()
+                if not key.endswith("fingerprint")
+            },
             estimate_theta=estimate_theta,
             fixed_theta=(np.nan if fixed_theta is None else float(fixed_theta)),
             vi_time_s=vi_time_s,

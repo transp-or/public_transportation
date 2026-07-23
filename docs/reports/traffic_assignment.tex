@@ -32,7 +32,7 @@ The software follows four main steps:
 \item Develop a detailed network representation of the public transportation system.
 \item Formulate an assignment model that maps an OD matrix to passenger flows on the network.
 \item Define measurement equations linking model outputs to observed data, yielding a likelihood function.
-  \item Use Bayesian inference (current baseline implementation: NumPyro with variational inference) to approximate the posterior distribution of the OD matrix.
+\item Estimate demand using ML, MAP, or Bayesian variational inference.
 \end{enumerate}
 
 \section{Modeling Elements}
@@ -88,34 +88,60 @@ Rather than placing a prior directly on the demand levels $\bm f$, we parameteri
 in terms of \emph{log-deviations} from $\bm f^{(0)}$. This improves numerical stability,
 facilitates weakly informative priors, and makes the role of prior information explicit.
 
-\paragraph{Modeling choice (log-deviation).}
-For each OD/time-bin cell, introduce a latent deviation $\delta_q^t\in\mathbb{R}$ and define
-the demand used by the assignment as
+\paragraph{Modeling choice (smoothly bounded log-deviation).}
+For each OD/time-bin cell, introduce an unconstrained latent variable
+$\widetilde{z}_q^t\in\mathbb{R}$. To protect the exponentiation and the downstream
+assignment from extreme values while retaining a smooth gradient, define the effective
+log-deviation as
+\[
+z_q^t
+=
+z_{\max}\tanh\!\left(\frac{\widetilde{z}_q^t}{z_{\max}}\right),
+\qquad z_{\max}>0.
+\]
+The demand used by the assignment is then
 \[
 f_q^t
 =
-f_{q}^{t,(0)}\exp(\delta_q^t).
+f_{q}^{t,(0)}\exp(z_q^t).
 \]
 This transformation guarantees $f_q^t\ge 0$ whenever $f_{q}^{t,(0)}\ge 0$ and preserves the baseline
-structure up to multiplicative adjustments.
+structure up to multiplicative adjustments. It also implies
+\[
+|z_q^t|\le z_{\max},
+\qquad
+\exp(-z_{\max})
+\le \frac{f_q^t}{f_q^{t,(0)}}
+\le \exp(z_{\max})
+\]
+for positive baseline cells. The default $z_{\max}=6$ therefore permits demand
+multipliers ranging approximately from $1/403$ to $403$. In the software configuration,
+this smooth bound is exposed under the historical name \texttt{z\_clip}; despite that
+name, the implementation uses a smooth hyperbolic-tangent transformation rather than
+hard clipping.
 
 \paragraph{Zero baseline cells.}
-If $f_{q}^{t,(0)}=0$, then $f_q^t=0$ for all values of $\delta_q^t$.
+If $f_{q}^{t,(0)}=0$, then $f_q^t=0$ for all values of $\widetilde{z}_q^t$.
 Therefore, OD cells that are zero in the baseline
 matrix remain structurally zero during inference.
 In order to allow strictly positive deviations from zero, a small but non zero seed value must be provided: $f_{q}^{t,(0)}=\varepsilon>0$.
 
 
 \paragraph{Prior scale.}
-The deviations are assumed independent and normally distributed:
+The raw unconstrained variables, rather than the bounded effective deviations, are
+assumed independent and normally distributed:
 \[
-\delta_q^t \sim \mathcal{N}(0,\sigma_z^2).
+\widetilde{z}_q^t \sim \mathcal{N}(0,\sigma_z^2).
 \]
 The parameter $\sigma_z>0$ controls the strength of regularization.
 Small values of $\sigma_z$ constrain demand to remain close to the baseline, while large values allow
-substantial multiplicative deviations.
+the effective deviations to approach their smooth bounds.
 In the current version of the software, $\sigma_z$ is a fixed
 hyperparameter.
+
+The distinction between $\widetilde{z}_q^t$ and $z_q^t$ is important: the
+Gaussian density is evaluated at the raw variable $\widetilde{z}_q^t$, whereas
+the assignment and all reported demand samples use the transformed value $z_q^t$.
 
 
 \paragraph{Separation of responsibilities.}
@@ -124,9 +150,10 @@ The assignment procedure is treated as a deterministic mapping
 (\bm f,\theta)\longmapsto \bm x(\bm f;\theta)
 \]
 and remains agnostic to priors and baseline information. The construction of $\bm f$ from
-$\bm f^{(0)}$ and $\bm\delta$ is performed in the \emph{Bayesian layer} (implemented using NumPyro and
+$\bm f^{(0)}$ and $\widetilde{\bm z}$ is performed in the \emph{Bayesian layer} (implemented using NumPyro and
 stochastic variational inference), which: (i) reads the baseline $\bm f^{(0)}$ provided by the user,
-(ii) draws deviations $\bm\delta$ from a prior distribution, and (iii) computes $\bm f$ using the
+(ii) draws the raw deviations $\widetilde{\bm z}$ from their prior distribution,
+(iii) applies the smooth bound to obtain $\bm z$, and (iv) computes $\bm f$ using the
 expression above before invoking the assignment. This design avoids introducing additional indexing
 conventions and keeps the assignment module independent of the inference engine.
 
@@ -626,31 +653,228 @@ For posterior computations, terms constant with respect to $(\bm f,\theta)$ may 
 Other likelihood choices (e.g., Gaussian noise on counts or Poisson models) may be implemented in the future,
 but the current baseline implementation uses the negative binomial likelihood described above.
 
+\section{Free and Frozen OD Demand Cells}
+
+An estimation run may hold a selected subset of OD/time-bin cells at predefined
+nonnegative values. Let $\mathcal{I}=\{1,\ldots,n_{\mathrm{OD}}\}$ be the full
+assignment indexing, and partition it into the free set $\mathcal{U}$ and the
+frozen set $\mathcal{F}$, with
+$\mathcal{U}\cap\mathcal{F}=\varnothing$ and
+$\mathcal{U}\cup\mathcal{F}=\mathcal{I}$. For each $i\in\mathcal{F}$, let
+$c_i\geq 0$ denote its predefined flow. The demand reconstruction is
+\[
+f_i(\bm z_{\mathcal U})=
+\begin{cases}
+f_i^{(0)}\exp(z_i), & i\in\mathcal{U},\\
+c_i, & i\in\mathcal{F}.
+\end{cases}
+\]
+The smooth bounded transformation described previously is applied to the raw
+coordinate associated with each $z_i$, $i\in\mathcal U$.
+
+The frozen cells are not represented by dummy parameters. They occur neither in
+the optimizer vector nor in the Bayesian guide, prior, gradient, Hessian, or
+covariance matrix. The full vector $\bm f$ is reconstructed only at the boundary
+of the assignment model, because assignment necessarily consumes all OD cells.
+Thus the statistical dimension is exactly
+\[
+d=|\mathcal U|+\mathbf{1}\{\theta\text{ is estimated}\},
+\]
+independently of $|\mathcal F|$. A frozen value may be zero or positive. In
+contrast, a free cell requires a strictly positive baseline $f_i^{(0)}$, since
+the multiplicative parameterization cannot move away from a zero baseline.
+
+Frozen values are supplied by a sparse CSV file with columns
+\texttt{origin\_stop\_id}, \texttt{dest\_stop\_id},
+\texttt{time\_bin\_id}, and optionally \texttt{fixed\_flow}. A missing or blank
+\texttt{fixed\_flow} denotes zero. Keys are validated against the scenario,
+duplicates are rejected, and the free/frozen partition is constructed in the
+canonical assignment order. The same immutable partition is passed to ML, MAP,
+and Bayesian VI. Saved results include the free indices, frozen indices, and
+frozen values so that downstream processing can verify the invariant.
+The layout also has its own canonical SHA-256 fingerprint, computed from the OD
+keys, partition indices, free baselines, and frozen values. This fingerprint is
+stored separately from the network/assignment fingerprint: changing only the
+frozen-demand file must therefore change the layout identity even though the
+network identity remains unchanged. The canonical JSON payload used to compute
+the digest is persisted with the result. On loading, the digest is recomputed
+from that payload to detect corruption or manual modification. During
+post-processing, the layout is rebuilt from the current scenario and
+\texttt{fixed\_demand.csv}; its fingerprint must match the result fingerprint
+before assignment or report generation proceeds. The network fingerprint and
+layout fingerprint are checked independently.
+
+If $|\mathcal U|=0$ and $\theta$ is fixed, then $d=0$. This is treated as a
+deterministic evaluation rather than as an optimization or variational-inference
+problem. The likelihood is evaluated once for validation, while NumPyro SVI and
+the numerical optimizer are bypassed entirely. Returned parameter, gradient,
+Hessian, covariance, and posterior-coordinate arrays are correspondingly empty.
+
+\paragraph{Complexity boundary.}
+The software exposes a structural complexity profile so that dimensionality can
+be audited without relying on machine-dependent timings. For reduced dimension
+$d$ and effective low rank $r_q^{\mathrm{eff}}$, the principal statistical
+state sizes are
+\[
+\begin{array}{c|c}
+\text{state} & \text{number of scalar entries}\\ \hline
+\text{optimizer vector or gradient} & d\\
+\text{diagonal Gaussian guide} & 2d\\
+\text{low-rank Gaussian guide} & 2d+d r_q^{\mathrm{eff}}\\
+\text{full Gaussian guide} & d+d(d+1)/2\\
+\text{dense Hessian or covariance} & d^2.
+\end{array}
+\]
+These statistical quantities depend only on the free cells and optional
+$\theta$, not on the number of frozen cells.
+
+There is a separate deterministic cost boundary. Each likelihood evaluation
+passes a compact demand vector containing the $n_{\mathrm{free}}$ free cells and
+the $n_{\mathrm{fixed},+}$ strictly positive frozen cells. Frozen-zero cells are
+absent from that vector, from the padded OD group arrays, and from assignment
+demand injection. A destination group is also removed when it contains no
+remaining cell. Thus the assignment demand-vector size is
+$n_{\mathrm{free}}+n_{\mathrm{fixed},+}$ rather than $n_{\mathrm{OD}}$.
+The time-expanded graph and other scenario-wide static arrays remain unchanged,
+so forward runtime still depends on the graph and on the surviving destination
+groups. Positive frozen flows must participate in assignment predictions; when
+$\theta$ is estimated, even their route-choice probabilities change with the
+estimated parameter. The full $n_{\mathrm{OD}}$ vector is reconstructed only
+after estimation for persistence and reporting.
+For every VI, ML, or MAP problem, the implementation reports the total, free,
+frozen-zero, and frozen-positive OD counts; the compact assignment-vector size;
+and the original, surviving, and removed destination-group counts. These
+structural metrics accompany elapsed time so that runtime differences can be
+interpreted in terms of the work actually performed by the assignment model.
+
+\section{Maximum Likelihood and Maximum A Posteriori Estimation}
+
+The differentiable assignment and measurement models can be used for point estimation
+without constructing a full posterior approximation. Let
+\[
+\bm\eta=
+\begin{cases}
+(\widetilde{\bm z}_{\mathcal U},\widetilde u), & \text{if $\theta$ is estimated},\\
+\widetilde{\bm z}_{\mathcal U}, & \text{if $\theta$ is fixed},
+\end{cases}
+\]
+denote the vector of raw unconstrained parameters. The same smooth transformations
+defined above map $\bm\eta$ to the effective demand vector $\bm f$ and, when
+applicable, to $\theta$. Consequently, all estimation methods use the same forward
+model and negative binomial likelihood.
+
+\subsection{Maximum likelihood estimation}
+
+The maximum likelihood estimator (MLE) is
+\[
+\widehat{\bm\eta}_{\mathrm{ML}}
+=
+\arg\max_{\bm\eta}
+\ell(\bm\eta),
+\]
+where
+\[
+\ell(\bm\eta)
+=
+\log\mathcal L\!\left(
+Y\mid \bm f(\widetilde{\bm z}),\theta(\widetilde u),\rho,r
+\right),
+\]
+with the dependence on $\widetilde u$ omitted when $\theta$ is fixed. The MLE
+uses no prior information. The baseline demand $\bm f^{(0)}$ still appears in
+the parameterization $\bm f=\bm f^{(0)}\exp(\bm z)$, but it is not a probabilistic
+prior in the ML objective.
+
+After optimization, the raw point estimate is transformed using exactly the same
+smooth mappings as in Bayesian inference:
+\[
+\widehat{z}_q^t
+=z_{\max}\tanh(\widehat{\widetilde z}_q^t/z_{\max}),
+\qquad
+\widehat f_q^t=f_q^{t,(0)}\exp(\widehat z_q^t),
+\]
+and, when estimated,
+\[
+\widehat u
+=u_{\max}\tanh(\widehat{\widetilde u}/u_{\max}),
+\qquad
+\widehat\theta=\exp(\widehat u).
+\]
+
+\subsection{Maximum a posteriori estimation}
+
+Maximum a posteriori (MAP) estimation uses the same likelihood and priors as the
+Bayesian model, but returns only the posterior mode:
+\[
+\widehat{\bm\eta}_{\mathrm{MAP}}
+=
+\arg\max_{\bm\eta}
+\left\{
+\ell(\bm\eta)+\log p(\bm\eta)
+\right\}.
+\]
+Here $p(\bm\eta)$ contains the Gaussian prior on $\widetilde{\bm z}$ and,
+when $\theta$ is estimated, the Gaussian prior on $\widetilde u$. The priors
+are evaluated on the raw variables, not on their smoothly bounded transforms.
+
+The software implements ML and MAP through the common penalized objective
+\[
+Q_w(\bm\eta)
+=
+-\ell(\bm\eta)-w\log p(\bm\eta),
+\qquad w\ge 0.
+\]
+The setting $w=0$ gives pure maximum likelihood and $w=1$ gives MAP under the
+same prior as the Bayesian model. Intermediate or larger values provide regularized
+point estimates, but do not in general correspond to the posterior of the stated
+Bayesian model.
+
+\subsection{Numerical optimization and local uncertainty}
+
+The current point-estimation implementation minimizes $Q_w$ with gradient-based
+SciPy optimizers such as BFGS or L-BFGS-B. Gradients are supplied by JAX automatic
+differentiation. Because the objective need not be globally convex, convergence
+to the global optimum is not guaranteed; initialization, stopping tolerances, and
+local curvature should therefore be inspected.
+
+When requested, the software computes the Hessian of $Q_w$ at the optimum and
+uses its inverse as a local covariance approximation. For ML this is an asymptotic
+likelihood-based approximation; for MAP it is a Laplace-style local approximation
+to posterior curvature. These standard errors are not equivalent to a complete
+posterior distribution and may be unreliable for weakly identified, asymmetric,
+bounded, or multimodal problems.
+
 \section{Bayesian Inference via Variational Inference}
 
-Let $\bm{\delta}$ denote the vector of log-deviations and $\theta$ the dispersion parameter of the route choice model.
+Let $\widetilde{\bm z}_{\mathcal U}$ denote the vector of raw OD-deviation variables for free cells and let
+$\widetilde u$ denote the raw variable associated with the dispersion parameter
+of the route choice model. The effective parameters supplied to the forward model
+are deterministic transformations of these raw variables.
 The posterior distribution is proportional to
 \[
-p(\bm{\delta},\theta \mid Y)
+p(\widetilde{\bm z}_{\mathcal U},\widetilde u \mid Y)
 \propto
-\mathcal{L}(Y \mid \bm{\delta},\theta)\,
-p(\bm{\delta})\,p(\theta).
+\mathcal{L}\!\left(Y \mid \bm f(\widetilde{\bm z}_{\mathcal U}),
+\theta(\widetilde u)\right)\,
+p(\widetilde{\bm z}_{\mathcal U})\,p(\widetilde u).
 \]
+When $\theta$ is fixed, $\widetilde u$ and its prior are omitted.
 
 Exact Bayesian inference is computationally intractable for high-dimensional OD vectors.
 The current implementation therefore uses \emph{stochastic variational inference} (SVI) as implemented in NumPyro.
 
 \paragraph{Variational approximation.}
-The posterior is approximated by a parametric distribution $q_\phi(\bm{\delta},\theta)$.
+The posterior is approximated by a parametric distribution
+$q_\phi(\widetilde{\bm z}_{\mathcal U},\widetilde u)$ in the raw unconstrained parameter space.
 The parameters $\phi$ are chosen to maximize the \emph{Evidence Lower Bound} (ELBO):
 \[
 \mathrm{ELBO}(\phi)
 =
 \mathbb{E}_{q_\phi}
 \left[
-\log p(Y,\bm{\delta},\theta)
+\log p(Y,\widetilde{\bm z}_{\mathcal U},\widetilde u)
 -
-\log q_\phi(\bm{\delta},\theta)
+\log q_\phi(\widetilde{\bm z}_{\mathcal U},\widetilde u)
 \right].
 \]
 Maximizing the ELBO is equivalent to minimizing $\mathrm{KL}(q_\phi \,\|\, p)$ between the variational approximation and the true posterior.
@@ -658,20 +882,127 @@ Maximizing the ELBO is equivalent to minimizing $\mathrm{KL}(q_\phi \,\|\, p)$ b
 \paragraph{Guide family.}
 The baseline implementation uses Gaussian variational families in an unconstrained parameter space
 (e.g., diagonal or low-rank approximations), and optimization is performed using stochastic gradients (Adam).
+For a requested low-rank value $r_q$, the implemented effective rank is
+\[
+r_q^{\mathrm{eff}}=\min(r_q,d),
+\]
+where $d=|\mathcal U|+\mathbf{1}\{\theta\text{ is estimated}\}$ is the reduced
+statistical dimension. This prevents a guide configured for the original model
+from retaining unnecessary covariance factors after many OD cells are frozen.
+The effective rank, rather than the oversized requested value, is recorded in
+the inference diagnostics. When $d=0$, no guide is constructed.
 
 \paragraph{Prior on $\theta$.}
-The dispersion parameter $\theta$ is strictly positive. In practice, inference is performed in an unconstrained space
-(e.g., via a log-transformation), and a weakly informative prior is used to avoid degenerate values (e.g., extremely small $\theta$).
-The exact prior family is configurable in the NumPyro implementation.
+The dispersion parameter $\theta$ is strictly positive. When it is estimated,
+the implementation introduces an unconstrained raw variable $\widetilde u\in\mathbb R$
+and defines
+\[
+u
+=
+u_{\max}\tanh\!\left(\frac{\widetilde u}{u_{\max}}\right),
+\qquad
+\theta=\exp(u),
+\qquad u_{\max}>0.
+\]
+Thus $\theta$ is positive and smoothly bounded between
+$\exp(-u_{\max})$ and $\exp(u_{\max})$. The configuration currently exposes
+$u_{\max}$ under the historical name \texttt{u\_clip}, although no hard clipping
+is performed.
+
+A Gaussian prior is placed on the raw variable,
+\[
+\widetilde u\sim\mathcal N(\mu_{\widetilde u},\sigma_u^2).
+\]
+If the requested center in effective log-dispersion space is $\mu_u$---for example,
+$\mu_u=\log(\theta^{(0)})$ for a baseline value $\theta^{(0)}$---the raw prior
+center is chosen by the inverse transformation,
+\[
+\mu_{\widetilde u}
+=
+u_{\max}\operatorname{arctanh}\!\left(\frac{\mu_u}{u_{\max}}\right).
+\]
+This guarantees that transforming the raw prior center gives exactly the requested
+effective center. It requires $|\mu_u|<u_{\max}$.
+
+\paragraph{Posterior transformation and reporting.}
+Posterior samples produced by the variational guide are samples of the raw variables
+$\widetilde{\bm z}$ and, when applicable, $\widetilde u$. Before reporting demand or
+$\theta$, the software applies the same smooth transformations used during likelihood
+evaluation:
+\[
+z_q^t=z_{\max}\tanh(\widetilde z_q^t/z_{\max}),
+\qquad
+f_q^t=f_q^{t,(0)}\exp(z_q^t),
+\]
+and
+\[
+u=u_{\max}\tanh(\widetilde u/u_{\max}),
+\qquad \theta=\exp(u).
+\]
+Consequently, reported posterior summaries correspond exactly to the parameter values
+used by the assignment and likelihood, rather than to untransformed raw samples.
 
 \paragraph{Alternative inference engines.}
 Markov chain Monte Carlo methods could be used in principle, but they are computationally expensive in high-dimensional OD settings.
 Support for alternative probabilistic programming frameworks (e.g., PyMC) may be considered in the future; the present baseline is NumPyro+SVI.
 
+\section{Comparison of the Estimation Methods}
+
+The three estimation approaches share the assignment model, measurement equation,
+likelihood, raw parameter space, and smooth parameter transformations. They differ
+in the statistical quantity they target.
+
+\paragraph{ML versus MAP.}
+The MLE maximizes the likelihood alone, whereas MAP balances the likelihood with
+the specified prior. They therefore need not coincide. MAP is typically pulled
+toward the prior center and can be more stable in weakly identified problems.
+As the amount of informative data increases and the likelihood dominates the prior,
+the ML and MAP estimates will often become close, subject to regularity and
+identifiability conditions.
+
+\paragraph{MAP versus Bayesian inference.}
+If MAP and Bayesian inference use exactly the same likelihood, priors, and
+parameterization, the MAP estimate is the mode of the exact Bayesian posterior.
+It is not generally equal to the posterior mean or median. Equality between the
+mode and mean occurs only in special cases, such as an exactly symmetric unimodal
+posterior. The difference may be substantial for skewed, weakly identified, bounded,
+or multimodal posteriors.
+
+\paragraph{Variational approximation.}
+The implemented Bayesian procedure reports means and other summaries computed from
+the variational approximation $q_\phi$, not from the exact posterior. Differences
+between MAP and VI results can therefore arise from three distinct sources:
+\begin{enumerate}
+\item the intrinsic difference between a posterior mode and a posterior mean;
+\item approximation error introduced by the selected variational guide; and
+\item optimization and finite posterior-sampling error in the VI procedure.
+\end{enumerate}
+The posterior draws used to compute VI summaries introduce Monte Carlo variability,
+but this is not the only, and often not the dominant, reason for differences between
+the estimates.
+
+\paragraph{When estimates should be close.}
+Under standard regularity conditions, with a large informative sample and a
+well-identified model, the posterior is often approximately Gaussian and concentrated.
+In that regime the MLE, MAP estimate, posterior mode, and posterior mean may be close.
+This is an asymptotic property rather than an equality guaranteed by the software.
+
+\paragraph{Recommended comparisons.}
+For validating the implementation, pure ML should be compared across optimizers
+using $w=0$, and MAP should be compared with the mode of the same posterior using
+$w=1$. Comparing an ML or MAP point estimate directly with the reported VI posterior
+mean is useful diagnostically, but disagreement should not automatically be interpreted
+as a software error. In every comparison, the effective transformed values
+$(\bm f,\theta)$ should be compared rather than the raw variables
+$(\widetilde{\bm z},\widetilde u)$.
+
 \section{Discussion}
 
 This software framework combines timetable information and operational counts to infer OD demand and quantify uncertainty,
-while using a differentiable assignment model compatible with gradient-based inference.
+while using a differentiable assignment model compatible with ML, MAP, and
+gradient-based Bayesian inference. ML and MAP provide computationally convenient
+point estimates and local curvature diagnostics, whereas Bayesian VI additionally
+provides an approximate distribution that represents parameter uncertainty.
 
 Planned extensions of the software include incorporating capacity effects in a
 differentiable manner, estimating additional measurement parameters

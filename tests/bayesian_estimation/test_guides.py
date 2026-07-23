@@ -11,7 +11,10 @@ from numpyro.infer.autoguide import (
     AutoNormal,
 )
 
-from public_transportation.estimation.bayesian.guides import make_autoguide
+from public_transportation.estimation.bayesian.guides import (
+    make_autoguide,
+    resolve_lowrank_rank,
+)
 
 
 def _simple_model() -> None:
@@ -101,3 +104,17 @@ def test_make_autoguide_rejects_unknown_guide(guide_name):
 def test_guide_keeps_reference_to_model():
     guide = make_autoguide(model=_simple_model, guide="auto_diag")
     assert guide.model is _simple_model
+
+
+@pytest.mark.parametrize(
+    ("dim", "requested", "expected"),
+    [(1000, 20, 20), (10, 20, 10), (1, None, 1), (0, 50, None)],
+)
+def test_resolve_lowrank_rank_caps_rank_at_reduced_dimension(dim, requested, expected):
+    assert resolve_lowrank_rank(dim=dim, lowrank_rank=requested) == expected
+
+
+@pytest.mark.parametrize("rank", [0, -1])
+def test_resolve_lowrank_rank_rejects_invalid_rank_even_for_zero_dimension(rank):
+    with pytest.raises(ValueError, match="positive integer"):
+        resolve_lowrank_rank(dim=0, lowrank_rank=rank)

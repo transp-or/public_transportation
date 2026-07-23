@@ -1,0 +1,13 @@
+method_id,measurement_type,stop_id,time,value,trip_id,line_id
+synthetic_from_true_assignment,alighting,B,08:30:00,8.037698745727539,L1_AB_0800,
+synthetic_from_true_assignment,alighting,B,08:45:00,26.285470962524414,L1_AB_0815,
+synthetic_from_true_assignment,alighting,B,09:00:00,35.67682647705078,L1_AB_0830,
+synthetic_from_true_assignment,alighting,D,08:30:00,9.639036178588867,L2_CD_0800,
+synthetic_from_true_assignment,alighting,D,08:50:00,10.711763381958008,L2_CD_0820,
+synthetic_from_true_assignment,alighting,D,09:10:00,49.649208068847656,L2_CD_0840,
+synthetic_from_true_assignment,boarding,A,08:00:01,8.181162282824516,L1_AB_0800,
+synthetic_from_true_assignment,boarding,A,08:15:01,27.814062040299177,L1_AB_0815,
+synthetic_from_true_assignment,boarding,A,08:30:01,34.004764556884766,L1_AB_0830,
+synthetic_from_true_assignment,boarding,C,08:00:01,9.760250769555569,L2_CD_0800,
+synthetic_from_true_assignment,boarding,C,08:20:01,11.009236991405487,L2_CD_0820,
+synthetic_from_true_assignment,boarding,C,08:40:01,49.23052181303501,L2_CD_0840,

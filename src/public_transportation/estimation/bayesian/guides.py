@@ -9,6 +9,22 @@ from numpyro.infer.autoguide import (
 )
 
 
+def resolve_lowrank_rank(*, dim: int, lowrank_rank: int | None) -> int | None:
+    """Return the effective low-rank rank for a statistical dimension.
+
+    A zero-dimensional deterministic problem has no guide and therefore no
+    rank. Positive ranks are capped at the actual reduced dimension.
+    """
+    if dim < 0:
+        raise ValueError("dim must be non-negative.")
+    requested = 20 if lowrank_rank is None else int(lowrank_rank)
+    if requested <= 0:
+        raise ValueError("lowrank_rank must be a positive integer.")
+    if dim == 0:
+        return None
+    return min(requested, dim)
+
+
 def make_autoguide(
     *,
     model: Callable[[], None],
@@ -39,4 +55,3 @@ def make_autoguide(
     if guide == "auto_normal":
         return AutoNormal(model)
     raise ValueError(f"Unknown guide: {guide!r}")
-

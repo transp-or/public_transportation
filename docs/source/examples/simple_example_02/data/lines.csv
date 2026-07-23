@@ -1,3 +1,6 @@
 line_id,short_name
-L1,Line A–B
-L2,Line C–D
+L1,Line A–G via C and E
+L2,Line B–H via D and F
+L3,"Diagonal line A–H via B, D, F"
+L4,Connector line C–F via D and E
+L5,North–University line N–U via C and D

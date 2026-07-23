@@ -1,10 +1,7 @@
 # tests/test_core_vi.py
 from __future__ import annotations
 
-from dataclasses import dataclass
-from types import SimpleNamespace
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -241,6 +238,21 @@ def test_run_vi_supports_auto_lowrank_guide():
     assert result.guide == "auto_lowrank"
     assert result.lowrank_rank == 1
     assert result.posterior_samples_theta.shape == (5, 3)
+
+
+def test_run_vi_caps_lowrank_rank_at_reduced_dimension():
+    result = run_vi(
+        dim=2,
+        data={},
+        loglik=lambda theta, data: -0.5 * jnp.sum(theta**2),
+        logprior=lambda theta: jnp.asarray(0.0),
+        guide="auto_lowrank",
+        lowrank_rank=50,
+        num_steps=1,
+        num_posterior_draws=2,
+    )
+    assert result.lowrank_rank == 2
+    assert result.posterior_samples_theta.shape == (2, 2)
 
 
 class _Logger:

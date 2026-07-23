@@ -7,7 +7,7 @@ import numpy as np
 from numpyro.infer import SVI, Trace_ELBO
 from numpyro.optim import Adam
 
-from .guides import make_autoguide
+from .guides import make_autoguide, resolve_lowrank_rank
 from ..common.model_blackbox import LogLikFn, LogPriorFn, make_blackbox_model
 from .results import VIResult
 
@@ -69,6 +69,42 @@ def run_vi(
         raise ValueError("num_posterior_draws must be positive.")
     if log_every <= 0:
         raise ValueError("log_every must be positive.")
+    if dim < 0:
+        raise ValueError("dim must be non-negative.")
+    effective_lowrank_rank = lowrank_rank
+    if guide == "auto_lowrank":
+        effective_lowrank_rank = resolve_lowrank_rank(
+            dim=dim,
+            lowrank_rank=lowrank_rank,
+        )
+    if dim == 0:
+        # There is no variational distribution to fit. Evaluate the target once
+        # for validation and return the deterministic empty posterior directly.
+        empty = np.empty((0,), dtype=float)
+        empty_samples = np.empty((num_posterior_draws, 0), dtype=float)
+        loglik(jax.numpy.asarray(empty), data)
+        logprior(jax.numpy.asarray(empty))
+        return VIResult(
+            guide=guide,
+            dim=0,
+            use_base_normal_correction=use_base_normal_correction,
+            svi_state=None,
+            params={},
+            losses=np.empty((0,), dtype=float),
+            posterior_samples_theta=empty_samples,
+            seed=seed,
+            num_steps=0,
+            learning_rate=learning_rate,
+            lowrank_rank=effective_lowrank_rank,
+            num_posterior_draws=num_posterior_draws,
+            runtime_seconds=0.0,
+            timestamp=datetime.now().isoformat(timespec="seconds"),
+            posterior_mean=empty.copy(),
+            posterior_sd=empty.copy(),
+            posterior_q05=empty.copy(),
+            posterior_q50=empty.copy(),
+            posterior_q95=empty.copy(),
+        )
 
     model = make_blackbox_model(
         dim=dim,
@@ -77,7 +113,11 @@ def run_vi(
         data=data,
         use_base_normal_correction=use_base_normal_correction,
     )
-    guide_obj = make_autoguide(model=model, guide=guide, lowrank_rank=lowrank_rank)
+    guide_obj = make_autoguide(
+        model=model,
+        guide=guide,
+        lowrank_rank=effective_lowrank_rank,
+    )
 
     optimizer = Adam(learning_rate)
     svi = SVI(model=model, guide=guide_obj, optim=optimizer, loss=Trace_ELBO())
@@ -153,7 +193,7 @@ def run_vi(
         seed=seed,
         num_steps=num_steps,
         learning_rate=learning_rate,
-        lowrank_rank=lowrank_rank,
+        lowrank_rank=effective_lowrank_rank,
         num_posterior_draws=num_posterior_draws,
         runtime_seconds=float(runtime_seconds),
         timestamp=timestamp,

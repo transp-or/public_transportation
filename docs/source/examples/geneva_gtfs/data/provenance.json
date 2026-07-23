@@ -1,0 +1,26 @@
+{
+  "agency_id": "881",
+  "agency_name": "Transports Publics Genevois",
+  "archive_name": "mdb-2898-202605290027.zip",
+  "archive_sha256": "c6f06bdad9f20349ed08b45daf2ff6114f116a3c231afdd48abe80608382c5dd",
+  "archived_download_url": "https://files.mobilitydatabase.org/mdb-2898/mdb-2898-202605290027/mdb-2898-202605290027.zip",
+  "num_dense_od_cells": 15128,
+  "num_free_od_cells": 96,
+  "num_frozen_zero_od_cells": 15032,
+  "num_physical_stops": 62,
+  "num_stop_times": 4754,
+  "num_time_bins": 4,
+  "num_trips": 173,
+  "official_dataset_url": "https://data.opentransportdata.swiss/dataset/timetable-2026-gtfs2020",
+  "prior_total_demand": 3074.62,
+  "selected_lines": [
+    "12",
+    "14",
+    "18"
+  ],
+  "selection_window": "07:00:00-09:00:00",
+  "service_date": "2026-06-02",
+  "stop_consolidation": "platform stop_ids consolidated by exact stripped stop_name",
+  "trip_selection": "complete trips having at least one departure in the half-open selection window",
+  "true_total_demand": 2904.0
+}

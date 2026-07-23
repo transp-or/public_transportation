@@ -1,0 +1,11 @@
+{
+  "num_measurements": 8967,
+  "num_od_cells": 15128,
+  "num_positive_measurements": 927,
+  "num_stop_times": 4754,
+  "num_stops": 62,
+  "num_trips": 173,
+  "num_zero_measurements": 8040,
+  "true_theta": 5.0,
+  "true_total_demand": 2904.0
+}

@@ -1,0 +1,3 @@
+origin_stop_id,dest_stop_id,time_bin_id,fixed_flow
+A,H,t0,0
+A,H,t1,25

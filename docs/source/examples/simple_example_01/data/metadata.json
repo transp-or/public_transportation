@@ -1,19 +1,30 @@
 {
-  "title": "examples_01_equal_probability",
-  "description": "One OD pair (O->D), two lines (L1,L2), two buses per line (4 trips). All in-vehicle times identical => equal split (25 each) for total demand 100.",
+  "title": "case_study_overlap_2lines",
+  "description": "Two lines share city center/hospital/train station; L1 headway 15 min and L2 headway 20 min (both directions). Three time bins from 08:00 to 08:45. Demand patterns: A->B low-high-low and C->D low-low-high.",
   "timezone": "Europe/Zurich",
   "cost_unit": "minutes",
   "extra": {
     "units": {
-      "time": "seconds_from_midnight",
-      "generalized_cost": "minutes"
+      "time": "HH:MM:SS",
+      "generalized_cost": "minutes",
+      "demand": "trips_per_bin"
+    },
+    "assumptions": {
+      "segment_travel_time_minutes": 5,
+      "min_dwell_seconds": 1,
+      "capacity": 100
+    },
+    "time_window": {
+      "start": "08:00:00",
+      "end": "08:45:00"
     },
     "files": {
       "stops": "stops.csv",
       "trips": "trips.csv",
       "stop_times": "stop_times.csv",
       "time_bins": "time_bins.csv",
-      "demand": "demand.csv"
+      "demand": "demand.csv",
+      "lines": "lines.csv"
     }
   }
 }

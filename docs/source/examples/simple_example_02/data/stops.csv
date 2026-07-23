@@ -1,12 +1,11 @@
 stop_id,name,lat,lon
-A,Stop A,46.5300,6.6100
-A1,A neighborhood,46.5330,6.6150
-CC,city center,46.5200,6.6300
-HOSP,hospital,46.5225,6.6390
-TS,train station,46.5160,6.6290
-B1,B neighborhood,46.5120,6.6420
-B,Stop B,46.5080,6.6500
-C,Stop C,46.5350,6.6400
-C1,C neighborhood,46.5320,6.6450
-D1,D neighborhood,46.5050,6.6250
-D,Stop D,46.5000,6.6200
+A,West terminal,46.52,6.6
+B,Southwest terminal,46.505,6.605
+C,West interchange,46.52,6.62
+D,South interchange,46.505,6.625
+E,East interchange,46.52,6.645
+F,Southeast interchange,46.505,6.65
+G,East terminal,46.52,6.67
+H,Far east terminal,46.505,6.675
+N,North terminal,46.538,6.625
+U,University terminal,46.49,6.635

@@ -1,0 +1,15 @@
+{
+  "source_data_dir": "/Users/bierlair/MyFiles/github/public_transportation/docs/source/examples/simple_example_02/data",
+  "results_dir": "/Users/bierlair/MyFiles/github/public_transportation/docs/source/examples/simple_example_02/pre_processing/results",
+  "true_demand_file": "/Users/bierlair/MyFiles/github/public_transportation/docs/source/examples/simple_example_02/data/true_demand.csv",
+  "prior_demand_file": "/Users/bierlair/MyFiles/github/public_transportation/docs/source/examples/simple_example_02/data/prior_demand.csv",
+  "generated_demand_file": "/Users/bierlair/MyFiles/github/public_transportation/docs/source/examples/simple_example_02/pre_processing/results/demand.csv",
+  "measurements_file": "/Users/bierlair/MyFiles/github/public_transportation/docs/source/examples/simple_example_02/pre_processing/results/measurements_boarding_alighting.csv",
+  "time_expanded_report": "/Users/bierlair/MyFiles/github/public_transportation/docs/source/examples/simple_example_02/pre_processing/results/time_expanded_report_true.html",
+  "measurement_mapping_report": "/Users/bierlair/MyFiles/github/public_transportation/docs/source/examples/simple_example_02/pre_processing/results/synthetic_measurement_link_mapping.md",
+  "true_assignment_file": "/Users/bierlair/MyFiles/github/public_transportation/docs/source/examples/simple_example_02/pre_processing/results/true_assignment.npz",
+  "num_od_records": 6,
+  "total_true_demand": 140.0,
+  "theta": 5.0,
+  "num_measurements": 12
+}

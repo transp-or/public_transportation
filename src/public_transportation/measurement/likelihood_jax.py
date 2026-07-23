@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-from jax.scipy.special import gammaln, xlog1py, xlogy
+from jax.scipy.special import gammaln, xlogy
 
 Array = jnp.ndarray
 
@@ -77,16 +77,18 @@ def _nb_logpmf_mu_r(y: Array, mu: Array, r: Array) -> Array:
 
     All operations are JAX-compatible.
     """
-    # p in (0,1)
-    p = r / (r + mu)
-    # Use gammaln for stability and to avoid factorials.
-    # Use xlogy/xlog1py to avoid NaN gradients from 0*log(0) or 0*(-inf).
+    # Evaluate the mean/dispersion parameterization directly.  Forming
+    # p = r / (r + mu) is numerically unsafe in float32: for small positive mu,
+    # p rounds to exactly one and the gradient of y*log(1-p) becomes NaN when
+    # y=0.  The expression below is algebraically identical but uses log1p and
+    # never subtracts two nearly equal probabilities.
     return (
         gammaln(y + r)
         - gammaln(r)
         - gammaln(y + 1.0)
-        + xlogy(r, p)
-        + xlog1py(y, -p)
+        - r * jnp.log1p(mu / r)
+        + xlogy(y, mu)
+        - xlogy(y, r + mu)
     )
 
 
@@ -141,10 +143,6 @@ def measurement_loglik_from_link_flow(
     # Mean of counts
     mu = rho * y_pred
     mu = jnp.maximum(mu, jnp.asarray(eps_mu, dtype=mu.dtype))
-    eps = jnp.asarray(1e-6, dtype=mu.dtype)
-    mu = mu + eps
-
     # NB loglik
     _ = theta  # theta influences link_flow; included for explicitness.
     return negbinom_loglikelihood(y_obs=y_obs, mu=mu, r=r)
-

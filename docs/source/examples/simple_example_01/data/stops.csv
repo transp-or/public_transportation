@@ -1,3 +1,12 @@
 stop_id,name,lat,lon
-O,Lausanne_Gare,46.5161,6.6292
-D,Geneve_Cornavin,46.2102,6.1423
+A,Stop A,46.5300,6.6100
+A1,A neighborhood,46.5330,6.6150
+CC,city center,46.5200,6.6300
+HOSP,hospital,46.5225,6.6390
+TS,train station,46.5160,6.6290
+B1,B neighborhood,46.5120,6.6420
+B,Stop B,46.5080,6.6500
+C,Stop C,46.5350,6.6400
+C1,C neighborhood,46.5320,6.6450
+D1,D neighborhood,46.5050,6.6250
+D,Stop D,46.5000,6.6200

@@ -1,0 +1,18 @@
+{
+  "title": "Geneva TPG tram OD estimation example",
+  "description": "Synthetic time-dependent OD estimation on real TPG lines 12, 14 and 18 derived from the 2026 Swiss GTFS timetable.",
+  "timezone": "Europe/Zurich",
+  "cost_unit": "minutes",
+  "extra": {
+    "service_date": "2026-06-02",
+    "source": "https://data.opentransportdata.swiss/dataset/timetable-2026-gtfs2020",
+    "source_archive_sha256": "c6f06bdad9f20349ed08b45daf2ff6114f116a3c231afdd48abe80608382c5dd",
+    "selected_lines": [
+      "12",
+      "14",
+      "18"
+    ],
+    "selection_window": "07:00-09:00",
+    "demand_unit": "synthetic passenger trips per 30-minute bin"
+  }
+}

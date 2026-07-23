@@ -1,6 +1,6 @@
 {
-  "title": "case_study_overlap_2lines",
-  "description": "Two lines share city center/hospital/train station; L1 headway 15 min and L2 headway 20 min (both directions). Three time bins from 08:00 to 08:45. Demand patterns: A->B low-high-low and C->D low-low-high.",
+  "title": "simple_example_03_route_choice_bus_network",
+  "description": "Larger synthetic public-transportation example with five bus lines, a three-hour morning horizon, and several OD pairs with multiple plausible routes. The network is designed so that route choice and the assignment dispersion parameter affect boarding and alighting measurements.",
   "timezone": "Europe/Zurich",
   "cost_unit": "minutes",
   "extra": {
@@ -9,22 +9,17 @@
       "generalized_cost": "minutes",
       "demand": "trips_per_bin"
     },
-    "assumptions": {
-      "segment_travel_time_minutes": 5,
-      "min_dwell_seconds": 1,
-      "capacity": 100
-    },
-    "time_window": {
-      "start": "08:00:00",
-      "end": "08:45:00"
-    },
-    "files": {
-      "stops": "stops.csv",
-      "trips": "trips.csv",
-      "stop_times": "stop_times.csv",
-      "time_bins": "time_bins.csv",
-      "demand": "demand.csv",
-      "lines": "lines.csv"
+    "design": {
+      "horizon": "07:00:00-10:00:00",
+      "number_of_stops": 10,
+      "number_of_lines": 5,
+      "number_of_trips": 132,
+      "route_choice_features": [
+        "A-H can use L3 direct or L1/L4/L2 via C/E/F with transfers.",
+        "A-F can use L3 direct or L1 plus L4 via C/E.",
+        "N-H can use L5 plus L2, or L5 plus L4 plus L2 depending on departure time.",
+        "B-G can use L2/L4/L1 via D/E, or L3/L1 via A/C depending on direction and timing."
+      ]
     }
   }
 }

@@ -1,0 +1,19 @@
+{
+  "active_destination_groups": 18,
+  "assignment_active_od": 96,
+  "compact_layout_fingerprint": "1e25e1107aaa84f328b350a26f0196601558b2e24ea5665668433a6e57079da7",
+  "method": "vi",
+  "num_fixed_od": 15032,
+  "num_fixed_positive_od": 0,
+  "num_fixed_zero_od": 15032,
+  "num_free_od": 96,
+  "num_od_total": 15128,
+  "objective": 1686.7193603515625,
+  "od_layout_fingerprint": "607e2f6bdbb3581c15ba605b4c0324c9c643650a23344840cc7867161df5c04d",
+  "original_destination_groups": 62,
+  "removed_destination_groups": 44,
+  "runtime_seconds": 590.1479801670648,
+  "success": true,
+  "theta_hat": 5.0,
+  "total_estimated_demand": 2903.4573263999328
+}

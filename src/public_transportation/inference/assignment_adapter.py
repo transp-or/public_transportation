@@ -39,6 +39,10 @@ import jax.numpy as jnp
 
 from public_transportation.assignment.assign import _assign_core
 from public_transportation.assignment.costs import link_costs
+from public_transportation.inference.compact_od_assignment_layout import (
+    CompactODAssignmentLayout,
+)
+from public_transportation.inference.compact_od_groups import compact_od_groups
 
 
 Array = jnp.ndarray
@@ -132,7 +136,11 @@ def build_base_link_cost(*, artifacts: Any, dtype: Any = jnp.float32) -> Array:
     )
 
 
-def build_assignment_inputs(*, artifacts: Any) -> AssignmentInputs:
+def build_assignment_inputs(
+    *,
+    artifacts: Any,
+    compact_layout: CompactODAssignmentLayout | None = None,
+) -> AssignmentInputs:
     """Extract and convert all assignment inputs needed for inference.
 
     Responsibility
@@ -155,6 +163,8 @@ def build_assignment_inputs(*, artifacts: Any) -> AssignmentInputs:
     base_link_cost = build_base_link_cost(artifacts=artifacts, dtype=jnp.float32)
 
     odg = artifacts.od_groups
+    if compact_layout is not None:
+        odg = compact_od_groups(od_groups=odg, layout=compact_layout)
     # dtypes: indices int32, masks bool
     group_dest_node = jnp.asarray(odg.group_dest_node, dtype=jnp.int32)
     group_link_mask = jnp.asarray(odg.group_link_mask, dtype=bool)
@@ -174,7 +184,7 @@ def build_assignment_inputs(*, artifacts: Any) -> AssignmentInputs:
 
 
 def assign_link_flow(*, inputs: AssignmentInputs, f: Array, theta: Array) -> Array:
-    """Compute assignment link flows from OD vector f and dispersion theta.
+    """Compute link flows from assignment demand and dispersion ``theta``.
 
     Responsibility
     --------------
@@ -185,7 +195,9 @@ def assign_link_flow(*, inputs: AssignmentInputs, f: Array, theta: Array) -> Arr
     inputs:
         AssignmentInputs built by `build_assignment_inputs(...)`.
     f:
-        OD vector aligned to assignment OD indexing, shape (num_od,).
+        Demand aligned with ``inputs.od_origin_node``. This is either the full
+        OD vector or the compact vector of free and positive-frozen cells. The
+        historical argument name ``f`` is retained for API compatibility.
     theta:
         Positive scalar dispersion parameter (minutes), shape ().
 
@@ -199,9 +211,16 @@ def assign_link_flow(*, inputs: AssignmentInputs, f: Array, theta: Array) -> Arr
     - We keep `return_group_link_flows=False` for inference.
     - The second return value from `_assign_core` (group flows) is ignored.
     """
+    demand = jnp.asarray(f)
+    expected_shape = inputs.od_origin_node.shape
+    if demand.ndim != 1 or demand.shape != expected_shape:
+        raise ValueError(f"f must have shape {expected_shape}, got {demand.shape}.")
+    if inputs.group_dest_node.shape[0] == 0:
+        return jnp.zeros((inputs.graph.num_links,), dtype=demand.dtype)
+
     link_flow, _ = _assign_core(
         graph=inputs.graph,
-        od_values=jnp.asarray(f),
+        od_values=demand,
         base_link_cost=inputs.base_link_cost,
         theta=jnp.asarray(theta).reshape(()),
         group_dest_node=inputs.group_dest_node,

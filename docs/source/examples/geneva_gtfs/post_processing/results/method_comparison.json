@@ -1,0 +1,59 @@
+{
+  "experiment": {
+    "fixed_theta": 5.0,
+    "num_free_od": 96,
+    "num_frozen_zero_od": 15032,
+    "num_measurements": 8967,
+    "true_total_demand": 2904.0000076293945,
+    "vi_interval": "equal-tail empirical 5%-95% interval from 500 variational draws"
+  },
+  "methods": [
+    {
+      "coverage_90_active": "",
+      "estimated_total_demand": 2884.6613369247325,
+      "link_flow_correlation": 0.9999508319920074,
+      "link_flow_mae": 0.06420888595460841,
+      "link_flow_rmse": 0.23093866725815948,
+      "mean_interval_width_90_active": "",
+      "method": "ML",
+      "od_mae_active": 6.710850933592366,
+      "od_rmse_active": 12.372467334176628,
+      "runtime_relative_to_fastest": 2.7114893716339776,
+      "runtime_seconds": 112.74157616693992,
+      "success": false,
+      "termination": "STOP: TOTAL NO. OF ITERATIONS REACHED LIMIT"
+    },
+    {
+      "coverage_90_active": "",
+      "estimated_total_demand": 2883.688878335324,
+      "link_flow_correlation": 0.9999102140746315,
+      "link_flow_mae": 0.08904561591211757,
+      "link_flow_rmse": 0.28238782983847593,
+      "mean_interval_width_90_active": "",
+      "method": "MAP",
+      "od_mae_active": 10.215090694002697,
+      "od_rmse_active": 15.912135865192111,
+      "runtime_relative_to_fastest": 1.0,
+      "runtime_seconds": 41.579206375055946,
+      "success": true,
+      "termination": "CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH"
+    },
+    {
+      "coverage_90_active": 0.6458333333333334,
+      "estimated_total_demand": 2903.4573263999328,
+      "link_flow_correlation": 0.9998068575984342,
+      "link_flow_mae": 0.11105196983829022,
+      "link_flow_rmse": 0.36965241785071795,
+      "mean_interval_width_90_active": 21.43677270597354,
+      "method": "VI",
+      "od_mae_active": 10.657878885704505,
+      "od_rmse_active": 16.025658888706356,
+      "runtime_relative_to_fastest": 14.193344020176017,
+      "runtime_seconds": 590.1479801670648,
+      "success": true,
+      "termination": "completed VI schedule",
+      "vi_final_loss": 1686.7193603515625,
+      "vi_initial_loss": 4897.2822265625
+    }
+  ]
+}

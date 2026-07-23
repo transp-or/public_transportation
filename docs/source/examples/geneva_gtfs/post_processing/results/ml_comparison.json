@@ -1,0 +1,13 @@
+{
+  "estimated_total_demand": 2884.6613369247325,
+  "link_flow_correlation": 0.9999508319920074,
+  "link_flow_mae": 0.06420888595460841,
+  "link_flow_max_abs_error": 3.6628646850585938,
+  "link_flow_rmse": 0.23093866725815948,
+  "method": "ml",
+  "num_active_od_cells": 96,
+  "num_compared_od_cells": 15128,
+  "od_mae_active": 6.710850933592366,
+  "od_rmse_active": 12.372467334176628,
+  "true_total_demand": 2904.0000076293945
+}

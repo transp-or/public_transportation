@@ -1,5 +1,5 @@
 """
-Post-process estimation results for simple_example_02.
+Post-process estimation results for simple_example_01.
 
 Reads:
     ../data/
@@ -24,11 +24,11 @@ import numpy as np
 from public_transportation.assignment import AssignmentConfig
 from public_transportation.assignment.assign import assign, prepare_assignment
 from public_transportation.assignment.id_manager import AssignmentIDManager
-from public_transportation.domain import Scenario
-from public_transportation.inference.fingerprint_debug import (
-    assert_results_compatible_with_id_manager,
+from public_transportation.domain import Scenario, read_fixed_demand_csv
+from public_transportation.inference.od_parameter_layout import (
+    assert_od_layout_fingerprint_matches,
+    build_od_parameter_layout,
 )
-from public_transportation.inference.results_io import load_od_theta_vi_results
 from public_transportation.measurement import (
     build_mapping_spec_strict,
     read_measurements_csv,
@@ -97,8 +97,14 @@ def load_point_estimates_from_results(
     method: str,
     theta_choice: str,
     f_choice: str,
-) -> tuple[np.ndarray, float, np.ndarray, str | None, str | None]:
+) -> tuple[np.ndarray, float, np.ndarray, np.ndarray, str, str | None, str | None, str | None]:
     with np.load(results_path, allow_pickle=False) as result:
+        results_fingerprint = str(result["fingerprint"])
+        od_layout_fingerprint = (
+            str(result["od_layout_fingerprint"])
+            if "od_layout_fingerprint" in result.files
+            else None
+        )
         estimate_theta = (
             bool(np.asarray(result["estimate_theta"]).reshape(-1)[0])
             if "estimate_theta" in result.files
@@ -113,6 +119,11 @@ def load_point_estimates_from_results(
             fixed_theta = None
 
         f0 = np.asarray(result["f0"], dtype=float).reshape(-1)
+        fixed_od_indices = (
+            np.asarray(result["fixed_od_indices"], dtype=np.int64).reshape(-1)
+            if "fixed_od_indices" in result.files
+            else np.asarray([], dtype=np.int64)
+        )
 
         if method == "bayesian":
             if "vi_f_mean" in result.files:
@@ -153,7 +164,16 @@ def load_point_estimates_from_results(
         else:
             raise ValueError(f"Unknown method: {method!r}")
 
-    return f_hat, theta_hat, f0, str(estimate_theta), None if fixed_theta is None else str(fixed_theta)
+    return (
+        f_hat,
+        theta_hat,
+        f0,
+        fixed_od_indices,
+        results_fingerprint,
+        od_layout_fingerprint,
+        str(estimate_theta),
+        None if fixed_theta is None else str(fixed_theta),
+    )
 
 
 def main() -> None:
@@ -214,6 +234,8 @@ def main() -> None:
 
     with prepare_scenario_folder() as scenario_dir:
         scenario = Scenario.from_folder(Path(scenario_dir))
+        fixed_demand = read_fixed_demand_csv(DATA / "fixed_demand.csv", scenario=scenario)
+        od_layout = build_od_parameter_layout(scenario=scenario, fixed_demand=fixed_demand)
 
         rep = scenario.validate()
         if rep.issues:
@@ -243,12 +265,27 @@ def main() -> None:
             out_dir = RESULTS / method
             out_dir.mkdir(parents=True, exist_ok=True)
 
-            f_hat, theta_hat, f0, estimate_theta, fixed_theta = load_point_estimates_from_results(
+            (
+                f_hat,
+                theta_hat,
+                f0,
+                fixed_od_indices,
+                results_fingerprint,
+                results_layout_fingerprint,
+                estimate_theta,
+                fixed_theta,
+            ) = load_point_estimates_from_results(
                 results_path=results_path,
                 method=method,
                 theta_choice=args.theta,
                 f_choice=args.f,
             )
+            if results_layout_fingerprint is not None:
+                assert_od_layout_fingerprint_matches(
+                    expected=od_layout.fingerprint,
+                    got=results_layout_fingerprint,
+                    context=str(results_path),
+                )
 
             if not np.isfinite(theta_hat) or theta_hat <= 0.0:
                 raise RuntimeError(f"Invalid theta_hat={theta_hat!r} for method {method!r}")
@@ -303,11 +340,12 @@ def main() -> None:
                 mapping_spec=mapping_spec,
                 y_obs=y_obs,
                 fingerprint_expected=str(idm.fingerprint),
-                fingerprint_results=str(idm.fingerprint),
+                fingerprint_results=results_fingerprint,
                 theta_hat=float(theta_hat),
                 f0=f0,
                 f_hat=f_hat,
                 rho=float(args.rho),
+                fixed_od_indices=fixed_od_indices,
             )
 
             cmp_path = out_dir / "inference_comparison_report.html"

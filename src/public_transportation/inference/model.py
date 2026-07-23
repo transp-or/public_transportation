@@ -5,7 +5,7 @@ JAX-compliant forward model for Bayesian inference.
 
 This module wires together (deterministically):
   - OD log-deviation parameterization: f = f0 * exp(z)
-  - Assignment evaluation (adapter): link_flow = assign_link_flow(inputs=assignment_inputs, f=f, theta=theta)
+  - Assignment evaluation from either a full or compact demand vector
   - Measurement aggregation (structural mapping): lambda_m = aggregate(link_flow, spec)
   - Detection rate: mu_m = rho * lambda_m
 
@@ -85,12 +85,23 @@ class ForwardModelInputs:
 
 @dataclass(frozen=True, slots=True)
 class ForwardModelOutputs:
-    """Outputs of the forward model (used by likelihood)."""
+    """Outputs of the forward model used by the likelihood.
 
-    f: Array         # (num_od,)
-    link_flow: Array # (num_links,)
+    ``assignment_demand`` follows the indexing encoded by ``AssignmentInputs``.
+    It is a full OD vector for the legacy/all-free path and a compact active-OD
+    vector for reduced estimation. It must not be interpreted as a reporting
+    vector without consulting the corresponding layout.
+    """
+
+    assignment_demand: Array  # (num_assignment_od,)
+    link_flow: Array  # (num_links,)
     lambda_m: Array  # (M,)
-    mu_m: Array      # (M,)
+    mu_m: Array  # (M,)
+
+    @property
+    def f(self) -> Array:
+        """Compatibility alias for ``assignment_demand``."""
+        return self.assignment_demand
 
 
 def make_forward_inputs(*, f0: Array, spec: AggregationSpec) -> ForwardModelInputs:
@@ -171,22 +182,60 @@ def forward_model(
     # f = f0 * exp(z)
     f = build_od_from_deviation(f0=inputs.f0, z=z)
 
-    # link_flow = assignment(f, theta)
-    link_flow = assign_link_flow(inputs=assignment_inputs, f=f, theta=theta)
+    return _forward_from_demand(
+        inputs=inputs,
+        f=f,
+        theta=theta,
+        rho=rho,
+        assignment_inputs=assignment_inputs,
+    )
 
-    # lambda_m = aggregation(link_flow)
+
+def forward_model_from_demand(
+    *,
+    inputs: ForwardModelInputs,
+    f: Array,
+    theta: Array,
+    rho: Array,
+    assignment_inputs: AssignmentInputs,
+) -> ForwardModelOutputs:
+    """Run assignment and measurement prediction from an explicit demand vector.
+
+    The vector may use full OD order or a compact assignment order; its required
+    shape is defined by ``assignment_inputs.od_origin_node``.
+    """
+    return _forward_from_demand(
+        inputs=inputs,
+        f=f,
+        theta=theta,
+        rho=rho,
+        assignment_inputs=assignment_inputs,
+    )
+
+
+def _forward_from_demand(
+    *,
+    inputs: ForwardModelInputs,
+    f: Array,
+    theta: Array,
+    rho: Array,
+    assignment_inputs: AssignmentInputs,
+) -> ForwardModelOutputs:
+    """Canonical assignment and measurement plumbing for an assignment vector."""
+    f_j = jnp.asarray(f)
+    expected_shape = assignment_inputs.od_origin_node.shape
+    if f_j.ndim != 1 or f_j.shape != expected_shape:
+        raise ValueError(f"f must have shape {expected_shape}, got {f_j.shape}.")
+    link_flow = assign_link_flow(inputs=assignment_inputs, f=f_j, theta=theta)
     lambda_m = predict_measurements(
         link_flow=link_flow,
         num_measurements=inputs.num_measurements,
         measurement_index=inputs.measurement_index,
         link_index=inputs.link_index,
     )
-
-    # mu_m = rho * lambda_m
     mu_m = apply_detection_rate(lambda_m=lambda_m, rho=rho)
-
     return ForwardModelOutputs(
-        f=f,
+        assignment_demand=f_j,
         link_flow=link_flow,
         lambda_m=lambda_m,
         mu_m=mu_m,

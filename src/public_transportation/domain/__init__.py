@@ -12,6 +12,7 @@ Visualization lives in ``public_transportation.viz``.
 """
 
 from .demand import ODDemand, ODRecord
+from .fixed_demand import FixedODDemand, FixedODRecord, read_fixed_demand_csv
 from .issues import Issue, Severity, ValidationReport
 from .metadata import Metadata
 from .scenario import Scenario
@@ -32,6 +33,9 @@ __all__ = [
     "TimeBin",
     "ODRecord",
     "ODDemand",
+    "FixedODRecord",
+    "FixedODDemand",
+    "read_fixed_demand_csv",
     "Trip",
     "StopTime",
     "Timetable",

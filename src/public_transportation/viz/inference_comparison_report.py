@@ -38,12 +38,9 @@ from public_transportation.viz.html_utils import (
     h2,
     kpi_row,
     link as html_link,
-    p,
     raw_p,
     table,
-    table_html_cells,
     wrap_html,
-    code,
 )
 
 from public_transportation.inference.assignment_adapter import build_assignment_inputs, assign_link_flow
@@ -62,6 +59,7 @@ class ODDiffRow:
     f_hat: float
     delta: float
     rel_delta: float  # delta / (f0 + eps)
+    estimation_status: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +101,14 @@ class ComparisonBundle:
     # Summaries
     od_total_f0: float
     od_total_f_hat: float
+    num_free_od: int
+    num_fixed_od: int
+    num_fixed_zero_od: int
+    num_fixed_positive_od: int
+    assignment_active_od: int
+    original_destination_groups: int
+    active_destination_groups: int
+    removed_destination_groups: int
     meas_total_obs: float
     meas_total_pred_prior: float
     meas_total_pred_post: float
@@ -160,6 +166,7 @@ def compute_od_and_flow_comparison(
     top_k_od: int = 20,
     top_k_meas: int = 30,
     eps_rel: float = 1e-9,
+    fixed_od_indices: np.ndarray | None = None,
 ) -> ComparisonBundle:
     """Compute everything needed for an OD/link/measurement comparison report.
 
@@ -196,6 +203,16 @@ def compute_od_and_flow_comparison(
     fhv = as_1d_float(f_hat, name="f_hat")
     if f0v.shape != fhv.shape:
         raise ValueError(f"f0 and f_hat shapes must match, got {f0v.shape} vs {fhv.shape}")
+    fixed_set: set[int] = set()
+    if fixed_od_indices is not None:
+        fixed_array = np.asarray(fixed_od_indices)
+        if fixed_array.ndim != 1 or not np.issubdtype(fixed_array.dtype, np.integer):
+            raise ValueError("fixed_od_indices must be a 1D integer array.")
+        fixed_set = {int(index) for index in fixed_array.tolist()}
+        if len(fixed_set) != fixed_array.size or any(
+            index < 0 or index >= f0v.size for index in fixed_set
+        ):
+            raise ValueError("fixed_od_indices must contain unique valid OD indices.")
 
     y = as_1d_float(y_obs, name="y_obs")
     if int(y.shape[0]) != int(mapping_spec.num_measurements):
@@ -224,6 +241,22 @@ def compute_od_and_flow_comparison(
     # --- Summaries
     od_total_f0 = float(np.sum(f0v))
     od_total_f_hat = float(np.sum(fhv))
+    fixed_indices_sorted = np.asarray(sorted(fixed_set), dtype=int)
+    fixed_values = fhv[fixed_indices_sorted]
+    num_fixed_zero = int(np.count_nonzero(fixed_values == 0.0))
+    num_fixed_positive = len(fixed_set) - num_fixed_zero
+    assignment_active_od = int(f0v.size - num_fixed_zero)
+    original_destination_groups = int(
+        assignment_artifacts.od_groups.group_dest_node.shape[0]
+    )
+    active_full_indices = np.asarray(
+        [index for index in range(f0v.size) if index not in fixed_set or fhv[index] > 0.0],
+        dtype=int,
+    )
+    active_destinations = np.asarray(assignment_artifacts.od_groups.od_dest_node)[
+        active_full_indices
+    ]
+    active_destination_groups = int(np.unique(active_destinations).size)
 
     meas_total_obs = float(np.sum(y))
     meas_total_pred_prior = float(np.sum(y_pred_prior))
@@ -262,6 +295,7 @@ def compute_od_and_flow_comparison(
                 f_hat=a1,
                 delta=d,
                 rel_delta=rel,
+                estimation_status=("frozen" if int(i) in fixed_set else "free"),
             )
         )
 
@@ -304,6 +338,16 @@ def compute_od_and_flow_comparison(
         y_pred_post=np.asarray(y_pred_post, dtype=float),
         od_total_f0=od_total_f0,
         od_total_f_hat=od_total_f_hat,
+        num_free_od=int(f0v.size - len(fixed_set)),
+        num_fixed_od=len(fixed_set),
+        num_fixed_zero_od=num_fixed_zero,
+        num_fixed_positive_od=num_fixed_positive,
+        assignment_active_od=assignment_active_od,
+        original_destination_groups=original_destination_groups,
+        active_destination_groups=active_destination_groups,
+        removed_destination_groups=(
+            original_destination_groups - active_destination_groups
+        ),
         meas_total_obs=meas_total_obs,
         meas_total_pred_prior=meas_total_pred_prior,
         meas_total_pred_post=meas_total_pred_post,
@@ -361,6 +405,16 @@ def write_od_theta_comparison_report_html(
                 KPI("theta_hat used for assignment", f"{bundle.theta_hat:.6g}"),
                 KPI("rho used for prediction", f"{bundle.rho:.6g}"),
                 KPI("num_od", f"{int(bundle.f0.shape[0])}"),
+                KPI("free OD", f"{bundle.num_free_od}"),
+                KPI("frozen OD", f"{bundle.num_fixed_od}"),
+                KPI("frozen-zero OD", f"{bundle.num_fixed_zero_od}"),
+                KPI("frozen-positive OD", f"{bundle.num_fixed_positive_od}"),
+                KPI("assignment-active OD", f"{bundle.assignment_active_od}"),
+                KPI(
+                    "destination groups",
+                    f"{bundle.active_destination_groups}/{bundle.original_destination_groups}",
+                ),
+                KPI("groups removed", f"{bundle.removed_destination_groups}"),
                 KPI("num_links", f"{int(bundle.link_flow_prior.shape[0])}"),
                 KPI("num_measurements", f"{int(bundle.y_obs.shape[0])}"),
             ]
@@ -392,6 +446,7 @@ def write_od_theta_comparison_report_html(
                 r.origin_stop_id,
                 r.dest_stop_id,
                 r.time_bin_index,
+                r.estimation_status,
                 f"{r.f0:.6g}",
                 f"{r.f_hat:.6g}",
                 f"{r.delta:.6g}",
@@ -400,7 +455,7 @@ def write_od_theta_comparison_report_html(
         )
     body_parts.append(
         table(
-            headers=["origin", "dest", "time_bin_idx", "f0", "f_hat", "Δ", "Δ/(f0)"],
+            headers=["origin", "dest", "time_bin_idx", "status", "f0", "f_hat", "Δ", "Δ/(f0)"],
             rows=od_table_rows,
             caption="Top OD changes (sorted by |Δ|).",
         )

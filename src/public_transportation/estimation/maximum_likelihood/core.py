@@ -158,8 +158,8 @@ def run_ml(
     MLResult
         Optimization result and inference diagnostics.
     """
-    if dim <= 0:
-        raise ValueError("dim must be positive.")
+    if dim < 0:
+        raise ValueError("dim must be non-negative.")
 
     cfg = MLConfig() if config is None else config
     cfg.validate()
@@ -176,6 +176,36 @@ def run_ml(
         raise ValueError("gtol must be positive.")
     if prior_weight < 0:
         raise ValueError("prior_weight must be non-negative.")
+
+    if dim == 0:
+        empty = jnp.empty((0,), dtype=float)
+        ll = float(np.asarray(_as_scalar(loglik(empty, data))))
+        lp = 0.0 if logprior is None else float(np.asarray(_as_scalar(logprior(empty))))
+        objective_value = -(ll + prior_weight * lp)
+        return MLResult(
+            dim=0,
+            theta_hat=np.empty((0,), dtype=float),
+            objective_value=float(objective_value),
+            loglikelihood=ll,
+            logprior=lp,
+            prior_weight=float(prior_weight),
+            gradient=np.empty((0,), dtype=float),
+            gradient_norm=0.0,
+            hessian=(np.empty((0, 0), dtype=float) if compute_hessian else None),
+            covariance_matrix=(np.empty((0, 0), dtype=float) if compute_hessian else None),
+            standard_errors=(np.empty((0,), dtype=float) if compute_hessian else None),
+            z_values=(np.empty((0,), dtype=float) if compute_hessian else None),
+            success=True,
+            message="No estimable parameters; optimizer bypassed.",
+            method=str(method),
+            num_iterations=0,
+            num_function_evaluations=1,
+            num_gradient_evaluations=0,
+            runtime_seconds=0.0,
+            timestamp=datetime.now().isoformat(timespec="seconds"),
+            optimization_trace=np.empty((0, 3), dtype=float),
+            scipy_result=None,
+        )
 
     if theta0 is None:
         theta0_np = np.zeros(dim, dtype=float)

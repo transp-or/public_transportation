@@ -40,7 +40,6 @@ This file intentionally avoids `getattr` / `hasattr`.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Mapping, Literal
 
 import numpy as np
