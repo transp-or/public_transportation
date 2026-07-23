@@ -1,0 +1,21 @@
+{
+  "audit_includes_retained_cells": true,
+  "num_cells": 15128,
+  "num_retained": 15128,
+  "num_structural_zero": 0,
+  "primary_reason_counts": {
+    "insufficient_feasible_departures": 0,
+    "maximum_initial_wait_exceeded": 0,
+    "maximum_journey_time_exceeded": 0,
+    "maximum_transfers_exceeded": 0,
+    "no_feasible_path": 0,
+    "same_stop": 0
+  },
+  "reconciliation": {
+    "num_added_structural_zero": 0,
+    "num_existing": 15032,
+    "num_existing_structural_zero": 0,
+    "num_merged": 15032
+  },
+  "schema_version": 1
+}

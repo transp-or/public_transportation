@@ -203,7 +203,12 @@ class Scenario:
 
     # ---------- Folder I/O ----------
     @staticmethod
-    def from_folder(folder: str | Path, *, strict: bool = False) -> "Scenario":
+    def from_folder(
+        folder: str | Path,
+        *,
+        strict: bool = False,
+        demand_file: str | Path | None = None,
+    ) -> "Scenario":
         """
         Load a scenario from a folder.
 
@@ -219,6 +224,8 @@ class Scenario:
 
         :param folder: Folder path.
         :param strict: If True, run Scenario.validate() after loading and raise a ValueError if any ERROR issues are found.
+        :param demand_file: Optional explicit demand table. When omitted,
+            ``demand.(csv|parquet|json)`` is read from ``folder``.
         :return: Scenario.
         """
         f = Path(folder)
@@ -244,7 +251,11 @@ class Scenario:
         stops_df = _read_any(f, "stops")
         lines_df = _read_any(f, "lines")
         time_bins_df = _read_any(f, "time_bins")
-        demand_df = _read_any(f, "demand")
+        demand_df = (
+            _read_any(f, "demand")
+            if demand_file is None
+            else read_table(Path(demand_file))
+        )
         trips_df = _read_any(f, "trips", required=False)
         stop_times_df = _read_any(f, "stop_times", required=False)
 

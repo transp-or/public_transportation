@@ -79,6 +79,7 @@ From the repository root:
 
 ```bash
 python docs/source/examples/geneva_gtfs/pre_processing/run_preprocessing.py
+python docs/source/examples/geneva_gtfs/pre_processing/run_structural_zeros.py
 python docs/source/examples/geneva_gtfs/estimation/run_estimation.py --method ml
 python docs/source/examples/geneva_gtfs/post_processing/run_comparison.py --method ml
 ```
@@ -88,6 +89,32 @@ accept `--maxiter`; VI accepts `--vi-steps` and `--posterior-draws`.  Theta is
 fixed at its known synthetic value of 5 in the initial validation experiment,
 so differences reflect OD estimation rather than confounding between demand
 and route-choice dispersion.
+
+### Structural-zero acceptance result
+
+The TOML-driven structural-zero run analyzes the 15,128 OD/time keys in
+`prior_demand.csv`. On the committed snapshot, every candidate has a feasible
+path and needs at most one transfer: 8,544 cells have a zero-transfer path and
+6,584 require one transfer. Feasible-departure counts range from 4 to 52, and
+the largest minimum journey time is about 56 minutes. Consequently, the enabled
+same-stop, no-path, and maximum-two-transfer rules add no new structural zeros.
+
+This is the expected result, not a failed test. The committed `fixed_demand.csv`
+contains 15,032 zero-valued cells selected when the synthetic demand support was
+constructed; those cells are topologically possible even though the validation
+experiment fixes them to zero. Reconciliation preserves all of them, and the
+generated fixed-demand CSV is byte-identical to the committed input. The actual
+estimation layout contains 15,128 total cells, 15,032 fixed-zero cells, and 96
+free parameters. A reference run completed the structural-zero service in about
+3.2 seconds on the development machine.
+
+The full Geneva acceptance test is opt-in so ordinary unit-test runs remain
+fast:
+
+```bash
+RUN_GENEVA_STRUCTURAL_ZERO_ACCEPTANCE=1 \
+  pytest -q tests/preprocessing/test_geneva_structural_zero_acceptance.py
+```
 
 To reproduce the committed three-method benchmark, run estimation and
 reassignment for `ml`, `map`, and `vi`, then generate the common report:

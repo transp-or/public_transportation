@@ -1,0 +1,54 @@
+# Structural-zero preprocessing for the committed Geneva GTFS snapshot.
+# All relative paths are resolved from this TOML file.
+version = 1
+
+[scenario]
+# Must name an existing scenario directory.
+folder = "data"
+# Explicit a-priori OD candidate universe; this example keeps separate true and
+# prior demand files instead of a generic demand.csv.
+demand_file = "data/prior_demand.csv"
+
+[output]
+# May be absent on load; a later execution phase creates it.
+folder = "pre_processing/results/structural_zeros"
+# true writes retained cells as well as rejected cells to the detailed audit.
+include_retained_cells_in_report = true
+
+[rules.enabled]
+# Every rule selector is required and must be true or false.
+same_stop = true
+no_feasible_path = true
+maximum_transfers = true
+maximum_initial_wait = false
+maximum_journey_time = false
+minimum_feasible_departures = false
+
+# Enabled rules require their own table. These two rules take no parameters.
+[rules.same_stop]
+
+[rules.no_feasible_path]
+
+[rules.maximum_transfers]
+# A cell is rejected only when every feasible path needs more than 2 transfers.
+max_transfers = 2
+
+# Disabled rule tables may be retained as documented presets.
+[rules.maximum_initial_wait]
+max_initial_wait_minutes = 30.0
+
+[rules.maximum_journey_time]
+max_journey_time_minutes = 120.0
+
+[rules.minimum_feasible_departures]
+min_feasible_departures = 2
+
+[assignment]
+# These settings define feasibility and must agree with subsequent assignment.
+max_access_deviation_minutes = 15.0
+max_transfer_wait_minutes = 30.0
+minimum_dwell_seconds = 1
+
+[existing_fixed_demand]
+# Conflicting nonzero values always cause an error; no override policy exists.
+file = "data/fixed_demand.csv"

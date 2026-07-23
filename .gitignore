@@ -33,3 +33,5 @@ src/public_transportation/estimation/bayesian/__pycache__/__init__.cpython-312.p
 docs/source/examples/simple_example_02/estimation/results/compare_vi_ml_od_theta_results.npz
 /docs/source/examples/simple_example_02/pre_processing/results
 /docs/source/examples/simple_example_02/post_processing/results
+docs/source/examples/geneva_gtfs/pre_processing/results/structural_zeros/fingerprints.json
+docs/source/examples/geneva_gtfs/pre_processing/results/structural_zeros/resolved_config.toml
