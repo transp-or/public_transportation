@@ -68,10 +68,10 @@ print("package:", public_transportation.__file__)
 PY
 
 echo "=== Ruff ==="
-"$UV_EXECUTABLE" run --frozen ruff check src tests benchmarks
+"$UV_EXECUTABLE" run --frozen --extra dev ruff check src tests benchmarks
 
 echo "=== Pytest ==="
-"$UV_EXECUTABLE" run --frozen pytest
+"$UV_EXECUTABLE" run --frozen --extra dev pytest
 
 echo "=== Resource usage ==="
 sstat --jobs="${SLURM_JOB_ID}.batch" \
