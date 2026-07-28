@@ -35,11 +35,11 @@ def write_mapping_report_html(
         tid = trip_id[ti] if 0 <= ti < len(trip_id) else f"trip_index={ti}"
         return f"{sid} / {tid} @ {hh:02d}:{mm:02d}:{ss:02d} (node={n})"
 
-    def link_label(l: int) -> str:
-        u = int(id_manager.link_tail[l])
-        v = int(id_manager.link_head[l])
-        lt = int(id_manager.link_type[l])
-        return f"link {l}: tail={u}, head={v}, type={lt}, flow={assignment_link_flow[l]:.6g}"
+    def link_label(link: int) -> str:
+        u = int(id_manager.link_tail[link])
+        v = int(id_manager.link_head[link])
+        lt = int(id_manager.link_type[link])
+        return f"link {link}: tail={u}, head={v}, type={lt}, flow={assignment_link_flow[link]:.6g}"
 
     css = (
         "body{font-family:system-ui, -apple-system, Segoe UI, Roboto, sans-serif;}"
@@ -87,7 +87,7 @@ def write_mapping_report_html(
         if e.matched_link_indices is None:
             links_html = "<i>(link list not stored; enable include_link_lists_for_report)</i>"
         else:
-            links_html = "<br/>".join(html.escape(link_label(l)) for l in e.matched_link_indices)
+            links_html = "<br/>".join(html.escape(link_label(link)) for link in e.matched_link_indices)
 
         rows.append("<tr>")
         rows.append(f"<td>{e.row_index}</td>")

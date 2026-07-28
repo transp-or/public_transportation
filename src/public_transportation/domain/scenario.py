@@ -61,8 +61,8 @@ class Scenario:
         # Local validations
         for s in self.stops:
             rep.extend(s.validate())
-        for l in self.lines:
-            rep.extend(l.validate())
+        for line in self.lines:
+            rep.extend(line.validate())
         for b in self.time_bins:
             rep.extend(b.validate())
         rep.extend(self.demand.validate())
@@ -99,7 +99,7 @@ class Scenario:
                     seen.add(i)
 
         check_unique("stops", [s.stop_id for s in self.stops])
-        check_unique("lines", [l.line_id for l in self.lines])
+        check_unique("lines", [line.line_id for line in self.lines])
         check_unique("time_bins", [b.bin_id for b in self.time_bins])
 
         return rep
@@ -108,7 +108,7 @@ class Scenario:
         rep = ValidationReport(issues=[])
 
         stop_ids = {s.stop_id for s in self.stops}
-        line_ids = {l.line_id for l in self.lines}
+        line_ids = {line.line_id for line in self.lines}
         time_bin_ids = {b.bin_id for b in self.time_bins}
 
         # Demand references

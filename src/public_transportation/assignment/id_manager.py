@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Iterable, TYPE_CHECKING, Mapping
-
 import hashlib
 import json
+from dataclasses import dataclass
+from typing import Any, Mapping, TYPE_CHECKING
 
 import numpy as np
 

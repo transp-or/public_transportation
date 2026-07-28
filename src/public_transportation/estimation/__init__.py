@@ -11,6 +11,15 @@ engine:
 The same log-likelihood and log-prior functions can be used by both engines.
 """
 
-from .common import Array, LogLikFn, LogPriorFn, base_normal_logpdf
-from .bayesian import VIConfig, VIResult, run_vi
-from .maximum_likelihood import MLConfig, MLResult, run_ml
+from .common import (
+    Array as Array,
+    LogLikFn as LogLikFn,
+    LogPriorFn as LogPriorFn,
+    base_normal_logpdf as base_normal_logpdf,
+)
+from .bayesian import VIConfig as VIConfig, VIResult as VIResult, run_vi as run_vi
+from .maximum_likelihood import (
+    MLConfig as MLConfig,
+    MLResult as MLResult,
+    run_ml as run_ml,
+)

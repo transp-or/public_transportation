@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import Iterable, TYPE_CHECKING
 
 from .issues import Issue, Severity, ValidationReport
+
 if TYPE_CHECKING:
     from .scenario import Scenario
-from .time_of_day import TimeOfDay
 
 
 @dataclass(frozen=True, slots=True)

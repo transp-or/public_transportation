@@ -1,0 +1,71 @@
+#!/bin/bash
+#SBATCH --job-name=pt-jed-probe
+#SBATCH --partition=standard
+#SBATCH --qos=serial
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=4G
+#SBATCH --time=00:05:00
+#SBATCH --output=jed-probe-%j.out
+
+set -eu
+
+echo "=== Slurm allocation ==="
+echo "JOB_ID=$SLURM_JOB_ID"
+echo "NODELIST=$SLURM_JOB_NODELIST"
+echo "CPUS_PER_TASK=$SLURM_CPUS_PER_TASK"
+echo "MEM_PER_NODE=${SLURM_MEM_PER_NODE:-not-set}"
+echo "TMPDIR=${TMPDIR:-not-set}"
+
+echo "=== Host ==="
+hostname
+uname -a
+
+echo "=== CPU ==="
+lscpu
+
+echo "=== NUMA ==="
+if command -v numactl >/dev/null 2>&1; then
+    numactl --hardware
+else
+    echo "numactl unavailable"
+fi
+
+echo "=== Memory ==="
+free -h
+
+echo "=== Slurm view ==="
+scontrol show job "$SLURM_JOB_ID"
+
+echo "=== Storage ==="
+df -h "$HOME"
+if [ -n "${SCRATCH:-}" ] && [ -e "$SCRATCH" ]; then
+    df -h "$SCRATCH"
+fi
+df -h "${TMPDIR:-/tmp}"
+
+echo "=== Software ==="
+command -v uv || true
+command -v python || true
+command -v python3 || true
+python3 --version 2>&1 || true
+
+python3 - <<'PY'
+import importlib.util
+import platform
+
+print("python_platform:", platform.platform())
+for name in ("jax", "jaxlib", "numpy", "scipy"):
+    spec = importlib.util.find_spec(name)
+    print(f"{name}_available:", spec is not None)
+    if spec is not None:
+        module = __import__(name)
+        print(f"{name}_version:", getattr(module, "__version__", "unknown"))
+
+if importlib.util.find_spec("jax") is not None:
+    import jax
+    print("jax_backend:", jax.default_backend())
+    print("jax_devices:", jax.devices())
+    print("jax_x64:", jax.config.x64_enabled)
+PY

@@ -16,25 +16,16 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
+import jax
 import numpy as np
 import pytest
-import jax
-import jax.numpy as jnp
 
 from public_transportation.assignment.build_time_expanded import build_jax_graph
 from public_transportation.assignment.config import AssignmentConfig
-from public_transportation.assignment.graph_sentinels import (
-    CENTROID_TIME_S,
-    NODE_KIND_CENTROID_IN,
-    NODE_KIND_EVENT_ARR,
-    NODE_KIND_EVENT_DEP,
-    NODE_KIND_CENTROID_OUT,
-    LINK_TYPE_ACCESS,
-    LINK_TYPE_EGRESS,
-    LINK_TYPE_RIDE,
-    LINK_TYPE_TRANSFER,
-    LINK_TYPE_DWELL,
-)
+from public_transportation.assignment.graph_sentinels import (CENTROID_TIME_S, LINK_TYPE_ACCESS, LINK_TYPE_DWELL,
+                                                              LINK_TYPE_EGRESS, LINK_TYPE_RIDE, LINK_TYPE_TRANSFER,
+                                                              NODE_KIND_CENTROID_IN, NODE_KIND_CENTROID_OUT,
+                                                              NODE_KIND_EVENT_ARR, NODE_KIND_EVENT_DEP)
 
 
 # ---------------------------------------------------------------------------

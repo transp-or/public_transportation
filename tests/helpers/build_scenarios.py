@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+
 
 # NOTE:
 # We intentionally build domain objects directly rather than writing files.

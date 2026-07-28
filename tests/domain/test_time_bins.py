@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
 from public_transportation.domain.issues import Severity
 from public_transportation.domain.time_bin import TimeBin
 from public_transportation.domain.time_of_day import TimeOfDay

@@ -50,14 +50,14 @@ If some of these fields are missing, the report degrades gracefully.
 
 from __future__ import annotations
 
+import html
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
-import html
-
-from public_transportation.viz.html_utils import esc, wrap_html
 import numpy as np
+
+from public_transportation.viz.html_utils import wrap_html
 
 # --------------------------------------------------------------------------------------
 # Visualization constants (SVG)
@@ -821,7 +821,6 @@ def _render_links_table(
     time_bins: list[dict[str, Any]] | None = None,
 ) -> str:
     rows = []
-    has_cost = link_cost is not None
     for e in range(g.num_links):
         t = int(g.tail[e])
         h = int(g.head[e])
