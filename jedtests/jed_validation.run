@@ -1,0 +1,80 @@
+#!/bin/bash
+#SBATCH --job-name=pt-validation
+#SBATCH --account=transpor
+#SBATCH --partition=standard
+#SBATCH --qos=serial
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
+#SBATCH --time=00:30:00
+#SBATCH --output=jedtests/jed-validation-%j.out
+
+set -euo pipefail
+
+REPOSITORY_DIR="${SLURM_SUBMIT_DIR:-$HOME/github/public_transportation}"
+UV_EXECUTABLE="$HOME/.local/bin/uv"
+
+if [[ ! -f "$REPOSITORY_DIR/pyproject.toml" ]]; then
+    echo "ERROR: submit this job from the public_transportation repository root." >&2
+    exit 2
+fi
+
+if [[ ! -x "$UV_EXECUTABLE" ]]; then
+    echo "ERROR: uv not found at $UV_EXECUTABLE" >&2
+    exit 2
+fi
+
+cd "$REPOSITORY_DIR"
+
+export JAX_PLATFORM_NAME=cpu
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+
+echo "=== Allocation ==="
+echo "job_id=$SLURM_JOB_ID"
+echo "node=$SLURM_JOB_NODELIST"
+echo "submit_dir=$SLURM_SUBMIT_DIR"
+echo "repository=$REPOSITORY_DIR"
+echo "cpus_per_task=$SLURM_CPUS_PER_TASK"
+echo "memory_per_node=${SLURM_MEM_PER_NODE:-not-set}"
+echo "tmpdir=${TMPDIR:-not-set}"
+
+echo "=== Revisions ==="
+git status --short
+git log -1 --oneline
+if [[ -d ../public_transport_TPG/.git ]]; then
+    git -C ../public_transport_TPG status --short
+    git -C ../public_transport_TPG log -1 --oneline
+else
+    echo "ERROR: sibling public_transport_TPG repository not found." >&2
+    exit 2
+fi
+
+echo "=== Runtime ==="
+"$UV_EXECUTABLE" run --frozen python - <<'PY'
+import platform
+
+import jax
+import numpyro
+import public_transportation
+
+print("host:", platform.node())
+print("python:", platform.python_version())
+print("jax:", jax.__version__)
+print("numpyro:", numpyro.__version__)
+print("backend:", jax.default_backend())
+print("devices:", jax.devices())
+print("package:", public_transportation.__file__)
+PY
+
+echo "=== Ruff ==="
+"$UV_EXECUTABLE" run --frozen ruff check src tests benchmarks
+
+echo "=== Pytest ==="
+"$UV_EXECUTABLE" run --frozen pytest
+
+echo "=== Resource usage ==="
+sstat --jobs="${SLURM_JOB_ID}.batch" \
+    --format=JobID,AveCPU,MaxRSS,MaxVMSize 2>/dev/null || true
+
+echo "=== Validation complete ==="

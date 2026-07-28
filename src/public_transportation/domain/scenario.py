@@ -537,13 +537,13 @@ class Scenario:
         lines_df = pd.DataFrame(
             [
                 {
-                    "line_id": l.line_id,
-                    "short_name": l.short_name,
-                    "long_name": l.long_name,
-                    "mode": l.mode,
-                    "agency_id": l.agency_id,
+                    "line_id": line.line_id,
+                    "short_name": line.short_name,
+                    "long_name": line.long_name,
+                    "mode": line.mode,
+                    "agency_id": line.agency_id,
                 }
-                for l in self.lines
+                for line in self.lines
             ]
         )
 
