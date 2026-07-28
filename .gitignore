@@ -35,3 +35,4 @@ docs/source/examples/simple_example_02/estimation/results/compare_vi_ml_od_theta
 /docs/source/examples/simple_example_02/post_processing/results
 docs/source/examples/geneva_gtfs/pre_processing/results/structural_zeros/fingerprints.json
 docs/source/examples/geneva_gtfs/pre_processing/results/structural_zeros/resolved_config.toml
+benchmarks/tpg_operator_cache/fixed-routing-measurement-f3de09a4637a00bf38d51735214e60d0f314287d637286a24316a1ed7c4ec04e.npz
