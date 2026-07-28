@@ -27,8 +27,12 @@ fi
 
 cd "$REPOSITORY_DIR"
 
+unset VIRTUAL_ENV
 export JAX_PLATFORM_NAME=cpu
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export MPLCONFIGDIR="${TMPDIR:-/tmp}/matplotlib"
+export XDG_CACHE_HOME="${TMPDIR:-/tmp}/xdg-cache"
+mkdir -p "$MPLCONFIGDIR" "$XDG_CACHE_HOME"
 
 echo "=== Allocation ==="
 echo "job_id=$SLURM_JOB_ID"
@@ -66,6 +70,12 @@ print("backend:", jax.default_backend())
 print("devices:", jax.devices())
 print("package:", public_transportation.__file__)
 PY
+
+echo "=== Generate deterministic test fixtures ==="
+"$UV_EXECUTABLE" run --frozen python \
+    docs/source/examples/simple_example_02/pre_processing/run_preprocessing.py \
+    --mode generate \
+    --theta 1.0
 
 echo "=== Ruff ==="
 "$UV_EXECUTABLE" run --frozen --extra dev ruff check src tests benchmarks
