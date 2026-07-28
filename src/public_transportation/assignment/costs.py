@@ -244,7 +244,7 @@ def typical_cost_scale_from_assignment(
     demand_total: float | None = None,
     eps: float = 1.0e-12,
 ) -> float:
-    """Compute a single typical generalized-cost scale (minutes) from an assignment output.
+    r"""Compute a single typical generalized-cost scale (minutes) from an assignment output.
 
     Purpose
     -------
