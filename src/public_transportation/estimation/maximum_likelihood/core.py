@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from time import perf_counter
 from typing import Any
@@ -13,6 +14,95 @@ from scipy.optimize import minimize
 from ..common.model_blackbox import Array, LogLikFn, LogPriorFn, _as_scalar
 from .config import MLConfig
 from .results import MLResult
+
+
+@dataclass(frozen=True, slots=True)
+class MLCompilationMetrics:
+    tracing_seconds: float
+    lowering_seconds: float
+    compilation_seconds: float
+    executable_loading_seconds: float
+    first_execution_seconds: float
+    lowered_text_bytes: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedMLObjective:
+    """Stable value/diagnostics/gradient kernel with dynamic data arguments."""
+
+    jitted: Any
+    theta_example: Array
+    data: Any
+
+
+@dataclass(frozen=True, slots=True)
+class CompiledMLObjective:
+    """Ahead-of-time compiled objective and its separated phase timings."""
+
+    callable: Any
+    metrics: MLCompilationMetrics
+
+
+def prepare_ml_objective(
+    *,
+    theta_example: Array,
+    data: Any,
+    loglik: LogLikFn,
+    logprior: LogPriorFn | None = None,
+    prior_weight: float = 0.0,
+) -> PreparedMLObjective:
+    """Prepare a stable objective whose numerical data remain dynamic arguments."""
+    if prior_weight < 0:
+        raise ValueError("prior_weight must be non-negative.")
+    lp_fun = _zero_logprior if logprior is None else logprior
+    weight = float(prior_weight)
+
+    def objective(theta: Array, dynamic_data: Any):
+        ll = _as_scalar(loglik(theta, dynamic_data))
+        lp = _as_scalar(lp_fun(theta))
+        return -(ll + weight * lp), (ll, lp)
+
+    jitted = jax.jit(jax.value_and_grad(objective, argnums=0, has_aux=True))
+    return PreparedMLObjective(jitted, jnp.asarray(theta_example), data)
+
+
+def compile_ml_objective(
+    prepared: PreparedMLObjective, *, execute_first: bool = True
+) -> CompiledMLObjective:
+    """Trace, lower, compile, and optionally execute while timing each phase."""
+    started = perf_counter()
+    traced = prepared.jitted.trace(prepared.theta_example, prepared.data)
+    tracing_seconds = perf_counter() - started
+    started = perf_counter()
+    lowered = traced.lower()
+    lowering_seconds = perf_counter() - started
+    try:
+        lowered_text_bytes = len(lowered.as_text().encode("utf-8"))
+    except (AttributeError, TypeError, ValueError):
+        lowered_text_bytes = None
+    started = perf_counter()
+    compiled_callable = lowered.compile()
+    compilation_seconds = perf_counter() - started
+    started = perf_counter()
+    compiled_callable.runtime_executable()
+    executable_loading_seconds = perf_counter() - started
+    first_execution_seconds = 0.0
+    if execute_first:
+        started = perf_counter()
+        first = compiled_callable(prepared.theta_example, prepared.data)
+        jax.block_until_ready(first)
+        first_execution_seconds = perf_counter() - started
+    return CompiledMLObjective(
+        compiled_callable,
+        MLCompilationMetrics(
+            tracing_seconds,
+            lowering_seconds,
+            compilation_seconds,
+            executable_loading_seconds,
+            first_execution_seconds,
+            lowered_text_bytes,
+        ),
+    )
 
 
 def _format_duration(seconds: float) -> str:
@@ -55,14 +145,49 @@ def make_ml_objective(
     """
     if prior_weight < 0:
         raise ValueError("prior_weight must be non-negative.")
-    lp_fun = _zero_logprior if logprior is None else logprior
+    objective_with_aux = _make_ml_objective_with_aux(
+        loglik=loglik,
+        logprior=logprior,
+        data=data,
+        prior_weight=prior_weight,
+    )
 
     def objective(theta: Array) -> Array:
-        ll = _as_scalar(loglik(theta, data))
-        lp = _as_scalar(lp_fun(theta))
-        return -(ll + prior_weight * lp)
+        value, _ = objective_with_aux(theta)
+        return value
 
     return objective
+
+
+def _make_ml_objective_with_aux(
+    *,
+    loglik: LogLikFn,
+    logprior: LogPriorFn | None,
+    data: Any,
+    prior_weight: float,
+) -> Callable[[Array], tuple[Array, tuple[Array, Array]]]:
+    """Build the objective together with likelihood and prior diagnostics."""
+    if prior_weight < 0:
+        raise ValueError("prior_weight must be non-negative.")
+    lp_fun = _zero_logprior if logprior is None else logprior
+
+    def objective(theta: Array) -> tuple[Array, tuple[Array, Array]]:
+        ll = _as_scalar(loglik(theta, data))
+        lp = _as_scalar(lp_fun(theta))
+        return -(ll + prior_weight * lp), (ll, lp)
+
+    return objective
+
+
+@dataclass(frozen=True)
+class _CachedEvaluation:
+    """One compiled objective/gradient evaluation at an exact parameter vector."""
+
+    theta: np.ndarray
+    objective: float
+    gradient: np.ndarray
+    loglikelihood: float
+    logprior: float
 
 
 def _extract_inverse_hessian(scipy_result: Any, dim: int) -> np.ndarray | None:
@@ -120,6 +245,7 @@ def run_ml(
     gtol: float | None = None,
     prior_weight: float | None = None,
     compute_hessian: bool | None = None,
+    compiled_objective: CompiledMLObjective | Any | None = None,
     logger: Any | None = None,
 ) -> MLResult:
     """
@@ -168,7 +294,9 @@ def run_ml(
     maxiter = cfg.maxiter if maxiter is None else int(maxiter)
     gtol = cfg.gtol if gtol is None else float(gtol)
     prior_weight = cfg.prior_weight if prior_weight is None else float(prior_weight)
-    compute_hessian = cfg.compute_hessian if compute_hessian is None else bool(compute_hessian)
+    compute_hessian = (
+        cfg.compute_hessian if compute_hessian is None else bool(compute_hessian)
+    )
 
     if maxiter <= 0:
         raise ValueError("maxiter must be positive.")
@@ -192,7 +320,9 @@ def run_ml(
             gradient=np.empty((0,), dtype=float),
             gradient_norm=0.0,
             hessian=(np.empty((0, 0), dtype=float) if compute_hessian else None),
-            covariance_matrix=(np.empty((0, 0), dtype=float) if compute_hessian else None),
+            covariance_matrix=(
+                np.empty((0, 0), dtype=float) if compute_hessian else None
+            ),
             standard_errors=(np.empty((0,), dtype=float) if compute_hessian else None),
             z_values=(np.empty((0,), dtype=float) if compute_hessian else None),
             success=True,
@@ -204,6 +334,7 @@ def run_ml(
             runtime_seconds=0.0,
             timestamp=datetime.now().isoformat(timespec="seconds"),
             optimization_trace=np.empty((0, 3), dtype=float),
+            num_compiled_evaluations=0,
             scipy_result=None,
         )
 
@@ -212,38 +343,69 @@ def run_ml(
     else:
         theta0_np = np.asarray(theta0, dtype=float).reshape((dim,))
 
+    if isinstance(compiled_objective, CompiledMLObjective):
+        value_and_grad = compiled_objective.callable
+    elif compiled_objective is not None:
+        value_and_grad = compiled_objective
+    else:
+        value_and_grad = prepare_ml_objective(
+            theta_example=jnp.asarray(theta0_np),
+            data=data,
+            loglik=loglik,
+            logprior=logprior,
+            prior_weight=prior_weight,
+        ).jitted
     objective = make_ml_objective(
         loglik=loglik,
         logprior=logprior,
         data=data,
         prior_weight=prior_weight,
     )
-    value_and_grad = jax.jit(jax.value_and_grad(objective))
 
     trace: list[tuple[int, float, float]] = []
     start_time = perf_counter()
-    last_log_time = start_time
+    cached_evaluation: _CachedEvaluation | None = None
+    num_compiled_evaluations = 0
 
     def scipy_fun(theta_np: np.ndarray) -> tuple[float, np.ndarray]:
+        nonlocal cached_evaluation, num_compiled_evaluations
         theta = jnp.asarray(theta_np)
-        value, grad = value_and_grad(theta)
+        (value, (ll, lp)), grad = value_and_grad(theta, data)
         value_np = float(np.asarray(value))
-        grad_np = np.asarray(grad, dtype=float)
+        grad_np = np.array(grad, dtype=float, copy=True)
+        cached_evaluation = _CachedEvaluation(
+            theta=np.array(theta_np, dtype=float, copy=True),
+            objective=value_np,
+            gradient=grad_np,
+            loglikelihood=float(np.asarray(ll)),
+            logprior=float(np.asarray(lp)),
+        )
+        num_compiled_evaluations += 1
         return value_np, grad_np
+
+    def evaluation_at(theta_np: np.ndarray) -> _CachedEvaluation:
+        nonlocal cached_evaluation
+        candidate = np.asarray(theta_np, dtype=float)
+        if cached_evaluation is None or not np.array_equal(
+            candidate, cached_evaluation.theta
+        ):
+            scipy_fun(candidate)
+        assert cached_evaluation is not None
+        return cached_evaluation
 
     iteration = {"k": 0}
 
     def callback(theta_np: np.ndarray) -> None:
-        value_np, grad_np = scipy_fun(theta_np)
-        grad_norm = float(np.linalg.norm(grad_np))
-        trace.append((iteration["k"], value_np, grad_norm))
+        evaluation = evaluation_at(theta_np)
+        grad_norm = float(np.linalg.norm(evaluation.gradient))
+        trace.append((iteration["k"], evaluation.objective, grad_norm))
 
         if logger is not None and iteration["k"] % cfg.log_every == 0:
             now = perf_counter()
             logger.info(
                 "ML iteration %d — objective: %.6f — gradient norm: %.6g — elapsed: %s",
                 iteration["k"],
-                value_np,
+                evaluation.objective,
                 grad_norm,
                 _format_duration(now - start_time),
             )
@@ -262,17 +424,15 @@ def run_ml(
         options=options,
     )
 
-    theta_hat = np.asarray(scipy_result.x, dtype=float)
-    final_objective, final_gradient = scipy_fun(theta_hat)
+    theta_hat = np.array(scipy_result.x, dtype=float, copy=True)
+    final_evaluation = evaluation_at(theta_hat)
+    final_objective = final_evaluation.objective
+    final_gradient = final_evaluation.gradient
     final_gradient_norm = float(np.linalg.norm(final_gradient))
 
     theta_jax = jnp.asarray(theta_hat)
-    loglikelihood = float(np.asarray(_as_scalar(loglik(theta_jax, data))))
-    logprior_value = (
-        0.0
-        if logprior is None
-        else float(np.asarray(_as_scalar(logprior(theta_jax))))
-    )
+    loglikelihood = final_evaluation.loglikelihood
+    logprior_value = final_evaluation.logprior
 
     hessian_np: np.ndarray | None = None
     covariance_np: np.ndarray | None = None
@@ -323,5 +483,6 @@ def run_ml(
         runtime_seconds=float(runtime_seconds),
         timestamp=timestamp,
         optimization_trace=np.asarray(trace, dtype=float),
+        num_compiled_evaluations=num_compiled_evaluations,
         scipy_result=scipy_result,
     )

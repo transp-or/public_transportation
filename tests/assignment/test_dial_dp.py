@@ -8,10 +8,13 @@ import numpy as np
 import pytest
 
 from public_transportation.assignment.dial_dp import (
+    DestinationRouting,
     DialResult,
     compute_link_probabilities,
     compute_value_function,
+    load_destination_flows,
     load_flows,
+    prepare_destination_routing,
     run_dial_for_destination,
 )
 from public_transportation.assignment.jax_graph_types import JaxGraph
@@ -465,6 +468,81 @@ def test_run_dial_for_destination_diamond_flow_conservation():
     assert np.isclose(float(result.node_flow[3]), 100.0, atol=1e-5)
     assert np.isclose(float(result.link_flow[:2].sum()), 100.0, atol=1e-5)
     assert np.isclose(float(result.link_flow[2:].sum()), 100.0, atol=1e-5)
+
+
+@pytest.mark.parametrize("theta", [0.5, 1.5, 5.0])
+def test_separate_routing_and_loading_match_composed_dial(theta):
+    graph = _mk_diamond_graph()
+    link_cost = jnp.asarray([1.0, 2.0, 3.0, 4.0], dtype=jnp.float32)
+    enabled = jnp.asarray([True, True, True, True])
+    initial = jnp.asarray([37.0, 0.0, 0.0, 0.0], dtype=jnp.float32)
+
+    routing = prepare_destination_routing(
+        graph=graph,
+        link_cost=link_cost,
+        enabled_link_mask=enabled,
+        dest_node=3,
+        theta=theta,
+    )
+    node_flow, link_flow = load_destination_flows(
+        graph=graph,
+        routing=routing,
+        initial_node_flow=initial,
+    )
+    composed = run_dial_for_destination(
+        graph=graph,
+        link_cost=link_cost,
+        enabled_link_mask=enabled,
+        dest_node=3,
+        theta=theta,
+        initial_node_flow=initial,
+    )
+
+    assert isinstance(routing, DestinationRouting)
+    assert np.allclose(_as_np(routing.value), _as_np(composed.value), atol=1e-6)
+    assert np.allclose(_as_np(routing.link_prob), _as_np(composed.link_prob), atol=1e-6)
+    assert np.allclose(_as_np(node_flow), _as_np(composed.node_flow), atol=1e-6)
+    assert np.allclose(_as_np(link_flow), _as_np(composed.link_flow), atol=1e-6)
+
+
+def test_prepared_routing_is_reusable_for_different_demands_under_jit():
+    graph = _mk_diamond_graph()
+    routing = prepare_destination_routing(
+        graph=graph,
+        link_cost=jnp.asarray([1.0, 2.0, 3.0, 4.0], dtype=jnp.float32),
+        enabled_link_mask=jnp.asarray([True, True, True, True]),
+        dest_node=3,
+        theta=1.5,
+    )
+    load = jax.jit(
+        lambda demand: load_destination_flows(
+            graph=graph,
+            routing=routing,
+            initial_node_flow=demand,
+        )[1]
+    )
+
+    first = load(jnp.asarray([10.0, 0.0, 0.0, 0.0], dtype=jnp.float32))
+    second = load(jnp.asarray([25.0, 0.0, 0.0, 0.0], dtype=jnp.float32))
+
+    assert np.allclose(_as_np(second), 2.5 * _as_np(first), atol=1e-5)
+
+
+def test_destination_routing_is_pytree_round_trippable():
+    routing = DestinationRouting(
+        dest_node=jnp.asarray(1, dtype=jnp.int32),
+        theta=jnp.asarray(2.0, dtype=jnp.float32),
+        enabled_link_mask=jnp.asarray([True]),
+        value=jnp.asarray([2.0, 0.0], dtype=jnp.float32),
+        link_prob=jnp.asarray([1.0], dtype=jnp.float32),
+    )
+
+    children, treedef = jax.tree_util.tree_flatten(routing)
+    rebuilt = jax.tree_util.tree_unflatten(treedef, children)
+
+    assert isinstance(rebuilt, DestinationRouting)
+    assert np.allclose(_as_np(rebuilt.value), _as_np(routing.value))
+    assert np.allclose(_as_np(rebuilt.link_prob), _as_np(routing.link_prob))
 
 
 def test_jitted_functions_match_eager_wrapped_versions():

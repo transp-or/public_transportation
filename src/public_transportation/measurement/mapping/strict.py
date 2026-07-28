@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from time import perf_counter
+
+import jax
 import numpy as np
 import jax.numpy as jnp
 
@@ -14,17 +18,35 @@ from .spec import AggregationSpec, MappingEntry, MappingInfo, MappingSpecResult
 from .indexing import (
     AssignmentMappingIndex,
     build_assignment_mapping_index,
-    links_for_boarding,
-    links_for_alighting,
+    indexed_links_for_boarding,
+    indexed_links_for_alighting,
 )
 
 
-def build_mapping_spec_strict(
+@dataclass(frozen=True, slots=True)
+class StrictMappingProfile:
+    """Synchronized phase timings and structural counts for strict mapping."""
+
+    index_seconds: float
+    record_resolution_seconds: float
+    array_assembly_seconds: float
+    device_synchronization_seconds: float
+    total_seconds: float
+    num_measurements: int
+    num_contributions: int
+    boarding_measurements: int
+    alighting_measurements: int
+    minimum_links_per_measurement: int
+    maximum_links_per_measurement: int
+    mean_links_per_measurement: float
+
+
+def _build_mapping_spec_strict(
     *,
     id_manager: AssignmentIDManager,
     table: MeasurementTable,
     include_link_lists_for_report: bool = False,
-) -> MappingSpecResult:
+) -> tuple[MappingSpecResult, StrictMappingProfile]:
     """Strictly map MeasurementTable records to assignment links and return an aggregation spec.
 
     Structural only:
@@ -35,14 +57,21 @@ def build_mapping_spec_strict(
     - Each record must match exactly one timetable event node.
     - Contributing links must be non-empty.
     """
+    total_started = perf_counter()
+    started = perf_counter()
     idx: AssignmentMappingIndex = build_assignment_mapping_index(id_manager)
+    index_seconds = perf_counter() - started
 
     entries: list[MappingEntry] = []
     y_obs: list[float] = []
 
     meas_index_flat: list[int] = []
     link_index_flat: list[int] = []
+    link_counts: list[int] = []
+    boarding_count = 0
+    alighting_count = 0
 
+    started = perf_counter()
     for i, r in enumerate(table.records):
         # Basic checks
         if r.value < 0.0:
@@ -81,9 +110,11 @@ def build_mapping_spec_strict(
         if r.measurement_type == MeasurementType.BOARDING:
             need_kind = int(NODE_KIND_EVENT_DEP)
             mtype_str = "boarding"
+            boarding_count += 1
         elif r.measurement_type == MeasurementType.ALIGHTING:
             need_kind = int(NODE_KIND_EVENT_ARR)
             mtype_str = "alighting"
+            alighting_count += 1
         else:
             raise ValueError(
                 f"Record {i}: unsupported measurement_type={r.measurement_type.value!r} "
@@ -114,9 +145,9 @@ def build_mapping_spec_strict(
 
         # Contributing links
         if r.measurement_type == MeasurementType.BOARDING:
-            link_ids = links_for_boarding(id_manager, event_node)
+            link_ids = indexed_links_for_boarding(idx, event_node)
         else:
-            link_ids = links_for_alighting(id_manager, event_node)
+            link_ids = indexed_links_for_alighting(idx, event_node)
 
         if link_ids.size == 0:
             raise ValueError(
@@ -125,6 +156,7 @@ def build_mapping_spec_strict(
             )
 
         link_ids_list = link_ids.tolist()
+        link_counts.append(len(link_ids_list))
         meas_index_flat.extend([int(i)] * len(link_ids_list))
         link_index_flat.extend(int(lid) for lid in link_ids_list)
 
@@ -148,7 +180,9 @@ def build_mapping_spec_strict(
                 matched_link_indices=matched_links,
             )
         )
+    record_resolution_seconds = perf_counter() - started
 
+    started = perf_counter()
     info = MappingInfo(entries=tuple(entries), fingerprint=str(id_manager.fingerprint))
 
     spec = AggregationSpec(
@@ -157,8 +191,57 @@ def build_mapping_spec_strict(
         link_index=np.ascontiguousarray(np.asarray(link_index_flat, dtype=np.int32)),
     )
 
-    return MappingSpecResult(
+    result = MappingSpecResult(
         y_obs=jnp.asarray(y_obs),
         spec=spec,
         info=info,
+    )
+    array_assembly_seconds = perf_counter() - started
+    started = perf_counter()
+    jax.block_until_ready(result.y_obs)
+    device_synchronization_seconds = perf_counter() - started
+    counts = np.asarray(link_counts, dtype=np.int64)
+    profile = StrictMappingProfile(
+        index_seconds=index_seconds,
+        record_resolution_seconds=record_resolution_seconds,
+        array_assembly_seconds=array_assembly_seconds,
+        device_synchronization_seconds=device_synchronization_seconds,
+        total_seconds=perf_counter() - total_started,
+        num_measurements=len(y_obs),
+        num_contributions=len(link_index_flat),
+        boarding_measurements=boarding_count,
+        alighting_measurements=alighting_count,
+        minimum_links_per_measurement=int(counts.min()) if counts.size else 0,
+        maximum_links_per_measurement=int(counts.max()) if counts.size else 0,
+        mean_links_per_measurement=float(counts.mean()) if counts.size else 0.0,
+    )
+    return result, profile
+
+
+def build_mapping_spec_strict(
+    *,
+    id_manager: AssignmentIDManager,
+    table: MeasurementTable,
+    include_link_lists_for_report: bool = False,
+) -> MappingSpecResult:
+    """Build the strict mapping, retaining the established result-only API."""
+    result, _ = _build_mapping_spec_strict(
+        id_manager=id_manager,
+        table=table,
+        include_link_lists_for_report=include_link_lists_for_report,
+    )
+    return result
+
+
+def profile_mapping_spec_strict(
+    *,
+    id_manager: AssignmentIDManager,
+    table: MeasurementTable,
+    include_link_lists_for_report: bool = False,
+) -> tuple[MappingSpecResult, StrictMappingProfile]:
+    """Build the strict mapping and return synchronized internal measurements."""
+    return _build_mapping_spec_strict(
+        id_manager=id_manager,
+        table=table,
+        include_link_lists_for_report=include_link_lists_for_report,
     )

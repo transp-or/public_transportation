@@ -1,0 +1,1010 @@
+{
+  "groups": [
+    1667,
+    273,
+    595,
+    140,
+    105,
+    130
+  ],
+  "mode": "isolated_representative_destination_samples",
+  "samples": [
+    {
+      "dimensions": {
+        "candidate_od": 1408084,
+        "free_od": 628164,
+        "full_groups": 1898,
+        "links": 1456458,
+        "nodes": 433462
+      },
+      "kernels": {
+        "flow_loading": {
+          "compile": {
+            "compilation_seconds": 5.666357916954439,
+            "first_execution_seconds": 6.100268749985844,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.10092341603012756,
+            "tracing_seconds": 0.0015637080068700016
+          },
+          "warm": {
+            "median_seconds": 5.987192332977429,
+            "samples_seconds": [
+              5.987192332977429
+            ]
+          }
+        },
+        "gradient_only": {
+          "compile": {
+            "compilation_seconds": 5.553106333012693,
+            "first_execution_seconds": 12.425926792027894,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.10318862501299009,
+            "tracing_seconds": 0.005323749966919422
+          },
+          "warm": {
+            "median_seconds": 12.164593791007064,
+            "samples_seconds": [
+              12.164593791007064
+            ]
+          }
+        },
+        "likelihood": {
+          "compile": {
+            "compilation_seconds": 0.1270161250140518,
+            "first_execution_seconds": 0.0007362079923041165,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.005230791983194649,
+            "tracing_seconds": 0.0005454160273075104
+          },
+          "warm": {
+            "median_seconds": 0.0005847499705851078,
+            "samples_seconds": [
+              0.0005847499705851078
+            ]
+          }
+        },
+        "measurement_aggregation": {
+          "compile": {
+            "compilation_seconds": 0.041383666975889355,
+            "first_execution_seconds": 0.0006339999963529408,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.003981125017162412,
+            "tracing_seconds": 0.0006404170417226851
+          },
+          "warm": {
+            "median_seconds": 0.0004190829931758344,
+            "samples_seconds": [
+              0.0004190829931758344
+            ]
+          }
+        },
+        "value_and_gradient": {
+          "compile": {
+            "compilation_seconds": 5.863444166025147,
+            "first_execution_seconds": 12.292342166998424,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.14865362498676404,
+            "tracing_seconds": 0.06332733400631696
+          },
+          "warm": {
+            "median_seconds": 12.221065791964065,
+            "samples_seconds": [
+              12.221065791964065
+            ]
+          }
+        },
+        "value_only": {
+          "compile": {
+            "compilation_seconds": 5.724583167000674,
+            "first_execution_seconds": 6.007160875014961,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.08701737504452467,
+            "tracing_seconds": 0.002531374979298562
+          },
+          "warm": {
+            "median_seconds": 5.959191375004593,
+            "samples_seconds": [
+              5.959191375004593
+            ]
+          }
+        }
+      },
+      "memory": {
+        "device_memory_stats": null,
+        "peak_rss_bytes": 17461313536,
+        "peak_rss_snapshots": {
+          "after_all_diagnostic_kernels": 17461313536,
+          "after_separated_forward": 16278159360,
+          "after_value_and_gradient": 16278159360,
+          "before_kernel_compilation": 9782525952
+        }
+      },
+      "mode": "bounded_single_destination_matrix_free_reference",
+      "numerical": {
+        "gradient_norm": 1025.974853515625,
+        "objective_at_baseline": 31158412.0,
+        "prediction_nonzero": 494,
+        "prediction_sum": 18.0
+      },
+      "orchestrator_wall_seconds": 314.62100170896156,
+      "persistent_array_bytes": {
+        "assignment_artifacts": 3827579178,
+        "measurement_mapping": 5160536,
+        "single_group_inputs": 7282375,
+        "single_group_routing": 14564588
+      },
+      "platform": {
+        "architecture": "arm64",
+        "backend": "cpu",
+        "device": "TFRT_CPU_0",
+        "jax": "0.8.1",
+        "jaxlib": "0.8.1",
+        "logical_cpus": 12,
+        "system": "macOS-26.5.2-arm64-arm-64bit"
+      },
+      "preparation_seconds": {
+        "assignment_preparation": 5.762832791020628,
+        "fixed_routing_preparation": 38.11375308298739,
+        "id_manager": 3.1784741670126095,
+        "measurement_csv": 1.7401277080061845,
+        "od_layout": 4.099004709045403,
+        "scenario_loading_and_validation": 22.63412258401513,
+        "single_group_extraction": 0.7383998750010505,
+        "strict_measurement_mapping": 121.21861479204381
+      },
+      "safety": {
+        "global_fixed_routing_constructed": false,
+        "jacobian_constructed": false,
+        "map_optimization_started": false,
+        "measurement_operator_constructed": false,
+        "memory_ceiling_bytes": 25769803776,
+        "observed_memory_ceiling_exceeded": false,
+        "routing_preflight_bytes": 7282290,
+        "selected_groups": 1
+      },
+      "sample": {
+        "destination_node": 433182,
+        "enabled_links": 1243240,
+        "free_cells": 9,
+        "local_measurements": 213267,
+        "original_group_index": 1667,
+        "total_measurements": 426436
+      },
+      "schema_version": 1,
+      "total_process_seconds": 313.90194599999813
+    },
+    {
+      "dimensions": {
+        "candidate_od": 1408084,
+        "free_od": 628164,
+        "full_groups": 1898,
+        "links": 1456458,
+        "nodes": 433462
+      },
+      "kernels": {
+        "flow_loading": {
+          "compile": {
+            "compilation_seconds": 5.634831874980591,
+            "first_execution_seconds": 5.956347667030059,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.09175650001270697,
+            "tracing_seconds": 0.002025082998443395
+          },
+          "warm": {
+            "median_seconds": 5.977407708007377,
+            "samples_seconds": [
+              5.977407708007377
+            ]
+          }
+        },
+        "gradient_only": {
+          "compile": {
+            "compilation_seconds": 5.7066069999709725,
+            "first_execution_seconds": 12.52600358397467,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.11453904199879616,
+            "tracing_seconds": 0.005136583000421524
+          },
+          "warm": {
+            "median_seconds": 12.219173667021096,
+            "samples_seconds": [
+              12.219173667021096
+            ]
+          }
+        },
+        "likelihood": {
+          "compile": {
+            "compilation_seconds": 0.1319127079914324,
+            "first_execution_seconds": 0.0007454589940607548,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.005366542027331889,
+            "tracing_seconds": 0.0006017500418238342
+          },
+          "warm": {
+            "median_seconds": 0.0005881660035811365,
+            "samples_seconds": [
+              0.0005881660035811365
+            ]
+          }
+        },
+        "measurement_aggregation": {
+          "compile": {
+            "compilation_seconds": 0.04203924996545538,
+            "first_execution_seconds": 0.0005816250341013074,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.003966832999140024,
+            "tracing_seconds": 0.0004202080308459699
+          },
+          "warm": {
+            "median_seconds": 0.00043579202610999346,
+            "samples_seconds": [
+              0.00043579202610999346
+            ]
+          }
+        },
+        "value_and_gradient": {
+          "compile": {
+            "compilation_seconds": 5.8975593749783,
+            "first_execution_seconds": 12.30071504204534,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.10499779199017212,
+            "tracing_seconds": 0.060025000013411045
+          },
+          "warm": {
+            "median_seconds": 12.105351333972067,
+            "samples_seconds": [
+              12.105351333972067
+            ]
+          }
+        },
+        "value_only": {
+          "compile": {
+            "compilation_seconds": 5.753227457986213,
+            "first_execution_seconds": 5.9641335000051185,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.08727879199432209,
+            "tracing_seconds": 0.0020660830195993185
+          },
+          "warm": {
+            "median_seconds": 5.961324457952287,
+            "samples_seconds": [
+              5.961324457952287
+            ]
+          }
+        }
+      },
+      "memory": {
+        "device_memory_stats": null,
+        "peak_rss_bytes": 18275958784,
+        "peak_rss_snapshots": {
+          "after_all_diagnostic_kernels": 18275958784,
+          "after_separated_forward": 15893413888,
+          "after_value_and_gradient": 15893413888,
+          "before_kernel_compilation": 12682313728
+        }
+      },
+      "mode": "bounded_single_destination_matrix_free_reference",
+      "numerical": {
+        "gradient_norm": 2236.6708984375,
+        "objective_at_baseline": 31037532.0,
+        "prediction_nonzero": 6292,
+        "prediction_sum": 274.0
+      },
+      "orchestrator_wall_seconds": 317.5004292500089,
+      "persistent_array_bytes": {
+        "assignment_artifacts": 3827579178,
+        "measurement_mapping": 5160536,
+        "single_group_inputs": 7283527,
+        "single_group_routing": 14564588
+      },
+      "platform": {
+        "architecture": "arm64",
+        "backend": "cpu",
+        "device": "TFRT_CPU_0",
+        "jax": "0.8.1",
+        "jaxlib": "0.8.1",
+        "logical_cpus": 12,
+        "system": "macOS-26.5.2-arm64-arm-64bit"
+      },
+      "preparation_seconds": {
+        "assignment_preparation": 5.767959750024602,
+        "fixed_routing_preparation": 39.39908862498123,
+        "id_manager": 3.155632958980277,
+        "measurement_csv": 1.794621208042372,
+        "od_layout": 4.193804375012405,
+        "scenario_loading_and_validation": 22.863354208995588,
+        "single_group_extraction": 0.7358556250110269,
+        "strict_measurement_mapping": 122.18917287496151
+      },
+      "safety": {
+        "global_fixed_routing_constructed": false,
+        "jacobian_constructed": false,
+        "map_optimization_started": false,
+        "measurement_operator_constructed": false,
+        "memory_ceiling_bytes": 25769803776,
+        "observed_memory_ceiling_exceeded": false,
+        "routing_preflight_bytes": 7282290,
+        "selected_groups": 1
+      },
+      "sample": {
+        "destination_node": 431463,
+        "enabled_links": 1243237,
+        "free_cells": 137,
+        "local_measurements": 213271,
+        "original_group_index": 273,
+        "total_measurements": 426436
+      },
+      "schema_version": 1,
+      "total_process_seconds": 316.7753982919967
+    },
+    {
+      "dimensions": {
+        "candidate_od": 1408084,
+        "free_od": 628164,
+        "full_groups": 1898,
+        "links": 1456458,
+        "nodes": 433462
+      },
+      "kernels": {
+        "flow_loading": {
+          "compile": {
+            "compilation_seconds": 5.606455583998468,
+            "first_execution_seconds": 5.989533375017345,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.08370358298998326,
+            "tracing_seconds": 0.001422833011019975
+          },
+          "warm": {
+            "median_seconds": 5.988310332992114,
+            "samples_seconds": [
+              5.988310332992114
+            ]
+          }
+        },
+        "gradient_only": {
+          "compile": {
+            "compilation_seconds": 5.580145957996137,
+            "first_execution_seconds": 11.966094000032172,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.116161625017412,
+            "tracing_seconds": 0.005005249986425042
+          },
+          "warm": {
+            "median_seconds": 12.15144520899048,
+            "samples_seconds": [
+              12.15144520899048
+            ]
+          }
+        },
+        "likelihood": {
+          "compile": {
+            "compilation_seconds": 0.1281162499799393,
+            "first_execution_seconds": 0.0007604159764014184,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.0047977500362321734,
+            "tracing_seconds": 0.0004967499990016222
+          },
+          "warm": {
+            "median_seconds": 0.0005833340110257268,
+            "samples_seconds": [
+              0.0005833340110257268
+            ]
+          }
+        },
+        "measurement_aggregation": {
+          "compile": {
+            "compilation_seconds": 0.042768499988596886,
+            "first_execution_seconds": 0.0006498330039903522,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.004136041970923543,
+            "tracing_seconds": 0.00038162502460181713
+          },
+          "warm": {
+            "median_seconds": 0.00044779095333069563,
+            "samples_seconds": [
+              0.00044779095333069563
+            ]
+          }
+        },
+        "value_and_gradient": {
+          "compile": {
+            "compilation_seconds": 5.902176750008948,
+            "first_execution_seconds": 12.566669082967564,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.1463779170298949,
+            "tracing_seconds": 0.058067584002856165
+          },
+          "warm": {
+            "median_seconds": 12.37918249994982,
+            "samples_seconds": [
+              12.37918249994982
+            ]
+          }
+        },
+        "value_only": {
+          "compile": {
+            "compilation_seconds": 5.786360208003316,
+            "first_execution_seconds": 6.035303707991261,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.0873198329936713,
+            "tracing_seconds": 0.0020350829581730068
+          },
+          "warm": {
+            "median_seconds": 6.067729333008174,
+            "samples_seconds": [
+              6.067729333008174
+            ]
+          }
+        }
+      },
+      "memory": {
+        "device_memory_stats": null,
+        "peak_rss_bytes": 19500892160,
+        "peak_rss_snapshots": {
+          "after_all_diagnostic_kernels": 19500892160,
+          "after_separated_forward": 16985096192,
+          "after_value_and_gradient": 16985096192,
+          "before_kernel_compilation": 9764634624
+        }
+      },
+      "mode": "bounded_single_destination_matrix_free_reference",
+      "numerical": {
+        "gradient_norm": 8997.013671875,
+        "objective_at_baseline": 30543510.0,
+        "prediction_nonzero": 18261,
+        "prediction_sum": 552.000244140625
+      },
+      "orchestrator_wall_seconds": 316.0903717500041,
+      "persistent_array_bytes": {
+        "assignment_artifacts": 3827579178,
+        "measurement_mapping": 5160536,
+        "single_group_inputs": 7284778,
+        "single_group_routing": 14564588
+      },
+      "platform": {
+        "architecture": "arm64",
+        "backend": "cpu",
+        "device": "TFRT_CPU_0",
+        "jax": "0.8.1",
+        "jaxlib": "0.8.1",
+        "logical_cpus": 12,
+        "system": "macOS-26.5.2-arm64-arm-64bit"
+      },
+      "preparation_seconds": {
+        "assignment_preparation": 5.779070875025354,
+        "fixed_routing_preparation": 38.084219874988776,
+        "id_manager": 3.009955917019397,
+        "measurement_csv": 1.7528682080446742,
+        "od_layout": 4.138825457950588,
+        "scenario_loading_and_validation": 23.12505037500523,
+        "single_group_extraction": 0.771357458026614,
+        "strict_measurement_mapping": 122.06847666698741
+      },
+      "safety": {
+        "global_fixed_routing_constructed": false,
+        "jacobian_constructed": false,
+        "map_optimization_started": false,
+        "measurement_operator_constructed": false,
+        "memory_ceiling_bytes": 25769803776,
+        "observed_memory_ceiling_exceeded": false,
+        "routing_preflight_bytes": 7282290,
+        "selected_groups": 1
+      },
+      "sample": {
+        "destination_node": 431869,
+        "enabled_links": 1243238,
+        "free_cells": 276,
+        "local_measurements": 213264,
+        "original_group_index": 595,
+        "total_measurements": 426436
+      },
+      "schema_version": 1,
+      "total_process_seconds": 315.40175424999325
+    },
+    {
+      "dimensions": {
+        "candidate_od": 1408084,
+        "free_od": 628164,
+        "full_groups": 1898,
+        "links": 1456458,
+        "nodes": 433462
+      },
+      "kernels": {
+        "flow_loading": {
+          "compile": {
+            "compilation_seconds": 5.532110083033331,
+            "first_execution_seconds": 6.02932262502145,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.08051037503173575,
+            "tracing_seconds": 0.0015257919440045953
+          },
+          "warm": {
+            "median_seconds": 6.075440999993589,
+            "samples_seconds": [
+              6.075440999993589
+            ]
+          }
+        },
+        "gradient_only": {
+          "compile": {
+            "compilation_seconds": 5.569925917021465,
+            "first_execution_seconds": 12.903489292017184,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.10859374998835847,
+            "tracing_seconds": 0.004596042039338499
+          },
+          "warm": {
+            "median_seconds": 11.921465041988995,
+            "samples_seconds": [
+              11.921465041988995
+            ]
+          }
+        },
+        "likelihood": {
+          "compile": {
+            "compilation_seconds": 0.13095833297120407,
+            "first_execution_seconds": 0.0007940409705042839,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.005431625002529472,
+            "tracing_seconds": 0.0006215409957803786
+          },
+          "warm": {
+            "median_seconds": 0.0006756249931640923,
+            "samples_seconds": [
+              0.0006756249931640923
+            ]
+          }
+        },
+        "measurement_aggregation": {
+          "compile": {
+            "compilation_seconds": 0.04160991701064631,
+            "first_execution_seconds": 0.000584915978834033,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.003712125006131828,
+            "tracing_seconds": 0.00036745902616530657
+          },
+          "warm": {
+            "median_seconds": 0.0004519589710980654,
+            "samples_seconds": [
+              0.0004519589710980654
+            ]
+          }
+        },
+        "value_and_gradient": {
+          "compile": {
+            "compilation_seconds": 5.741523917007726,
+            "first_execution_seconds": 12.004705082974397,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.1437743750284426,
+            "tracing_seconds": 0.06233083299594
+          },
+          "warm": {
+            "median_seconds": 12.092599166964646,
+            "samples_seconds": [
+              12.092599166964646
+            ]
+          }
+        },
+        "value_only": {
+          "compile": {
+            "compilation_seconds": 5.725614124967251,
+            "first_execution_seconds": 6.029297583037987,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.0855852080276236,
+            "tracing_seconds": 0.002023832988925278
+          },
+          "warm": {
+            "median_seconds": 6.021598333027214,
+            "samples_seconds": [
+              6.021598333027214
+            ]
+          }
+        }
+      },
+      "memory": {
+        "device_memory_stats": null,
+        "peak_rss_bytes": 19167199232,
+        "peak_rss_snapshots": {
+          "after_all_diagnostic_kernels": 19167199232,
+          "after_separated_forward": 17405640704,
+          "after_value_and_gradient": 17405640704,
+          "before_kernel_compilation": 9814097920
+        }
+      },
+      "mode": "bounded_single_destination_matrix_free_reference",
+      "numerical": {
+        "gradient_norm": 10712.197265625,
+        "objective_at_baseline": 29840308.0,
+        "prediction_nonzero": 36732,
+        "prediction_sum": 930.0001220703125
+      },
+      "orchestrator_wall_seconds": 319.8742405840312,
+      "persistent_array_bytes": {
+        "assignment_artifacts": 3827579178,
+        "measurement_mapping": 5160536,
+        "single_group_inputs": 7286479,
+        "single_group_routing": 14564588
+      },
+      "platform": {
+        "architecture": "arm64",
+        "backend": "cpu",
+        "device": "TFRT_CPU_0",
+        "jax": "0.8.1",
+        "jaxlib": "0.8.1",
+        "logical_cpus": 12,
+        "system": "macOS-26.5.2-arm64-arm-64bit"
+      },
+      "preparation_seconds": {
+        "assignment_preparation": 5.723153917002492,
+        "fixed_routing_preparation": 41.07741237495793,
+        "id_manager": 3.0301323339808732,
+        "measurement_csv": 1.7289139999775216,
+        "od_layout": 4.146707209001761,
+        "scenario_loading_and_validation": 23.064622417034116,
+        "single_group_extraction": 0.7773332910146564,
+        "strict_measurement_mapping": 123.36037929198937
+      },
+      "safety": {
+        "global_fixed_routing_constructed": false,
+        "jacobian_constructed": false,
+        "map_optimization_started": false,
+        "measurement_operator_constructed": false,
+        "memory_ceiling_bytes": 25769803776,
+        "observed_memory_ceiling_exceeded": false,
+        "routing_preflight_bytes": 7282290,
+        "selected_groups": 1
+      },
+      "sample": {
+        "destination_node": 431297,
+        "enabled_links": 1242992,
+        "free_cells": 465,
+        "local_measurements": 213362,
+        "original_group_index": 140,
+        "total_measurements": 426436
+      },
+      "schema_version": 1,
+      "total_process_seconds": 319.1840992500074
+    },
+    {
+      "dimensions": {
+        "candidate_od": 1408084,
+        "free_od": 628164,
+        "full_groups": 1898,
+        "links": 1456458,
+        "nodes": 433462
+      },
+      "kernels": {
+        "flow_loading": {
+          "compile": {
+            "compilation_seconds": 5.747619041998405,
+            "first_execution_seconds": 6.083495541999582,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.11277104204054922,
+            "tracing_seconds": 0.0018969170050695539
+          },
+          "warm": {
+            "median_seconds": 6.057152375055011,
+            "samples_seconds": [
+              6.057152375055011
+            ]
+          }
+        },
+        "gradient_only": {
+          "compile": {
+            "compilation_seconds": 5.656544333964121,
+            "first_execution_seconds": 12.537002583034337,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.11448966700118035,
+            "tracing_seconds": 0.004574500024318695
+          },
+          "warm": {
+            "median_seconds": 12.183911542000715,
+            "samples_seconds": [
+              12.183911542000715
+            ]
+          }
+        },
+        "likelihood": {
+          "compile": {
+            "compilation_seconds": 0.13664600002812222,
+            "first_execution_seconds": 0.0009723750408738852,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.004791125014889985,
+            "tracing_seconds": 0.0009656660258769989
+          },
+          "warm": {
+            "median_seconds": 0.0006072500254958868,
+            "samples_seconds": [
+              0.0006072500254958868
+            ]
+          }
+        },
+        "measurement_aggregation": {
+          "compile": {
+            "compilation_seconds": 0.04248270799871534,
+            "first_execution_seconds": 0.0005858340300619602,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.0038579169777221978,
+            "tracing_seconds": 0.0005070410552434623
+          },
+          "warm": {
+            "median_seconds": 0.00046300003305077553,
+            "samples_seconds": [
+              0.00046300003305077553
+            ]
+          }
+        },
+        "value_and_gradient": {
+          "compile": {
+            "compilation_seconds": 5.74411762499949,
+            "first_execution_seconds": 12.427953333011828,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.10375858301995322,
+            "tracing_seconds": 0.061693041992839426
+          },
+          "warm": {
+            "median_seconds": 12.155082584009506,
+            "samples_seconds": [
+              12.155082584009506
+            ]
+          }
+        },
+        "value_only": {
+          "compile": {
+            "compilation_seconds": 5.690971124975476,
+            "first_execution_seconds": 6.007168624957558,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.12497833400266245,
+            "tracing_seconds": 0.002273541991598904
+          },
+          "warm": {
+            "median_seconds": 6.015633207978681,
+            "samples_seconds": [
+              6.015633207978681
+            ]
+          }
+        }
+      },
+      "memory": {
+        "device_memory_stats": null,
+        "peak_rss_bytes": 17203232768,
+        "peak_rss_snapshots": {
+          "after_all_diagnostic_kernels": 17203232768,
+          "after_separated_forward": 15919054848,
+          "after_value_and_gradient": 15919054848,
+          "before_kernel_compilation": 12665716736
+        }
+      },
+      "mode": "bounded_single_destination_matrix_free_reference",
+      "numerical": {
+        "gradient_norm": 20517.494140625,
+        "objective_at_baseline": 28139878.0,
+        "prediction_nonzero": 68038,
+        "prediction_sum": 1539.9998779296875
+      },
+      "orchestrator_wall_seconds": 318.17048545804573,
+      "persistent_array_bytes": {
+        "assignment_artifacts": 3827579178,
+        "measurement_mapping": 5160536,
+        "single_group_inputs": 7289224,
+        "single_group_routing": 14564588
+      },
+      "platform": {
+        "architecture": "arm64",
+        "backend": "cpu",
+        "device": "TFRT_CPU_0",
+        "jax": "0.8.1",
+        "jaxlib": "0.8.1",
+        "logical_cpus": 12,
+        "system": "macOS-26.5.2-arm64-arm-64bit"
+      },
+      "preparation_seconds": {
+        "assignment_preparation": 5.7611202920088544,
+        "fixed_routing_preparation": 38.51913020899519,
+        "id_manager": 3.032654083974194,
+        "measurement_csv": 1.6356748749967664,
+        "od_layout": 4.2404198329895735,
+        "scenario_loading_and_validation": 23.242282457998954,
+        "single_group_extraction": 0.7242907500476576,
+        "strict_measurement_mapping": 123.12001329200575
+      },
+      "safety": {
+        "global_fixed_routing_constructed": false,
+        "jacobian_constructed": false,
+        "map_optimization_started": false,
+        "measurement_operator_constructed": false,
+        "memory_ceiling_bytes": 25769803776,
+        "observed_memory_ceiling_exceeded": false,
+        "routing_preflight_bytes": 7282290,
+        "selected_groups": 1
+      },
+      "sample": {
+        "destination_node": 431256,
+        "enabled_links": 1242657,
+        "free_cells": 770,
+        "local_measurements": 213427,
+        "original_group_index": 105,
+        "total_measurements": 426436
+      },
+      "schema_version": 1,
+      "total_process_seconds": 317.3895375840366
+    },
+    {
+      "dimensions": {
+        "candidate_od": 1408084,
+        "free_od": 628164,
+        "full_groups": 1898,
+        "links": 1456458,
+        "nodes": 433462
+      },
+      "kernels": {
+        "flow_loading": {
+          "compile": {
+            "compilation_seconds": 5.626022417040076,
+            "first_execution_seconds": 6.014016791014001,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.08419533295091242,
+            "tracing_seconds": 0.0014642499736510217
+          },
+          "warm": {
+            "median_seconds": 5.993893540988211,
+            "samples_seconds": [
+              5.993893540988211
+            ]
+          }
+        },
+        "gradient_only": {
+          "compile": {
+            "compilation_seconds": 5.6828024159767665,
+            "first_execution_seconds": 12.85202216700418,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.10528629197506234,
+            "tracing_seconds": 0.004886291979346424
+          },
+          "warm": {
+            "median_seconds": 11.966974500042852,
+            "samples_seconds": [
+              11.966974500042852
+            ]
+          }
+        },
+        "likelihood": {
+          "compile": {
+            "compilation_seconds": 0.136343999998644,
+            "first_execution_seconds": 0.0012596670421771705,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.00440587499178946,
+            "tracing_seconds": 0.00046975002624094486
+          },
+          "warm": {
+            "median_seconds": 0.0006021250155754387,
+            "samples_seconds": [
+              0.0006021250155754387
+            ]
+          }
+        },
+        "measurement_aggregation": {
+          "compile": {
+            "compilation_seconds": 0.042183542042039335,
+            "first_execution_seconds": 0.0005754169542342424,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.0037315000081434846,
+            "tracing_seconds": 0.0003631669678725302
+          },
+          "warm": {
+            "median_seconds": 0.0004183750133961439,
+            "samples_seconds": [
+              0.0004183750133961439
+            ]
+          }
+        },
+        "value_and_gradient": {
+          "compile": {
+            "compilation_seconds": 5.771104791027028,
+            "first_execution_seconds": 12.0145299169817,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.1377452079905197,
+            "tracing_seconds": 0.05576858302811161
+          },
+          "warm": {
+            "median_seconds": 12.06836870801635,
+            "samples_seconds": [
+              12.06836870801635
+            ]
+          }
+        },
+        "value_only": {
+          "compile": {
+            "compilation_seconds": 5.721824582957197,
+            "first_execution_seconds": 6.01265308301663,
+            "lowered_text_bytes": null,
+            "lowering_seconds": 0.08131662500090897,
+            "tracing_seconds": 0.0023407500120811164
+          },
+          "warm": {
+            "median_seconds": 5.996676417009439,
+            "samples_seconds": [
+              5.996676417009439
+            ]
+          }
+        }
+      },
+      "memory": {
+        "device_memory_stats": null,
+        "peak_rss_bytes": 18705235968,
+        "peak_rss_snapshots": {
+          "after_all_diagnostic_kernels": 18705235968,
+          "after_separated_forward": 17366204416,
+          "after_value_and_gradient": 17366204416,
+          "before_kernel_compilation": 9801416704
+        }
+      },
+      "mode": "bounded_single_destination_matrix_free_reference",
+      "numerical": {
+        "gradient_norm": 25039.828125,
+        "objective_at_baseline": 26903696.0,
+        "prediction_nonzero": 90975,
+        "prediction_sum": 2362.00048828125
+      },
+      "orchestrator_wall_seconds": 314.0392158330069,
+      "persistent_array_bytes": {
+        "assignment_artifacts": 3827579178,
+        "measurement_mapping": 5160536,
+        "single_group_inputs": 7292923,
+        "single_group_routing": 14564588
+      },
+      "platform": {
+        "architecture": "arm64",
+        "backend": "cpu",
+        "device": "TFRT_CPU_0",
+        "jax": "0.8.1",
+        "jaxlib": "0.8.1",
+        "logical_cpus": 12,
+        "system": "macOS-26.5.2-arm64-arm-64bit"
+      },
+      "preparation_seconds": {
+        "assignment_preparation": 5.60138895799173,
+        "fixed_routing_preparation": 37.46231087500928,
+        "id_manager": 3.0098010830115527,
+        "measurement_csv": 1.730986166978255,
+        "od_layout": 4.021499749971554,
+        "scenario_loading_and_validation": 22.98341316601727,
+        "single_group_extraction": 0.7699830420315266,
+        "strict_measurement_mapping": 121.41777762502898
+      },
+      "safety": {
+        "global_fixed_routing_constructed": false,
+        "jacobian_constructed": false,
+        "map_optimization_started": false,
+        "measurement_operator_constructed": false,
+        "memory_ceiling_bytes": 25769803776,
+        "observed_memory_ceiling_exceeded": false,
+        "routing_preflight_bytes": 7282290,
+        "selected_groups": 1
+      },
+      "sample": {
+        "destination_node": 431285,
+        "enabled_links": 1228728,
+        "free_cells": 1181,
+        "local_measurements": 214028,
+        "original_group_index": 130,
+        "total_measurements": 426436
+      },
+      "schema_version": 1,
+      "total_process_seconds": 313.36110262497095
+    }
+  ],
+  "schema_version": 1,
+  "summary": {
+    "maximum_peak_rss_bytes": 19500892160,
+    "median_sample_forward_seconds": 5.991101936990162,
+    "median_sample_routing_preparation_seconds": 38.31644164599129,
+    "median_sample_value_gradient_seconds": 12.130216958990786,
+    "num_samples": 6,
+    "sequential_full_network_value_gradient_hours": 6.395319941156809,
+    "sequential_full_network_value_gradient_seconds": 23023.151788164512,
+    "sequential_two_pass_streamed_hours": 9.553962017936623,
+    "sequential_two_pass_streamed_seconds": 34394.26326457184,
+    "total_orchestrator_seconds": 1900.2963055000291
+  }
+}

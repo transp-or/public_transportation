@@ -31,6 +31,7 @@ import jax.numpy as jnp
 
 from public_transportation.measurement.mapping import AggregationSpec
 from public_transportation.measurement.likelihood_jax import (
+    negbinom_loglikelihood,
     predict_measurements_from_link_flow,
     measurement_loglik_from_link_flow,
 )
@@ -66,6 +67,7 @@ class PreparedLikelihoodInputs:
     - Construct this once (Python side) and reuse it across likelihood evaluations.
     - `spec_num_measurements` is ultimately used as a static shape argument in the underlying JAX-jitted aggregation.
     """
+
     y_obs: Array
     spec_num_measurements: int
     spec_measurement_index: Array
@@ -245,3 +247,20 @@ def loglikelihood_from_link_flow(
         eps_mu=eps_mu,
     )
     return ll
+
+
+@jax.jit
+def loglikelihood_from_measurement_mean(
+    *,
+    mu: Array,
+    prepared: PreparedLikelihoodInputs,
+    r: Array,
+    eps_mu: float = 1e-9,
+) -> Array:
+    """Evaluate the NB likelihood from an already aggregated measurement mean."""
+    mean = jnp.asarray(mu)
+    expected_shape = (prepared.spec_num_measurements,)
+    if mean.shape != expected_shape:
+        raise ValueError(f"mu must have shape {expected_shape}, got {mean.shape}.")
+    mean = jnp.maximum(mean, jnp.asarray(eps_mu, dtype=mean.dtype))
+    return negbinom_loglikelihood(y_obs=prepared.y_obs, mu=mean, r=r)

@@ -46,6 +46,10 @@ class MLResult:
 
     success, message:
         Optimizer termination information.
+
+    num_compiled_evaluations:
+        Actual calls to the compiled objective/gradient function, including
+        callback or final-result cache misses.
     """
 
     dim: int
@@ -69,4 +73,5 @@ class MLResult:
     runtime_seconds: float
     timestamp: str
     optimization_trace: np.ndarray
+    num_compiled_evaluations: int = 0
     scipy_result: Any | None = None

@@ -22,6 +22,9 @@ Note: the OD grouping is an internal performance detail; scripts should not hand
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
+from time import perf_counter
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -36,9 +39,13 @@ from .config import AssignmentConfig
 
 from .costs import CostParts, precompute_base_costs, link_costs
 
-from .dial_dp import run_dial_for_destination
+from .dial_dp import (
+    load_flows,
+    load_link_flow_fixed_custom_adjoint,
+    run_dial_for_destination,
+)
 from .jax_graph_types import JaxGraph
-from .graph_sentinels import NODE_KIND_CENTROID_OUT, NODE_KIND_EVENT_ARR, LINK_TYPE_EGRESS, LINK_TYPE_ACCESS
+from .graph_sentinels import NODE_KIND_CENTROID_OUT, NODE_KIND_EVENT_ARR, LINK_TYPE_EGRESS
 
 Array = jnp.ndarray
 
@@ -114,6 +121,24 @@ def _initial_node_flow_for_group(
     return y0
 
 
+def _routing_inputs_for_destination(
+    *,
+    graph: JaxGraph,
+    base_link_cost: Array,
+    group_link_mask: Array,
+    dest_node: Array,
+) -> tuple[Array, Array]:
+    """Return the effective link mask and costs for one destination."""
+    _, disallowed = _dest_absorption_masks(graph=graph, dest_node=dest_node)
+    enabled_link_mask = jnp.asarray(group_link_mask, dtype=bool) & (~disallowed)
+    link_cost = jnp.where(
+        disallowed,
+        jnp.asarray(BIG_M_COST, dtype=base_link_cost.dtype),
+        base_link_cost,
+    )
+    return enabled_link_mask, link_cost
+
+
 @partial(jax.jit, static_argnames=("return_group_link_flows",))
 def _assign_core(
     *,
@@ -142,17 +167,11 @@ def _assign_core(
 
     def step(total, g):
         dest_node = group_dest_node[g]
-        enabled_link_mask = jnp.asarray(group_link_mask[g], dtype=bool)
-
-        # Destination absorption masks
-        _, disallowed = _dest_absorption_masks(graph=graph, dest_node=dest_node)
-        enabled_link_mask = enabled_link_mask & (~disallowed)
-
-        # Costs: base costs with BIG-M on disallowed links
-        c = jnp.where(
-            disallowed,
-            jnp.asarray(BIG_M_COST, dtype=base_link_cost.dtype),
-            base_link_cost,
+        enabled_link_mask, c = _routing_inputs_for_destination(
+            graph=graph,
+            base_link_cost=base_link_cost,
+            group_link_mask=group_link_mask[g],
+            dest_node=dest_node,
         )
 
         y0 = _initial_node_flow_for_group(
@@ -183,6 +202,86 @@ def _assign_core(
         return total_flow, per_group
     return total_flow, None
 
+
+@jax.jit
+def _assign_fixed_routing_core(
+    *,
+    graph: JaxGraph,
+    od_values: Array,
+    effective_group_link_mask: Array,
+    group_link_probability: Array,
+    od_origin_node: Array,
+    group_od_index_padded: Array,
+    group_od_mask: Array,
+) -> Array:
+    """Load demand with prepared probabilities and return only total link flow."""
+    num_groups = group_link_probability.shape[0]
+    num_links = graph.num_links
+
+    def step(total, group_index):
+        initial_node_flow = _initial_node_flow_for_group(
+            num_nodes=graph.num_nodes,
+            od_values=od_values,
+            od_origin_node=od_origin_node,
+            group_od_index_padded=group_od_index_padded,
+            group_od_mask=group_od_mask,
+            group_index=group_index,
+        )
+        _, link_flow = load_flows(
+            graph,
+            group_link_probability[group_index],
+            effective_group_link_mask[group_index],
+            initial_node_flow,
+        )
+        return total + link_flow, None
+
+    initial_total = jnp.zeros((num_links,), dtype=od_values.dtype)
+    total_flow, _ = lax.scan(
+        step,
+        initial_total,
+        jnp.arange(num_groups, dtype=jnp.int32),
+    )
+    return total_flow
+
+
+@jax.jit
+def _assign_fixed_routing_custom_adjoint_core(
+    *,
+    graph: JaxGraph,
+    od_values: Array,
+    effective_group_link_mask: Array,
+    group_link_probability: Array,
+    od_origin_node: Array,
+    group_od_index_padded: Array,
+    group_od_mask: Array,
+) -> Array:
+    """Fixed-routing loading with a node-sized explicit demand adjoint."""
+    num_groups = group_link_probability.shape[0]
+
+    def step(total, group_index):
+        initial_node_flow = _initial_node_flow_for_group(
+            num_nodes=graph.num_nodes,
+            od_values=od_values,
+            od_origin_node=od_origin_node,
+            group_od_index_padded=group_od_index_padded,
+            group_od_mask=group_od_mask,
+            group_index=group_index,
+        )
+        link_flow = load_link_flow_fixed_custom_adjoint(
+            graph,
+            group_link_probability[group_index],
+            effective_group_link_mask[group_index],
+            initial_node_flow,
+        )
+        return total + link_flow, None
+
+    total, _ = lax.scan(
+        step,
+        jnp.zeros((graph.num_links,), dtype=od_values.dtype),
+        jnp.arange(num_groups, dtype=jnp.int32),
+    )
+    return total
+
 @dataclass(frozen=True, slots=True)
 class AssignmentArtifacts:
     """Precomputed artifacts for repeated assignment evaluations.
@@ -197,6 +296,9 @@ class AssignmentArtifacts:
     od_groups: ODGroups
     cost_parts: CostParts
     config: AssignmentConfig
+    cache_metrics: Any | None = None
+    provenance_payload_json: str | None = None
+    provenance_fingerprint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,29 +324,107 @@ class AssignmentResult:
 def prepare_assignment(
     scenario: Scenario,
     config: AssignmentConfig,
+    *,
+    cache_directory: str | os.PathLike[str] | None = None,
+    cache_policy: str | None = None,
 ) -> AssignmentArtifacts:
-    """Build and validate everything that is invariant across OD-demand evaluations."""
+    """Build demand-independent artifacts, optionally using the persistent cache.
 
+    With no explicit directory, ``PUBLIC_TRANSPORTATION_ASSIGNMENT_CACHE_DIR``
+    enables caching. Policy is ``off``, ``auto``, ``refresh``, or ``readonly``
+    and defaults to ``auto`` when a directory exists, otherwise ``off``.
+    """
+    selected_directory = cache_directory or os.environ.get(
+        "PUBLIC_TRANSPORTATION_ASSIGNMENT_CACHE_DIR"
+    )
+    selected_policy = cache_policy or os.environ.get(
+        "PUBLIC_TRANSPORTATION_ASSIGNMENT_CACHE_POLICY",
+        "auto" if selected_directory is not None else "off",
+    )
+    if selected_policy != "off":
+        if selected_directory is None:
+            raise ValueError("An assignment cache directory is required by cache_policy.")
+        from .cache import load_or_prepare_assignment
+
+        return load_or_prepare_assignment(
+            scenario=scenario,
+            config=config,
+            cache_directory=selected_directory,
+            policy=selected_policy,
+        )
+    return _prepare_assignment_uncached(scenario=scenario, config=config)
+
+
+def _prepare_assignment_uncached(
+    scenario: Scenario,
+    config: AssignmentConfig,
+) -> AssignmentArtifacts:
+    """Uncached builder used by the public API and persistent cache."""
+    stages: dict[str, float] = {}
+    started = perf_counter()
+
+    stage = perf_counter()
     config.validate()
-
     if scenario.timetable is None:
         raise ValueError("Scenario.timetable is required for assignment.")
+    stages["input_and_configuration_validation"] = perf_counter() - stage
 
-    # Build JAX graph representation (immutable arrays)
-    graph = build_time_expanded_graph(scenario=scenario, config=config)
+    stage = perf_counter()
+    graph = build_time_expanded_graph(scenario=scenario, config=config, profile=stages)
+    stages["time_expanded_graph_construction"] = perf_counter() - stage
 
-    # Build OD groups (group by destination; centroid-in nodes are duplicated per time bin).
-    # NOTE: build_od_groups must accept the `graph` keyword.
-    od_groups = build_od_groups(scenario=scenario, graph=graph)
+    stage = perf_counter()
+    od_groups = build_od_groups(scenario=scenario, graph=graph, profile=stages)
+    stages["destination_and_od_grouping"] = perf_counter() - stage
 
-    # Precompute base costs (ride/transfer)
+    stage = perf_counter()
     cost_parts = precompute_base_costs(graph, config)
+    cost_arrays = tuple(
+        getattr(cost_parts, name)
+        for name in (
+            "base_cost", "is_access", "is_ride", "is_transfer", "is_egress", "is_dwell"
+        )
+        if hasattr(cost_parts, name)
+    )
+    jax.block_until_ready(cost_arrays)
+    stages["cost_array_construction_and_synchronization"] = perf_counter() - stage
+
+    from .cache import AssignmentCacheMetrics, assignment_artifact_summary
+
+    total = perf_counter() - started
+    provisional = AssignmentArtifacts(graph, od_groups, cost_parts, config)
+    try:
+        logical_bytes, array_summary = assignment_artifact_summary(provisional)
+    except AttributeError:  # permits lightweight test doubles and legacy adapters
+        logical_bytes, array_summary = 0, {}
 
     return AssignmentArtifacts(
         graph=graph,
         od_groups=od_groups,
         cost_parts=cost_parts,
         config=config,
+        cache_metrics=AssignmentCacheMetrics(
+            status="bypass",
+            cache_hit=False,
+            cache_load_seconds=0.0,
+            validation_seconds=0.0,
+            host_reconstruction_seconds=0.0,
+            device_transfer_seconds=0.0,
+            preparation_seconds_when_built=total,
+            stored_bytes=0,
+            schema_version=1,
+            cache_key=None,
+            fingerprint_seconds=0.0,
+            preparation_stages=stages,
+            logical_bytes=logical_bytes,
+            num_nodes=int(graph.num_nodes),
+            num_links=int(graph.num_links),
+            num_od=int(
+                getattr(od_groups, "num_od", od_groups.od_origin_node.shape[0])
+            ),
+            num_groups=int(od_groups.group_dest_node.shape[0]),
+            array_summary=array_summary,
+        ),
     )
 
 

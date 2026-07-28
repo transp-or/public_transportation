@@ -1,0 +1,80 @@
+{
+  "compilation": {
+    "compilation_seconds": 0.12602041702484712,
+    "executable_loading_seconds": 2.04198295250535e-06,
+    "first_execution_seconds": 0.0014538749819621444,
+    "lowered_text_bytes": 16790,
+    "lowering_seconds": 0.011447333032265306,
+    "tracing_seconds": 0.027133374998811632
+  },
+  "persistent_compilation_cache": {
+    "directory": null,
+    "enabled": false,
+    "files_after": {},
+    "files_before": {},
+    "inferred_hit": false,
+    "new_files": []
+  },
+  "platform": {
+    "architecture": "arm64",
+    "backend": "cpu",
+    "device": "TFRT_CPU_0",
+    "system": "macOS-26.5.2-arm64-arm-64bit",
+    "x64_enabled": false
+  },
+  "preparation": {
+    "operator_cache_hit": true,
+    "operator_cache_load_seconds": 0.0006454579997807741,
+    "stages": {
+      "assignment_preparation": 3.494090290972963,
+      "fixed_demand_loading": 0.018850957974791527,
+      "id_manager": 0.03234437498031184,
+      "map_problem_construction": 0.6447944170213304,
+      "measurement_loading": 0.045654332963749766,
+      "measurement_mapping": 0.04666541703045368,
+      "parameter_layout": 0.0422139170113951,
+      "prior_baseline": 0.010066499991808087,
+      "scenario_loading": 0.35745229199528694
+    },
+    "wall_seconds": 4.942230584041681
+  },
+  "problem": {
+    "bcoo_index_shape": [
+      158219,
+      2
+    ],
+    "nonzero_count": 158219,
+    "operator_dtype": "float32",
+    "operator_shape": [
+      3690,
+      15772
+    ],
+    "parameter_dtype": "float32",
+    "parameter_shape": [
+      15772
+    ]
+  },
+  "run_ml": {
+    "first_evaluation_seconds": 0.0009372909553349018,
+    "function_evaluations": 24,
+    "gradient_evaluations": 24,
+    "gradient_norm_final": 4.560095305160411,
+    "iterations": 20,
+    "objective_evaluations": 24,
+    "objective_final": 49140.42578125,
+    "optimization_seconds": 5.8046950830030255
+  },
+  "total_process_seconds": 11.623029875045177,
+  "versions": {
+    "jax": "0.8.1",
+    "jaxlib": "0.8.1"
+  },
+  "warm_execution_median_seconds": 0.0009912090026773512,
+  "warm_execution_seconds": [
+    0.0010502499644644558,
+    0.0010487500112503767,
+    0.0009912090026773512,
+    0.0009450000361539423,
+    0.0009689999860711396
+  ]
+}

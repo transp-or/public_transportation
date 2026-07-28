@@ -46,9 +46,20 @@ def _request(**overrides: Any) -> ODThetaEstimationRequest:
 
 def _stub_forward_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     captured: dict[str, Any] = {}
-    monkeypatch.setattr(ml_pipeline, "build_assignment_inputs", lambda **_: "assignment")
-    monkeypatch.setattr(ml_pipeline, "make_forward_inputs", lambda **_: SimpleNamespace())
-    monkeypatch.setattr(ml_pipeline, "prepare_likelihood_inputs", lambda **_: "prepared")
+    monkeypatch.setattr(
+        ml_pipeline, "build_assignment_inputs", lambda **_: "assignment"
+    )
+    monkeypatch.setattr(
+        ml_pipeline,
+        "prepare_fixed_routing",
+        lambda **kwargs: captured.setdefault("fixed_routing", kwargs) or "routing",
+    )
+    monkeypatch.setattr(
+        ml_pipeline, "make_forward_inputs", lambda **_: SimpleNamespace()
+    )
+    monkeypatch.setattr(
+        ml_pipeline, "prepare_likelihood_inputs", lambda **_: "prepared"
+    )
     monkeypatch.setattr(
         ml_pipeline,
         "build_od_assignment_runtime_profile",
@@ -69,8 +80,10 @@ def _stub_forward_dependencies(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any
 
 
 @pytest.mark.parametrize("estimate_theta", [False, True])
-def test_problem_dimension_depends_only_on_free_cells_and_theta(monkeypatch, estimate_theta):
-    _stub_forward_dependencies(monkeypatch)
+def test_problem_dimension_depends_only_on_free_cells_and_theta(
+    monkeypatch, estimate_theta
+):
+    captured = _stub_forward_dependencies(monkeypatch)
     problem = ml_pipeline.build_od_theta_ml_problem(
         _request(
             estimate_theta=estimate_theta,
@@ -86,6 +99,10 @@ def test_problem_dimension_depends_only_on_free_cells_and_theta(monkeypatch, est
     assert problem.od_layout_payload_json == _layout().fingerprint_payload_json
     assert problem.compact_layout_fingerprint is not None
     assert problem.compact_layout_payload_json is not None
+    if estimate_theta:
+        assert "fixed_routing" not in captured
+    else:
+        assert captured["fixed_routing"] == {"inputs": "assignment", "theta": 3.0}
 
 
 def test_forward_and_decode_keep_frozen_values_exact(monkeypatch):
@@ -97,6 +114,7 @@ def test_forward_and_decode_keep_frozen_values_exact(monkeypatch):
     assert float(problem.loglik(parameter, problem.data)) == pytest.approx(-1.25)
     expected_free = 20.0 * np.exp(6.0 * np.tanh(1.0))
     assert np.allclose(captured["forward"]["f"], [expected_free, 7.5])
+    assert captured["forward"]["fixed_routing"] == captured["fixed_routing"]
 
     f_hat, theta_hat = problem.decode(np.asarray([6.0]))
     assert np.allclose(f_hat, [0.0, expected_free, 7.5])
@@ -109,6 +127,23 @@ def test_prior_contains_only_free_od_and_optional_theta(monkeypatch):
         _request(estimate_theta=False, fixed_theta=3.0, sigma_z=2.0)
     )
     assert np.ndim(fixed_theta_problem.logprior(jnp.asarray([0.5]))) == 0
+
+
+def test_measurement_operator_is_not_built_when_theta_is_estimated(monkeypatch):
+    _stub_forward_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        ml_pipeline,
+        "prepare_fixed_routing_measurement_operator",
+        lambda **_: (_ for _ in ()).throw(AssertionError("operator path called")),
+    )
+    problem = ml_pipeline.build_od_theta_ml_problem(
+        _request(
+            estimate_theta=True,
+            fixed_theta=None,
+            fixed_measurement_operator="dense",
+        )
+    )
+    assert problem.fixed_measurement_operator is None
 
 
 def test_rejects_layout_baseline_mismatch(monkeypatch):

@@ -162,7 +162,12 @@ def _odgroups_unflatten(aux, children):
 jax.tree_util.register_pytree_node(ODGroups, _odgroups_flatten, _odgroups_unflatten)
 
 
-def build_od_groups(scenario: "Scenario", *, graph: JaxGraph) -> ODGroups:
+def build_od_groups(
+    scenario: "Scenario",
+    *,
+    graph: JaxGraph,
+    profile: dict[str, float] | None = None,
+) -> ODGroups:
     """Build OD record arrays, groupings, and per-group link masks.
 
     Assumptions about the domain structures
@@ -188,6 +193,13 @@ def build_od_groups(scenario: "Scenario", *, graph: JaxGraph) -> ODGroups:
     :param graph: Built time-expanded graph.
     :return: ODGroups with JAX arrays.
     """
+    from time import perf_counter
+
+    def record(name: str, started: float) -> None:
+        if profile is not None:
+            profile[name] = perf_counter() - started
+
+    started = perf_counter()
     if scenario.demand is None:
         raise ValueError("Scenario has no demand.")
     if scenario.time_bins is None or len(scenario.time_bins) == 0:
@@ -198,11 +210,13 @@ def build_od_groups(scenario: "Scenario", *, graph: JaxGraph) -> ODGroups:
             "Graph is missing `node_stop_id` metadata. "
             "Ensure build_time_expanded stores stop ids in JaxGraph(node_stop_id=...)."
         )
+    record("od_input_validation", started)
 
 
     # ---------------------------------------------------------------
     # Precompute bin_index_by_id for time-bin lookup
     # ---------------------------------------------------------------
+    started = perf_counter()
     bin_index_by_id: dict[str, int] = {}
     for idx, tb in enumerate(scenario.time_bins):
         tb_id = getattr(tb, "bin_id", None)
@@ -227,6 +241,10 @@ def build_od_groups(scenario: "Scenario", *, graph: JaxGraph) -> ODGroups:
 
     stop_pos_by_id = {str(sid): i for i, sid in enumerate(graph.node_stop_id)}
     num_stops = len(graph.node_stop_id)
+    # Read immutable graph metadata once. Repeated ``int(jax_array[i])`` calls
+    # each synchronize a scalar device result and dominated large preparations.
+    node_kind = np.asarray(graph.node_kind)
+    node_stop_index = np.asarray(graph.node_stop_index)
 
     expected_num_centroid_in = num_stops * num_time_bins
     if int(graph.num_nodes) < expected_num_centroid_in:
@@ -241,15 +259,15 @@ def build_od_groups(scenario: "Scenario", *, graph: JaxGraph) -> ODGroups:
     for sid, spos in stop_pos_by_id.items():
         for t_idx in range(num_time_bins):
             node = int(spos * num_time_bins + t_idx)
-            if int(graph.node_kind[node]) != NODE_KIND_CENTROID_IN:
+            if int(node_kind[node]) != NODE_KIND_CENTROID_IN:
                 raise ValueError(
                     "Graph centroid-in block is inconsistent with expected ordering. "
-                    f"Node {node} for stop_id={sid}, time_bin_index={t_idx} has node_kind={int(graph.node_kind[node])}."
+                    f"Node {node} for stop_id={sid}, time_bin_index={t_idx} has node_kind={int(node_kind[node])}."
                 )
-            if int(graph.node_stop_index[node]) != int(spos):
+            if int(node_stop_index[node]) != int(spos):
                 raise ValueError(
                     "Graph centroid-in block has inconsistent node_stop_index. "
-                    f"Node {node} for stop_id={sid}, time_bin_index={t_idx} has node_stop_index={int(graph.node_stop_index[node])}, "
+                    f"Node {node} for stop_id={sid}, time_bin_index={t_idx} has node_stop_index={int(node_stop_index[node])}, "
                     f"expected {spos}."
                 )
             centroid_in_index[(sid, int(t_idx))] = node
@@ -257,9 +275,9 @@ def build_od_groups(scenario: "Scenario", *, graph: JaxGraph) -> ODGroups:
     # Centroid-out nodes are not time-tagged either; we derive their indices by scanning nodes.
     centroid_out_index: dict[str, int] = {}
     for node in range(int(graph.num_nodes)):
-        if int(graph.node_kind[node]) != NODE_KIND_CENTROID_OUT:
+        if int(node_kind[node]) != NODE_KIND_CENTROID_OUT:
             continue
-        s_idx = int(graph.node_stop_index[node])
+        s_idx = int(node_stop_index[node])
         if s_idx < 0 or s_idx >= len(graph.node_stop_id):
             raise ValueError(f"Invalid node_stop_index for node {node}: {s_idx}")
         sid = str(graph.node_stop_id[s_idx])
@@ -270,8 +288,6 @@ def build_od_groups(scenario: "Scenario", *, graph: JaxGraph) -> ODGroups:
             "Could not derive centroid-out node indices from the graph. "
             "Check that build_time_expanded created centroid-out nodes and populated node_kind/node_stop_index."
         )
-
-    num_links = int(graph.num_links)
 
     # ---------------------------------------------------------------
     # Read OD records
@@ -315,10 +331,12 @@ def build_od_groups(scenario: "Scenario", *, graph: JaxGraph) -> ODGroups:
 
         od_origin_node[k] = int(centroid_in_index[key])
         od_dest_node[k] = int(centroid_out_index[d])
+    record("od_and_destination_indexing", started)
 
     # ---------------------------------------------------------------
     # Group by destination (centroid-out) only.
     # ---------------------------------------------------------------
+    started = perf_counter()
     keys = od_dest_node
     order = np.argsort(keys, kind="mergesort")  # stable, deterministic
     keys_sorted = keys[order]
@@ -338,10 +356,12 @@ def build_od_groups(scenario: "Scenario", *, graph: JaxGraph) -> ODGroups:
         group_dest_node[g] = int(keys_sorted[i0])
 
     group_od_index = order.astype(int)
+    record("destination_grouping_and_stable_sort", started)
 
     # ---------------------------------------------------------------
     # JIT-friendly padded OD indices per group
     # ---------------------------------------------------------------
+    started = perf_counter()
     group_sizes = np.diff(group_start)  # (num_groups,)
     max_group_size = int(group_sizes.max()) if num_groups > 0 else 0
 
@@ -357,33 +377,32 @@ def build_od_groups(scenario: "Scenario", *, graph: JaxGraph) -> ODGroups:
         idx = group_od_index[i0:i1]
         group_od_index_padded[g, :n] = idx
         group_od_mask[g, :n] = True
+    record("od_padded_index_and_mask_construction", started)
 
     # ---------------------------------------------------------------
     # Per-group enabled-link masks implementing destination-gated egress.
     # link_type codes: 0 ride, 1 transfer, 2 access, 3 egress, 4 dwell/continue.
     # ---------------------------------------------------------------
+    started = perf_counter()
     link_type = np.asarray(graph.link_type)
     head = np.asarray(graph.head)
 
-    base_enabled = np.ones((num_links,), dtype=bool)
     is_egress = link_type == LINK_TYPE_EGRESS
-
-    group_link_mask = np.empty((num_groups, num_links), dtype=bool)
-    for g in range(num_groups):
-        dnode = int(group_dest_node[g])
-        m = base_enabled.copy()
-        m[is_egress & (head != dnode)] = False
-        group_link_mask[g] = m
+    group_link_mask = (~is_egress[None, :]) | (
+        head[None, :] == group_dest_node[:, None]
+    )
+    record("destination_link_mask_construction", started)
 
     # Sanity: group destinations must be centroid-out nodes.
     for g in range(num_groups):
         dnode = int(group_dest_node[g])
-        if int(graph.node_kind[dnode]) != NODE_KIND_CENTROID_OUT:
+        if int(node_kind[dnode]) != NODE_KIND_CENTROID_OUT:
             raise ValueError(
-                f"group_dest_node[{g}]={dnode} is not a centroid-out node (node_kind={int(graph.node_kind[dnode])})."
+                f"group_dest_node[{g}]={dnode} is not a centroid-out node (node_kind={int(node_kind[dnode])})."
             )
 
-    return ODGroups(
+    started = perf_counter()
+    result = ODGroups(
         num_od=num_od,
         od_origin_node=jnp.asarray(od_origin_node),
         od_dest_node=jnp.asarray(od_dest_node),
@@ -394,3 +413,6 @@ def build_od_groups(scenario: "Scenario", *, graph: JaxGraph) -> ODGroups:
         group_od_mask=jnp.asarray(group_od_mask),
         group_link_mask=jnp.asarray(group_link_mask),
     )
+    jax.block_until_ready(result)
+    record("od_numpy_to_jax_device_transfer_and_synchronization", started)
+    return result

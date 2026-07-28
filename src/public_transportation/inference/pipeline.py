@@ -33,11 +33,17 @@ from public_transportation.inference.likelihood import (
     loglikelihood_from_link_flow,
 )
 
-from public_transportation.inference.assignment_adapter import build_assignment_inputs
+from public_transportation.inference.assignment_adapter import (
+    build_assignment_inputs,
+    prepare_fixed_routing,
+)
 from public_transportation.inference.compact_od_assignment_layout import (
     build_compact_od_assignment_layout,
 )
-from public_transportation.inference.model import make_forward_inputs, forward_model_from_demand
+from public_transportation.inference.model import (
+    make_forward_inputs,
+    forward_model_from_demand,
+)
 from public_transportation.inference.od_parameter_layout import ODParameterLayout
 from public_transportation.inference.parameterization import (
     raw_value_for_effective_center,
@@ -48,7 +54,6 @@ from public_transportation.inference.runtime_profile import (
     ODAssignmentRuntimeProfile,
     build_od_assignment_runtime_profile,
 )
-
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +108,17 @@ class ODThetaEstimationRequest:
     # Assignment evaluation (opaque artifacts from prepare_assignment)
     assignment_artifacts: Any = None
 
+    # Optional fixed-theta ML/MAP acceleration. ``off`` preserves the reference
+    # link-flow loader; ``dense`` and ``bcoo`` precompute a direct free-OD to
+    # measurement operator. This option is ignored by VI and estimated-theta ML.
+    fixed_measurement_operator: Literal["off", "auto", "dense", "bcoo"] = "off"
+    fixed_measurement_operator_chunk_size: int = 128
+    fixed_measurement_operator_cache_directory: str | None = None
+    fixed_measurement_operator_expected_evaluations: int = 0
+    fixed_measurement_operator_construction_seconds: float | None = None
+    fixed_measurement_operator_reference_seconds: float = 1.94
+    fixed_measurement_operator_evaluation_seconds: float = 0.0
+
     # Optional logger
     logger: Any | None = None
 
@@ -113,26 +129,27 @@ class ODThetaEstimationRequest:
 @dataclass(frozen=True, slots=True)
 class ODThetaInferenceResult:
     """High-level outputs (ready to save/report)."""
-    vi: VIResult                     # raw engine output
+
+    vi: VIResult  # raw engine output
     num_od: int
     num_free_od: int
     num_fixed_od: int
     runtime_profile: ODAssignmentRuntimeProfile
-    f0: np.ndarray                   # baseline in assignment OD order
-    theta_samples: np.ndarray        # shape (S,)
-    f_samples: np.ndarray            # shape (S, num_od)
+    f0: np.ndarray  # baseline in assignment OD order
+    theta_samples: np.ndarray  # shape (S,)
+    f_samples: np.ndarray  # shape (S, num_od)
 
     # optional convenience summaries
     theta_mean: float
     theta_sd: float
-    f_mean: np.ndarray               # (num_od,)
+    f_mean: np.ndarray  # (num_od,)
 
     # Theta handling used for this run
     estimate_theta: bool
     fixed_theta: float | None
 
     # provenance / consistency checks
-    fingerprint: str                 # copied from id_manager
+    fingerprint: str  # copied from id_manager
     od_layout_fingerprint: str | None
     od_layout_payload_json: str | None
     compact_layout_fingerprint: str | None
@@ -140,7 +157,6 @@ class ODThetaInferenceResult:
 
     # Optional: exact JSON payload used to compute the fingerprint (for richer diagnostics)
     fingerprint_payload_json: str | None = None
-
 
 
 def estimate_od_theta_vi(request: ODThetaEstimationRequest) -> ODThetaInferenceResult:
@@ -160,7 +176,9 @@ def estimate_od_theta_vi(request: ODThetaEstimationRequest) -> ODThetaInferenceR
     - post-processing of posterior samples.
     """
     if request.assignment_artifacts is None:
-        raise ValueError("request.assignment_artifacts must be provided (output of prepare_assignment).")
+        raise ValueError(
+            "request.assignment_artifacts must be provided (output of prepare_assignment)."
+        )
 
     f0 = jnp.asarray(request.f0)
     if f0.ndim != 1:
@@ -173,7 +191,9 @@ def estimate_od_theta_vi(request: ODThetaEstimationRequest) -> ODThetaInferenceR
     spec = request.mapping_spec
     m = int(spec.num_measurements)
     if int(y_obs.shape[0]) != m:
-        raise ValueError(f"y_obs length {int(y_obs.shape[0])} does not match spec.num_measurements {m}")
+        raise ValueError(
+            f"y_obs length {int(y_obs.shape[0])} does not match spec.num_measurements {m}"
+        )
 
     estimate_theta = bool(request.estimate_theta)
     fixed_theta: float | None = None
@@ -188,7 +208,6 @@ def estimate_od_theta_vi(request: ODThetaEstimationRequest) -> ODThetaInferenceR
             raise ValueError(
                 f"fixed_theta must be positive and finite when estimate_theta=False, got {fixed_theta!r}"
             )
-
 
     num_od = int(f0.shape[0])
     layout = request.od_layout
@@ -211,11 +230,15 @@ def estimate_od_theta_vi(request: ODThetaEstimationRequest) -> ODThetaInferenceR
             rtol=0.0,
             atol=0.0,
         ):
-            raise ValueError("od_layout free baselines must exactly match f0 at free OD indices.")
+            raise ValueError(
+                "od_layout free baselines must exactly match f0 at free OD indices."
+            )
         num_free = layout.num_free
 
     compact_layout = (
-        None if layout is None else build_compact_od_assignment_layout(parameter_layout=layout)
+        None
+        if layout is None
+        else build_compact_od_assignment_layout(parameter_layout=layout)
     )
 
     def assemble_assignment_demand(z_free: jnp.ndarray) -> jnp.ndarray:
@@ -228,6 +251,11 @@ def estimate_od_theta_vi(request: ODThetaEstimationRequest) -> ODThetaInferenceR
     assignment_inputs = build_assignment_inputs(
         artifacts=request.assignment_artifacts,
         compact_layout=compact_layout,
+    )
+    fixed_routing = (
+        None
+        if estimate_theta
+        else prepare_fixed_routing(inputs=assignment_inputs, theta=fixed_theta)
     )
     runtime_profile = build_od_assignment_runtime_profile(
         num_od_total=num_od,
@@ -287,7 +315,9 @@ def estimate_od_theta_vi(request: ODThetaEstimationRequest) -> ODThetaInferenceR
         "r_nb": r_nb,
     }
 
-    def _split_theta(theta_vec: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray | None, jnp.ndarray]:
+    def _split_theta(
+        theta_vec: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, jnp.ndarray | None, jnp.ndarray]:
         """Split the engine parameter vector and return z, u, theta.
 
         If theta is estimated, the vector is [z, u] and theta = exp(u).
@@ -318,6 +348,7 @@ def estimate_od_theta_vi(request: ODThetaEstimationRequest) -> ODThetaInferenceR
             theta=theta,
             rho=data_["rho"],
             assignment_inputs=assignment_inputs,
+            fixed_routing=fixed_routing,
         )
 
         # Measurement NB log-likelihood on link_flow (aggregation spec is passed here)
@@ -373,7 +404,9 @@ def estimate_od_theta_vi(request: ODThetaEstimationRequest) -> ODThetaInferenceR
     # ---- Post-process samples
     samples = np.asarray(vi_res.posterior_samples_theta)
     if samples.ndim != 2 or int(samples.shape[1]) != dim:
-        raise RuntimeError(f"Unexpected posterior sample shape: {samples.shape}, expected (S, {dim})")
+        raise RuntimeError(
+            f"Unexpected posterior sample shape: {samples.shape}, expected (S, {dim})"
+        )
 
     z_raw_samples = samples[:, :num_free]
     z_samples = _smooth_bound_numpy(z_raw_samples, z_bound)
@@ -411,12 +444,18 @@ def estimate_od_theta_vi(request: ODThetaEstimationRequest) -> ODThetaInferenceR
         fixed_theta=fixed_theta,
         fingerprint=str(request.fingerprint),
         od_layout_fingerprint=(None if layout is None else layout.fingerprint),
-        od_layout_payload_json=(None if layout is None else layout.fingerprint_payload_json),
+        od_layout_payload_json=(
+            None if layout is None else layout.fingerprint_payload_json
+        ),
         compact_layout_fingerprint=(
             None if compact_layout is None else compact_layout.fingerprint
         ),
         compact_layout_payload_json=(
             None if compact_layout is None else compact_layout.fingerprint_payload_json
         ),
-        fingerprint_payload_json=(None if request.fingerprint_payload_json is None else str(request.fingerprint_payload_json)),
+        fingerprint_payload_json=(
+            None
+            if request.fingerprint_payload_json is None
+            else str(request.fingerprint_payload_json)
+        ),
     )

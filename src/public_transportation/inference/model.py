@@ -30,7 +30,12 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 
-from public_transportation.inference.assignment_adapter import AssignmentInputs, assign_link_flow
+from public_transportation.inference.assignment_adapter import (
+    AssignmentInputs,
+    FixedRoutingInputs,
+    assign_link_flow,
+    assign_link_flow_fixed_routing,
+)
 from public_transportation.measurement.likelihood_jax import predict_measurements_from_link_flow
 from public_transportation.measurement.mapping import AggregationSpec
 
@@ -169,6 +174,7 @@ def forward_model(
     theta: Array,
     rho: Array,
     assignment_inputs: AssignmentInputs,
+    fixed_routing: FixedRoutingInputs | None = None,
 ) -> ForwardModelOutputs:
     """Run the full forward model (assignment + aggregation + detection).
 
@@ -188,6 +194,7 @@ def forward_model(
         theta=theta,
         rho=rho,
         assignment_inputs=assignment_inputs,
+        fixed_routing=fixed_routing,
     )
 
 
@@ -198,6 +205,7 @@ def forward_model_from_demand(
     theta: Array,
     rho: Array,
     assignment_inputs: AssignmentInputs,
+    fixed_routing: FixedRoutingInputs | None = None,
 ) -> ForwardModelOutputs:
     """Run assignment and measurement prediction from an explicit demand vector.
 
@@ -210,6 +218,7 @@ def forward_model_from_demand(
         theta=theta,
         rho=rho,
         assignment_inputs=assignment_inputs,
+        fixed_routing=fixed_routing,
     )
 
 
@@ -220,13 +229,21 @@ def _forward_from_demand(
     theta: Array,
     rho: Array,
     assignment_inputs: AssignmentInputs,
+    fixed_routing: FixedRoutingInputs | None,
 ) -> ForwardModelOutputs:
     """Canonical assignment and measurement plumbing for an assignment vector."""
     f_j = jnp.asarray(f)
     expected_shape = assignment_inputs.od_origin_node.shape
     if f_j.ndim != 1 or f_j.shape != expected_shape:
         raise ValueError(f"f must have shape {expected_shape}, got {f_j.shape}.")
-    link_flow = assign_link_flow(inputs=assignment_inputs, f=f_j, theta=theta)
+    if fixed_routing is None:
+        link_flow = assign_link_flow(inputs=assignment_inputs, f=f_j, theta=theta)
+    else:
+        link_flow = assign_link_flow_fixed_routing(
+            inputs=assignment_inputs,
+            routing=fixed_routing,
+            f=f_j,
+        )
     lambda_m = predict_measurements(
         link_flow=link_flow,
         num_measurements=inputs.num_measurements,

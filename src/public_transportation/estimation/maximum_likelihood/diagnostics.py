@@ -35,6 +35,7 @@ def compute_optimization_diagnostics(
         "num_iterations": int(result.num_iterations),
         "num_function_evaluations": int(result.num_function_evaluations),
         "num_gradient_evaluations": result.num_gradient_evaluations,
+        "num_compiled_evaluations": int(result.num_compiled_evaluations),
         "objective_initial": objective_initial,
         "objective_final": float(objective_final),
         "objective_best": float(objective_best),

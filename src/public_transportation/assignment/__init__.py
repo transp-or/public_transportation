@@ -25,8 +25,6 @@ The domain layer is intentionally free of JAX. The conversion happens here.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 # Keep imports tolerant while the subpackage is built file-by-file.
 # Once all modules exist, these imports will resolve normally.
 try:
@@ -51,16 +49,13 @@ try:
 except Exception:  # pragma: no cover
     assign_flows = None  # type: ignore[misc,assignment]
 
-if TYPE_CHECKING:  # pragma: no cover
-    # These are only for static type checking; runtime imports are handled above.
-    from .config import AssignmentConfig as _AssignmentConfig
-    from .jax_graph_types import (
-        JaxTimeExpandedGraph as _JaxTimeExpandedGraph,
-        ODGrouping as _ODGrouping,
-        GraphBuildReport as _GraphBuildReport,
-    )
-    from .build_time_expanded import build_jax_graph as _build_jax_graph
-    from .assign import assign_flows as _assign_flows
+from .cache import (
+    ASSIGNMENT_CACHE_SCHEMA_VERSION,
+    AssignmentCacheMetrics,
+    assignment_cache_path,
+    assignment_cache_provenance,
+    load_or_prepare_assignment,
+)
 
 __all__ = [
     "AssignmentConfig",
@@ -69,4 +64,9 @@ __all__ = [
     "GraphBuildReport",
     "build_jax_graph",
     "assign_flows",
+    "ASSIGNMENT_CACHE_SCHEMA_VERSION",
+    "AssignmentCacheMetrics",
+    "assignment_cache_path",
+    "assignment_cache_provenance",
+    "load_or_prepare_assignment",
 ]

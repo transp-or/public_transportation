@@ -118,6 +118,10 @@ def _build_optimization_section(
         ("Iterations", optimization["num_iterations"]),
         ("Function evaluations", optimization["num_function_evaluations"]),
         ("Gradient evaluations", optimization["num_gradient_evaluations"]),
+        (
+            "Compiled objective/gradient evaluations",
+            optimization["num_compiled_evaluations"],
+        ),
         ("Final objective", _fmt_float(optimization["objective_final"])),
         ("Best objective", _fmt_float(optimization["objective_best"])),
         ("Gradient norm", _fmt_float(optimization["gradient_norm"])),
@@ -156,7 +160,10 @@ def _build_covariance_section(
         ("Hessian symmetric", _yes_no(covariance["hessian_symmetric"])),
         ("Hessian positive definite", _yes_no(covariance["hessian_positive_definite"])),
         ("Hessian min eigenvalue", _fmt_float(covariance["hessian_min_eigenvalue"])),
-        ("Hessian condition number", _fmt_float(covariance["hessian_condition_number"])),
+        (
+            "Hessian condition number",
+            _fmt_float(covariance["hessian_condition_number"]),
+        ),
         ("Covariance available", _yes_no(covariance["covariance_available"])),
         ("Standard errors available", _yes_no(covariance["standard_errors_available"])),
         ("Invalid standard errors", _yes_no(covariance["invalid_standard_errors"])),

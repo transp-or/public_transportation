@@ -103,13 +103,13 @@ def test_prepare_assignment_calls_builders_and_returns_artifacts(monkeypatch):
     cost_parts = SimpleNamespace(name="cost_parts")
     calls = {"graph": 0, "groups": 0, "cost_parts": 0}
 
-    def _build_graph(*, scenario, config):
+    def _build_graph(*, scenario, config, profile):
         calls["graph"] += 1
         assert scenario.timetable is not None
         assert isinstance(config, AssignmentConfig)
         return graph
 
-    def _build_groups(*, scenario, graph: _DummyGraph):
+    def _build_groups(*, scenario, graph: _DummyGraph, profile):
         calls["groups"] += 1
         assert scenario.timetable is not None
         return od_groups

@@ -103,6 +103,46 @@ class DialResult:
         )
 
 
+@jax.tree_util.register_pytree_node_class
+@dataclass(frozen=True, slots=True)
+class DestinationRouting:
+    """Demand-independent routing state for one destination.
+
+    The value function and link probabilities depend on the graph, costs,
+    destination, enabled links, and dispersion, but not on OD demand. Keeping
+    them in a separate PyTree allows fixed-dispersion inference to prepare this
+    state once and reuse it for multiple flow-loading calls.
+    """
+
+    dest_node: Array
+    theta: Array
+    enabled_link_mask: Array
+    value: Array
+    link_prob: Array
+
+    def tree_flatten(self):
+        children = (
+            self.dest_node,
+            self.theta,
+            self.enabled_link_mask,
+            self.value,
+            self.link_prob,
+        )
+        return children, None
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        del aux_data
+        dest_node, theta, enabled_link_mask, value, link_prob = children
+        return cls(
+            dest_node=dest_node,
+            theta=theta,
+            enabled_link_mask=enabled_link_mask,
+            value=value,
+            link_prob=link_prob,
+        )
+
+
 def _require_padded_adjacency(graph: JaxGraph) -> None:
     """
     Check that the graph has the padded adjacency representation required for JIT.
@@ -357,6 +397,132 @@ def load_flows(
     return y, x
 
 
+def _fixed_loading_initial_flow_adjoint(
+    graph: JaxGraph,
+    link_prob: Array,
+    enabled_link_mask: Array,
+    link_flow_cotangent: Array,
+) -> Array:
+    """Apply the exact fixed-routing adjoint to a link-flow cotangent."""
+    enabled_link_mask = enabled_link_mask.astype(jnp.bool_)
+    node_adjoint = jnp.zeros((graph.num_nodes,), dtype=link_flow_cotangent.dtype)
+
+    def step(adjoint: Array, node_index: Array) -> tuple[Array, None]:
+        node = graph.topo_order_rev[node_index]
+        links = graph.out_links[node]
+        mask = graph.out_mask[node]
+        safe_links = jnp.where(mask, links, 0)
+        active = jnp.logical_and(mask, enabled_link_mask[safe_links])
+        heads = graph.head[safe_links]
+        contribution = link_prob[safe_links] * (
+            link_flow_cotangent[safe_links] + adjoint[heads]
+        )
+        value = jnp.sum(jnp.where(active, contribution, 0.0))
+        return adjoint.at[node].add(value), None
+
+    node_adjoint, _ = jax.lax.scan(
+        step,
+        node_adjoint,
+        jnp.arange(graph.num_nodes, dtype=jnp.int32),
+    )
+    return node_adjoint
+
+
+@jax.custom_vjp
+def load_link_flow_fixed_custom_adjoint(
+    graph: JaxGraph,
+    link_prob: Array,
+    enabled_link_mask: Array,
+    initial_node_flow: Array,
+) -> Array:
+    """Load link flow with an explicit fixed-routing demand adjoint."""
+    return load_flows(
+        graph, link_prob, enabled_link_mask, initial_node_flow
+    )[1]
+
+
+def _load_link_flow_fixed_fwd(
+    graph: JaxGraph,
+    link_prob: Array,
+    enabled_link_mask: Array,
+    initial_node_flow: Array,
+) -> tuple[Array, tuple[JaxGraph, Array, Array]]:
+    link_flow = load_flows(
+        graph, link_prob, enabled_link_mask, initial_node_flow
+    )[1]
+    return link_flow, (graph, link_prob, enabled_link_mask)
+
+
+def _load_link_flow_fixed_bwd(
+    residual: tuple[JaxGraph, Array, Array], link_flow_cotangent: Array
+) -> tuple[None, None, None, Array]:
+    graph, link_prob, enabled_link_mask = residual
+    initial_adjoint = _fixed_loading_initial_flow_adjoint(
+        graph, link_prob, enabled_link_mask, link_flow_cotangent
+    )
+    return None, None, None, initial_adjoint
+
+
+load_link_flow_fixed_custom_adjoint.defvjp(
+    _load_link_flow_fixed_fwd, _load_link_flow_fixed_bwd
+)
+
+
+def prepare_destination_routing(
+    *,
+    graph: JaxGraph,
+    link_cost: Array,
+    enabled_link_mask: Array,
+    dest_node: int | Array,
+    theta: float | Array,
+) -> DestinationRouting:
+    """Compute the demand-independent routing state for one destination."""
+    _require_padded_adjacency(graph)
+    if isinstance(theta, (int, float)) and float(theta) <= 0.0:
+        raise ValueError("theta must be positive.")
+
+    link_cost_j = jnp.asarray(link_cost)
+    enabled_j = jnp.asarray(enabled_link_mask, dtype=jnp.bool_)
+    dest_node_j = jnp.asarray(dest_node, dtype=jnp.int32)
+    theta_j = jnp.asarray(theta, dtype=link_cost_j.dtype)
+    value = compute_value_function(
+        graph,
+        link_cost_j,
+        enabled_j,
+        dest_node_j,
+        theta_j,
+    )
+    link_prob = compute_link_probabilities(
+        graph,
+        link_cost_j,
+        enabled_j,
+        value,
+        theta_j,
+    )
+    return DestinationRouting(
+        dest_node=dest_node_j,
+        theta=theta_j,
+        enabled_link_mask=enabled_j,
+        value=value,
+        link_prob=link_prob,
+    )
+
+
+def load_destination_flows(
+    *,
+    graph: JaxGraph,
+    routing: DestinationRouting,
+    initial_node_flow: Array,
+) -> tuple[Array, Array]:
+    """Load demand using routing state prepared independently of demand."""
+    return load_flows(
+        graph,
+        routing.link_prob,
+        routing.enabled_link_mask,
+        initial_node_flow,
+    )
+
+
 def run_dial_for_destination(
     *,
     graph: JaxGraph,
@@ -397,18 +563,24 @@ def run_dial_for_destination(
     if isinstance(theta, (int, float)) and float(theta) <= 0.0:
         raise ValueError("theta must be positive.")
 
-    dest_node_j = jnp.asarray(dest_node, dtype=jnp.int32)
-    theta_j = jnp.asarray(theta, dtype=jnp.asarray(link_cost).dtype)
-
-    v = compute_value_function(graph, link_cost, enabled_link_mask, dest_node_j, theta_j)
-    p = compute_link_probabilities(graph, link_cost, enabled_link_mask, v, theta_j)
-    node_flow, link_flow = load_flows(graph, p, enabled_link_mask, initial_node_flow)
+    routing = prepare_destination_routing(
+        graph=graph,
+        link_cost=link_cost,
+        enabled_link_mask=enabled_link_mask,
+        dest_node=dest_node,
+        theta=theta,
+    )
+    node_flow, link_flow = load_destination_flows(
+        graph=graph,
+        routing=routing,
+        initial_node_flow=initial_node_flow,
+    )
 
     return DialResult(
-        dest_node=dest_node_j,
-        theta=theta_j,
-        value=v,
-        link_prob=p,
+        dest_node=routing.dest_node,
+        theta=routing.theta,
+        value=routing.value,
+        link_prob=routing.link_prob,
         node_flow=node_flow,
         link_flow=link_flow,
     )

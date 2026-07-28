@@ -12,7 +12,7 @@
 
 \title{Passenger Assignment Model in a Public Transportation Network}
 \author{Michel Bierlaire \and Evangelos Paschalidis}
-\date{April 23, 2026}
+\date{July 28, 2026}
 
 \newtheorem{definition}{Definition}
 \newtheorem{assumption}{Assumption}
@@ -551,6 +551,485 @@ the model enables only egress links leading to $s_d^{\mathrm{out}}$ via a destin
 For computational efficiency, value functions and flow propagation are computed in batches for OD groups sharing the same destination
 (and, depending on the implementation, the same departure interval), enabling vectorized evaluation with JAX.
 
+\subsubsection{Separation of routing preparation and demand loading}
+
+For a destination group $g$, let $d_g$ denote its destination, let
+$\mathcal A_g^+$ denote its enabled links after destination gating, and let
+$\bm f_g$ collect the OD/time-bin demand injected for that group. The backward
+value recursion and the resulting transition probabilities depend on
+$(\mathcal G,\bm c,d_g,\mathcal A_g^+,\theta)$, but not on $\bm f_g$. The
+assignment can therefore be written as two distinct operations:
+\[
+\mathcal R_g(\mathcal G,\bm c,d_g,\mathcal A_g^+,\theta)
+= (\bm V_g,\bm P_g),
+\]
+followed by
+\[
+\bm x_g
+=\mathcal L_g(\mathcal G,\bm P_g,\mathcal A_g^+,\bm f_g),
+\qquad
+\bm x=\sum_g \bm x_g,
+\]
+where $\mathcal R_g$ is routing preparation and $\mathcal L_g$ is the forward
+flow-loading operation. For fixed probabilities, $\mathcal L_g$ is linear in
+the injected demand. This separation is exact: it does not approximate the
+route-choice model or alter its probabilities.
+
+\paragraph{Precomputation for fixed dispersion.}
+When $\theta$ is fixed during inference, and generalized costs do not depend on
+the current demand, the routing state $(\bm V_g,\bm P_g)$ is invariant across
+all likelihood evaluations. The software consequently prepares the effective
+destination masks and link probabilities once, stores them in an immutable
+JAX-compatible cache, and evaluates only $\mathcal L_g$ as the OD parameters
+change. Reverse-mode differentiation then traverses the demand-loading and
+measurement computations, but not the invariant value-function and
+route-probability calculations.
+
+This optimization is valid under the current uncongested assignment model,
+because link costs are fixed. It must not be applied when $\theta$ is estimated,
+or if a future model makes generalized costs depend on passenger flows. In
+those cases, routing is recomputed inside every assignment evaluation. The ML,
+MAP, and variational-inference pipelines select the cached path automatically
+for fixed $\theta$ and retain the dynamic path for estimated $\theta$.
+
+\paragraph{Cache consistency.}
+A prepared cache is associated with the exact graph instance, base link costs,
+destination-group ordering, and original destination masks from which it was
+constructed. These quantities are checked before cached loading is used. A
+change to any routing-sensitive input invalidates the cache. Empty destination
+sets and compact OD layouts are handled explicitly. The cached scan accumulates
+only total link flow and does not materialize per-destination link-flow arrays
+when they have not been requested.
+
+\paragraph{Computational consequences.}
+Let $G$ be the number of active destination groups, $N$ the number of graph
+nodes, and $A$ the number of links. Routing preparation requires one backward
+pass and probability construction per group, while each subsequent cached
+evaluation requires only the forward loading passes. The principal incremental
+cache arrays scale as $O(GA)$ for probabilities and masks. Compact OD grouping
+can reduce both $G$ and this storage when frozen-zero demand removes complete
+destination groups.
+
+Table~\ref{tab:fixed-routing-benchmarks} reports illustrative CPU measurements
+from the package examples. Timings are warm medians using 32-bit arithmetic and
+are machine-dependent; numerical equivalence is tested separately and these
+values are not used as test thresholds.
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lrrrrr}
+\hline
+Example and layout & $G$ & Cache (MiB) & Forward & Value--gradient & Speedup \\
+\hline
+Simple example, compact & 7 & 0.20 & $9.44\!\to\!2.75$ ms & $12.78\!\to\!6.21$ ms & $2.06\times$ \\
+Geneva, compact & 18 & 3.43 & $0.449\!\to\!0.109$ s & $0.537\!\to\!0.180$ s & $2.98\times$ \\
+Geneva, full & 62 & 11.83 & $1.552\!\to\!0.383$ s & $1.788\!\to\!0.591$ s & $3.03\times$ \\
+\hline
+\end{tabular}
+\caption{Dynamic-to-cached fixed-routing measurements. The final column reports
+the likelihood value-and-gradient speedup; forward speedups range from
+$3.43\times$ to $4.12\times$.}
+\label{tab:fixed-routing-benchmarks}
+\end{table}
+
+\subsubsection{Direct fixed-routing measurement operator}
+
+Fixed routing permits a second, more aggressive optimization when inference
+needs measurement predictions but not link-level outputs.  For fixed
+transition probabilities, every forward DAG update consists only of additions
+and multiplication by constants.  It is therefore linear in the injected OD
+demand.  Measurement aggregation is also linear.  Their composition can be
+represented by a matrix $\bm A$:
+\[
+\bm\lambda = \bm A\bm f,
+\qquad
+\bm\mu = \rho\bm A\bm f.
+\]
+This identity is exact, rather than a local linearization.
+
+For a compact layout containing free cells and positive frozen cells, the
+implemented representation separates variable columns from constants:
+\[
+\bm\mu
+=\rho\left(\bm A_{\mathrm{free}}\bm f_{\mathrm{free}}
++\bm b_{\mathrm{fixed}}\right),
+\qquad
+\bm b_{\mathrm{fixed}}
+=\bm A_{\mathrm{fixed}}\bm f_{\mathrm{fixed}}.
+\]
+Frozen-zero cells have neither columns nor an offset contribution. Operator
+construction proceeds destination group by destination group, but does not
+construct unit-demand link-flow columns. Instead it combines loading and
+measurement aggregation in one reverse dynamic program. For destination group
+$g$, let $H_g(i,m)$ be the expected accumulated contribution to measurement
+$m$ of one passenger starting at node $i$. In reverse topological order,
+\[
+H_g(i,m)=
+\sum_{\ell\in\delta^+(i)} P_{g\ell}
+\left[\mathbf{1}\{\ell\in\mathcal A_m\}+H_g(h(\ell),m)\right],
+\]
+where $h(\ell)$ is the head of link $\ell$. Operator columns are obtained by
+gathering $H_g$ at the OD origin nodes. Consequently, no
+\texttt{chunk\_size}-by-$|\mathcal A|$ link-flow array is constructed or
+transferred to the host.
+
+Only measurements mapped to links enabled for a destination group are carried
+by that group's recursion. The local measurement dimension is padded to a
+single fixed maximum, and every OD output chunk is padded to the configured
+chunk size. The builder explicitly lowers and compiles this fixed-shape kernel
+once, then reuses the executable for every group and chunk, including the final
+partial chunk. For BCOO output, nonzero data and row/column indices are appended
+directly from returned local contributions; a dense operator is never allocated
+and subsequently converted.
+
+\paragraph{Construction profiling.}
+Each chunk reports its ordinal number, fixed shape, completed columns, elapsed
+time, host peak memory, kernel dispatch, device synchronization, and NumPy
+transfer. Final metrics record the explicit compilation count and time, number
+of chunks, construction and assembly time, logical dense bytes, stored bytes,
+nonzero count, density, host peak memory, and device peak memory when the
+backend exposes it. Measurement aggregation has no separately dispatched phase
+because it is fused into the reverse loading kernel; it is therefore not
+double-counted as a separate device operation.
+
+\paragraph{Validity and fallback.}
+The direct operator is valid only while dispersion, routing probabilities,
+link costs, graph structure, OD ordering, and the measurement mapping remain
+fixed.  It is invalid when dispersion is estimated, costs depend on demand,
+capacity or congestion feeds back into routing, or graph, layout, or mapping
+indices change.  The normal fixed-routing loader remains the reference and
+fallback implementation and is always required when link-level outputs are
+requested.  The estimated-dispersion path never constructs or uses the direct
+operator.
+
+\paragraph{Persistent cache and provenance.}
+Operators can be saved as compressed NumPy archives and reused by a fresh
+process. The cache key includes the assignment identity; content digests of the
+graph and all loading arrays; the complete measurement mapping; OD-layout and
+compact-layout fingerprints, including frozen indices and values; fixed
+dispersion; representation; numeric type; package version; and cache-schema
+version. Loaded dimensions and array shapes are also validated. Cache writes
+use a temporary file followed by an atomic replacement. A missing, corrupt,
+outdated, or provenance-mismatched artifact is rejected and rebuilt safely.
+The cache directory may be supplied on the estimation request or through
+\texttt{PUBLIC\_TRANSPORTATION\_OPERATOR\_CACHE\_DIR}. Dense and JAX BCOO
+representations remain available as explicit overrides.
+
+\paragraph{Activation policy.}
+The modes are \texttt{off}, \texttt{auto}, \texttt{dense}, and \texttt{bcoo}.
+Explicit modes are preserved. In automatic mode, a valid BCOO cache is reused
+immediately. Without a valid cache, construction is selected only when the
+expected number of evaluations multiplied by the measured per-evaluation saving
+exceeds the expected construction time. Missing construction evidence or a
+nonpositive saving keeps the ordinary fixed-routing loader active. Estimated
+dispersion always disables the operator irrespective of this policy.
+
+\paragraph{TPG structural measurement.}
+For the TPG case, the operator has shape $3{,}690\times15{,}772$, or
+$58{,}198{,}680$ logical entries. Only 158,219 entries are nonzero, giving a
+density of 0.271860\%. The logical dense float32 size is 222.01 MiB, whereas
+the direct BCOO representation occupies 1.811 MiB. This observed sparsity,
+rather than an a-priori assumption, motivates BCOO as the automatic
+representation.
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{rrrrrr}
+\hline
+Chunk & Calls & Compile (s) & Build (s) & Host peak (MiB) & Warm value--gradient (s) \\
+\hline
+128  & 184 & 0.133 & 107.168 & 10.43 & 0.000823 \\
+256  & 124 & 0.136 & 73.982  & 10.39 & 0.000804 \\
+512  & 113 & 0.132 & 66.657  & 10.39 & --- \\
+1024 & 113 & 0.139 & 66.574  & 10.39 & 0.000808 \\
+2048 & 113 & 0.135 & 66.894  & 10.40 & 0.000806 \\
+\hline
+\end{tabular}
+\caption{TPG direct-BCOO construction by fixed OD chunk size. The 2048 case
+was the largest tested safe value. At 512 and above every destination group
+fits in one call, so larger chunks do not reduce the 113 calls.}
+\label{tab:tpg-operator-construction}
+\end{table}
+
+At chunk size 1024, device synchronization accounted for 65.113 s of the
+66.574 s construction; NumPy transfer took only 0.0062 s and compilation
+occurred exactly once. Relative to a 1.94 s reference evaluation, the measured
+construction break-even is approximately 34.3 evaluations. A cache-seeding
+process required 110.65 s for complete MAP-problem construction, while fresh
+processes loading the persistent cache required 0.70--0.74 s.
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{rrrrrr}
+\hline
+Iterations & Evaluations & Loader (s) & Cached BCOO (s) & Speedup & Objective difference \\
+\hline
+1  & 4  & 8.543  & 0.477 & $17.9\times$ & 0.0039 \\
+5  & 8  & 18.551 & 2.948 & $6.3\times$  & 0.0000 \\
+20 & 24 & 52.648 & 5.679 & $9.3\times$  & 0.0039 \\
+\hline
+\end{tabular}
+\caption{Fresh-process TPG optimizer timings from the unchanged profiling
+harness. Compilation is reported separately by that harness. Warm cached BCOO
+value-and-gradient time was 0.000784--0.000841 s, versus 1.868--1.954 s for the
+fixed-routing loader.}
+\label{tab:tpg-operator-harness}
+\end{table}
+
+Across three distinct demand vectors, the maximum absolute differences were
+0.00390625 for the objective, 0.001953125 for the likelihood, and
+$2.861\times10^{-6}$ for any gradient coordinate, consistent with float32
+rounding. Tests also cover raw measurement predictions, frozen-zero cells,
+positive frozen offsets, cache round trips, corrupt-cache rebuilds, and
+provenance mismatch rejection.
+
+\subsubsection{Matrix-free destination streaming for very large OD layouts}
+
+The direct operator is not suitable when its dimensions or its construction
+state exceed the available memory. In the TPG full-network case there are
+$628{,}164$ free OD cells and $426{,}436$ measurements. A dense float32
+operator would require approximately 998~GiB. More importantly, the reverse
+operator construction described above would require a destination-local state
+proportional to the number of graph nodes times the number of reachable
+measurements. Measurements from a sampled destination cover approximately
+$213{,}000$ observations, implying about 344~GiB of value state for one
+destination. The explicit builder must therefore not be used for this layout.
+
+For this regime, the software provides an exact two-pass matrix-free
+decomposition. Let $\bm p_g(\bm z_g)$ be the measurement prediction contributed
+by destination group $g$, including any positive frozen-demand contribution,
+and let $L$ be the nonlinear negative-binomial objective in measurement space.
+The complete prediction and its measurement-space cotangent are
+\[
+\bm p=\sum_g\bm p_g(\bm z_g),
+\qquad
+\bm c=\frac{\partial L(\bm p)}{\partial\bm p}.
+\]
+The gradient for each destination is then obtained independently as
+\[
+\frac{\partial L}{\partial\bm z_g}
+=J_{\bm p_g}(\bm z_g)^\mathsf{T}\bm c.
+\]
+The implementation first streams destination predictions into the complete
+measurement vector. It evaluates the likelihood only after this sum is
+complete, then recomputes each destination under a JAX vector--Jacobian product
+and scatters the local result into the global free-parameter gradient. It never
+constructs $J_{\bm p_g}$, a global Jacobian, or a reverse-mode tape spanning all
+destinations. Computing and summing separate likelihoods from partial predicted
+means would be mathematically incorrect and is not supported.
+
+Frozen-zero cells are removed from each local assignment view. Positive frozen
+cells remain in the group and are placed at their fixed values, so their flow
+contribution participates in both the aggregated prediction and the common
+likelihood residual. Tests compare the streamed calculation with monolithic
+automatic differentiation for a nonlinear synthetic case with positive frozen
+offsets and for the actual fixed-routing loader split by destination. Values
+and gradients agree within explicit float32 tolerances.
+
+The streaming implementation uses a replayable provider rather than retaining
+all destination predictors. It checks a declared destination-state byte ceiling
+before prediction, retains only compact parameter-index signatures between
+passes, and rejects changed group membership or ordering during replay. Thus a
+provider may construct and release one routing block at a time.
+
+Six isolated full-network destinations spanning 9, 137, 276, 465, 770, and
+1,181 free cells were measured under a 24~GiB process ceiling. Warm forward
+loading was 5.98--6.08~s and ordinary value--gradient evaluation was
+12.07--12.38~s; peak resident memory was 16.02--18.16~GiB. The near-constant
+runtime over a 131-fold change in OD count shows that graph traversal, not
+demand injection, dominates. Median forward and value--gradient times were
+5.991~s and 12.130~s. An ordinary sweep across 1,898 destinations is therefore
+estimated at 6.40 hours. Since the exact two-pass scheme adds one forward
+recomputation, its sequential estimate is 9.55 hours per complete objective and
+gradient, before optimizer overhead. Median routing preparation of 38.32~s per
+sample would itself require about 20.2 hours if performed serially without
+persistence. Consequently, a practical full-network implementation also
+requires direct event-aligned measurement accumulation, reduced-cost or
+explicit-adjoint loading, and destination-level process parallelism.
+
+\paragraph{Event-aligned measurement resolution.}
+Boarding and alighting mappings have additional structure that avoids generic
+repeated graph searches. The strict resolver formerly scanned all links for
+every measurement to find access links entering a matched departure event or
+egress links leaving a matched arrival event. It now builds node-keyed CSR
+indices for those relations once and retains all existing stop, time,
+trip/line, event-kind, uniqueness, and nonempty-link validations. On the full
+network, synchronized strict mapping decreased from approximately 121.2~s to
+2.31~s: 0.24~s for event/link indices, 1.64~s for 426,436 record resolutions,
+and 0.42~s for result construction.
+
+All 213,218 alighting measurements map to exactly one egress link. Of 213,218
+boarding measurements, 207,805 map to one access link and 5,413 map to two
+access links because two time-bin access alternatives may enter the same
+departure event. The compact event-aligned representation therefore stores one
+primary link per measurement plus only these sparse secondary boarding pairs.
+It is exact; forcing every row to one link would not be. On the full-network
+arrays, index storage decreased from 3,454,792 to 1,749,048 bytes and warm
+aggregation decreased from 0.482 to 0.108~ms, with bit-identical predictions
+and gradients. This optimization removes mapping startup cost but does not
+materially change the six-second destination-loading bottleneck.
+
+\paragraph{Explicit fixed-routing adjoint.}
+Generic reverse-mode differentiation through the node-loading scan retains more
+state than is necessary when link probabilities are fixed. Let $c_\ell$ be the
+cotangent of link flow and let $a_i$ be the node-flow adjoint. A reverse
+topological pass evaluates
+\[
+a_i=\sum_{\ell\in\delta^+(i)}P_\ell
+\left(c_\ell+a_{h(\ell)}\right).
+\]
+The derivative with respect to initial flow injected at node $i$ is $a_i$; the
+existing OD injection operation then gathers this adjoint at origin nodes. The
+custom vector--Jacobian product therefore retains a node vector and the supplied
+link cotangent rather than the complete forward scan tape. It deliberately
+defines no derivative with respect to routing probabilities and is exposed only
+for the fixed-routing path.
+
+On the representative 465-cell full-network destination, ordinary reverse mode,
+whole-loader rematerialization, and the explicit adjoint required respectively
+12.09, 8.17, and 6.69~s for a warm value--gradient evaluation. Their resident
+memory immediately after that evaluation was 16.21, 17.54, and 13.91~GiB.
+All objective, prediction, and gradient diagnostics agreed within float32
+tolerances. Whole-loader rematerialization is therefore rejected; on this CPU
+backend it was slower and larger than the explicit adjoint.
+
+Combining the six-sample median forward time of 5.991~s with the 6.690~s
+explicit-adjoint evaluation gives a two-pass sequential estimate of 6.69 hours
+for 1,898 destinations, improved from 9.55 hours under ordinary autodiff but
+still impractical locally. The measured custom-adjoint process peak was
+15.21~GiB. With 20\% headroom and conservative per-worker replication, 12
+workers require about 219~GiB and have an idealized lower bound of 33 minutes
+per complete objective and gradient. Actual server efficiency depends on
+per-process thread limits and memory bandwidth and must be measured on the
+target machine.
+
+\paragraph{Stable objective compilation and reuse.}
+The fixed-operator MAP objective is defined at package scope and receives all
+numerical operator arrays, observations, baselines, and offsets as dynamic JAX
+arguments. Thus parameter values, observations, and optimizer iteration limits
+do not alter the compiled signature; shapes, dtypes, backend, JAX/JAXLIB
+versions, and compilation-relevant configuration still must agree. The public
+\texttt{prepare\_ml\_objective} and \texttt{compile\_ml\_objective} interface
+separates tracing, lowering, compilation, executable loading, and first
+execution, and \texttt{run\_ml} accepts the resulting executable without
+creating another jitted closure.
+
+An isolated investigation showed that a previously observed 29.484 s first-call
+delay was not XLA compilation. Fixed-routing preparation had launched unused
+asynchronous device work before the valid operator cache was loaded, and the
+first objective result synchronized that work. The pipeline now validates and
+loads the cached operator before preparing routing. On the TPG case, isolated
+tracing takes about 0.026 s, lowering 0.011 s, cold XLA compilation
+0.120--0.129 s, executable loading below 0.00001 s, and first execution about
+0.0014 s.
+
+The compact persistent artifact remains canonical row-major BCOO storage, with
+sorted unique indices. Three objective kernels were compared after all scenario
+preparation had completed. BCOO matvec, direct indexed scatter-add, and sorted
+segment reduction gave identical float32 objectives and gradients. Their warm
+value-and-gradient medians were respectively 0.001073 s, 0.000944 s, and
+0.000973 s; direct indexed aggregation is therefore used by the stable
+objective.
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{rrlrrrr}
+\hline
+Iter. & Cache & Compile/load & Warm V\&G & Optimizer & Process & Objective \\
+\hline
+1  & cold     & 0.1204 & 0.000975 & 0.303 & 5.800  & 55243.4375 \\
+1  & populate & 0.1285 & 0.000996 & 0.292 & 5.845  & 55243.4375 \\
+1  & hit      & 0.0070 & 0.000983 & 0.297 & 5.167  & 55243.4375 \\
+5  & cold     & 0.1231 & 0.001001 & 2.878 & 8.377  & 49635.4922 \\
+5  & populate & 0.1194 & 0.001021 & 2.604 & 8.167  & 49635.4922 \\
+5  & hit      & 0.0075 & 0.000958 & 2.539 & 7.622  & 49635.4922 \\
+20 & cold     & 0.1260 & 0.000991 & 5.805 & 11.623 & 49140.4258 \\
+20 & populate & 0.1260 & 0.000972 & 5.777 & 11.401 & 49140.4258 \\
+20 & hit      & 0.0070 & 0.000996 & 5.820 & 11.047 & 49140.4258 \\
+\hline
+\end{tabular}
+\caption{Fresh-process TPG compilation-cache and optimizer measurements. The
+compile column is cold compilation or persistent executable loading; process
+time also includes scenario and assignment preparation.}
+\label{tab:tpg-ml-compilation-cache}
+\end{table}
+
+The JAX persistent compilation cache is configured before computation through
+\path{PUBLIC_TRANSPORTATION_JAX_COMPILATION_CACHE_DIR} or the public
+package configuration function. Entry-size and compile-time thresholds default
+to zero so the objective is eligible. Fresh hit processes create no new cache
+entry and reproduce cold objectives and gradients. JAX 0.8.1 on the tested
+Apple CPU emits an AOT target-feature warning while loading entries even though
+execution succeeds and results agree exactly; this runtime warning should be
+rechecked when JAX is upgraded.
+
+\paragraph{Persistent assignment artifacts.}
+Assignment preparation is also demand-independent. Its immutable reusable state
+consists of the time-expanded graph arrays and labels, destination/OD grouping
+arrays, and generalized-cost components. It does not contain demand magnitudes,
+observations, priors, optimizer settings, or compiled executables. The package
+can store this state as compressed NPZ plus canonical JSON through optional
+\texttt{off}, \texttt{auto}, \texttt{refresh}, and \texttt{readonly} policies;
+ordinary uncached calls remain the default.
+
+The assignment-cache provenance includes the complete graph-relevant scenario
+contents, OD keys, assignment and cost configuration, numeric type, package and
+schema versions, sentinel conventions, and indexing rules. Loaded archives are
+checked for exact provenance, recognized fields, counts, shapes, dtypes, CSR and
+padded-mask consistency, and integer/Boolean conventions before JAX arrays are
+reconstructed. Cache writes use a unique temporary file, synchronization to
+disk, and atomic replacement. Thus concurrent writers are safe, corrupt or
+incompatible entries rebuild under \texttt{auto}, and \texttt{readonly} never
+writes. The measurement-operator cache retains its own compact-input content
+hash, so a valid assignment archive cannot validate an incompatible operator.
+
+Internal TPG profiling initially assigned 3.142 s of a 3.313 s preparation to
+destination grouping. The cause was repeated Python scalar extraction from JAX
+node arrays, which introduced thousands of small device synchronizations. One
+NumPy view is now reused for immutable node indexing and validation, and all
+destination link masks are constructed in one broadcasted operation. Uncached
+assignment construction consequently fell to 0.097 s: graph construction took
+about 0.049 s, OD indexing and grouping 0.022 s, and cost construction plus
+synchronization 0.026 s in the compilation-cache-enabled run.
+
+The TPG artifact contains 36,478 nodes, 11,259 links, 22,022 OD records, and 113
+destination groups. Its explicit arrays occupy 6,909,418 bytes and compress to
+576,227 bytes. A representative strict cache hit spent 0.00044 s opening the
+archive, 0.00460 s decompressing arrays, 0.01473 s in combined validation and
+decompression, 0.000006 s reconstructing host objects, 0.00500 s transferring
+and synchronizing JAX arrays, and 0.08787 s generating the canonical provenance.
+The complete assignment-cache call took 0.1084 s.
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{lrrrrr}
+\hline
+Policy/case & Assignment & Preparation & Warm V\&G & Optimizer & Process \\
+\hline
+Off & 0.0971 & 1.1756 & 0.000992 & 0.2908 & 2.1939 \\
+Populate & 0.3412 & 1.3532 & 0.000993 & 0.2975 & 2.4106 \\
+Valid hit & 0.1084 & 1.0775 & 0.000937 & 0.2721 & 2.0211 \\
+Corrupt/rebuild & 0.3201 & 1.3339 & 0.000965 & 0.3073 & 2.4081 \\
+Mismatch/rebuild & 0.3321 & 1.3463 & 0.001048 & 0.3166 & 2.3935 \\
+Read-only hit & 0.1128 & 1.1242 & 0.000972 & 0.2922 & 2.1872 \\
+\hline
+\end{tabular}
+\caption{Fresh-process TPG assignment-cache measurements in seconds with the
+measurement-operator and JAX compilation caches enabled.}
+\label{tab:tpg-assignment-cache}
+\end{table}
+
+After eliminating scalar synchronization, uncached reconstruction is already
+slightly faster than strict cache validation in the assignment stage itself;
+canonical fingerprinting accounts for most of the hit time. The persistent
+artifact is therefore useful primarily for strict reproducibility and validation,
+while the focused grouping simplification provides the main speedup. Relative to
+the original profile, complete one-iteration time falls from 5.389 s to roughly
+2.0--2.2 s. Cache-hit runs at 1, 5, and 20 iterations reproduce objectives
+55,243.4375, 49,635.4922, and 49,140.4258 exactly.
+
 \subsubsection{Opt-out alternative (future extension)}
 
 In a general formulation, an opt-out alternative can be introduced for each OD pair and departure interval. In the first implementation,
@@ -564,6 +1043,10 @@ a topological ordering of nodes; compressed representations of outgoing adjacenc
 The backward recursion for the value function and forward propagation for flows are implemented using JAX primitives such as
 \texttt{logsumexp} and scan-like passes over the topological order. Variable out-degrees are handled through CSR-like adjacency
 and/or padded adjacency with masks, enabling compilation with \texttt{jit}.
+The implementation exposes routing preparation and demand loading as separate
+JAX-compatible operations. A composed operation preserves the original dynamic
+assignment behavior, while the fixed-routing inference path supplies prepared
+probabilities directly to the loading scan.
 
 \subsubsection{Deterministic indexing requirement}
 Reproducibility of inference results requires that the indexing of nodes, links, and OD cells remain strictly deterministic across runs.

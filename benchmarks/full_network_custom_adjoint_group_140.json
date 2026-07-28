@@ -1,0 +1,164 @@
+{
+  "dimensions": {
+    "candidate_od": 1408084,
+    "free_od": 628164,
+    "full_groups": 1898,
+    "links": 1456458,
+    "nodes": 433462
+  },
+  "kernels": {
+    "flow_loading": {
+      "compile": {
+        "compilation_seconds": 5.843914625002071,
+        "first_execution_seconds": 5.937287667009514,
+        "lowered_text_bytes": null,
+        "lowering_seconds": 0.08916520897764713,
+        "tracing_seconds": 0.0015010840143077075
+      },
+      "warm": {
+        "median_seconds": 5.961019333975855,
+        "samples_seconds": [
+          5.961019333975855
+        ]
+      }
+    },
+    "gradient_only": {
+      "compile": {
+        "compilation_seconds": 5.931008958024904,
+        "first_execution_seconds": 6.8332802500226535,
+        "lowered_text_bytes": null,
+        "lowering_seconds": 0.14164279197575524,
+        "tracing_seconds": 0.006764500052668154
+      },
+      "warm": {
+        "median_seconds": 6.5277387910173275,
+        "samples_seconds": [
+          6.5277387910173275
+        ]
+      }
+    },
+    "likelihood": {
+      "compile": {
+        "compilation_seconds": 0.12680749996798113,
+        "first_execution_seconds": 0.0008032500045374036,
+        "lowered_text_bytes": null,
+        "lowering_seconds": 0.005103041010443121,
+        "tracing_seconds": 0.0009472499950788915
+      },
+      "warm": {
+        "median_seconds": 0.0007583329570479691,
+        "samples_seconds": [
+          0.0007583329570479691
+        ]
+      }
+    },
+    "measurement_aggregation": {
+      "compile": {
+        "compilation_seconds": 0.041501583997160196,
+        "first_execution_seconds": 0.0006146670202724636,
+        "lowered_text_bytes": null,
+        "lowering_seconds": 0.004023707995656878,
+        "tracing_seconds": 0.0004153749905526638
+      },
+      "warm": {
+        "median_seconds": 0.0004487080150283873,
+        "samples_seconds": [
+          0.0004487080150283873
+        ]
+      }
+    },
+    "value_and_gradient": {
+      "compile": {
+        "compilation_seconds": 5.818111208034679,
+        "first_execution_seconds": 7.059848792036064,
+        "lowered_text_bytes": null,
+        "lowering_seconds": 0.10340091702528298,
+        "tracing_seconds": 0.06321612501051277
+      },
+      "warm": {
+        "median_seconds": 6.689694791042712,
+        "samples_seconds": [
+          6.689694791042712
+        ]
+      }
+    },
+    "value_only": {
+      "compile": {
+        "compilation_seconds": 6.15959787502652,
+        "first_execution_seconds": 5.939812041993719,
+        "lowered_text_bytes": null,
+        "lowering_seconds": 0.0928562079789117,
+        "tracing_seconds": 0.002414833987131715
+      },
+      "warm": {
+        "median_seconds": 5.950169708987232,
+        "samples_seconds": [
+          5.950169708987232
+        ]
+      }
+    }
+  },
+  "loader_mode": "custom_adjoint",
+  "memory": {
+    "device_memory_stats": null,
+    "peak_rss_bytes": 16331980800,
+    "peak_rss_snapshots": {
+      "after_all_diagnostic_kernels": 16331980800,
+      "after_separated_forward": 15783084032,
+      "after_value_and_gradient": 14933032960,
+      "before_kernel_compilation": 12665782272
+    }
+  },
+  "mode": "bounded_single_destination_matrix_free_reference",
+  "numerical": {
+    "gradient_norm": 10712.197265625,
+    "objective_at_baseline": 29840308.0,
+    "prediction_nonzero": 36732,
+    "prediction_sum": 930.0001220703125
+  },
+  "persistent_array_bytes": {
+    "assignment_artifacts": 3827579178,
+    "measurement_mapping": 5160536,
+    "single_group_inputs": 7286479,
+    "single_group_routing": 14564588
+  },
+  "platform": {
+    "architecture": "arm64",
+    "backend": "cpu",
+    "device": "TFRT_CPU_0",
+    "jax": "0.8.1",
+    "jaxlib": "0.8.1",
+    "logical_cpus": 12,
+    "system": "macOS-26.5.2-arm64-arm-64bit"
+  },
+  "preparation_seconds": {
+    "assignment_preparation": 5.44369587500114,
+    "fixed_routing_preparation": 37.76326204201905,
+    "id_manager": 3.066754041996319,
+    "measurement_csv": 1.7169837080291472,
+    "od_layout": 3.972226416983176,
+    "scenario_loading_and_validation": 22.57500012498349,
+    "single_group_extraction": 0.6905164580093697,
+    "strict_measurement_mapping": 2.0613769170013256
+  },
+  "safety": {
+    "global_fixed_routing_constructed": false,
+    "jacobian_constructed": false,
+    "map_optimization_started": false,
+    "measurement_operator_constructed": false,
+    "memory_ceiling_bytes": 25769803776,
+    "observed_memory_ceiling_exceeded": false,
+    "routing_preflight_bytes": 7282290,
+    "selected_groups": 1
+  },
+  "sample": {
+    "destination_node": 431297,
+    "enabled_links": 1242992,
+    "free_cells": 465,
+    "local_measurements": 213362,
+    "original_group_index": 140,
+    "total_measurements": 426436
+  },
+  "schema_version": 1,
+  "total_process_seconds": 166.22571008297382
+}

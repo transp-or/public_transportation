@@ -1,0 +1,48 @@
+{
+  "example": "simple_example_02",
+  "num_active_od": 72,
+  "num_measurements": 8,
+  "num_links": 5846,
+  "routing_preparation_seconds": 0.152038166008424,
+  "repeats": 5,
+  "chunk_size": 16,
+  "reference": {
+    "first_forward_seconds": 0.08487266700831242,
+    "warm_forward_seconds": 0.0027702919906005263,
+    "first_value_and_gradient_seconds": 0.27578395800082944,
+    "warm_value_and_gradient_seconds": 0.006145124993054196
+  },
+  "representations": {
+    "dense": {
+      "construction_seconds": 0.5098253330215812,
+      "first_forward_seconds": 0.015579875005641952,
+      "warm_forward_seconds": 7.08398874849081e-06,
+      "first_value_and_gradient_seconds": 0.08028133297921158,
+      "warm_value_and_gradient_seconds": 9.750016033649445e-06,
+      "dense_bytes": 2304,
+      "stored_bytes": 2304,
+      "peak_construction_bytes": 570253,
+      "nonzero_entries": 60,
+      "total_entries": 576,
+      "density": 0.10416666666666667,
+      "max_measurement_difference": 5.960464477539063e-08,
+      "break_even_evaluations": 83.09603486846079
+    },
+    "bcoo": {
+      "construction_seconds": 1.0494209580065217,
+      "first_forward_seconds": 0.028882541024358943,
+      "warm_forward_seconds": 4.875008016824722e-06,
+      "first_value_and_gradient_seconds": 0.09099262501695193,
+      "warm_value_and_gradient_seconds": 7.499998901039362e-06,
+      "dense_bytes": 2304,
+      "stored_bytes": 720,
+      "peak_construction_bytes": 1292835,
+      "nonzero_entries": 60,
+      "total_entries": 576,
+      "density": 0.10416666666666667,
+      "max_measurement_difference": 1.1920928955078125e-07,
+      "break_even_evaluations": 170.98160265676452
+    }
+  },
+  "recommendation": "Enable manually when the expected objective-evaluation count exceeds the measured break-even point and the dense/BCOO storage fits the memory budget."
+}

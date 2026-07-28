@@ -96,6 +96,11 @@ def _install_pipeline_stubs(
     monkeypatch.setattr(pipeline, "build_assignment_inputs", fake_build_assignment_inputs)
     monkeypatch.setattr(
         pipeline,
+        "prepare_fixed_routing",
+        lambda **kwargs: captured.setdefault("fixed_routing", kwargs) or "routing",
+    )
+    monkeypatch.setattr(
+        pipeline,
         "build_od_assignment_runtime_profile",
         lambda **_: SimpleNamespace(assignment_active_od=2),
     )
@@ -173,6 +178,11 @@ def test_fixed_theta_is_not_transformed(monkeypatch):
 
     assert run_args["dim"] == 2
     assert float(captured["forward_calls"][0]["theta"]) == pytest.approx(3.5)
+    assert captured["fixed_routing"] == {
+        "inputs": "assignment-inputs",
+        "theta": 3.5,
+    }
+    assert captured["forward_calls"][0]["fixed_routing"] == captured["fixed_routing"]
     assert np.all(result.theta_samples == 3.5)
     assert result.theta_mean == pytest.approx(3.5)
     assert result.theta_sd == pytest.approx(0.0)

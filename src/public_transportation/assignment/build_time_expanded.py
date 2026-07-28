@@ -46,6 +46,7 @@ from typing import Any, Iterable, TYPE_CHECKING
 
 import numpy as np
 import warnings
+import jax
 import jax.numpy as jnp
 
 from .config import AssignmentConfig
@@ -747,7 +748,6 @@ def _build_links(
     for stop_id in common_stops:
         arr_items = sorted(arr_events_by_stop[stop_id], key=lambda z: z[0])
         dep_items = sorted(dep_events_by_stop[stop_id], key=lambda z: z[0])
-        arr_times = np.asarray([it[0] for it in arr_items], dtype=int)
         dep_times = np.asarray([it[0] for it in dep_items], dtype=int)
         n_arr = len(arr_items)
         n_dep = len(dep_items)
@@ -849,6 +849,7 @@ def build_jax_graph(
     scenario: "Scenario",
     *,
     config: AssignmentConfig,
+    profile: dict[str, float] | None = None,
 ) -> JaxGraph:
     """
     Build a static, JAX-compatible time-expanded graph from a validated Scenario.
@@ -857,12 +858,24 @@ def build_jax_graph(
     :param config: Assignment configuration.
     :return: JaxGraph with immutable arrays.
     """
-    config.validate()
+    from time import perf_counter
 
+    def record(name: str, started: float) -> None:
+        if profile is not None:
+            profile[name] = perf_counter() - started
+
+    started = perf_counter()
+    config.validate()
+    record("graph_configuration_validation", started)
+
+    started = perf_counter()
     nodes = _build_nodes(scenario, config=config)
+    record("stop_trip_line_timetable_time_bin_indexing_and_nodes", started)
+    started = perf_counter()
     tail, head, link_type, travel_time_min, capacity, link_trip_index = _build_links(
         scenario, nodes, config=config
     )
+    record("link_creation_and_concatenation", started)
 
     num_nodes = int(nodes.node_time_min.shape[0])
     num_links = int(tail.shape[0])
@@ -881,28 +894,37 @@ def build_jax_graph(
     #   NODE_KIND_CENTROID_IN  <  NODE_KIND_EVENT_ARR  <  NODE_KIND_EVENT_DEP  <  NODE_KIND_CENTROID_OUT
     #
     # We enforce this robustly by lexicographic sort on (time, phase).
+    started = perf_counter()
     kind = nodes.node_kind.astype(int)
     time = nodes.node_time_min.astype(float)
     topo_order = np.lexsort((kind, time)).astype(int)  # primary: time, secondary: kind
     topo_order_rev = topo_order[::-1].copy()
+    record("link_and_node_sorting_canonicalization", started)
 
     # CSR outgoing adjacency
+    started = perf_counter()
     out_start, out_links_csr = _build_csr_outgoing(num_nodes, tail)
+    record("csr_adjacency_construction", started)
 
     # Padded outgoing adjacency
+    started = perf_counter()
     out_links_pad, out_mask = _build_padded_outgoing(
         num_nodes=num_nodes,
         out_start=out_start,
         out_links_csr=out_links_csr,
     )
+    record("mask_and_padded_array_construction", started)
 
     # Python-side metadata
+    started = perf_counter()
     trips = list(scenario.timetable.trips)
     trip_ids = tuple([str(getattr(tr, "trip_id")) for tr in trips])
     trip_line_ref = tuple([_trip_line_id(tr) for tr in trips])
     stop_ids_sorted = nodes.stop_ids
+    record("graph_metadata_and_diagnostic_construction", started)
 
-    return JaxGraph(
+    started = perf_counter()
+    graph = JaxGraph(
         num_nodes=num_nodes,
         num_links=num_links,
         tail=jnp.asarray(tail),
@@ -929,3 +951,6 @@ def build_jax_graph(
         trip_id=trip_ids,
         trip_line_ref=trip_line_ref,
     )
+    jax.block_until_ready(graph)
+    record("graph_numpy_to_jax_device_transfer_and_synchronization", started)
+    return graph

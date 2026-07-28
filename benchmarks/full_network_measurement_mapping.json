@@ -1,0 +1,89 @@
+{
+  "aggregation_benchmark": {
+    "event_aligned": {
+      "compilation_seconds": 0.02813891600817442,
+      "first_execution_seconds": 0.0003233329625800252,
+      "lowering_seconds": 0.004167792038060725,
+      "warm_median_seconds": 0.00010833400301635265
+    },
+    "generic": {
+      "compilation_seconds": 0.040446790982969105,
+      "first_execution_seconds": 0.0006088750087656081,
+      "lowering_seconds": 0.0039084579912014306,
+      "warm_median_seconds": 0.0004823750350624323
+    },
+    "maximum_prediction_difference": 0.0
+  },
+  "dimensions": {
+    "links": 1456458,
+    "mapping_contributions": 431849,
+    "measurements": 426436,
+    "nodes": 433462,
+    "unique_contributing_links": 431849
+  },
+  "mode": "event_indexed_strict_mapping",
+  "multiplicity": {
+    "alighting": {
+      "maximum": 1,
+      "mean": 1.0,
+      "measurements": 213218,
+      "minimum": 1,
+      "multiple_links": 0,
+      "one_link": 213218
+    },
+    "boarding": {
+      "maximum": 2,
+      "mean": 1.0253871624346913,
+      "measurements": 213218,
+      "minimum": 1,
+      "multiple_links": 5413,
+      "one_link": 207805
+    },
+    "histogram": {
+      "1": 421023,
+      "2": 5413
+    },
+    "maximum": 2,
+    "mean": 1.0126935812173457,
+    "minimum": 1,
+    "multiple_link_measurements": 5413,
+    "one_link_measurements": 421023
+  },
+  "peak_rss_bytes": 9991782400,
+  "phases": {
+    "assignment_preparation_seconds": 5.687564916966949,
+    "id_manager_seconds": 2.7436054589925334,
+    "measurement_csv_seconds": 1.726507915998809,
+    "scenario_loading_seconds": 22.635428125038743
+  },
+  "platform": {
+    "architecture": "arm64",
+    "backend": "cpu",
+    "device": "TFRT_CPU_0",
+    "system": "macOS-26.5.2-arm64-arm-64bit"
+  },
+  "profile": {
+    "alighting_measurements": 213218,
+    "array_assembly_seconds": 0.42167820798931643,
+    "boarding_measurements": 213218,
+    "device_synchronization_seconds": 2.037500962615013e-05,
+    "index_seconds": 0.24174254201352596,
+    "maximum_links_per_measurement": 2,
+    "mean_links_per_measurement": 1.0126935812173457,
+    "minimum_links_per_measurement": 1,
+    "num_contributions": 431849,
+    "num_measurements": 426436,
+    "record_resolution_seconds": 1.642413416004274,
+    "total_seconds": 2.3123274160316214
+  },
+  "schema_version": 1,
+  "storage_bytes": {
+    "event_aligned_primary": 1705744,
+    "event_aligned_secondary_link": 21652,
+    "event_aligned_secondary_measurement": 21652,
+    "link_index": 1727396,
+    "measurement_index": 1727396,
+    "observations": 1705744
+  },
+  "total_process_seconds": 35.46356254199054
+}

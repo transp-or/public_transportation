@@ -19,6 +19,26 @@ class AssignmentMappingIndex:
     trip_index_by_id: dict[str, int]
     trip_indices_by_line_id: dict[str, list[int]]
     event_node_index: dict[tuple[int, int, int, int], int]  # (kind, stop_i, trip_i, time_s) -> node_id
+    boarding_link_start: np.ndarray
+    boarding_link_index: np.ndarray
+    alighting_link_start: np.ndarray
+    alighting_link_index: np.ndarray
+
+
+def _event_link_csr(
+    *, num_nodes: int, event_node: np.ndarray, link_index: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Create stable node-to-link CSR arrays in one linear-size preparation."""
+    nodes = np.asarray(event_node, dtype=np.int64)
+    links = np.asarray(link_index, dtype=np.int32)
+    order = np.argsort(nodes, kind="stable")
+    sorted_nodes = nodes[order]
+    sorted_links = np.ascontiguousarray(links[order])
+    counts = np.bincount(sorted_nodes, minlength=num_nodes)
+    start = np.empty((num_nodes + 1,), dtype=np.int64)
+    start[0] = 0
+    np.cumsum(counts, out=start[1:])
+    return start, sorted_links
 
 
 def build_assignment_mapping_index(idm: AssignmentIDManager) -> AssignmentMappingIndex:
@@ -58,12 +78,51 @@ def build_assignment_mapping_index(idm: AssignmentIDManager) -> AssignmentMappin
             )
         idx[key] = int(node_id)
 
+    access_links = np.flatnonzero(
+        idm.link_type == int(LINK_TYPE_ACCESS)
+    ).astype(np.int32)
+    boarding_start, boarding_links = _event_link_csr(
+        num_nodes=int(idm.num_nodes),
+        event_node=idm.link_head[access_links],
+        link_index=access_links,
+    )
+    egress_links = np.flatnonzero(
+        idm.link_type == int(LINK_TYPE_EGRESS)
+    ).astype(np.int32)
+    alighting_start, alighting_links = _event_link_csr(
+        num_nodes=int(idm.num_nodes),
+        event_node=idm.link_tail[egress_links],
+        link_index=egress_links,
+    )
+
     return AssignmentMappingIndex(
         stop_index_by_id=stop_index_by_id,
         trip_index_by_id=trip_index_by_id,
         trip_indices_by_line_id=trip_indices_by_line_id,
         event_node_index=idx,
+        boarding_link_start=boarding_start,
+        boarding_link_index=boarding_links,
+        alighting_link_start=alighting_start,
+        alighting_link_index=alighting_links,
     )
+
+
+def indexed_links_for_boarding(
+    index: AssignmentMappingIndex, dep_node: int
+) -> np.ndarray:
+    """Return access links entering a departure node from the prepared CSR."""
+    start = int(index.boarding_link_start[dep_node])
+    end = int(index.boarding_link_start[dep_node + 1])
+    return index.boarding_link_index[start:end]
+
+
+def indexed_links_for_alighting(
+    index: AssignmentMappingIndex, arr_node: int
+) -> np.ndarray:
+    """Return egress links leaving an arrival node from the prepared CSR."""
+    start = int(index.alighting_link_start[arr_node])
+    end = int(index.alighting_link_start[arr_node + 1])
+    return index.alighting_link_index[start:end]
 
 
 def links_for_boarding(idm: AssignmentIDManager, dep_node: int) -> np.ndarray:

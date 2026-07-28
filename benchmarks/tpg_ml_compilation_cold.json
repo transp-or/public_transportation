@@ -1,0 +1,80 @@
+{
+  "compilation": {
+    "compilation_seconds": 0.12035983300302178,
+    "executable_loading_seconds": 2.6249908842146397e-06,
+    "first_execution_seconds": 0.0014257090515457094,
+    "lowered_text_bytes": 16790,
+    "lowering_seconds": 0.010208542051259428,
+    "tracing_seconds": 0.026168083015363663
+  },
+  "persistent_compilation_cache": {
+    "directory": null,
+    "enabled": false,
+    "files_after": {},
+    "files_before": {},
+    "inferred_hit": false,
+    "new_files": []
+  },
+  "platform": {
+    "architecture": "arm64",
+    "backend": "cpu",
+    "device": "TFRT_CPU_0",
+    "system": "macOS-26.5.2-arm64-arm-64bit",
+    "x64_enabled": false
+  },
+  "preparation": {
+    "operator_cache_hit": true,
+    "operator_cache_load_seconds": 0.0007441250490956008,
+    "stages": {
+      "assignment_preparation": 3.2401171249803156,
+      "fixed_demand_loading": 0.017969249980524182,
+      "id_manager": 0.03054254100425169,
+      "map_problem_construction": 0.6140732080093585,
+      "measurement_loading": 0.04612408304819837,
+      "measurement_mapping": 0.045453125028871,
+      "parameter_layout": 0.04217370803235099,
+      "prior_baseline": 0.009890542016364634,
+      "scenario_loading": 0.34962716698646545
+    },
+    "wall_seconds": 4.633716458978597
+  },
+  "problem": {
+    "bcoo_index_shape": [
+      158219,
+      2
+    ],
+    "nonzero_count": 158219,
+    "operator_dtype": "float32",
+    "operator_shape": [
+      3690,
+      15772
+    ],
+    "parameter_dtype": "float32",
+    "parameter_shape": [
+      15772
+    ]
+  },
+  "run_ml": {
+    "first_evaluation_seconds": 0.0009952079853974283,
+    "function_evaluations": 4,
+    "gradient_evaluations": 4,
+    "gradient_norm_final": 77.66635056441159,
+    "iterations": 1,
+    "objective_evaluations": 4,
+    "objective_final": 55243.4375,
+    "optimization_seconds": 0.30326183303259313
+  },
+  "total_process_seconds": 5.799901999998838,
+  "versions": {
+    "jax": "0.8.1",
+    "jaxlib": "0.8.1"
+  },
+  "warm_execution_median_seconds": 0.0009750829776749015,
+  "warm_execution_seconds": [
+    0.0009707080316729844,
+    0.0009750829776749015,
+    0.0009561249753460288,
+    0.0010930420248769224,
+    0.0010735420510172844
+  ]
+}

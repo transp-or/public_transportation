@@ -27,6 +27,18 @@ from .compact_od_assignment_layout import (  # noqa: F401
     build_compact_od_assignment_layout,
 )
 from .compact_od_groups import compact_od_groups  # noqa: F401
+from .fixed_routing_measurement_operator import (  # noqa: F401
+    FixedRoutingMeasurementOperator,
+    MeasurementOperatorMetrics,
+    choose_fixed_measurement_operator,
+    fixed_routing_measurement_operator_cache_path,
+    load_fixed_routing_measurement_operator,
+    load_or_prepare_fixed_routing_measurement_operator,
+    predict_measurements_fixed_operator,
+    prepare_fixed_routing_measurement_operator,
+    save_fixed_routing_measurement_operator,
+    validate_fixed_routing_measurement_operator,
+)
 from .maximum_likelihood_pipeline import (  # noqa: F401
     ODThetaMLProblem,
     build_od_theta_ml_problem,
@@ -44,4 +56,16 @@ from .likelihood import (  # noqa: F401
     predict_y,
     predict_mu,
     loglikelihood_from_link_flow,
+    loglikelihood_from_measurement_mean,
+)
+from .fixed_routing_group import (  # noqa: F401
+    SingleGroupAssignment,
+    assemble_single_group_demand,
+    build_single_free_group_assignment,
+)
+from .matrix_free_streaming import (  # noqa: F401
+    StreamedDestinationGroup,
+    StreamedValueAndGradient,
+    replayable_streamed_measurement_value_and_grad,
+    streamed_measurement_value_and_grad,
 )

@@ -1,0 +1,49 @@
+{
+  "operator": {
+    "indices_sorted": true,
+    "nonzero_count": 158219,
+    "shape": [
+      3690,
+      15772
+    ],
+    "unique_indices": true
+  },
+  "variants": [
+    {
+      "compile_seconds": 0.11859525000909343,
+      "first_execution_seconds": 0.0015598340542055666,
+      "gradient_max_absolute_difference": 0.0,
+      "gradient_norm": 98.09233093261719,
+      "lower_seconds": 0.01531637500738725,
+      "name": "bcoo_matvec",
+      "objective": 31694.955078125,
+      "objective_absolute_difference": 0.0,
+      "trace_seconds": 0.022906708007212728,
+      "warm_median_seconds": 0.0010726249893195927
+    },
+    {
+      "compile_seconds": 0.11548720800783485,
+      "first_execution_seconds": 0.001337457972113043,
+      "gradient_max_absolute_difference": 0.0,
+      "gradient_norm": 98.09233093261719,
+      "lower_seconds": 0.009575459000188857,
+      "name": "direct_scatter",
+      "objective": 31694.955078125,
+      "objective_absolute_difference": 0.0,
+      "trace_seconds": 0.006283207971137017,
+      "warm_median_seconds": 0.0009437079716008157
+    },
+    {
+      "compile_seconds": 0.11160875001223758,
+      "first_execution_seconds": 0.0014193750103004277,
+      "gradient_max_absolute_difference": 0.0,
+      "gradient_norm": 98.09233093261719,
+      "lower_seconds": 0.009641208045650274,
+      "name": "sorted_segment_sum",
+      "objective": 31694.955078125,
+      "objective_absolute_difference": 0.0,
+      "trace_seconds": 0.004625333996955305,
+      "warm_median_seconds": 0.0009730210003908724
+    }
+  ]
+}

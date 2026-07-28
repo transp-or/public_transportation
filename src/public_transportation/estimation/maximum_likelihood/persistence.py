@@ -32,6 +32,7 @@ def save_ml_result(
         "num_iterations": result.num_iterations,
         "num_function_evaluations": result.num_function_evaluations,
         "num_gradient_evaluations": result.num_gradient_evaluations,
+        "num_compiled_evaluations": result.num_compiled_evaluations,
         "runtime_seconds": result.runtime_seconds,
         "timestamp": result.timestamp,
     }
@@ -49,9 +50,7 @@ def save_ml_result(
             else result.covariance_matrix
         ),
         standard_errors=(
-            np.asarray([])
-            if result.standard_errors is None
-            else result.standard_errors
+            np.asarray([]) if result.standard_errors is None else result.standard_errors
         ),
         z_values=np.asarray([]) if result.z_values is None else result.z_values,
     )
@@ -83,7 +82,9 @@ def save_ml_result(
 
     if save_scipy_result:
         try:
-            np.save(output_path / "scipy_result.npy", result.scipy_result, allow_pickle=True)
+            np.save(
+                output_path / "scipy_result.npy", result.scipy_result, allow_pickle=True
+            )
         except Exception as exc:
             raise ValueError("Unable to save scipy_result.") from exc
 
@@ -105,7 +106,9 @@ def load_ml_result(
 
     scipy_result: Any | None = None
     if load_scipy_result and (input_path / "scipy_result.npy").exists():
-        scipy_result = np.load(input_path / "scipy_result.npy", allow_pickle=True).item()
+        scipy_result = np.load(
+            input_path / "scipy_result.npy", allow_pickle=True
+        ).item()
 
     return MLResult(
         dim=int(metadata["dim"]),
@@ -133,5 +136,11 @@ def load_ml_result(
         runtime_seconds=float(metadata["runtime_seconds"]),
         timestamp=str(metadata["timestamp"]),
         optimization_trace=arrays["optimization_trace"],
+        num_compiled_evaluations=int(
+            metadata.get(
+                "num_compiled_evaluations",
+                metadata["num_function_evaluations"],
+            )
+        ),
         scipy_result=scipy_result,
     )

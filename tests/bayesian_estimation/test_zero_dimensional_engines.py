@@ -62,6 +62,7 @@ def test_ml_bypasses_scipy_for_zero_dimensional_problem():
     assert result.dim == 0
     assert result.theta_hat.shape == (0,)
     assert result.objective_value == 3.5
+    assert result.num_compiled_evaluations == 0
     assert result.hessian is not None and result.hessian.shape == (0, 0)
     assert "optimizer bypassed" in result.message
 
