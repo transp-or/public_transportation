@@ -36,3 +36,6 @@ version = {attr = "public_transportation.version.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
