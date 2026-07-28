@@ -1,0 +1,61 @@
+=== Allocation ===
+job_id=65852705
+node=jst371
+submit_dir=/home/bierlair/github/public_transportation
+repository=/home/bierlair/github/public_transportation
+cpus_per_task=4
+memory_per_node=16384
+tmpdir=/tmp/65852705
+=== Revisions ===
+?? jedtests/jed-validation-65852705.out
+dff84f5 Updated validation.run
+40624a5 Updated distribution
+=== Runtime ===
+host: jst371
+python: 3.14.5
+jax: 0.11.0
+numpyro: 0.21.0
+backend: cpu
+devices: [CpuDevice(id=0)]
+package: /home/bierlair/github/public_transportation/src/public_transportation/__init__.py
+=== Ruff ===
+All checks passed!
+=== Pytest ===
+============================= test session starts ==============================
+platform linux -- Python 3.14.5, pytest-9.0.3, pluggy-1.6.0
+rootdir: /home/bierlair/github/public_transportation
+configfile: pyproject.toml
+collected 909 items / 2 errors
+
+==================================== ERRORS ====================================
+__ ERROR collecting tests/bayesian_estimation/test_fixed_routing_baseline.py ___
+ImportError while importing test module '/home/bierlair/github/public_transportation/tests/bayesian_estimation/test_fixed_routing_baseline.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+../../.local/share/uv/python/cpython-3.14.5-linux-x86_64-gnu/lib/python3.14/importlib/__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/bayesian_estimation/test_fixed_routing_baseline.py:11: in <module>
+    from benchmarks.benchmark_fixed_routing_baseline import build_baseline_setup
+E   ModuleNotFoundError: No module named 'benchmarks'
+_ ERROR collecting tests/bayesian_estimation/test_fixed_routing_performance_benchmark.py _
+ImportError while importing test module '/home/bierlair/github/public_transportation/tests/bayesian_estimation/test_fixed_routing_performance_benchmark.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+../../.local/share/uv/python/cpython-3.14.5-linux-x86_64-gnu/lib/python3.14/importlib/__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/bayesian_estimation/test_fixed_routing_performance_benchmark.py:5: in <module>
+    from benchmarks.benchmark_fixed_routing_performance import run_benchmark
+E   ModuleNotFoundError: No module named 'benchmarks'
+=============================== warnings summary ===============================
+src/public_transportation/assignment/costs.py:263
+  /home/bierlair/github/public_transportation/src/public_transportation/assignment/costs.py:263: SyntaxWarning: "\e" is an invalid escape sequence. Such sequences will not work in the future. Did you mean "\\e"? A raw string is also an option.
+    Let ``x_\ell`` be the predicted flow on link ``\ell`` and ``c_\ell`` its generalized
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+ERROR tests/bayesian_estimation/test_fixed_routing_baseline.py
+ERROR tests/bayesian_estimation/test_fixed_routing_performance_benchmark.py
+!!!!!!!!!!!!!!!!!!! Interrupted: 2 errors during collection !!!!!!!!!!!!!!!!!!!!
+======================== 1 warning, 2 errors in 30.27s =========================
