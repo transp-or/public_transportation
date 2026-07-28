@@ -1,0 +1,157 @@
+#!/bin/bash
+#SBATCH --job-name=pt-tpg-operator
+#SBATCH --account=transpor
+#SBATCH --partition=bigmem
+#SBATCH --qos=serial
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=128G
+#SBATCH --time=02:00:00
+#SBATCH --output=jedtests/jed-tpg-benchmark-%j.out
+
+set -euo pipefail
+
+PUBLIC_REPOSITORY="${SLURM_SUBMIT_DIR:-$HOME/github/public_transportation}"
+TPG_REPOSITORY="$PUBLIC_REPOSITORY/../public_transport_TPG"
+TPG_HARNESS="$TPG_REPOSITORY/models/two_lines_morning_time/profile_map.py"
+UV_EXECUTABLE="$HOME/.local/bin/uv"
+RESULT_DIRECTORY="$PUBLIC_REPOSITORY/jedtests/tpg-benchmark-$SLURM_JOB_ID"
+CACHE_ROOT="${TMPDIR:-/tmp}/tpg-operator-cache-$SLURM_JOB_ID"
+
+if [[ ! -f "$PUBLIC_REPOSITORY/pyproject.toml" ]]; then
+    echo "ERROR: submit this job from the public_transportation repository root." >&2
+    exit 2
+fi
+if [[ ! -f "$TPG_HARNESS" ]]; then
+    echo "ERROR: TPG harness not found at $TPG_HARNESS" >&2
+    exit 2
+fi
+if [[ ! -x "$UV_EXECUTABLE" ]]; then
+    echo "ERROR: uv not found at $UV_EXECUTABLE" >&2
+    exit 2
+fi
+if [[ ! -x /usr/bin/time ]]; then
+    echo "ERROR: GNU time not found at /usr/bin/time" >&2
+    exit 2
+fi
+
+cd "$PUBLIC_REPOSITORY"
+unset VIRTUAL_ENV
+export JAX_PLATFORM_NAME=cpu
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export OMP_NUM_THREADS="$SLURM_CPUS_PER_TASK"
+export OPENBLAS_NUM_THREADS="$SLURM_CPUS_PER_TASK"
+export MKL_NUM_THREADS="$SLURM_CPUS_PER_TASK"
+export MPLCONFIGDIR="${TMPDIR:-/tmp}/matplotlib"
+export XDG_CACHE_HOME="${TMPDIR:-/tmp}/xdg-cache"
+mkdir -p "$RESULT_DIRECTORY" "$CACHE_ROOT" "$MPLCONFIGDIR" "$XDG_CACHE_HOME"
+
+{
+    echo "job_id=$SLURM_JOB_ID"
+    echo "node=$SLURM_JOB_NODELIST"
+    echo "cpus_per_task=$SLURM_CPUS_PER_TASK"
+    echo "memory_per_node_mib=${SLURM_MEM_PER_NODE:-not-set}"
+    echo "tmpdir=${TMPDIR:-not-set}"
+    echo "public_repository=$PUBLIC_REPOSITORY"
+    echo "public_revision=$(git rev-parse HEAD)"
+    echo "tpg_repository=$TPG_REPOSITORY"
+    echo "tpg_revision=$(git -C "$TPG_REPOSITORY" rev-parse HEAD)"
+    "$UV_EXECUTABLE" run --frozen python --version
+    "$UV_EXECUTABLE" run --frozen python - <<'PY'
+import jax
+import jaxlib
+import numpyro
+
+print("jax=" + jax.__version__)
+print("jaxlib=" + jaxlib.__version__)
+print("numpyro=" + numpyro.__version__)
+print("backend=" + jax.default_backend())
+print("devices=" + repr(jax.devices()))
+PY
+} | tee "$RESULT_DIRECTORY/manifest.txt"
+
+run_profile() {
+    local label="$1"
+    local mode="$2"
+    local chunk_size="$3"
+    local iterations="$4"
+    local warm_evaluations="$5"
+    local cache_directory="$6"
+    local expected_evaluations="$7"
+    local output_directory="$RESULT_DIRECTORY/$label"
+
+    mkdir -p "$output_directory" "$cache_directory"
+    echo "=== Starting $label ==="
+    echo "mode=$mode chunk=$chunk_size iterations=$iterations cache=$cache_directory"
+
+    /usr/bin/time -v \
+        -o "$output_directory/time.txt" \
+        "$UV_EXECUTABLE" run --frozen python "$TPG_HARNESS" \
+        --max-iterations "$iterations" \
+        --warm-evaluations "$warm_evaluations" \
+        --fixed-measurement-operator "$mode" \
+        --operator-chunk-size "$chunk_size" \
+        --operator-cache-directory "$cache_directory" \
+        --operator-expected-evaluations "$expected_evaluations" \
+        --operator-construction-seconds 66.6 \
+        --output-root "$output_directory/profiles" \
+        2>&1 | tee "$output_directory/stdout.log"
+
+    local profile
+    profile=$(find "$output_directory/profiles" -name profile.json -type f -print -quit)
+    if [[ -z "$profile" ]]; then
+        echo "ERROR: $label did not produce profile.json" >&2
+        exit 3
+    fi
+    cp "$profile" "$output_directory/profile.json"
+    echo "=== Completed $label ==="
+    tail -n 1 "$output_directory/stdout.log"
+    grep "Maximum resident set size" "$output_directory/time.txt" || true
+}
+
+echo "=== Construction benchmark ==="
+for chunk_size in 128 256 512 1024 2048; do
+    run_profile \
+        "construction-$chunk_size" \
+        bcoo \
+        "$chunk_size" \
+        1 \
+        3 \
+        "$CACHE_ROOT/chunk-$chunk_size" \
+        4
+done
+
+echo "=== Existing-harness comparison ==="
+for iterations in 1 5 20; do
+    case "$iterations" in
+        1) expected_evaluations=4 ;;
+        5) expected_evaluations=8 ;;
+        20) expected_evaluations=24 ;;
+    esac
+    run_profile \
+        "loader-$iterations" \
+        off \
+        1024 \
+        "$iterations" \
+        3 \
+        "$CACHE_ROOT/unused-loader-$iterations" \
+        "$expected_evaluations"
+    run_profile \
+        "cached-auto-$iterations" \
+        auto \
+        1024 \
+        "$iterations" \
+        3 \
+        "$CACHE_ROOT/chunk-1024" \
+        "$expected_evaluations"
+done
+
+echo "=== Result inventory ==="
+find "$RESULT_DIRECTORY" -type f -printf '%P\t%s bytes\n' | sort
+
+echo "=== Slurm resource snapshot ==="
+sstat --jobs="${SLURM_JOB_ID}.batch" \
+    --format=JobID,AveCPU,MaxRSS,MaxVMSize 2>/dev/null || true
+
+echo "TPG benchmark complete: $RESULT_DIRECTORY"
