@@ -1,0 +1,44 @@
+{
+  "example": "simple_example_01",
+  "forward_equivalence": {
+    "absolute_tolerance": 5e-05,
+    "cases": [
+      {
+        "max_abs_difference": 3.814697265625e-06,
+        "name": "zero",
+        "rms_difference": 1.1012082465927615e-06
+      },
+      {
+        "max_abs_difference": 8.028000593185425e-07,
+        "name": "prior",
+        "rms_difference": 3.5990275762706705e-07
+      },
+      {
+        "max_abs_difference": 3.4570693969726562e-06,
+        "name": "true",
+        "rms_difference": 1.4052559030018867e-06
+      },
+      {
+        "max_abs_difference": 2.854512150207711e-06,
+        "name": "seeded_random",
+        "rms_difference": 1.105198613278385e-06
+      }
+    ],
+    "passed": true,
+    "relative_tolerance": 5e-05,
+    "worst_max_abs_difference": 3.814697265625e-06
+  },
+  "noise_free_recovery": {
+    "estimation_error_norm": 1.4862067603866e-14,
+    "identifiable_error_norm": 1.4862067603865995e-14,
+    "measurement_nullity": 0,
+    "measurement_rank": 4,
+    "measurement_residual_inf_norm": 1.4210854715202004e-14,
+    "null_space_error_norm": 7.698975290363477e-30,
+    "projected_gradient_inf_norm": 2.8028530553513513e-14,
+    "rank_tolerance": 3.780354960508092e-15,
+    "solver_success": true
+  },
+  "routing_parameter": 5.0,
+  "schema_version": 1
+}

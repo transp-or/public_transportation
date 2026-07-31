@@ -1,0 +1,22 @@
+{
+  "dimensions": {
+    "active_od": 628164,
+    "destination_groups": 1871,
+    "fixed_positive_od": 0,
+    "free_od": 628164,
+    "links": 1456458,
+    "logical_operator_entries": 267871743504,
+    "measurements": 426436,
+    "nodes": 433462
+  },
+  "mode": "preflight",
+  "peak_rss_bytes": 11091787776,
+  "phases": {
+    "assignment_preparation_seconds": 7.084251291991677,
+    "measurement_mapping_seconds": 5.421409167000093,
+    "od_layout_seconds": 3.9383107079775073,
+    "scenario_loading_seconds": 21.40338283398887
+  },
+  "schema_version": 1,
+  "total_seconds": 37.86850574996788
+}

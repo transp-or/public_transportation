@@ -1,0 +1,65 @@
+{
+  "configuration": {
+    "lsmr_iterations": 200,
+    "product_repeats": 2,
+    "quality_samples": 0,
+    "random_seed": 1729,
+    "regularization_strength": 1.0,
+    "solver_iterations": 50,
+    "theta": 5.0
+  },
+  "dimensions": {
+    "active_od": 96,
+    "destination_groups": 18,
+    "fixed_positive_od": 0,
+    "free_od": 96,
+    "links": 40020,
+    "logical_operator_entries": 860832,
+    "measurements": 8967,
+    "nodes": 9818
+  },
+  "mode": "matrix_free_fixed_routing_linear_pilot",
+  "peak_rss_bytes": 595902464,
+  "phases": {
+    "assignment_preparation_seconds": 0.6563374580000527,
+    "fixed_routing_preparation_seconds": 0.1542580829700455,
+    "matrix_free_operator_initialization_seconds": 0.5873974580317736,
+    "measurement_mapping_seconds": 0.11505949997808784,
+    "od_layout_seconds": 0.06009920802898705,
+    "scenario_loading_seconds": 0.2761497500468977
+  },
+  "platform": {
+    "jax_backend": "cpu",
+    "jax_device": "cpu:0",
+    "system": "macOS-26.5.2-arm64-arm-64bit-Mach-O"
+  },
+  "products": {
+    "forward_median_seconds": 0.17447645848733373,
+    "forward_seconds": [
+      0.23780299996724352,
+      0.11114991700742394
+    ],
+    "reproducibility_max_abs_difference": 0.0,
+    "transpose_median_seconds": 0.33867727100732736,
+    "transpose_seconds": [
+      0.41453995800111443,
+      0.2628145840135403
+    ]
+  },
+  "quality": null,
+  "schema_version": 1,
+  "solver": {
+    "data_objective": 55.82117213714579,
+    "elapsed_seconds": 71.00193691597087,
+    "feasibility_inf_norm": 0.0,
+    "iterations": 0,
+    "matvec_count": 198,
+    "message": "The unconstrained solution is optimal.",
+    "objective": 128.2303347127958,
+    "projected_gradient_inf_norm": 4.900071144220419e-05,
+    "rmatvec_count": 199,
+    "status": 3,
+    "success": true
+  },
+  "total_seconds": 74.38112670800183
+}

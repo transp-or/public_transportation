@@ -1,0 +1,77 @@
+{
+  "configuration": {
+    "lsmr_iterations": 10,
+    "product_repeats": 2,
+    "quality_samples": 2,
+    "random_seed": 1729,
+    "regularization_strength": 1.0,
+    "solver_iterations": 2,
+    "theta": 5.0
+  },
+  "dimensions": {
+    "active_od": 96,
+    "destination_groups": 18,
+    "fixed_positive_od": 0,
+    "free_od": 96,
+    "links": 40020,
+    "logical_operator_entries": 860832,
+    "measurements": 8967,
+    "nodes": 9818
+  },
+  "mode": "matrix_free_fixed_routing_linear_pilot",
+  "peak_rss_bytes": 595165184,
+  "phases": {
+    "assignment_preparation_seconds": 0.6645894170505926,
+    "fixed_routing_preparation_seconds": 0.15193233301397413,
+    "matrix_free_operator_initialization_seconds": 0.5868684590095654,
+    "measurement_mapping_seconds": 0.12047062499914318,
+    "od_layout_seconds": 0.061878209002316,
+    "scenario_loading_seconds": 0.2793757499894127
+  },
+  "platform": {
+    "jax_backend": "cpu",
+    "jax_device": "cpu:0",
+    "system": "macOS-26.5.2-arm64-arm-64bit-Mach-O"
+  },
+  "products": {
+    "forward_median_seconds": 0.1758738960197661,
+    "forward_seconds": [
+      0.24018958304077387,
+      0.11155820899875835
+    ],
+    "reproducibility_max_abs_difference": 0.0,
+    "transpose_median_seconds": 0.3222162289894186,
+    "transpose_seconds": [
+      0.40727133298059925,
+      0.23716112499823794
+    ]
+  },
+  "quality": {
+    "condition_estimate": NaN,
+    "effective_data_degrees_of_freedom_estimate": NaN,
+    "effective_data_degrees_of_freedom_standard_error": NaN,
+    "estimated_nullity_lower_bound": 0,
+    "estimated_rank_upper_bound": 96,
+    "largest_singular_value_estimate": NaN,
+    "resolution_converged_samples": 0,
+    "resolution_samples": 2,
+    "smallest_singular_value_estimates": [],
+    "spectral_converged": false,
+    "spectral_message": "ArpackNoConvergence: ARPACK error -1: No convergence (11 iterations, 0/1 eigenvectors converged)"
+  },
+  "schema_version": 1,
+  "solver": {
+    "data_objective": 747.6793530598998,
+    "elapsed_seconds": 3.931620582996402,
+    "feasibility_inf_norm": 0.0,
+    "iterations": 0,
+    "matvec_count": 11,
+    "message": "The unconstrained solution is optimal.",
+    "objective": 766.6751768278214,
+    "projected_gradient_inf_norm": 5.240725994110107,
+    "rmatvec_count": 12,
+    "status": 3,
+    "success": true
+  },
+  "total_seconds": 67.5922489160439
+}

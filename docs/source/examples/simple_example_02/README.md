@@ -6,3 +6,10 @@ Synthetic route-choice bus network. The reference data are in `data/`.
 estimation. A blank or omitted `fixed_flow` means zero; an explicit value fixes
 the cell at that nonnegative flow. All estimation scripts read this file and
 use the same reduced layout for Bayesian VI, maximum likelihood, and MAP.
+
+To compare unregularized, ridge-to-prior, and scaled-ridge fixed-routing linear
+least squares, run:
+
+```bash
+python estimation/run_linear_fixed_routing.py
+```

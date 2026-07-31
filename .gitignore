@@ -38,3 +38,4 @@ docs/source/examples/geneva_gtfs/pre_processing/results/structural_zeros/resolve
 benchmarks/tpg_operator_cache/fixed-routing-measurement-f3de09a4637a00bf38d51735214e60d0f314287d637286a24316a1ed7c4ec04e.npz
 /jedtests/tpg-benchmark-65852792
 jedtests/jed-tpg-benchmark-65852792.out
+*.npz

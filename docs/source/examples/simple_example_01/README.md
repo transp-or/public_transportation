@@ -98,6 +98,12 @@ or:
 python run_both.py
 ```
 
+For fixed-routing linear least squares with explicit regularization, run:
+
+```bash
+python run_linear_fixed_routing.py
+```
+
 The estimation scripts read:
 
 ```text

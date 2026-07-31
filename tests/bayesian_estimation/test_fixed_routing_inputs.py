@@ -25,10 +25,6 @@ from public_transportation.inference.assignment_adapter import (
     prepare_fixed_routing,
     validate_fixed_routing_compatibility,
 )
-from public_transportation.inference.matrix_free_streaming import (
-    StreamedDestinationGroup,
-    streamed_measurement_value_and_grad,
-)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -252,80 +248,6 @@ def test_fixed_routing_custom_adjoint_matches_ordinary_autodiff(assignment_input
     np.testing.assert_allclose(explicit_value, ordinary_value, rtol=0, atol=0)
     np.testing.assert_allclose(
         explicit_gradient, ordinary_gradient, rtol=2e-5, atol=2e-5
-    )
-
-
-def test_streamed_destination_vjps_match_monolithic_fixed_routing(assignment_inputs):
-    routing = prepare_fixed_routing(inputs=assignment_inputs, theta=1.0)
-    demand = jnp.linspace(
-        0.2,
-        2.0,
-        assignment_inputs.od_origin_node.shape[0],
-        dtype=jnp.float32,
-    )
-    num_measurements = min(7, assignment_inputs.graph.num_links)
-    groups = []
-    for group_index in range(assignment_inputs.group_dest_node.shape[0]):
-        mask = np.asarray(assignment_inputs.group_od_mask[group_index], dtype=bool)
-        full_indices = np.asarray(
-            assignment_inputs.group_od_index_padded[group_index][mask],
-            dtype=np.int32,
-        )
-        local_inputs = replace(
-            assignment_inputs,
-            group_dest_node=assignment_inputs.group_dest_node[
-                group_index : group_index + 1
-            ],
-            group_link_mask=assignment_inputs.group_link_mask[
-                group_index : group_index + 1
-            ],
-            od_origin_node=assignment_inputs.od_origin_node[full_indices],
-            group_od_index_padded=jnp.arange(
-                full_indices.size, dtype=jnp.int32
-            ).reshape(1, -1),
-            group_od_mask=jnp.ones((1, full_indices.size), dtype=bool),
-        )
-        local_routing = replace(
-            routing,
-            group_dest_node=routing.group_dest_node[group_index : group_index + 1],
-            source_group_link_mask=routing.source_group_link_mask[
-                group_index : group_index + 1
-            ],
-            effective_group_link_mask=routing.effective_group_link_mask[
-                group_index : group_index + 1
-            ],
-            group_link_probability=routing.group_link_probability[
-                group_index : group_index + 1
-            ],
-        )
-
-        def predict(local, inputs=local_inputs, fixed=local_routing):
-            return assign_link_flow_fixed_routing(
-                inputs=inputs, routing=fixed, f=local
-            )[:num_measurements]
-
-        groups.append(StreamedDestinationGroup(full_indices, predict))
-
-    def measurement_objective(prediction):
-        return jnp.sum(jnp.log1p(jnp.square(prediction)))
-
-    streamed = streamed_measurement_value_and_grad(
-        parameter=demand,
-        groups=groups,
-        num_measurements=num_measurements,
-        measurement_objective=measurement_objective,
-    )
-
-    def monolithic(value):
-        flow = assign_link_flow_fixed_routing(
-            inputs=assignment_inputs, routing=routing, f=value
-        )
-        return measurement_objective(flow[:num_measurements])
-
-    expected_value, expected_gradient = jax.value_and_grad(monolithic)(demand)
-    np.testing.assert_allclose(streamed.value, expected_value, rtol=2e-5, atol=2e-5)
-    np.testing.assert_allclose(
-        streamed.gradient, expected_gradient, rtol=3e-5, atol=3e-5
     )
 
 

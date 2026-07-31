@@ -1,0 +1,110 @@
+{
+  "conclusion": "The fixed-OD constraints match the generating demand. The unregularized linear model therefore provides the correctness reference; regularization intentionally trades fit for proximity to the prior.",
+  "example": "simple_example_01",
+  "measurement_generation": {
+    "added_observation_noise": false,
+    "routing_parameter": 5.0,
+    "source": "deterministic fixed-routing assignment of true demand"
+  },
+  "methods": {
+    "linear_none": {
+      "demand_mae": 8.913348761296902e-07,
+      "demand_max_abs_error": 1.7944896448796044e-06,
+      "demand_rmse": 1.0340602664628004e-06,
+      "distance_to_prior": 51.4198414892075,
+      "least_squares_data_objective": 7.871543076758857e-12,
+      "measurement_mae": 9.776790655576424e-07,
+      "measurement_max_abs_error": 1.7203434126145112e-06,
+      "measurement_rmse": 1.145392441971954e-06,
+      "projected_gradient_inf_norm": 3.529747290996119e-14,
+      "solver_success": true,
+      "total_objective": 7.871543076758857e-12
+    },
+    "linear_ridge_to_prior": {
+      "demand_mae": 6.296136684966886,
+      "demand_max_abs_error": 16.64595126238641,
+      "demand_rmse": 8.683435728756555,
+      "distance_to_prior": 34.06773080076298,
+      "least_squares_data_objective": 295.4453896612627,
+      "measurement_mae": 4.197425445603869,
+      "measurement_max_abs_error": 16.482384893811293,
+      "measurement_rmse": 7.017185922923599,
+      "projected_gradient_inf_norm": 1.4210854715202004e-14,
+      "solver_success": true,
+      "total_objective": 875.75053061789
+    },
+    "linear_scaled_ridge_to_prior": {
+      "demand_mae": 6.296136684966886,
+      "demand_max_abs_error": 16.64595126238641,
+      "demand_rmse": 8.683435728756555,
+      "distance_to_prior": 34.06773080076298,
+      "least_squares_data_objective": 295.4453896612627,
+      "measurement_mae": 4.197425445603869,
+      "measurement_max_abs_error": 16.482384893811293,
+      "measurement_rmse": 7.017185922923599,
+      "projected_gradient_inf_norm": 1.4210854715202004e-14,
+      "solver_success": true,
+      "total_objective": 875.75053061789
+    },
+    "nonlinear_negative_binomial_ml": {
+      "compatible_with_current_od_layout": false,
+      "current_free_od_demand_rmse": 0.004160724353637278,
+      "demand_mae": 0.0030549050220753196,
+      "demand_max_abs_error": 0.007232522459108992,
+      "demand_rmse": 0.0036596794214832774,
+      "fixed_theta": 5.0,
+      "negative_binomial_log_likelihood": -30.771984100341797,
+      "negative_binomial_objective": 63.919307708740234,
+      "optimizer_message": "Desired error not necessarily achieved due to precision loss.",
+      "prior_weight": 1.0,
+      "runtime_seconds": 1.3628973330487497,
+      "solver_success": false
+    },
+    "true_demand": {
+      "demand_mae": 0.0,
+      "demand_max_abs_error": 0.0,
+      "demand_rmse": 0.0,
+      "distance_to_prior": 51.419840528729765,
+      "least_squares_data_objective": 1.200478431939711e-11,
+      "measurement_mae": 9.963599344094594e-07,
+      "measurement_max_abs_error": 3.4570693969726562e-06,
+      "measurement_rmse": 1.4144954530030081e-06
+    }
+  },
+  "nonlinear_comparison": {
+    "archive_path": "/Users/bierlair/MyFiles/github/public_transportation/docs/source/examples/simple_example_01/estimation/results/compare_vi_ml_od_theta_results.npz",
+    "compatible_with_current_od_layout": false,
+    "interpretation": "The saved nonlinear archive predates the current OD-layout metadata and is not a controlled comparison with the current fixed-demand model. Its demand error is reported for historical context only."
+  },
+  "problem": {
+    "fixed_constraints_match_generating_truth": true,
+    "fixed_od_constraints": [
+      {
+        "difference": 0.0,
+        "fixed_value": 10.0,
+        "generating_true_value": 10.0,
+        "od_index": 0,
+        "od_key": [
+          "A",
+          "B",
+          "t0"
+        ]
+      },
+      {
+        "difference": 0.0,
+        "fixed_value": 50.0,
+        "generating_true_value": 50.0,
+        "od_index": 1,
+        "od_key": [
+          "A",
+          "B",
+          "t1"
+        ]
+      }
+    ],
+    "num_free_od": 4,
+    "num_measurements": 12,
+    "regularization_strength_for_regularized_runs": 1.0
+  },
+  "schema_version": 1
+}

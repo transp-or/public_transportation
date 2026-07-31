@@ -37,7 +37,7 @@ from .compact_od_assignment_layout import CompactODAssignmentLayout
 Array = jnp.ndarray
 OperatorRepresentation = Literal["dense", "bcoo"]
 ActivationMode = Literal["off", "auto", "dense", "bcoo"]
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 def _hash_arrays(*arrays: object) -> str:
@@ -115,6 +115,7 @@ class FixedRoutingMeasurementOperator:
     theta: float
     dtype: str
     metrics: MeasurementOperatorMetrics
+    zero_tolerance: float = 0.0
     schema_version: int = _SCHEMA_VERSION
     package_version: str = __version__
 
@@ -230,6 +231,7 @@ def _provenance(
     dtype,
     routing=None,
     theta=None,
+    zero_tolerance=0.0,
 ) -> dict[str, object]:
     return {
         "schema_version": _SCHEMA_VERSION,
@@ -246,6 +248,7 @@ def _provenance(
         else float(theta),
         "representation": representation,
         "dtype": str(np.dtype(dtype)),
+        "zero_tolerance": float(zero_tolerance),
         "num_active_od": int(inputs.od_origin_node.shape[0]),
         "num_free_od": int(inputs.od_origin_node.shape[0])
         if compact_layout is None
@@ -345,6 +348,7 @@ def prepare_fixed_routing_measurement_operator(
             float(np.asarray(routing.theta)),
             str(dtype),
             metrics,
+            zero_tolerance,
         )
     free_column = np.full(num_active, -1, np.int32)
     free_column[free_indices] = np.arange(num_free, dtype=np.int32)
@@ -547,6 +551,7 @@ def prepare_fixed_routing_measurement_operator(
         float(np.asarray(routing.theta)),
         str(dtype),
         metrics,
+        zero_tolerance,
     )
 
 
@@ -559,6 +564,7 @@ def validate_fixed_routing_measurement_operator(
     assignment_fingerprint,
     compact_layout,
     od_layout_fingerprint,
+    zero_tolerance=0.0,
 ) -> None:
     validate_fixed_routing_compatibility(inputs=inputs, routing=routing)
     expected = _provenance(
@@ -570,6 +576,7 @@ def validate_fixed_routing_measurement_operator(
         od_layout_fingerprint=od_layout_fingerprint,
         representation=operator.representation,
         dtype=inputs.base_link_cost.dtype,
+        zero_tolerance=zero_tolerance,
     )
     actual = {key: getattr(operator, key) for key in expected}
     for key, value in expected.items():
@@ -606,6 +613,7 @@ def save_fixed_routing_measurement_operator(
             "mapping_fingerprint",
             "theta",
             "dtype",
+            "zero_tolerance",
             "schema_version",
             "package_version",
         )
@@ -643,6 +651,28 @@ def load_fixed_routing_measurement_operator(
     start = perf_counter()
     with np.load(Path(path), allow_pickle=False) as archive:
         metadata = json.loads(str(archive["metadata"]))
+        if metadata.get("schema_version") != _SCHEMA_VERSION:
+            raise ValueError(
+                "Unsupported fixed-routing measurement operator schema version."
+            )
+        if metadata.get("representation") not in {"dense", "bcoo"}:
+            raise ValueError("Stored operator representation must be dense or bcoo.")
+        zero_tolerance = metadata.get("zero_tolerance")
+        if (
+            not isinstance(zero_tolerance, (int, float))
+            or not np.isfinite(zero_tolerance)
+            or zero_tolerance < 0.0
+        ):
+            raise ValueError("Stored operator zero tolerance is invalid.")
+        rows = metadata.get("num_measurements")
+        columns = metadata.get("num_free_od")
+        if (
+            not isinstance(rows, int)
+            or rows < 0
+            or not isinstance(columns, int)
+            or columns < 0
+        ):
+            raise ValueError("Stored operator dimensions are invalid.")
         metrics_payload = metadata.pop("metrics")
         metrics_payload["chunk_shape"] = tuple(metrics_payload["chunk_shape"])
         metrics = replace(
@@ -651,9 +681,22 @@ def load_fixed_routing_measurement_operator(
             cache_load_seconds=perf_counter() - start,
         )
         if metadata["representation"] == "bcoo":
-            data, indices = _canonical_bcoo_arrays(
-                np.asarray(archive["data"]), np.asarray(archive["indices"])
-            )
+            raw_data = np.asarray(archive["data"])
+            raw_indices = np.asarray(archive["indices"])
+            if raw_data.ndim != 1 or raw_indices.shape != (raw_data.size, 2):
+                raise ValueError("Stored BCOO data and indices have invalid shapes.")
+            if raw_indices.dtype.kind not in "iu":
+                raise ValueError("Stored BCOO indices must be integers.")
+            if not np.all(np.isfinite(raw_data)) or np.any(raw_data < 0.0):
+                raise ValueError("Stored BCOO data must be finite and non-negative.")
+            if raw_indices.size and (
+                np.any(raw_indices[:, 0] < 0)
+                or np.any(raw_indices[:, 0] >= rows)
+                or np.any(raw_indices[:, 1] < 0)
+                or np.any(raw_indices[:, 1] >= columns)
+            ):
+                raise ValueError("Stored BCOO indices are out of bounds.")
+            data, indices = _canonical_bcoo_arrays(raw_data, raw_indices)
             matrix = jsparse.BCOO(
                 (jnp.asarray(data), jnp.asarray(indices)),
                 shape=(metadata["num_measurements"], metadata["num_free_od"]),
@@ -661,8 +704,22 @@ def load_fixed_routing_measurement_operator(
                 unique_indices=True,
             )
         else:
-            matrix = jnp.asarray(archive["matrix"])
-        offset = jnp.asarray(archive["offset"])
+            dense = np.asarray(archive["matrix"])
+            if dense.shape != (rows, columns):
+                raise ValueError("Stored dense operator has an invalid shape.")
+            if not np.all(np.isfinite(dense)) or np.any(dense < 0.0):
+                raise ValueError(
+                    "Stored dense operator must be finite and non-negative."
+                )
+            matrix = jnp.asarray(dense)
+        stored_offset = np.asarray(archive["offset"])
+        if stored_offset.shape != (rows,):
+            raise ValueError("Stored fixed measurement offset has an invalid shape.")
+        if not np.all(np.isfinite(stored_offset)) or np.any(stored_offset < 0.0):
+            raise ValueError(
+                "Stored fixed measurement offset must be finite and non-negative."
+            )
+        offset = jnp.asarray(stored_offset)
     return FixedRoutingMeasurementOperator(
         matrix=matrix, fixed_measurement_offset=offset, metrics=metrics, **metadata
     )
@@ -686,6 +743,7 @@ def fixed_routing_measurement_operator_cache_path(
     representation="bcoo",
     routing=None,
     theta=None,
+    zero_tolerance=0.0,
 ) -> Path:
     """Resolve the exact provenance-keyed cache path without accessing it."""
     provenance = _provenance(
@@ -698,6 +756,7 @@ def fixed_routing_measurement_operator_cache_path(
         od_layout_fingerprint=od_layout_fingerprint,
         representation=representation,
         dtype=inputs.base_link_cost.dtype,
+        zero_tolerance=zero_tolerance,
     )
     return cached_operator_path(cache_directory, **provenance)
 
@@ -712,6 +771,7 @@ def load_valid_cached_fixed_routing_measurement_operator(
     compact_layout=None,
     od_layout_fingerprint=None,
     representation="bcoo",
+    zero_tolerance=0.0,
 ) -> FixedRoutingMeasurementOperator | None:
     """Load and validate a cache hit without computing routing probabilities."""
     provenance = _provenance(
@@ -723,6 +783,7 @@ def load_valid_cached_fixed_routing_measurement_operator(
         od_layout_fingerprint=od_layout_fingerprint,
         representation=representation,
         dtype=inputs.base_link_cost.dtype,
+        zero_tolerance=zero_tolerance,
     )
     path = cached_operator_path(cache_directory, **provenance)
     if not path.exists():
@@ -766,6 +827,7 @@ def load_or_prepare_fixed_routing_measurement_operator(
         od_layout_fingerprint=od_layout_fingerprint,
         representation=representation,
         dtype=inputs.base_link_cost.dtype,
+        zero_tolerance=zero_tolerance,
     )
     path = cached_operator_path(cache_directory, **provenance)
     if path.exists():
@@ -779,6 +841,7 @@ def load_or_prepare_fixed_routing_measurement_operator(
                 assignment_fingerprint=assignment_fingerprint,
                 compact_layout=compact_layout,
                 od_layout_fingerprint=od_layout_fingerprint,
+                zero_tolerance=zero_tolerance,
             )
             return operator
         except (ValueError, KeyError, OSError, json.JSONDecodeError):

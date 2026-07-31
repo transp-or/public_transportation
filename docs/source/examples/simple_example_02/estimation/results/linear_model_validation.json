@@ -1,0 +1,63 @@
+{
+  "actual_observations_at_true_demand": {
+    "residual_inf_norm": 9.229560328094522e-05,
+    "residual_rmse": 7.007495015283388e-06
+  },
+  "example": "simple_example_02",
+  "fixed_constraints_match_generating_truth": true,
+  "fixed_od_constraints": [
+    {
+      "fixed_value": 18.0,
+      "generating_true_value": 18.0,
+      "od_index": 0,
+      "od_key": [
+        "A",
+        "H",
+        "t0"
+      ]
+    },
+    {
+      "fixed_value": 42.0,
+      "generating_true_value": 42.0,
+      "od_index": 1,
+      "od_key": [
+        "A",
+        "H",
+        "t1"
+      ]
+    }
+  ],
+  "forward_equivalence": {
+    "cases": [
+      {
+        "max_abs_difference": 3.814697265625e-06,
+        "name": "zero"
+      },
+      {
+        "max_abs_difference": 3.5281555028632283e-06,
+        "name": "prior"
+      },
+      {
+        "max_abs_difference": 4.366040229797363e-06,
+        "name": "true"
+      },
+      {
+        "max_abs_difference": 2.278243925957213e-06,
+        "name": "seeded_random"
+      }
+    ],
+    "passed": true,
+    "worst_max_abs_difference": 4.366040229797363e-06
+  },
+  "noise_free_recovery": {
+    "estimation_error_norm": 5.59217827668872e-13,
+    "identifiable_error_norm": 5.592178276688723e-13,
+    "measurement_nullity": 0,
+    "measurement_rank": 70,
+    "measurement_residual_inf_norm": 4.1033842990145786e-13,
+    "null_space_error_norm": 9.097676527699908e-28,
+    "solver_success": true
+  },
+  "routing_parameter": 1.0,
+  "schema_version": 1
+}

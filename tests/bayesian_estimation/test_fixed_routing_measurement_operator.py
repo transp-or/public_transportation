@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
+import shutil
 from dataclasses import replace
 from pathlib import Path
-import shutil
 
 import jax
 import jax.numpy as jnp
@@ -23,11 +24,32 @@ from public_transportation.inference.compact_od_assignment_layout import (
 from public_transportation.inference.fixed_routing_measurement_operator import (
     choose_fixed_measurement_operator,
     fixed_routing_measurement_operator_cache_path,
+    load_fixed_routing_measurement_operator,
     load_or_prepare_fixed_routing_measurement_operator,
     measurement_mapping_fingerprint,
     predict_measurements_fixed_operator,
     prepare_fixed_routing_measurement_operator,
+    save_fixed_routing_measurement_operator,
     validate_fixed_routing_measurement_operator,
+)
+from public_transportation.inference.fixed_routing_linear_backend import (
+    SparseOperatorSelectionConfig,
+    prepare_fixed_routing_linear_measurement_backend,
+)
+from public_transportation.inference.fixed_routing_sharded_builder import (
+    ShardedConstructionConfig,
+    load_complete_sharded_fixed_routing_cache,
+    plan_sharded_fixed_routing_operator,
+    prepare_sharded_fixed_routing_measurement_operator,
+)
+from public_transportation.inference.fixed_routing_origin_support import (
+    OriginSupportConfig,
+    analyze_fixed_routing_origin_support,
+    validate_origin_support_against_operator,
+)
+from public_transportation.inference.sharded_sparse_operator import (
+    ShardedSparseLinearOperator,
+    shard_path,
 )
 from public_transportation.inference.od_parameter_layout import ODParameterLayout
 from public_transportation.inference.maximum_likelihood_pipeline import (
@@ -180,6 +202,409 @@ def test_sparse_operator_matches_dense(all_free_operator):
     )
     np.testing.assert_allclose(sparse_value, dense_value, rtol=2e-6, atol=2e-6)
     assert sparse.metrics.stored_bytes <= sparse.metrics.dense_bytes
+
+
+def test_linear_sparse_backend_cache_hit_skips_routing_rebuild(artifacts, tmp_path):
+    full_inputs = build_assignment_inputs(artifacts=artifacts)
+    num_od = int(full_inputs.od_origin_node.shape[0])
+    layout = ODParameterLayout(
+        num_od_total=num_od,
+        od_keys=tuple((f"o{i}", "d", "t") for i in range(num_od)),
+        free_od_indices=tuple(range(num_od)),
+        fixed_od_indices=(),
+        fixed_od_values=(),
+        free_baseline_values=tuple(1.0 for _ in range(num_od)),
+        fixed_zero_indices=(),
+        fixed_positive_indices=(),
+    )
+    compact = build_compact_od_assignment_layout(parameter_layout=layout)
+    inputs = build_assignment_inputs(artifacts=artifacts, compact_layout=compact)
+    routing = prepare_fixed_routing(inputs=inputs, theta=1.0)
+    spec = _spec(inputs.graph.num_links)
+    config = SparseOperatorSelectionConfig(
+        mode="sparse", memory_budget_bytes=100_000_000, chunk_size=8
+    )
+    built = prepare_fixed_routing_linear_measurement_backend(
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        compact_layout=compact,
+        assignment_fingerprint="linear-backend-cache",
+        od_layout_fingerprint=layout.fingerprint,
+        cache_directory=tmp_path,
+        config=config,
+    )
+    assert not built.metrics.cache_hit
+
+    cached = prepare_fixed_routing_linear_measurement_backend(
+        inputs=inputs,
+        theta=1.0,
+        routing_factory=lambda: pytest.fail("cache hit rebuilt fixed routing"),
+        spec=spec,
+        compact_layout=compact,
+        assignment_fingerprint="linear-backend-cache",
+        od_layout_fingerprint=layout.fingerprint,
+        cache_directory=tmp_path,
+        config=config,
+    )
+    assert cached.metrics.cache_hit
+    demand = np.linspace(0.0, 2.0, num_od)
+    np.testing.assert_allclose(cached.operator.matvec(demand), built.operator.matvec(demand))
+    np.testing.assert_allclose(
+        cached.fixed_measurement_offset, built.fixed_measurement_offset
+    )
+
+
+def test_sharded_builder_matches_monolithic_and_resumes(all_free_operator, tmp_path):
+    inputs, routing, spec, monolithic = all_free_operator
+    num_od = int(inputs.od_origin_node.shape[0])
+    layout = ODParameterLayout(
+        num_od_total=num_od,
+        od_keys=tuple((f"o{i}", "d", "t") for i in range(num_od)),
+        free_od_indices=tuple(range(num_od)),
+        fixed_od_indices=(),
+        fixed_od_values=(),
+        free_baseline_values=tuple(1.0 for _ in range(num_od)),
+        fixed_zero_indices=(),
+        fixed_positive_indices=(),
+    )
+    compact = build_compact_od_assignment_layout(parameter_layout=layout)
+    config = ShardedConstructionConfig(
+        od_chunk_size=8,
+        measurement_block_size=2,
+        worker_memory_budget_bytes=100_000_000,
+    )
+    built = prepare_sharded_fixed_routing_measurement_operator(
+        directory=tmp_path,
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        compact_layout=compact,
+        assignment_fingerprint="sharded-public-example",
+        od_layout_fingerprint=layout.fingerprint,
+        config=config,
+    )
+    assert built.manifest.complete
+    assert built.rebuilt_shards == built.plan.num_shards
+    assert built.plan.construction_tasks >= built.plan.num_shards
+    assert built.dispatch_count <= built.plan.construction_tasks
+    assert built.synchronization_count == built.dispatch_count
+    assert built.dispatch_count == len(built.origins_per_dispatch)
+    assert built.plan.num_shards <= config.maximum_storage_shards
+    assert built.plan.estimated_sparse_calls_per_product == built.plan.num_shards
+    assert built.manifest_write_count <= (
+        2 + built.plan.num_shards // config.manifest_checkpoint_shards
+    )
+    assert built.plan.maximum_shard_measurements <= 2
+    assert built.plan.candidate_entries == built.manifest.aggregate_nonzeros
+    assert built.plan.candidate_entries < built.plan.group_level_candidate_entries
+    operator = ShardedSparseLinearOperator(tmp_path)
+    demand = np.linspace(0.0, 2.0, num_od)
+    cotangent = np.asarray([0.25, -0.5, 2.0])
+    np.testing.assert_allclose(
+        operator.matvec(demand),
+        np.asarray(monolithic.matrix) @ demand,
+        rtol=5e-5,
+        atol=5e-5,
+    )
+    np.testing.assert_allclose(
+        operator.rmatvec(cotangent),
+        np.asarray(monolithic.matrix).T @ cotangent,
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    resumed = prepare_sharded_fixed_routing_measurement_operator(
+        directory=tmp_path,
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        compact_layout=compact,
+        assignment_fingerprint="sharded-public-example",
+        od_layout_fingerprint=layout.fingerprint,
+        config=config,
+    )
+    assert resumed.reused_shards == built.plan.num_shards
+    assert resumed.rebuilt_shards == 0
+    assert resumed.compilation_seconds == 0.0
+
+    fast_cached = load_complete_sharded_fixed_routing_cache(
+        directory=tmp_path,
+        inputs=inputs,
+        spec=spec,
+        compact_layout=compact,
+        assignment_fingerprint="sharded-public-example",
+        od_layout_fingerprint=layout.fingerprint,
+        theta=1.0,
+        config=config,
+    )
+    assert fast_cached is not None
+    assert fast_cached.plan.num_shards == built.plan.num_shards
+    assert fast_cached.support_discovery_seconds == 0.0
+    assert fast_cached.compilation_seconds == 0.0
+
+    damaged_path = shard_path(tmp_path, built.plan.expected_shards[0])
+    with np.load(damaged_path, allow_pickle=False) as archive:
+        damaged = {name: archive[name] for name in archive.files}
+    damaged_metadata = json.loads(str(damaged["metadata"]))
+    damaged_metadata["content_hash"] = "0" * 64
+    damaged["metadata"] = np.asarray(json.dumps(damaged_metadata))
+    np.savez(damaged_path, **damaged)
+    repaired = prepare_sharded_fixed_routing_measurement_operator(
+        directory=tmp_path,
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        compact_layout=compact,
+        assignment_fingerprint="sharded-public-example",
+        od_layout_fingerprint=layout.fingerprint,
+        config=config,
+    )
+    assert repaired.rejected_shards == 1
+    assert repaired.rebuilt_shards == 1
+    assert repaired.reused_shards == built.plan.num_shards - 1
+
+    interrupted_directory = tmp_path / "interrupted"
+    tiny_config = ShardedConstructionConfig(
+        od_chunk_size=8,
+        measurement_block_size=2,
+        worker_memory_budget_bytes=100_000_000,
+        target_nonzeros_per_storage_shard=1,
+        maximum_nonzeros_per_storage_shard=1,
+        manifest_checkpoint_shards=16,
+    )
+
+    def interrupt_after_first(event):
+        if event["completed_shards"] == 1:
+            raise RuntimeError("simulated interruption")
+
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        prepare_sharded_fixed_routing_measurement_operator(
+            directory=interrupted_directory,
+            inputs=inputs,
+            routing=routing,
+            spec=spec,
+            compact_layout=compact,
+            assignment_fingerprint="sharded-interrupted-example",
+            od_layout_fingerprint=layout.fingerprint,
+            config=tiny_config,
+            progress=interrupt_after_first,
+        )
+    resumed_after_interruption = prepare_sharded_fixed_routing_measurement_operator(
+        directory=interrupted_directory,
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        compact_layout=compact,
+        assignment_fingerprint="sharded-interrupted-example",
+        od_layout_fingerprint=layout.fingerprint,
+        config=tiny_config,
+    )
+    assert resumed_after_interruption.reused_shards == 1
+    interrupted_operator = ShardedSparseLinearOperator(interrupted_directory)
+    np.testing.assert_allclose(
+        interrupted_operator.matvec(demand),
+        operator.matvec(demand),
+        rtol=5e-5,
+        atol=5e-5,
+    )
+
+
+def test_sharded_positive_fixed_flow_is_offset_only(artifacts, tmp_path):
+    full_inputs = build_assignment_inputs(artifacts=artifacts)
+    num_od = int(full_inputs.od_origin_node.shape[0])
+    free_indices = tuple(range(1, num_od))
+    layout = ODParameterLayout(
+        num_od_total=num_od,
+        od_keys=tuple((f"o{i}", "d", "t") for i in range(num_od)),
+        free_od_indices=free_indices,
+        fixed_od_indices=(0,),
+        fixed_od_values=(4.0,),
+        free_baseline_values=tuple(1.0 for _ in free_indices),
+        fixed_zero_indices=(),
+        fixed_positive_indices=(0,),
+    )
+    compact = build_compact_od_assignment_layout(parameter_layout=layout)
+    inputs = build_assignment_inputs(artifacts=artifacts, compact_layout=compact)
+    routing = prepare_fixed_routing(inputs=inputs, theta=1.0)
+    spec = _spec(inputs.graph.num_links)
+    reference = prepare_fixed_routing_measurement_operator(
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        assignment_fingerprint="sharded-positive-fixed",
+        compact_layout=compact,
+        od_layout_fingerprint=layout.fingerprint,
+        representation="dense",
+        chunk_size=8,
+    )
+    origin_support = analyze_fixed_routing_origin_support(
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        compact_layout=compact,
+    )
+    support_validation = validate_origin_support_against_operator(
+        support=origin_support, operator=reference
+    )
+    assert support_validation.complete
+    assert origin_support.positive_fixed_support.shape[1] == 1
+    prepare_sharded_fixed_routing_measurement_operator(
+        directory=tmp_path,
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        compact_layout=compact,
+        assignment_fingerprint="sharded-positive-fixed",
+        od_layout_fingerprint=layout.fingerprint,
+        config=ShardedConstructionConfig(
+            od_chunk_size=8,
+            measurement_block_size=2,
+            worker_memory_budget_bytes=100_000_000,
+        ),
+    )
+    sharded = ShardedSparseLinearOperator(tmp_path)
+    demand = np.linspace(0.0, 2.0, layout.num_free)
+    np.testing.assert_allclose(
+        sharded.matvec(demand) + sharded.fixed_measurement_offset,
+        np.asarray(reference.matrix) @ demand
+        + np.asarray(reference.fixed_measurement_offset),
+        rtol=5e-5,
+        atol=5e-5,
+    )
+    np.testing.assert_allclose(
+        sharded.fixed_measurement_offset,
+        reference.fixed_measurement_offset,
+        rtol=5e-5,
+        atol=5e-5,
+    )
+    assert sharded.shape[1] == layout.num_free
+
+
+def test_sharded_preflight_rejects_unsafe_kernel(all_free_operator):
+    inputs, routing, spec, _ = all_free_operator
+    num_od = int(inputs.od_origin_node.shape[0])
+    layout = ODParameterLayout(
+        num_od_total=num_od,
+        od_keys=tuple((f"o{i}", "d", "t") for i in range(num_od)),
+        free_od_indices=tuple(range(num_od)),
+        fixed_od_indices=(),
+        fixed_od_values=(),
+        free_baseline_values=tuple(1.0 for _ in range(num_od)),
+        fixed_zero_indices=(),
+        fixed_positive_indices=(),
+    )
+    compact = build_compact_od_assignment_layout(parameter_layout=layout)
+    with pytest.raises(MemoryError, match="memory budget"):
+        plan_sharded_fixed_routing_operator(
+            inputs=inputs,
+            routing=routing,
+            spec=spec,
+            compact_layout=compact,
+            config=ShardedConstructionConfig(
+                od_chunk_size=128,
+                measurement_block_size=2048,
+                worker_memory_budget_bytes=1,
+            ),
+        )
+
+
+def test_origin_specific_support_contains_every_realized_entry(all_free_operator):
+    inputs, routing, spec, operator = all_free_operator
+    num_od = int(inputs.od_origin_node.shape[0])
+    layout = ODParameterLayout(
+        num_od_total=num_od,
+        od_keys=tuple((f"o{i}", "d", "t") for i in range(num_od)),
+        free_od_indices=tuple(range(num_od)),
+        fixed_od_indices=(),
+        fixed_od_values=(),
+        free_baseline_values=tuple(1.0 for _ in range(num_od)),
+        fixed_zero_indices=(),
+        fixed_positive_indices=(),
+    )
+    compact = build_compact_od_assignment_layout(parameter_layout=layout)
+    support = analyze_fixed_routing_origin_support(
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        compact_layout=compact,
+        config=OriginSupportConfig(origin_chunk_size=3),
+    )
+    validation = validate_origin_support_against_operator(
+        support=support, operator=operator
+    )
+    assert validation.complete
+    assert validation.missing_free_entries == 0
+    assert support.metrics.origin_specific_entries <= (
+        support.metrics.group_level_candidate_entries
+    )
+    assert support.metrics.free_support_entries >= operator.metrics.nonzero_entries
+
+
+def test_origin_support_is_deterministic_across_chunk_sizes(all_free_operator):
+    inputs, routing, spec, _ = all_free_operator
+    num_od = int(inputs.od_origin_node.shape[0])
+    layout = ODParameterLayout(
+        num_od_total=num_od,
+        od_keys=tuple((f"o{i}", "d", "t") for i in range(num_od)),
+        free_od_indices=tuple(range(num_od)),
+        fixed_od_indices=(),
+        fixed_od_values=(),
+        free_baseline_values=tuple(1.0 for _ in range(num_od)),
+        fixed_zero_indices=(),
+        fixed_positive_indices=(),
+    )
+    compact = build_compact_od_assignment_layout(parameter_layout=layout)
+    first = analyze_fixed_routing_origin_support(
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        compact_layout=compact,
+        config=OriginSupportConfig(origin_chunk_size=1),
+    )
+    second = analyze_fixed_routing_origin_support(
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        compact_layout=compact,
+        config=OriginSupportConfig(origin_chunk_size=8),
+    )
+    assert first.fingerprint == second.fingerprint
+    np.testing.assert_array_equal(
+        first.free_support.toarray(), second.free_support.toarray()
+    )
+
+
+def test_origin_support_summary_mode_and_memory_preflight(all_free_operator):
+    inputs, routing, spec, _ = all_free_operator
+    num_od = int(inputs.od_origin_node.shape[0])
+    layout = ODParameterLayout(
+        num_od_total=num_od,
+        od_keys=tuple((f"o{i}", "d", "t") for i in range(num_od)),
+        free_od_indices=tuple(range(num_od)),
+        fixed_od_indices=(),
+        fixed_od_values=(),
+        free_baseline_values=tuple(1.0 for _ in range(num_od)),
+        fixed_zero_indices=(),
+        fixed_positive_indices=(),
+    )
+    compact = build_compact_od_assignment_layout(parameter_layout=layout)
+    summary = analyze_fixed_routing_origin_support(
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        compact_layout=compact,
+        config=OriginSupportConfig(materialize=False),
+    )
+    assert not summary.materialized
+    assert summary.metrics.origin_specific_entries > 0
+    with pytest.raises(MemoryError, match="memory budget"):
+        analyze_fixed_routing_origin_support(
+            inputs=inputs,
+            routing=routing,
+            spec=spec,
+            compact_layout=compact,
+            config=OriginSupportConfig(worker_memory_budget_bytes=1),
+        )
 
 
 def test_compact_positive_frozen_flow_becomes_offset(artifacts):
@@ -366,6 +791,62 @@ def test_persistent_cache_reuse_and_invalid_file_rebuild(
     path.write_bytes(b"not a valid cache")
     rebuilt = load_or_prepare_fixed_routing_measurement_operator(**kwargs)
     assert not rebuilt.metrics.cache_hit
+
+
+def test_sparse_cache_identity_includes_zero_tolerance(artifacts, tmp_path):
+    inputs = build_assignment_inputs(artifacts=artifacts)
+    routing = prepare_fixed_routing(inputs=inputs, theta=1.0)
+    spec = _spec(inputs.graph.num_links)
+    common = dict(
+        cache_directory=tmp_path,
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        assignment_fingerprint="zero-tolerance",
+        representation="bcoo",
+    )
+    exact_path = fixed_routing_measurement_operator_cache_path(
+        **common, zero_tolerance=0.0
+    )
+    truncated_path = fixed_routing_measurement_operator_cache_path(
+        **common, zero_tolerance=0.1
+    )
+    assert exact_path != truncated_path
+
+    exact = load_or_prepare_fixed_routing_measurement_operator(
+        **common, zero_tolerance=0.0
+    )
+    truncated = load_or_prepare_fixed_routing_measurement_operator(
+        **common, zero_tolerance=0.1
+    )
+    assert exact.zero_tolerance == 0.0
+    assert truncated.zero_tolerance == 0.1
+    assert exact_path.exists()
+    assert truncated_path.exists()
+
+
+def test_sparse_loader_rejects_out_of_bounds_indices(artifacts, tmp_path):
+    inputs = build_assignment_inputs(artifacts=artifacts)
+    routing = prepare_fixed_routing(inputs=inputs, theta=1.0)
+    spec = _spec(inputs.graph.num_links)
+    operator = prepare_fixed_routing_measurement_operator(
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        assignment_fingerprint="invalid-indices",
+        representation="bcoo",
+    )
+    path = tmp_path / "operator.npz"
+    save_fixed_routing_measurement_operator(operator, path)
+    with np.load(path, allow_pickle=False) as archive:
+        payload = {name: archive[name] for name in archive.files}
+    indices = np.array(payload["indices"], copy=True)
+    indices[0, 0] = operator.num_measurements
+    payload["indices"] = indices
+    np.savez_compressed(path, **payload)
+
+    with pytest.raises(ValueError, match="indices are out of bounds"):
+        load_fixed_routing_measurement_operator(path)
 
 
 def test_auto_activation_policy_respects_cache_and_break_even():

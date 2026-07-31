@@ -5,6 +5,8 @@
 \usepackage{amsmath,amssymb,amsthm}
 \usepackage{bm}
 \geometry{left=2cm, top=1.5cm, right=2cm, bottom=1.5cm}
+\setlength{\emergencystretch}{2em}
+\pgfplotsset{compat=1.18}
 
 \usepackage[dcucite,abbr]{harvard}
 \harvardparenthesis{none}
@@ -12,7 +14,7 @@
 
 \title{Passenger Assignment Model in a Public Transportation Network}
 \author{Michel Bierlaire \and Evangelos Paschalidis}
-\date{July 28, 2026}
+\date{July 30, 2026}
 
 \newtheorem{definition}{Definition}
 \newtheorem{assumption}{Assumption}
@@ -31,8 +33,11 @@ The software follows four main steps:
 \begin{enumerate}
 \item Develop a detailed network representation of the public transportation system.
 \item Formulate an assignment model that maps an OD matrix to passenger flows on the network.
-\item Define measurement equations linking model outputs to observed data, yielding a likelihood function.
-\item Estimate demand using ML, MAP, or Bayesian variational inference.
+\item Define measurement equations linking model outputs to observed data,
+yielding either a likelihood or an explicitly weighted linear objective.
+\item Detect topology-driven structural-zero OD cells before estimation.
+\item Estimate demand using ML, MAP, fixed-routing linear and block-coordinate
+methods, or Bayesian variational inference.
 \end{enumerate}
 
 \section{Modeling Elements}
@@ -80,7 +85,7 @@ The full demand vector is denoted by
 \bm{f} = \{ f_q^t : q \in \mathcal{Q},\; t \in \mathcal{T} \}.
 \]
 
-\subsection{Baseline demand and deviation parameterization (Bayesian layer)}
+\subsection{Baseline demand and Bayesian deviation parameterization}
 
 The model assumes that the analyst can provide an \emph{a-priori} demand matrix
 $\bm f^{(0)}=\{f_{q}^{t,(0)}\}$, aligned with the OD/time-bin indexing of the scenario.
@@ -785,7 +790,7 @@ rounding. Tests also cover raw measurement predictions, frozen-zero cells,
 positive frozen offsets, cache round trips, corrupt-cache rebuilds, and
 provenance mismatch rejection.
 
-\subsubsection{Matrix-free destination streaming for very large OD layouts}
+\subsubsection{Scalability limits for very large OD layouts}
 
 The direct operator is not suitable when its dimensions or its construction
 state exceed the available memory. In the TPG full-network case there are
@@ -797,57 +802,17 @@ measurements. Measurements from a sampled destination cover approximately
 $213{,}000$ observations, implying about 344~GiB of value state for one
 destination. The explicit builder must therefore not be used for this layout.
 
-For this regime, the software provides an exact two-pass matrix-free
-decomposition. Let $\bm p_g(\bm z_g)$ be the measurement prediction contributed
-by destination group $g$, including any positive frozen-demand contribution,
-and let $L$ be the nonlinear negative-binomial objective in measurement space.
-The complete prediction and its measurement-space cotangent are
-\[
-\bm p=\sum_g\bm p_g(\bm z_g),
-\qquad
-\bm c=\frac{\partial L(\bm p)}{\partial\bm p}.
-\]
-The gradient for each destination is then obtained independently as
-\[
-\frac{\partial L}{\partial\bm z_g}
-=J_{\bm p_g}(\bm z_g)^\mathsf{T}\bm c.
-\]
-The implementation first streams destination predictions into the complete
-measurement vector. It evaluates the likelihood only after this sum is
-complete, then recomputes each destination under a JAX vector--Jacobian product
-and scatters the local result into the global free-parameter gradient. It never
-constructs $J_{\bm p_g}$, a global Jacobian, or a reverse-mode tape spanning all
-destinations. Computing and summing separate likelihoods from partial predicted
-means would be mathematically incorrect and is not supported.
-
-Frozen-zero cells are removed from each local assignment view. Positive frozen
-cells remain in the group and are placed at their fixed values, so their flow
-contribution participates in both the aggregated prediction and the common
-likelihood residual. Tests compare the streamed calculation with monolithic
-automatic differentiation for a nonlinear synthetic case with positive frozen
-offsets and for the actual fixed-routing loader split by destination. Values
-and gradients agree within explicit float32 tolerances.
-
-The streaming implementation uses a replayable provider rather than retaining
-all destination predictors. It checks a declared destination-state byte ceiling
-before prediction, retains only compact parameter-index signatures between
-passes, and rejects changed group membership or ordering during replay. Thus a
-provider may construct and release one routing block at a time.
-
 Six isolated full-network destinations spanning 9, 137, 276, 465, 770, and
 1,181 free cells were measured under a 24~GiB process ceiling. Warm forward
 loading was 5.98--6.08~s and ordinary value--gradient evaluation was
 12.07--12.38~s; peak resident memory was 16.02--18.16~GiB. The near-constant
 runtime over a 131-fold change in OD count shows that graph traversal, not
-demand injection, dominates. Median forward and value--gradient times were
-5.991~s and 12.130~s. An ordinary sweep across 1,898 destinations is therefore
-estimated at 6.40 hours. Since the exact two-pass scheme adds one forward
-recomputation, its sequential estimate is 9.55 hours per complete objective and
-gradient, before optimizer overhead. Median routing preparation of 38.32~s per
-sample would itself require about 20.2 hours if performed serially without
-persistence. Consequently, a practical full-network implementation also
-requires direct event-aligned measurement accumulation, reduced-cost or
-explicit-adjoint loading, and destination-level process parallelism.
+demand injection, dominates. These measurements establish that destination
+streaming alone is not a viable large-scale solver: it repeats expensive graph
+traversals and does not exploit the linear structure available when routing is
+fixed. The large-scale mode should instead expose the fixed-routing assignment
+as a sparse linear operator and solve the resulting explicitly regularized,
+bound-constrained least-squares problem.
 
 \paragraph{Event-aligned measurement resolution.}
 Boarding and alighting mappings have additional structure that avoids generic
@@ -887,23 +852,13 @@ link cotangent rather than the complete forward scan tape. It deliberately
 defines no derivative with respect to routing probabilities and is exposed only
 for the fixed-routing path.
 
-On the representative 465-cell full-network destination, ordinary reverse mode,
-whole-loader rematerialization, and the explicit adjoint required respectively
-12.09, 8.17, and 6.69~s for a warm value--gradient evaluation. Their resident
-memory immediately after that evaluation was 16.21, 17.54, and 13.91~GiB.
-All objective, prediction, and gradient diagnostics agreed within float32
-tolerances. Whole-loader rematerialization is therefore rejected; on this CPU
-backend it was slower and larger than the explicit adjoint.
-
-Combining the six-sample median forward time of 5.991~s with the 6.690~s
-explicit-adjoint evaluation gives a two-pass sequential estimate of 6.69 hours
-for 1,898 destinations, improved from 9.55 hours under ordinary autodiff but
-still impractical locally. The measured custom-adjoint process peak was
-15.21~GiB. With 20\% headroom and conservative per-worker replication, 12
-workers require about 219~GiB and have an idealized lower bound of 33 minutes
-per complete objective and gradient. Actual server efficiency depends on
-per-process thread limits and memory bandwidth and must be measured on the
-target machine.
+On the representative 465-cell full-network destination, ordinary reverse mode
+and the explicit adjoint required respectively 12.09 and 6.69~s for a warm
+value--gradient evaluation. Their resident memory immediately after that
+evaluation was 16.21 and 13.91~GiB. Objective, prediction, and gradient
+diagnostics agreed within float32 tolerances. The explicit adjoint is retained
+as the fixed-routing differentiation path and as a reference for validating
+future sparse-operator construction.
 
 \paragraph{Stable objective compilation and reuse.}
 The fixed-operator MAP objective is defined at package scope and receives all
@@ -1032,6 +987,283 @@ the original profile, complete one-iteration time falls from 5.389 s to roughly
 2.0--2.2 s. Cache-hit runs at 1, 5, and 20 iterations reproduce objectives
 55,243.4375, 49,635.4922, and 49,140.4258 exactly.
 
+\subsubsection{Fixed-routing linear MAP estimation at scale}
+\label{sec:fixed-routing-linear-map}
+
+When $\theta$ and all generalized costs are fixed, routing probabilities are
+constant and the complete measurement prediction is affine in the free OD
+demand.  Let $\bm f_{\mathcal U}\in\mathbb R^n$ denote the free physical flows,
+let $m$ be the number of observations, and let $\bm c\in\mathbb R^m$ be the
+measurement contribution of strictly positive frozen demand.  The fixed-routing
+model is
+\[
+\widehat{\bm y}=A\bm f_{\mathcal U}+\bm c,
+\qquad A\in\mathbb R^{m\times n}.
+\]
+Frozen-zero cells have no column in $A$, while positive frozen cells contribute
+only to $\bm c$.  Thus neither kind of frozen cell increases the estimation
+dimension.
+
+The implemented linear MAP problem uses positive observation weights
+$W=\operatorname{diag}(\bm w)$, componentwise physical bounds
+$\bm\ell\leq\bm f_{\mathcal U}\leq\bm u$, and an explicitly selected ordered
+collection of linear regularization blocks $(L_k,\bm r_k,\lambda_k)$:
+\[
+\min_{\bm\ell\leq\bm f_{\mathcal U}\leq\bm u}
+\left\{
+\frac12\left\|W^{1/2}
+  (A\bm f_{\mathcal U}+\bm c-\bm y)\right\|_2^2
++\frac12\sum_k\lambda_k
+  \left\|L_k\bm f_{\mathcal U}-\bm r_k\right\|_2^2
+\right\}.
+\]
+The supported choices are no regularization, ridge toward the prior demand, and
+scaled ridge toward the prior demand.  No recommendation is applied implicitly.
+This weighted least-squares mode is distinct from the negative-binomial ML and
+MAP objectives described below: the two are comparable only when their
+observation models and priors have deliberately been made equivalent.
+
+\paragraph{Operator representations.}
+All solvers use a common forward--transpose protocol.  Small problems may use a
+dense reference operator.  Production alternatives include a native sparse
+operator with versioned persistence, a matrix-free operator that performs fixed
+routing during each product, and a sharded sparse operator whose construction
+and resident storage are bounded.  The fixed offset $\bm c$ is assembled once.
+Cache identities cover the assignment and OD layouts, fixed demand,
+measurement mapping, routing parameter, numeric representation, construction
+configuration, schema, and package version.  Cache writes are atomic and an
+incomplete, corrupt, or incompatible artifact is never accepted as complete.
+
+The monolithic solver interface currently provides a dense reference backend
+and a bound-constrained TRF/LSMR backend.  Results are returned in physical
+demand units with objective components, residuals, gradients, bound KKT
+diagnostics, elapsed time, and available forward/transpose product counts.
+Exact rank and resolution analysis is reserved for small problems.  The
+scalable path instead uses reproducible spectral and randomized probes and
+reports their convergence and Monte Carlo uncertainty explicitly.
+
+\paragraph{OD blocks without network cuts.}
+For problems too large for a monolithic solve, the package partitions only the
+free OD columns.  The default deterministic order is destination group, time
+bin, and then free-column index, with deterministic subdivision of oversized
+groups and optional merging of small compatible groups.  Every block uses the
+complete time-expanded network; partitioning never removes links or prevents a
+path from traversing another part of the service.  User-defined partitions are
+accepted only if every free column occurs exactly once and no frozen column is
+present.  Block membership and the complete partition are fingerprinted.
+
+Let $B$ be the active block, $A_B$ its independently constructible operator,
+and $\widehat{\bm y}$ the current complete prediction.  A trial changes only
+$\bm f_B$ and is evaluated incrementally as
+\[
+\widehat{\bm y}_{\mathrm{trial}}
+=\widehat{\bm y}+A_B
+ (\bm f_B^{\mathrm{trial}}-\bm f_B).
+\]
+The remaining OD variables are held fixed.  An update is accepted only if it is
+finite, respects the bounds, and does not increase the complete objective beyond
+the numerical acceptance tolerance.  Damping and backtracking are applied when
+needed.  Rejected updates leave the complete state unchanged.  Separable
+quadratic priors are evaluated conditionally; unsupported cross-block prior or
+constraint coupling is rejected rather than ignored.  Exact full products are
+performed at configurable validation boundaries to detect incremental drift,
+not after every block.
+
+\paragraph{Anytime state and recovery.}
+Initialization already constitutes a complete feasible approximate solution.
+After every accepted block or conflict-free parallel batch, the estimator has a
+complete flow vector, complete prediction, current and best objective, and
+convergence diagnostics.  The durable journal records the replayable flow and
+prediction deltas using temporary-file creation, synchronization, atomic
+publication, and a separate commit marker.  Periodic compact checkpoints store
+the complete state and exact next schedule position.  Resume is rejected when
+any authoritative fingerprint changes, including scenario, assignment, OD
+layout, fixed demand, measurements, prior, routing, partition, solver semantics,
+or schema.  Returned statuses distinguish convergence, time, sweep, and update
+budgets, graceful interruption with an approximate solution, resource guards,
+and numerical failure.
+
+Progress events do not claim a generic percentage precision.  They distinguish
+exact, sampled, stale, deferred, and unavailable diagnostics and report objective
+improvements, projected-gradient measures, block and variable coverage,
+completed sweeps, elapsed time, checkpoint commitment, and estimated remaining
+sweep time.
+
+For a bounded large-network pilot, complete-operator products are governed by
+an explicit fingerprinted policy.  The initial prediction may be computed or
+supplied with validated shape, finiteness, bounds, fixed offset, and provenance.
+Initial, periodic, and final exact projected gradients can be enabled
+independently; a disabled diagnostic is recorded as deferred, never relabeled as
+an exact global quantity.  Resume prediction validation may likewise be exact
+or deferred.  Deferred operation avoids an otherwise mandatory global forward
+or transpose product, but postpones the corresponding global consistency or
+optimality claim.  A separate validation entry point can later recompute the
+prediction, objective, and projected gradient, including in a fresh process.
+
+A restricted pilot schedule is separately authorized from a complete sweep.
+Every named block must belong to a completed support group, have compatible
+persisted exact support, and satisfy support-row, nonzero, operator-storage, and
+temporary-memory ceilings.  The checkpoint records that deterministic schedule
+and its next position. Numerical semantics and the schedule remain
+fingerprinted, whereas invocation limits may extend safely, so resuming a
+five-update run with a six-update budget executes only the sixth update.
+
+The monotonic elapsed-time deadline covers initialization, global products,
+selected-block construction, solving, and checkpoint persistence.  JAX
+compilation or dispatched device work cannot generally be interrupted inside a
+process; an indivisible phase can therefore overshoot its allowance.  Such an
+overshoot is reported explicitly, and no subsequent expensive phase is started.
+Structured diagnostics expose global forward and transpose counts and times,
+block construction and solve time, checkpoint time, prediction source, and
+validation status.
+
+The selected-block numerical kernels pass graph and routing arrays as explicit
+dynamic JAX arguments rather than capturing complete assignment arrays in
+Python closures.  Tracing, lowering, compilation, synchronized device
+execution, and host transfer are timed separately.  A bounded lock-protected
+compiled-executable cache is keyed by assignment provenance, backend, numeric
+type, effective OD width, mapped-edge width, graph dimensions, and kernel schema;
+deadline and callback state are excluded.  Deadline checks remain in Python
+before and after each indivisible JAX stage.  On the public example,
+fresh-process one-variable construction took 0.093--0.194 seconds, with zero
+captured array constants and identical sparse results; compilation dominated
+the roughly 0.001-second device execution.
+
+\paragraph{Safe parallelism.}
+Independent block operators can be constructed and cached concurrently.  For
+block solves, the software builds a conflict graph whose nodes are blocks and
+whose edges represent shared measurement support or declared prior/constraint
+coupling.  A deterministic coloring gives batches with disjoint exact update
+support.  Such blocks may be solved concurrently and their deltas are merged
+atomically in deterministic order.  Overlapping proposals are never treated as
+independent Gauss--Seidel updates.  Construction workers, solver workers, and
+threads per worker are explicit, and their product is checked against the
+available CPUs; native numerical thread pools are bounded as well.
+
+\paragraph{Resource preflight and adaptive refinement.}
+The scalable workflow first creates a structural partition and then performs
+bounded exact-support discovery.  The old sharded planner materializes global
+origin support and retains per-column patterns and future construction tasks;
+it is therefore a compatibility path for reviewed small cases, not a
+full-network preflight.  The streaming preflight instead prepares and analyzes
+one destination group at a time.  It reduces exact reachable measurement rows
+immediately to group and block summaries, writes an atomic checkpoint, and
+releases group-local routing, reachability, pattern, and mapping state before
+continuing.  Retained state is proportional to destination and block summaries,
+not to OD--measurement support entries.
+
+Four explicit modes distinguish structural inspection, deterministic sampled
+exact support, complete streaming exact support, and an explicitly authorized
+materialized compatibility plan.  The materialized mode is rejected unless a
+prior conservative logical-support estimate fits its retained-state budget.
+Sampled selection includes small, median, 95th-percentile, and maximum
+structural groups.  Its extrapolations report observed ranges and assumptions;
+sampled completion alone cannot authorize a complete-network pilot.
+
+Elapsed time, process RSS, temporary group state, retained summaries, support
+rows, nonzeros, and operator bytes are effective limits.  Budget exhaustion or
+interruption produces a typed partial result and a valid atomic checkpoint.
+Resume validates scenario, assignment, OD layout, fixed demand, measurement
+mapping, routing, partition, configuration, and schema fingerprints.  It
+neither repeats completed groups nor skips pending groups.
+
+Checkpoint identity separates numerical semantics from invocation policy.
+The semantic fingerprint covers mode, deterministic sampling and selected
+groups, support chunking and tolerance, persisted representation, and schema;
+the authoritative data and routing fingerprints remain mandatory.  Elapsed and
+memory allowances, checkpoint cadence, and deterministic worker settings have
+a separate recorded policy fingerprint and may change compatibly on resume.
+Tightened limits are rejected before work if retained summaries or accepted
+blocks already violate them.
+
+Cumulative support time is never reset and includes discarded work from an
+incomplete group.  In contrast, the elapsed-time allowance applies only to the
+current invocation and its timer begins at zero after each resume.  Reports
+give previous, current, and cumulative time, invocation count, allowance
+overshoot, and whether stopping occurred before a group or inside a bounded
+chunk.  Thus exhausting a 120-second allowance does not cause the next
+120-second invocation to stop immediately.  An unfinished group is not
+committed and may be recomputed, while every completed group is skipped.
+
+Only after support discovery does the resource preflight select the smallest,
+median, 95th-percentile, largest, or explicitly named blocks.  Before invoking
+any builder it estimates CSR values and indices, transpose storage,
+construction temporaries, retained cache, and solver work arrays.  An unsafe
+block is rejected before allocation; no unselected operator is constructed.
+For accepted blocks it records machine memory,
+logical and physical CPUs, cache storage, operator and local-solver memory,
+construction and product times, and cache/checkpoint sizes.  The \texttt{auto},
+\texttt{laptop}, \texttt{workstation}, and \texttt{server} profiles apply
+different conservative fractions of available memory.  Worker count is bounded
+by both CPUs and safety-adjusted measured peak memory:
+\[
+n_{\mathrm{workers}}
+\leq
+\min\!\left(
+n_{\mathrm{CPU}},
+\left\lfloor\frac{M-M_0}{M_B}\right\rfloor
+\right),
+\]
+where $M$ is the selected job budget, $M_0$ is coordinator and assignment
+memory, and $M_B$ is the conservative measured worker peak.  Estimated cache
+storage is checked separately.  The structured recommendation contains hard
+variable and nonzero ceilings, worker and thread allocation, peak memory,
+cache size, first-sweep and cache-hit sweep times, and uncertainty.  Automatic
+sizing is never activated until the exact recommendation fingerprint is
+explicitly accepted.
+
+Selected fixed-routing blocks are constructed directly from their authoritative
+assignment inputs, compact free-to-active OD layout, destination-group routing,
+measurement mapping, and persisted exact support.  The production builder does
+not require a complete measurement operator.  It combines one or more base OD
+chunks into a separately configured, memory-guarded OD batch. For each batch,
+one JIT-compiled forward dynamic program computes node reach probabilities once;
+fixed-size mapped-edge gathers
+then aggregate only bounded supported-measurement chunks on the host. Numerical
+zeros are filtered before canonical COO-to-CSR assembly.  Both CSR and
+CSC storage retain only the union of supported rows, while forward products
+scatter into the complete measurement coordinate system and transpose products
+gather from it.  Consequently, the forbidden dense array of shape
+$n_{\mathcal M}\times |B|$ is never allocated: the largest dense numerical
+buffers are bounded by the effective OD batch times the node count, mapped-edge chunk,
+or supported-measurement chunk.
+
+Measurement-row lookup, enabled-link filtering, global-to-local row translation,
+and padded mapped-edge plans are invariant for the block and are prepared once,
+outside the OD-batch loop. The requested batch factor is reduced automatically
+until conservative reach, mapping, sparse-assembly, routing, solver, and retained
+storage estimates satisfy both temporary and worker ceilings. Failure of even
+one base batch is reported before numerical allocation. Because batching does
+not change the canonical per-column accumulation order, safe batch sizes share
+one logical cache identity.
+
+Exact selected support and each numerical block are persisted independently by
+atomic replacement.  Their identities include package and schema versions,
+all scenario, assignment, OD-layout, fixed-demand, measurement, routing, and
+partition fingerprints, the block and support fingerprints, fixed routing
+parameter, tolerance, dtype, and canonical accumulation contract. Pure
+performance chunk sizes are excluded from the logical cache identity. Content
+hashes, sparse dimensions, row coordinates, and dtype are validated before
+reuse; corrupt numerical caches are discarded and rebuilt, while corrupt or
+incompatible support artifacts are rejected.  A fresh process can therefore
+load a block without repeating routing or numerical construction.  In-memory
+retention is explicitly bounded and releasable.
+
+The accepted measurements also define a conservative memory/runtime cost model.
+Before estimation, any unsafe candidate block is bisected deterministically
+until every child satisfies the accepted limits.  Coverage remains exact,
+children retain a conservative measurement support, and blocks are never
+silently enlarged.  If a minimum-size block is still unsafe, a resource guard
+stops the workflow before its operator is constructed.  Refinement creates a
+new partition fingerprint, and the revised schedule is written in the initial
+checkpoint.  A checkpoint for the obsolete parent partition therefore cannot
+resume the refined run.
+
+This block-coordinate implementation is presently restricted to the
+fixed-routing linear MAP objective.  It must not be used when routing changes
+with the OD iterate or when the required conditional prior cannot be evaluated
+exactly.
+
 \subsubsection{Opt-out alternative (future extension)}
 
 In a general formulation, an opt-out alternative can be introduced for each OD pair and departure interval. In the first implementation,
@@ -1121,16 +1353,19 @@ The likelihood is the product over observed measurements:
 \]
 The corresponding log-likelihood is
 \[
+\begin{aligned}
 \ell(\bm f,\theta,\rho,r)
-=
+={}&
 \sum_{m\in\mathcal{M}}
-\left[
+\Bigl[
 \log\Gamma\!\left(y_m^{\mathrm{obs}}+r\right)
 -\log\Gamma(r)
--\log\!\left(y_m^{\mathrm{obs}}!\right)
+-\log\!\left(y_m^{\mathrm{obs}}!\right) \\
+&\qquad
 +r\log p_m(\bm f;\theta,\rho,r)
 +y_m^{\mathrm{obs}}\log\!\left(1-p_m(\bm f;\theta,\rho,r)\right)
-\right].
+\Bigr].
+\end{aligned}
 \]
 For posterior computations, terms constant with respect to $(\bm f,\theta)$ may be dropped.
 
@@ -1170,9 +1405,9 @@ contrast, a free cell requires a strictly positive baseline $f_i^{(0)}$, since
 the multiplicative parameterization cannot move away from a zero baseline.
 
 Frozen values are supplied by a sparse CSV file with columns
-\texttt{origin\_stop\_id}, \texttt{dest\_stop\_id},
-\texttt{time\_bin\_id}, and optionally \texttt{fixed\_flow}. A missing or blank
-\texttt{fixed\_flow} denotes zero. Keys are validated against the scenario,
+\path{origin_stop_id}, \path{dest_stop_id}, \path{time_bin_id}, and optionally
+\path{fixed_flow}. A missing or blank \path{fixed_flow} denotes zero. Keys are
+validated against the scenario,
 duplicates are rejected, and the free/frozen partition is constructed in the
 canonical assignment order. The same immutable partition is passed to ML, MAP,
 and Bayesian VI. Saved results include the free indices, frozen indices, and
@@ -1185,9 +1420,53 @@ network identity remains unchanged. The canonical JSON payload used to compute
 the digest is persisted with the result. On loading, the digest is recomputed
 from that payload to detect corruption or manual modification. During
 post-processing, the layout is rebuilt from the current scenario and
-\texttt{fixed\_demand.csv}; its fingerprint must match the result fingerprint
+\path{fixed_demand.csv}; its fingerprint must match the result fingerprint
 before assignment or report generation proceeds. The network fingerprint and
 layout fingerprint are checked independently.
+
+\subsection{Topology-driven structural-zero preprocessing}
+
+The fixed-demand file may be generated by a deterministic preprocessing service
+before ML, MAP, or Bayesian estimation.  Its single substantive input is a
+versioned TOML configuration.  The configuration identifies the scenario and
+output folders, selects rules in a dedicated \texttt{rules.enabled} table, and
+provides a separate table for the parameters of each enabled rule.  Unknown
+keys, missing required keys, invalid types, invalid ranges, and missing input
+paths are errors.  Relative paths are resolved relative to the TOML file.
+
+The service builds the same production time-expanded topology used for
+assignment, with the configured access-deviation, transfer-wait, and minimum
+dwell assumptions.  A backward dynamic program is performed once per
+destination and evaluates only OD/time keys already present in the demand
+candidate table.  It records path feasibility, minimum transfers, minimum
+initial wait, minimum journey time, number of feasible departures, and earliest
+arrival.  Boarding the first vehicle is not a transfer, and arrival at the
+destination is absorbing.
+
+Two core rules classify a cell as structural zero when no feasible path exists,
+or when the minimum feasible transfer count exceeds the accepted maximum.  With
+\texttt{max\_transfers = 2}, paths requiring three transfers or more are
+therefore excluded.  Optional rules cover identical origin and destination
+stops, excessive initial wait, excessive journey time, and too few feasible
+departures.  Equality at a configured maximum or minimum is retained.  All
+triggered reasons are saved, while a fixed precedence supplies one primary
+reason for mutually exclusive summary counts.
+
+An existing fixed-demand file can be reconciled with the detected zeros.  The
+only implemented conflict policy is \emph{error}: a nonzero existing value on a
+newly detected structural zero stops preprocessing.  Compatible zero and
+positive fixed values are preserved exactly, and newly detected cells are added
+with \texttt{fixed\_flow = 0}.  Duplicate or unknown keys, negative or
+non-finite values, and all conflicts are reported without producing a partial
+merged result.
+
+The output transaction writes a canonically sorted \texttt{fixed\_demand.csv},
+a per-cell audit CSV, a JSON summary, the fully resolved TOML configuration, and
+scenario, graph, and configuration fingerprints with content hashes.  Every
+file is rendered and validated before atomic replacement.  Passing the
+generated fixed-demand file to estimation removes those structural-zero cells
+from the parameter vector altogether; they are not zero-valued dummy
+parameters.
 
 If $|\mathcal U|=0$ and $\theta$ is fixed, then $d=0$. This is treated as a
 deterministic evaluation rather than as an optimization or variational-inference
@@ -1245,8 +1524,10 @@ without constructing a full posterior approximation. Let
 \]
 denote the vector of raw unconstrained parameters. The same smooth transformations
 defined above map $\bm\eta$ to the effective demand vector $\bm f$ and, when
-applicable, to $\theta$. Consequently, all estimation methods use the same forward
-model and negative binomial likelihood.
+applicable, to $\theta$. Consequently, the likelihood-based ML, MAP, and Bayesian
+methods use the same forward model and negative binomial likelihood. The separate
+fixed-routing linear mode uses the weighted objective defined in
+Section~\ref{sec:fixed-routing-linear-map}.
 
 \subsection{Maximum likelihood estimation}
 

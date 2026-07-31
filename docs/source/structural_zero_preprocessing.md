@@ -51,7 +51,7 @@ must differ from the scenario folder. The loader does not create or modify it.
 |---|---:|---|---|
 | `scenario.folder` | yes | nonempty path to an existing directory | Scenario root. |
 | `scenario.demand_file` | no | path to an existing CSV, Parquet, or JSON table | Explicit demand candidate table. When omitted, `demand.*` is loaded from `scenario.folder`. |
-| `output.folder` | yes | nonempty path different from `scenario.folder` | Destination for future generated artifacts. |
+| `output.folder` | yes | nonempty path different from `scenario.folder` | Destination for generated artifacts. |
 | `output.include_retained_cells_in_report` | no | Boolean; default `true` | Include non-structural-zero cells in the detailed audit table. |
 
 ### Rule selection

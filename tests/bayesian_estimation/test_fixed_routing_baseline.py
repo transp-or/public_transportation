@@ -39,7 +39,8 @@ def test_simple_example_02_matches_fixed_routing_reference() -> None:
     assert setup.metadata["example"] == "simple_example_02"
     assert setup.metadata["implementation"] == "dynamic_routing_reference"
     assert setup.metadata["fixed_theta"] == 1.0
-    assert setup.metadata["num_fixed_zero_od"] >= 1
+    assert setup.metadata["num_fixed_od"] == 2
+    assert setup.metadata["num_fixed_zero_od"] == 0
     assert [case.name for case in setup.cases] == [
         "baseline",
         "perturbed",
