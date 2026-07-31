@@ -44,6 +44,9 @@ from .fixed_routing_selected_block_builder import (
     SelectedBlockDeadlineDiagnostics,
     SelectedBlockConstructionProgress,
     SelectedBlockConstructionResult,
+    SelectedBlockDiagnosticStop,
+    SelectedBlockJSONLProgressSink,
+    SelectedBlockPhaseProgress,
     SelectedBlockSupportArtifact,
 )
 from .operator import (

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 from dataclasses import replace
 from pathlib import Path
@@ -31,6 +32,8 @@ from public_transportation.inference.block_coordinate.fixed_routing_selected_blo
     SelectedBlockBuilderConfig,
     SelectedBlockBuilderProvenance,
     SelectedBlockConstructionDeadlineError,
+    SelectedBlockDiagnosticStop,
+    SelectedBlockJSONLProgressSink,
 )
 from public_transportation.inference.block_coordinate.operator import (
     SparseBlockLinearOperator,
@@ -1074,6 +1077,105 @@ def test_selected_block_deadline_discards_partial_numerical_cache(setup, tmp_pat
     assert not diagnostics.numerical_cache_persistence_completed
     assert not diagnostics.valid_warm_cache_exists
     assert not tuple((tmp_path / "cache").glob("block-*.npz"))
+
+
+def test_selected_block_durable_progress_survives_compilation_cancellation(
+    setup, tmp_path
+):
+    inputs, compact, spec, fingerprints, partition, preflight = completed_preflight(
+        setup
+    )
+    summary = max(preflight.block_summaries, key=lambda item: item.exact_nonzeros)
+    block = next(item for item in partition.blocks if item.block_id == summary.block_id)
+    progress_path = tmp_path / "progress.jsonl"
+    sink = SelectedBlockJSONLProgressSink(progress_path, durable=True)
+
+    def cancel_at_compilation(event):
+        sink(event)
+        if event.event == "jax_compilation_start":
+            raise KeyboardInterrupt
+
+    builder = FixedRoutingSelectedBlockBuilder(
+        inputs=inputs,
+        spec=spec,
+        compact_layout=compact,
+        partition=partition,
+        provenance=SelectedBlockBuilderProvenance(
+            fingerprints=fingerprints,
+            semantic_preflight_fingerprint=SupportPreflightConfig().semantics_fingerprint,
+            theta=1.0,
+        ),
+        config=SelectedBlockBuilderConfig(
+            cache_directory=tmp_path / "cache",
+            support_directory=tmp_path / "support",
+            od_chunk_size=1,
+            od_batch_size=1,
+            measurement_chunk_size=2,
+            mapped_edge_chunk_size=3,
+        ),
+        phase_progress=cancel_at_compilation,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        builder.build_result(block)
+
+    records = [json.loads(line) for line in progress_path.read_text().splitlines()]
+    events = [record["event"] for record in records]
+    assert events[-1] == "jax_compilation_start"
+    assert "jax_tracing_start" in events
+    assert "jax_tracing_complete" in events
+    assert "jax_lowering_start" in events
+    assert "jax_lowering_complete" in events
+    assert "jax_compilation_complete" not in events
+    assert not tuple((tmp_path / "cache").glob("block-*.npz"))
+    assert all(record["schema_version"] == 1 for record in records)
+    assert all("input_shapes" in record for record in records)
+    assert progress_path.read_bytes().endswith(b"\n")
+
+
+@pytest.mark.parametrize(
+    ("stop_after", "forbidden"),
+    [
+        ("tracing", ("jax_lowering_start", "jax_compilation_start")),
+        ("lowering", ("jax_compilation_start", "jax_execution_start")),
+        ("compilation", ("jax_execution_start", "host_transfer_start")),
+    ],
+)
+def test_selected_block_probe_stops_at_requested_jax_boundary(
+    setup, tmp_path, stop_after, forbidden
+):
+    inputs, compact, spec, fingerprints, partition, preflight = completed_preflight(
+        setup
+    )
+    summary = max(preflight.block_summaries, key=lambda item: item.exact_nonzeros)
+    block = next(item for item in partition.blocks if item.block_id == summary.block_id)
+    events = []
+    builder = FixedRoutingSelectedBlockBuilder(
+        inputs=inputs,
+        spec=spec,
+        compact_layout=compact,
+        partition=partition,
+        provenance=SelectedBlockBuilderProvenance(
+            fingerprints=fingerprints,
+            semantic_preflight_fingerprint=SupportPreflightConfig().semantics_fingerprint,
+            theta=1.0,
+        ),
+        config=SelectedBlockBuilderConfig(
+            cache_directory=tmp_path / stop_after,
+            support_directory=tmp_path / "support",
+            od_chunk_size=1,
+            od_batch_size=1,
+            measurement_chunk_size=2,
+            mapped_edge_chunk_size=3,
+        ),
+        phase_progress=lambda event: events.append(event.event),
+        diagnostic_stop_after=stop_after,
+    )
+    with pytest.raises(SelectedBlockDiagnosticStop) as stopped:
+        builder.build_result(block)
+    assert stopped.value.event.event == f"jax_{stop_after}_complete"
+    assert events[-1] == f"jax_{stop_after}_complete"
+    assert not set(events).intersection(forbidden)
+    assert not tuple((tmp_path / stop_after).glob("block-*.npz"))
 
 
 def test_atomic_selected_block_write_does_not_publish_interrupted_file(

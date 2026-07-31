@@ -37,6 +37,12 @@
 - Added a bounded, lock-protected compiled-kernel cache keyed by assignment
   provenance, backend, dtype, fixed shapes, and kernel schema. Deadline and
   callback state do not affect compiled identity.
+- Added immediate structured phase-start/completion callbacks and an optional
+  flushed, fsync-capable JSONL sink so scheduler cancellation preserves the
+  identity of the active tracing, lowering, compilation, execution, or transfer
+  phase independently of numerical-cache publication.
+- Added diagnostic stop boundaries after tracing, lowering, compilation, and
+  execution to the public support-preflight benchmark.
 
 - Added independently memory-guarded OD batching to
   `FixedRoutingSelectedBlockBuilder`. Automatic mode chooses the largest safe

@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "scenario": "public simple_example_02 synthetic one-variable selected block",
+  "configuration": {
+    "od_batch_size": 1,
+    "block_variables": 1,
+    "nodes": 1162,
+    "links": 5846,
+    "backend": "cpu",
+    "kernel_identity": "7e1fb9995542804f4fac66652a3f4da3e630d1f25fcf493c10382026654b0bbe"
+  },
+  "phase_seconds_from_execution_probe": {
+    "tracing": 0.004881,
+    "lowering": 0.024028,
+    "compilation": 0.029609,
+    "execution": 0.001005
+  },
+  "probes": [
+    {
+      "stop_after": "tracing",
+      "last_event": "jax_tracing_complete",
+      "construction_elapsed_seconds": 0.023765458026900887,
+      "process_rss_bytes": 447119360,
+      "numerical_cache_published": false
+    },
+    {
+      "stop_after": "lowering",
+      "last_event": "jax_lowering_complete",
+      "construction_elapsed_seconds": 0.0486560839926824,
+      "process_rss_bytes": 446955520,
+      "numerical_cache_published": false
+    },
+    {
+      "stop_after": "compilation",
+      "last_event": "jax_compilation_complete",
+      "construction_elapsed_seconds": 0.07708208297844976,
+      "process_rss_bytes": 452935680,
+      "numerical_cache_published": false
+    },
+    {
+      "stop_after": "execution",
+      "last_event": "jax_execution_complete",
+      "construction_elapsed_seconds": 0.07935999997425824,
+      "process_rss_bytes": 451510272,
+      "numerical_cache_published": false
+    }
+  ],
+  "checks": {
+    "event_timestamps_monotonic": true,
+    "each_progress_file_ends_with_complete_json_line": true,
+    "all_probes_share_kernel_identity": true,
+    "later_phases_absent_after_requested_stop": true,
+    "global_operator_constructed": false,
+    "solver_run": false
+  }
+}

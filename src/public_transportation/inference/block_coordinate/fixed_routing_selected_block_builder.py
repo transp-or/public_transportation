@@ -11,6 +11,7 @@ import tempfile
 import threading
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable, cast
@@ -44,6 +45,7 @@ from .support_preflight import (
 SELECTED_BLOCK_SUPPORT_SCHEMA_VERSION = 1
 SELECTED_BLOCK_CACHE_SCHEMA_VERSION = 2
 SELECTED_BLOCK_KERNEL_SCHEMA_VERSION = 1
+SELECTED_BLOCK_PROGRESS_SCHEMA_VERSION = 1
 _MAXIMUM_COMPILED_KERNELS = 8
 
 
@@ -289,6 +291,64 @@ class SelectedBlockConstructionProgress:
 
 
 @dataclass(frozen=True, slots=True)
+class SelectedBlockPhaseProgress:
+    schema_version: int
+    monotonic_timestamp: float
+    wall_clock_timestamp: str
+    block_id: str
+    phase: str
+    state: str
+    event: str
+    elapsed_construction_seconds: float
+    absolute_deadline: float | None
+    remaining_seconds: float | None
+    effective_od_columns: int
+    od_batch_index: int
+    od_batch_count: int
+    mapped_edge_plan_index: int
+    mapped_edge_plan_count: int
+    input_shapes: tuple[tuple[int, ...], ...]
+    input_dtypes: tuple[str, ...]
+    process_rss_bytes: int
+    active_thread: str
+    active_thread_count: int
+    backend: str
+    devices: tuple[str, ...]
+    compiled_kernel_identity: str
+    compiled_kernel_cache_hits: int
+    compiled_kernel_cache_misses: int
+    completed_mapping_passes: int
+    candidate_contributions_examined: int
+    accepted_nonzeros: int
+
+
+class SelectedBlockJSONLProgressSink:
+    """Append complete, flushed phase records independently of numerical cache."""
+
+    def __init__(self, path: Path, *, durable: bool = False) -> None:
+        self.path = Path(path).expanduser()
+        self.durable = durable
+        self._lock = threading.Lock()
+
+    def __call__(self, event: SelectedBlockPhaseProgress) -> None:
+        payload = json.dumps(asdict(event), sort_keys=True, separators=(",", ":"))
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock, self.path.open("a", encoding="utf-8") as stream:
+            stream.write(payload + "\n")
+            stream.flush()
+            if self.durable:
+                os.fsync(stream.fileno())
+
+
+class SelectedBlockDiagnosticStop(RuntimeError):
+    """Intentional stop after a requested diagnostic JAX phase."""
+
+    def __init__(self, event: SelectedBlockPhaseProgress) -> None:
+        super().__init__(f"selected-block probe stopped after {event.phase}.")
+        self.event = event
+
+
+@dataclass(frozen=True, slots=True)
 class _MappedEdgeChunk:
     padded_links: np.ndarray
     edge_mask: np.ndarray
@@ -389,6 +449,10 @@ class FixedRoutingSelectedBlockBuilder:
         provenance: SelectedBlockBuilderProvenance,
         config: SelectedBlockBuilderConfig,
         progress: Callable[[SelectedBlockConstructionProgress], None] | None = None,
+        phase_progress: Callable[[SelectedBlockPhaseProgress], None] | None = None,
+        progress_file: Path | None = None,
+        durable_progress: bool = False,
+        diagnostic_stop_after: str | None = None,
         clock: Callable[[], float] = perf_counter,
     ) -> None:
         self.inputs = inputs
@@ -398,6 +462,20 @@ class FixedRoutingSelectedBlockBuilder:
         self.provenance = provenance
         self.config = config
         self.progress = progress
+        if phase_progress is not None and progress_file is not None:
+            raise ValueError("provide phase_progress or progress_file, not both.")
+        self.phase_progress = (
+            SelectedBlockJSONLProgressSink(progress_file, durable=durable_progress)
+            if progress_file is not None
+            else phase_progress
+        )
+        allowed_stops = {None, "tracing", "lowering", "compilation", "execution"}
+        if diagnostic_stop_after not in allowed_stops:
+            raise ValueError(
+                "diagnostic_stop_after must be tracing, lowering, compilation, "
+                "execution, or None."
+            )
+        self.diagnostic_stop_after = diagnostic_stop_after
         self.clock = clock
         if not callable(clock):
             raise TypeError("clock must be callable.")
@@ -438,6 +516,69 @@ class FixedRoutingSelectedBlockBuilder:
         self._persistence_completed = False
         self._current_temporary_estimate = 0
         self._deadline_cache_path: Path | None = None
+        self._phase_effective_columns = 0
+        self._phase_od_batch_index = 0
+        self._phase_edge_plan_index = 0
+        self._phase_edge_plan_count = 0
+        self._phase_kernel_identity = ""
+        self._phase_kernel_hits = 0
+        self._phase_kernel_misses = 0
+
+    def _emit_phase(
+        self,
+        phase: str,
+        state: str,
+        arguments: tuple[Any, ...] = (),
+    ) -> None:
+        callback = self.phase_progress
+        block = self._deadline_block
+        if callback is None or block is None:
+            return
+        now = self.clock()
+        deadline = self._absolute_deadline
+        event = SelectedBlockPhaseProgress(
+            schema_version=SELECTED_BLOCK_PROGRESS_SCHEMA_VERSION,
+            monotonic_timestamp=now,
+            wall_clock_timestamp=datetime.now(UTC).isoformat(),
+            block_id=block.block_id,
+            phase=phase,
+            state=state,
+            event=f"{phase}_{state}",
+            elapsed_construction_seconds=max(0.0, now - self._deadline_started),
+            absolute_deadline=deadline,
+            remaining_seconds=(None if deadline is None else max(0.0, deadline - now)),
+            effective_od_columns=self._phase_effective_columns,
+            od_batch_index=self._phase_od_batch_index,
+            od_batch_count=self._total_od_batches,
+            mapped_edge_plan_index=self._phase_edge_plan_index,
+            mapped_edge_plan_count=self._phase_edge_plan_count,
+            input_shapes=tuple(
+                tuple(int(size) for size in value.shape)
+                for value in arguments
+                if hasattr(value, "shape")
+            ),
+            input_dtypes=tuple(
+                str(value.dtype) for value in arguments if hasattr(value, "dtype")
+            ),
+            process_rss_bytes=_peak_rss_bytes(),
+            active_thread=threading.current_thread().name,
+            active_thread_count=threading.active_count(),
+            backend=jax.default_backend(),
+            devices=tuple(str(device) for device in jax.devices()),
+            compiled_kernel_identity=self._phase_kernel_identity,
+            compiled_kernel_cache_hits=self._phase_kernel_hits,
+            compiled_kernel_cache_misses=self._phase_kernel_misses,
+            completed_mapping_passes=self._completed_mapping_passes,
+            candidate_contributions_examined=self._candidate_contributions,
+            accepted_nonzeros=self._accepted_nonzeros,
+        )
+        callback(event)
+        if (
+            state == "complete"
+            and self.diagnostic_stop_after is not None
+            and phase == f"jax_{self.diagnostic_stop_after}"
+        ):
+            raise SelectedBlockDiagnosticStop(event)
 
     supports_absolute_deadline = True
 
@@ -890,11 +1031,30 @@ class FixedRoutingSelectedBlockBuilder:
         self._persistence_completed = False
         self._current_temporary_estimate = 0
         self._deadline_cache_path = None
+        self._phase_effective_columns = 0
+        self._phase_od_batch_index = 0
+        self._phase_edge_plan_index = 0
+        self._phase_edge_plan_count = 0
+        self._phase_kernel_identity = ""
+        self._phase_kernel_hits = 0
+        self._phase_kernel_misses = 0
+        self._emit_phase("builder_entry", "start")
         self._check_deadline("builder_entry")
+        self._emit_phase("builder_entry", "complete")
         support_was_cached = self._support_path(block).exists()
+        self._emit_phase("support_cache_lookup", "start")
+        self._emit_phase("support_cache_lookup", "complete")
+        self._emit_phase(
+            "support_artifact_load" if support_was_cached else "support_discovery",
+            "start",
+        )
         support_start = self.clock()
         artifact = self.prepare_support(block, absolute_deadline=absolute_deadline)
         support_seconds = self.clock() - support_start
+        self._emit_phase(
+            "support_artifact_load" if support_was_cached else "support_discovery",
+            "complete",
+        )
         self._check_deadline("resource_estimation")
         estimate = self.estimate_resources(block, artifact)
         self._current_temporary_estimate = estimate.peak_worker_bytes
@@ -932,6 +1092,7 @@ class FixedRoutingSelectedBlockBuilder:
             )
             self._last_result = result
             self._check_deadline("retained_cache_reuse")
+            self._emit_phase("construction", "complete")
             return result
         path = self._cache_path(block, artifact)
         if path.exists():
@@ -973,18 +1134,24 @@ class FixedRoutingSelectedBlockBuilder:
                 )
                 self._last_result = result
                 self._check_deadline("numerical_cache_reuse")
+                self._emit_phase("construction", "complete")
                 return result
 
+        self._emit_phase("routing_preparation", "start")
         routing_started = self.clock()
         routing = self._routing(artifact.destination_group)
         routing_seconds = self.clock() - routing_started
+        self._emit_phase("routing_preparation", "complete")
         effective_columns = estimate.effective_od_columns
+        self._phase_effective_columns = effective_columns
         compiled_identity = self._compiled_kernel_identity(effective_columns)
+        self._phase_kernel_identity = compiled_identity
         with self._compiled_kernel_lock:
             reach_kernel = self._reach_kernels.get(compiled_identity)
             gather_kernel = self._edge_gather_kernels.get(compiled_identity)
         compiled_hits = int(reach_kernel is not None) + int(gather_kernel is not None)
         compiled_misses = 0
+        self._phase_kernel_hits = compiled_hits
         argument_transfer_seconds = 0.0
         tracing_seconds = 0.0
         lowering_seconds = 0.0
@@ -1011,6 +1178,7 @@ class FixedRoutingSelectedBlockBuilder:
         data_parts: list[np.ndarray] = []
         numerical_started = self.clock()
         self._check_deadline("measurement_index_preparation")
+        self._emit_phase("measurement_index_preparation", "start")
         mapping_started = self.clock()
         enabled_links = np.asarray(routing.enabled_link_mask)
         measurement_plans: list[_MeasurementChunkPlan] = []
@@ -1058,12 +1226,16 @@ class FixedRoutingSelectedBlockBuilder:
                 _MeasurementChunkPlan(rows=row_chunk, edge_chunks=tuple(edge_chunks))
             )
         measurement_index_preparation_seconds = self.clock() - mapping_started
+        self._emit_phase("measurement_index_preparation", "complete")
         self._check_deadline("measurement_index_preparation")
         measurement_chunks = 0
         completed_chunks = 0
         od_batches = int(np.ceil(block.num_free_variables / effective_columns))
         self._total_od_batches = od_batches
         self._total_mapping_passes = od_batches * len(measurement_plans)
+        self._phase_edge_plan_count = sum(
+            len(plan.edge_chunks) for plan in measurement_plans
+        )
         total_chunks = od_batches * len(measurement_plans)
         od_preparation_seconds = 0.0
         routing_evaluation_seconds = 0.0
@@ -1072,6 +1244,7 @@ class FixedRoutingSelectedBlockBuilder:
         candidate_contributions = 0
         accepted_nonzeros = 0
         for od_first in range(0, block.num_free_variables, effective_columns):
+            self._phase_od_batch_index = self._completed_od_batches
             self._check_deadline("od_batch_preparation")
             od_started = self.clock()
             active = np.asarray(
@@ -1097,38 +1270,52 @@ class FixedRoutingSelectedBlockBuilder:
             argument_transfer_seconds += self.clock() - transfer_started
             if reach_kernel is None:
                 compiled_misses += 1
+                self._phase_kernel_misses = compiled_misses
                 raw_reach = _make_forward_reach_kernel(
                     chunk_size=effective_columns,
                     num_nodes=int(self.inputs.graph.num_nodes),
                 )
+                self._emit_phase("jax_tracing", "start", reach_arguments)
                 self._check_deadline("jax_reach_tracing")
                 started = self.clock()
                 traced = jax.jit(raw_reach).trace(*reach_arguments)
                 tracing_seconds += self.clock() - started
+                self._emit_phase("jax_tracing", "complete", reach_arguments)
                 self._check_deadline("jax_reach_tracing", indivisible=True)
+                self._emit_phase("jax_lowering", "start", reach_arguments)
+                self._check_deadline("jax_reach_lowering")
                 started = self.clock()
                 lowered = traced.lower()
                 lowering_seconds += self.clock() - started
+                self._emit_phase("jax_lowering", "complete", reach_arguments)
                 self._check_deadline("jax_reach_lowering", indivisible=True)
+                self._emit_phase("jax_compilation", "start", reach_arguments)
+                self._check_deadline("jax_reach_compilation")
                 started = self.clock()
                 reach_kernel = lowered.compile()
                 compilation_seconds += self.clock() - started
+                self._emit_phase("jax_compilation", "complete", reach_arguments)
                 self._check_deadline("jax_reach_compilation", indivisible=True)
                 self._remember_compiled(
                     self._reach_kernels, compiled_identity, reach_kernel
                 )
+            self._emit_phase("jax_execution", "start", reach_arguments)
+            self._check_deadline("jax_reach_execution")
             evaluation_started = self.clock()
             reach = reach_kernel(*reach_arguments)
             reach.block_until_ready()
             elapsed = self.clock() - evaluation_started
             routing_evaluation_seconds += elapsed
             execution_seconds += elapsed
+            self._emit_phase("jax_execution", "complete", reach_arguments)
             self._check_deadline("jax_reach_execution", indivisible=True)
             for plan in measurement_plans:
+                self._emit_phase("support_filtering", "start")
                 self._check_deadline("measurement_support_filtering")
                 filtering_started = self.clock()
                 values = np.zeros((active.size, plan.rows.size), dtype=np.float64)
                 for edge_chunk in plan.edge_chunks:
+                    self._phase_edge_plan_index += 1
                     self._check_deadline("mapped_edge_chunk")
                     transfer_started = self.clock()
                     gather_arguments = (
@@ -1144,42 +1331,61 @@ class FixedRoutingSelectedBlockBuilder:
                     argument_transfer_seconds += self.clock() - transfer_started
                     if gather_kernel is None:
                         compiled_misses += 1
+                        self._phase_kernel_misses = compiled_misses
                         raw_gather = _make_edge_gather_kernel(
                             edge_block_size=self.config.mapped_edge_chunk_size
                         )
+                        self._emit_phase("jax_tracing", "start", gather_arguments)
                         self._check_deadline("jax_gather_tracing")
                         started = self.clock()
                         traced = jax.jit(raw_gather).trace(*gather_arguments)
                         tracing_seconds += self.clock() - started
+                        self._emit_phase("jax_tracing", "complete", gather_arguments)
                         self._check_deadline("jax_gather_tracing", indivisible=True)
+                        self._emit_phase("jax_lowering", "start", gather_arguments)
+                        self._check_deadline("jax_gather_lowering")
                         started = self.clock()
                         lowered = traced.lower()
                         lowering_seconds += self.clock() - started
+                        self._emit_phase("jax_lowering", "complete", gather_arguments)
                         self._check_deadline("jax_gather_lowering", indivisible=True)
+                        self._emit_phase("jax_compilation", "start", gather_arguments)
+                        self._check_deadline("jax_gather_compilation")
                         started = self.clock()
                         gather_kernel = lowered.compile()
                         compilation_seconds += self.clock() - started
+                        self._emit_phase(
+                            "jax_compilation", "complete", gather_arguments
+                        )
                         self._check_deadline("jax_gather_compilation", indivisible=True)
                         self._remember_compiled(
                             self._edge_gather_kernels, compiled_identity, gather_kernel
                         )
+                    self._emit_phase("jax_execution", "start", gather_arguments)
+                    self._check_deadline("jax_gather_execution")
                     started = self.clock()
                     gathered = gather_kernel(*gather_arguments)
                     gathered.block_until_ready()
                     elapsed = self.clock() - started
                     execution_seconds += elapsed
+                    self._emit_phase("jax_execution", "complete", gather_arguments)
+                    self._emit_phase("host_transfer", "start", (gathered,))
+                    self._check_deadline("host_transfer")
                     transfer_started = self.clock()
                     edge_values = np.asarray(gathered)[
                         : active.size, : edge_chunk.valid_edges
                     ]
                     host_transfer_seconds += self.clock() - transfer_started
+                    self._emit_phase("host_transfer", "complete", (gathered,))
                     self._check_deadline("mapped_edge_chunk", indivisible=True)
                     candidate_contributions += active.size * edge_chunk.valid_edges
                     self._candidate_contributions = candidate_contributions
                     for edge_position, local_row in enumerate(edge_chunk.local_rows):
                         values[:, local_row] += edge_values[:, edge_position]
                 filtering_seconds += self.clock() - filtering_started
+                self._emit_phase("support_filtering", "complete")
                 measurement_chunks += 1
+                self._emit_phase("triplet_generation", "start")
                 self._check_deadline("sparse_triplet_generation")
                 triplet_started = self.clock()
                 for local, column in enumerate(range(od_first, od_first + active.size)):
@@ -1206,6 +1412,7 @@ class FixedRoutingSelectedBlockBuilder:
                     column_parts.append(np.full(nonzero.size, column, dtype=np.int64))
                     data_parts.append(selected[nonzero])
                 triplet_seconds += self.clock() - triplet_started
+                self._emit_phase("triplet_generation", "complete")
                 completed_chunks += 1
                 self._completed_mapping_passes += 1
                 self._check_deadline("sparse_triplet_generation")
@@ -1223,6 +1430,7 @@ class FixedRoutingSelectedBlockBuilder:
         numerical_seconds = self.clock() - numerical_started
         self._routing_group = None
         self._routing_value = None
+        self._emit_phase("sparse_assembly", "start")
         self._check_deadline("sparse_assembly")
         assembly_started = self.clock()
         rows = np.concatenate(row_parts) if row_parts else np.empty(0, np.int64)
@@ -1238,12 +1446,14 @@ class FixedRoutingSelectedBlockBuilder:
             (data, (rows, columns)),
             shape=(support_rows.size, block.num_free_variables),
         )
+        self._emit_phase("duplicate_reduction", "start")
         self._check_deadline("duplicate_reduction")
         reduction_started = self.clock()
         matrix = coo.tocsr()
         matrix.sum_duplicates()
         matrix.eliminate_zeros()
         duplicate_reduction_seconds = self.clock() - reduction_started
+        self._emit_phase("duplicate_reduction", "complete")
         self._check_deadline("csr_csc_assembly")
         csr_csc_started = self.clock()
         operator = SupportedRowsSparseBlockLinearOperator(
@@ -1251,11 +1461,14 @@ class FixedRoutingSelectedBlockBuilder:
         )
         csr_csc_seconds = self.clock() - csr_csc_started
         assembly_seconds = self.clock() - assembly_started
+        self._emit_phase("sparse_assembly", "complete")
+        self._emit_phase("validation", "start")
         self._check_deadline("numerical_validation")
         if not set(operator.measurement_support_indices).issubset(
             artifact.support_rows
         ):
             raise ValueError("numerical operator contains rows outside exact support.")
+        self._emit_phase("validation", "complete")
         compact_matrix = cast(Any, operator.compact_matrix)
         metadata = {
             "schema_version": SELECTED_BLOCK_CACHE_SCHEMA_VERSION,
@@ -1270,6 +1483,7 @@ class FixedRoutingSelectedBlockBuilder:
                 support_rows,
             ),
         }
+        self._emit_phase("cache_persistence", "start")
         self._check_deadline("numerical_cache_persistence")
         persistence_started = self.clock()
         disk = _atomic_npz(
@@ -1282,6 +1496,7 @@ class FixedRoutingSelectedBlockBuilder:
         )
         persistence_seconds = self.clock() - persistence_started
         self._persistence_completed = True
+        self._emit_phase("cache_persistence", "complete")
         self._check_deadline("numerical_cache_persistence", indivisible=True)
         self._check_deadline("final_cache_validation")
         self._load_operator(block, artifact, path)
@@ -1349,6 +1564,7 @@ class FixedRoutingSelectedBlockBuilder:
             ),
         )
         self._last_result = result
+        self._emit_phase("construction", "complete")
         return result
 
     def build(

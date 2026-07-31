@@ -104,6 +104,38 @@ resumable. Work stopped before validated atomic publication is discarded, a
 previous valid cache is preserved, and a cache fully published before the
 deadline remains reusable.
 
+### Durable phase observability
+
+`phase_progress` receives a structured start and completion event around every
+major construction stage, including tracing, lowering, compilation, synchronized
+execution, host transfer, filtering, assembly, validation, and persistence.
+Each event contains monotonic and UTC timestamps, deadline remainder, block and
+batch position, bounded shapes and dtypes, RSS, thread/device information,
+compiled-kernel identity, cache counters, and completed-work counters. Arrays
+and numerical payloads are never included.
+
+Alternatively, pass `progress_file=PATH`. `SelectedBlockJSONLProgressSink`
+writes one complete JSON object per line and flushes every record. With
+`durable_progress=True` it additionally calls `fsync`; this has filesystem- and
+scheduler-dependent overhead and is intended for diagnosis rather than routine
+high-frequency benchmarking. The progress stream is independent of numerical
+cache validity, so cancellation during XLA compilation leaves the preceding
+`jax_compilation_start` line readable without publishing a block cache.
+
+The public benchmark is also an independently stoppable probe:
+
+```text
+uv run --frozen python benchmarks/benchmark_support_preflight.py \
+  --check --benchmark-od-batching --synthetic-od-columns 1 \
+  --od-batch-size 1 --stop-after compilation \
+  --phase-progress-file selected-block-progress.jsonl \
+  --durable-progress --output selected-block-probe.json
+```
+
+`--stop-after` accepts `tracing`, `lowering`, `compilation`, or `execution`.
+Earlier modes do not enter later stages, construct a global operator, run a
+solver, perform sparse assembly, or publish a numerical block cache.
+
 OD batching does not change per-column accumulation order. Consequently,
 batch size and other pure scheduling chunk sizes are not part of cache identity;
 operators constructed with different safe batch factors share the same logical

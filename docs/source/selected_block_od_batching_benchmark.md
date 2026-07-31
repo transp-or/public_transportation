@@ -18,6 +18,17 @@ The separated timings identify staging and compilation, rather than device
 execution, as the dominant public cold cost. Timings are benchmark evidence,
 not unit-test thresholds.
 
+## Independent phase probes
+
+Four fresh public one-variable processes stopped independently after tracing,
+lowering, compilation, and execution. All used kernel identity
+`7e1fb9995542804f4fac66652a3f4da3e630d1f25fcf493c10382026654b0bbe`,
+left a complete durable final event, and published no numerical cache. In the
+execution probe, tracing took 0.0049 s, lowering 0.0240 s, compilation 0.0296 s,
+and synchronized execution 0.0010 s. The consolidated machine-readable result
+is `benchmarks/selected_block_public_phase_probe_summary.json`; the individual
+reports and JSONL streams use the prefix `selected_block_probe_`.
+
 | Requested batch | Effective columns | Graph evaluations | Cold numerical time | Peak estimate | Maximum difference |
 |---:|---:|---:|---:|---:|---:|
 | 1 | 1 | 512 | 0.361 s | 1.25 MB | 0 |

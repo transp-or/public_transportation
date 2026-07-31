@@ -1129,6 +1129,15 @@ fresh-process one-variable construction took 0.093--0.194 seconds, with zero
 captured array constants and identical sparse results; compilation dominated
 the roughly 0.001-second device execution.
 
+For scheduler diagnostics, the builder can emit structured start and completion
+events immediately around each phase.  An optional append-only JSON-lines sink
+flushes every complete record and can call \texttt{fsync}; it is separate from
+operator-cache validity.  Consequently, cancellation during XLA compilation
+leaves a durable \texttt{jax\_compilation\_start} record without publishing an
+incomplete numerical operator.  The public benchmark can stop intentionally
+after tracing, lowering, compilation, or execution, allowing these indivisible
+stages to be assigned separate external wall-time limits.
+
 \paragraph{Safe parallelism.}
 Independent block operators can be constructed and cached concurrently.  For
 block solves, the software builds a conflict graph whose nodes are blocks and

@@ -37,6 +37,7 @@ from public_transportation.inference.block_coordinate.fixed_routing_selected_blo
     FixedRoutingSelectedBlockBuilder,
     SelectedBlockBuilderConfig,
     SelectedBlockBuilderProvenance,
+    SelectedBlockDiagnosticStop,
 )
 from public_transportation.inference.block_coordinate.partition import (
     ODBlockPartition,
@@ -119,6 +120,10 @@ def _scenario_copy(source: Path, demand: Path) -> tempfile.TemporaryDirectory[st
 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
+    if args.stop_after is not None and not args.benchmark_od_batching:
+        raise ValueError("--stop-after requires --benchmark-od-batching.")
+    if args.stop_after is not None and args.phase_progress_file is None:
+        raise ValueError("--stop-after requires --phase-progress-file.")
     total_started = perf_counter()
     phases: dict[str, float] = {}
     temporary = _scenario_copy(args.scenario_folder, args.demand)
@@ -495,7 +500,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     theta=args.theta,
                 )
                 reference_matrix = None
-                for batch_size in (1, 2, 4, 8, None):
+                batch_sizes = (
+                    (args.od_batch_size,)
+                    if args.stop_after is not None
+                    else (1, 2, 4, 8, None)
+                )
+                for batch_size in batch_sizes:
                     label = "auto" if batch_size is None else str(batch_size)
                     batch_config = replace(
                         builder_config,
@@ -521,8 +531,28 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                         partition=synthetic_partition,
                         provenance=synthetic_provenance,
                         config=batch_config,
+                        progress_file=args.phase_progress_file,
+                        durable_progress=args.durable_progress,
+                        diagnostic_stop_after=args.stop_after,
                     )
-                    cold = batch_builder.build_result(benchmark_block)
+                    try:
+                        cold = batch_builder.build_result(benchmark_block)
+                    except SelectedBlockDiagnosticStop as stopped:
+                        od_batch_benchmark.append(
+                            {
+                                "label": label,
+                                "block_id": benchmark_block.block_id,
+                                "block_variables": benchmark_block.num_free_variables,
+                                "diagnostic_stop": asdict(stopped.event),
+                                "phase_progress_file": str(args.phase_progress_file),
+                                "numerical_cache_published": bool(
+                                    tuple(
+                                        batch_config.cache_directory.glob("block-*.npz")
+                                    )
+                                ),
+                            }
+                        )
+                        break
                     matrix = cast(Any, cold.operator.compact_matrix).toarray()
                     if reference_matrix is None:
                         reference_matrix = matrix
@@ -637,6 +667,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
     )
     parser.add_argument("--mapped-edge-chunk-size", type=int, default=2048)
+    parser.add_argument("--phase-progress-file", type=Path)
+    parser.add_argument("--durable-progress", action="store_true")
+    parser.add_argument(
+        "--stop-after",
+        choices=("tracing", "lowering", "compilation", "execution"),
+        help="diagnostic probe boundary; requires --benchmark-od-batching",
+    )
     parser.add_argument(
         "--check",
         action="store_true",
