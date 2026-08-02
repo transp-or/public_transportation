@@ -9,6 +9,12 @@ from .config import StructuralZeroConfig, load_structural_zero_config
 from .errors import StructuralZeroConfigError, StructuralZeroConflictError
 from .path_metrics import compute_od_path_metrics
 from .persistence import StructuralZeroOutputPaths, write_structural_zero_outputs
+from .progress import (
+    StructuralZeroProgress,
+    StructuralZeroProgressCallback,
+    StructuralZeroTqdmProgress,
+    structural_zero_tqdm_progress,
+)
 from .reconciliation import (
     FixedDemandReconciliationResult,
     load_and_reconcile_fixed_demand,
@@ -43,6 +49,9 @@ __all__ = [
     "StructuralZeroRecord",
     "StructuralZeroTopology",
     "StructuralZeroOutputPaths",
+    "StructuralZeroProgress",
+    "StructuralZeroProgressCallback",
+    "StructuralZeroTqdmProgress",
     "StructuralZeroExecutionResult",
     "analyze_structural_zeros",
     "build_structural_zero_topology",
@@ -54,5 +63,6 @@ __all__ = [
     "reconcile_fixed_demand",
     "run_structural_zero_preprocessing",
     "scenario_fingerprint_payload_json",
+    "structural_zero_tqdm_progress",
     "write_structural_zero_outputs",
 ]

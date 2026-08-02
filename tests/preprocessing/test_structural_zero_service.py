@@ -111,6 +111,39 @@ def test_end_to_end_service_uses_scenario_demand_as_candidate_universe(
     assert repeated.outputs.artifact_sha256 == result.outputs.artifact_sha256
 
 
+def test_service_progress_has_deterministic_phases_and_loop_finals(
+    tmp_path: Path,
+) -> None:
+    _write_scenario(tmp_path / "scenario")
+    events = []
+
+    result = run_structural_zero_preprocessing(
+        _write_config(tmp_path), progress=events.append
+    )
+
+    phases = [event.phase for event in events]
+    first_positions = {phase: phases.index(phase) for phase in set(phases)}
+    expected = (
+        "load_scenario",
+        "build_topology",
+        "destination_profiles",
+        "classify_cells",
+        "reconcile_fixed_demand",
+        "render_fixed_demand",
+        "render_outputs",
+        "render_summary",
+        "write_outputs",
+        "complete",
+    )
+    assert tuple(sorted(expected, key=first_positions.__getitem__)) == expected
+    classified = [event for event in events if event.phase == "classify_cells"]
+    assert classified[0].completed == 0
+    assert classified[-1].completed == result.analysis.num_cells
+    assert classified[-1].total == result.analysis.num_cells
+    assert events[-1].phase == "complete"
+    assert events[-1].completed == events[-1].total == 1
+
+
 def test_scenario_fingerprint_is_order_independent_and_demand_sensitive(
     tmp_path: Path,
 ) -> None:

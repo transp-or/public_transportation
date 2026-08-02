@@ -1,0 +1,519 @@
+"""Minimal checkpointed L-BFGS estimator for the gravity model."""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from time import perf_counter
+from typing import Any, Callable, Literal
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from scipy.optimize import minimize  # type: ignore[import-untyped]
+
+from public_transportation.compilation_cache import configure_jax_compilation_cache
+from public_transportation.inference.block_coordinate._canonical import fingerprint
+from public_transportation.inference.compact_od_assignment_layout import (
+    CompactODAssignmentLayout,
+)
+
+from .objective import (
+    GravityGradientStrategy,
+    GravityObjectiveEvaluation,
+    GravityObjectiveProblem,
+    gravity_value_and_gradient,
+)
+
+GRAVITY_CHECKPOINT_SCHEMA_VERSION = 1
+GRAVITY_RESULT_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True, slots=True)
+class GravityEstimatorConfig:
+    maximum_iterations: int = 100
+    gradient_tolerance: float = 1.0e-6
+    objective_tolerance: float = 1.0e-9
+
+    def __post_init__(self) -> None:
+        if self.maximum_iterations <= 0:
+            raise ValueError("maximum_iterations must be positive.")
+        if self.gradient_tolerance <= 0 or self.objective_tolerance <= 0:
+            raise ValueError("optimizer tolerances must be positive.")
+
+
+@dataclass(frozen=True, slots=True)
+class GravityExecutionPolicy:
+    gradient_strategy: Literal["auto", "batched_forward", "adjoint"] = "auto"
+    automatic_forward_parameter_limit: int = 8
+    wall_time_seconds: float | None = None
+    checkpoint_path: Path | None = None
+    progress_interval: int = 1
+    jax_compilation_cache_directory: Path | None = None
+
+    def __post_init__(self) -> None:
+        if self.gradient_strategy not in ("auto", "batched_forward", "adjoint"):
+            raise ValueError("unsupported gradient_strategy.")
+        if self.automatic_forward_parameter_limit <= 0:
+            raise ValueError("automatic_forward_parameter_limit must be positive.")
+        if self.wall_time_seconds is not None and self.wall_time_seconds <= 0:
+            raise ValueError("wall_time_seconds must be positive when provided.")
+        if self.progress_interval <= 0:
+            raise ValueError("progress_interval must be positive.")
+
+
+@dataclass(frozen=True, slots=True)
+class GravityCompilationDiagnostics:
+    strategy: str
+    tracing_seconds: float
+    lowering_seconds: float
+    compilation_seconds: float
+    first_execution_seconds: float
+    warm_execution_seconds: float
+    lowered_text_bytes: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class GravityStrategySelection:
+    requested: str
+    selected: str
+    reason: str
+    candidates: tuple[GravityCompilationDiagnostics, ...]
+    persistent_compilation_cache_enabled: bool
+    persistent_compilation_cache_directory: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class GravityEstimatorProgress:
+    iteration: int
+    objective: float
+    gradient_inf_norm: float
+    elapsed_seconds: float
+    checkpoint_written: bool
+
+
+@dataclass(frozen=True, slots=True)
+class GravityEstimationResult:
+    schema_version: int
+    status: str
+    success: bool
+    message: str
+    raw_parameters: np.ndarray
+    physical_parameters: np.ndarray
+    free_od_demand: np.ndarray
+    active_od_demand: np.ndarray
+    full_od_demand: np.ndarray
+    predicted_measurements: np.ndarray
+    objective: float
+    data_log_likelihood: float
+    gradient: np.ndarray
+    iterations: int
+    elapsed_seconds: float
+    model_fingerprint: str
+    strategy_selection: GravityStrategySelection
+    resumed: bool
+    checkpoint_path: Path | None
+
+    def __post_init__(self) -> None:
+        if self.schema_version != GRAVITY_RESULT_SCHEMA_VERSION:
+            raise ValueError("unsupported gravity result schema version.")
+        for name in (
+            "raw_parameters",
+            "physical_parameters",
+            "free_od_demand",
+            "active_od_demand",
+            "full_od_demand",
+            "predicted_measurements",
+            "gradient",
+        ):
+            value = np.array(getattr(self, name), copy=True)
+            value.setflags(write=False)
+            object.__setattr__(self, name, value)
+
+
+def gravity_model_fingerprint(
+    problem: GravityObjectiveProblem, compact_layout: CompactODAssignmentLayout
+) -> str:
+    operator = problem.operator
+    return fingerprint(
+        {
+            "schema_version": 1,
+            "features": problem.features.fingerprint,
+            "specification": problem.parameter_layout.specification.to_dict(),
+            "parameter_layout": problem.parameter_layout.fingerprint,
+            "compact_layout": compact_layout.fingerprint,
+            "assignment": operator.assignment_fingerprint,
+            "graph": operator.graph_fingerprint,
+            "mapping": operator.mapping_fingerprint,
+            "routing_theta": operator.theta,
+            "operator_dtype": str(operator.dtype),
+            "likelihood": problem.likelihood.value,
+            "rho": problem.rho,
+            "mean_floor": problem.mean_floor,
+            "observations": problem.observations,
+            "calibration_mask": problem.calibration_mask,
+        }
+    )
+
+
+def _atomic_checkpoint(path: Path, payload: dict[str, object]) -> None:
+    path = Path(path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _write_checkpoint(
+    path: Path,
+    *,
+    model_fingerprint: str,
+    raw_parameters: np.ndarray,
+    iterations: int,
+    elapsed_seconds: float,
+) -> None:
+    _atomic_checkpoint(
+        path,
+        {
+            "schema_version": GRAVITY_CHECKPOINT_SCHEMA_VERSION,
+            "model_fingerprint": model_fingerprint,
+            "raw_parameters": raw_parameters.tolist(),
+            "iterations": iterations,
+            "elapsed_seconds": elapsed_seconds,
+        },
+    )
+
+
+def _load_checkpoint(
+    path: Path, model_fingerprint: str, parameter_count: int = 3
+) -> tuple[np.ndarray, int, float]:
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read gravity checkpoint {path}.") from error
+    if payload.get("schema_version") != GRAVITY_CHECKPOINT_SCHEMA_VERSION:
+        raise ValueError("incompatible gravity checkpoint schema.")
+    if payload.get("model_fingerprint") != model_fingerprint:
+        raise ValueError("gravity checkpoint model fingerprint mismatch.")
+    raw = np.asarray(payload.get("raw_parameters"), dtype=np.float64)
+    if raw.shape != (parameter_count,) or not np.all(np.isfinite(raw)):
+        raise ValueError("gravity checkpoint parameters are invalid.")
+    return (
+        raw,
+        int(payload.get("iterations", 0)),
+        float(payload.get("elapsed_seconds", 0)),
+    )
+
+
+def _compile_strategy(
+    strategy: GravityGradientStrategy,
+    raw: jax.Array,
+    problem: GravityObjectiveProblem,
+    clock: Callable[[], float],
+) -> tuple[Any, GravityCompilationDiagnostics]:
+    def kernel(value: jax.Array):
+        return gravity_value_and_gradient(value, problem=problem, strategy=strategy)
+
+    jitted = jax.jit(kernel)
+    started = clock()
+    traced = jitted.trace(raw)
+    tracing = clock() - started
+    started = clock()
+    lowered = traced.lower()
+    lowering = clock() - started
+    try:
+        lowered_bytes = len(lowered.as_text().encode("utf-8"))
+    except AttributeError, TypeError, ValueError:
+        lowered_bytes = None
+    started = clock()
+    compiled = lowered.compile()
+    compilation = clock() - started
+    started = clock()
+    first = compiled(raw)
+    jax.block_until_ready(first)
+    first_execution = clock() - started
+    started = clock()
+    warm = compiled(raw)
+    jax.block_until_ready(warm)
+    warm_execution = clock() - started
+    return compiled, GravityCompilationDiagnostics(
+        strategy.value,
+        tracing,
+        lowering,
+        compilation,
+        first_execution,
+        warm_execution,
+        lowered_bytes,
+    )
+
+
+def _prepare_kernel(
+    requested: str,
+    raw: jax.Array,
+    problem: GravityObjectiveProblem,
+    policy: GravityExecutionPolicy,
+    clock: Callable[[], float],
+) -> tuple[Any, GravityStrategySelection]:
+    if requested != "auto":
+        strategy = GravityGradientStrategy(requested)
+        compiled, explicit_metrics = _compile_strategy(strategy, raw, problem, clock)
+        return compiled, GravityStrategySelection(
+            requested,
+            requested,
+            "explicit user selection",
+            (explicit_metrics,),
+            policy.jax_compilation_cache_directory is not None,
+            (
+                None
+                if policy.jax_compilation_cache_directory is None
+                else str(policy.jax_compilation_cache_directory.expanduser().resolve())
+            ),
+        )
+    if problem.operator.is_matrix_free:
+        strategy = GravityGradientStrategy.ADJOINT
+        compiled, metrics = _compile_strategy(strategy, raw, problem, clock)
+        return compiled, GravityStrategySelection(
+            requested="auto",
+            selected=strategy.value,
+            reason=(
+                "matrix-free operator defaults to adjoint without benchmarking "
+                "multiple cold full-network kernels"
+            ),
+            candidates=(metrics,),
+            persistent_compilation_cache_enabled=(
+                policy.jax_compilation_cache_directory is not None
+            ),
+            persistent_compilation_cache_directory=(
+                None
+                if policy.jax_compilation_cache_directory is None
+                else str(policy.jax_compilation_cache_directory.expanduser().resolve())
+            ),
+        )
+    candidates = (
+        GravityGradientStrategy.BATCHED_FORWARD,
+        GravityGradientStrategy.ADJOINT,
+    )
+    compiled_candidates: list[Any] = []
+    candidate_metrics: list[GravityCompilationDiagnostics] = []
+    for candidate in candidates:
+        compiled, item = _compile_strategy(candidate, raw, problem, clock)
+        compiled_candidates.append(compiled)
+        candidate_metrics.append(item)
+    parameter_count = problem.parameter_layout.size
+    allowed = (
+        range(2)
+        if parameter_count <= policy.automatic_forward_parameter_limit
+        else range(1, 2)
+    )
+    selected_index = min(
+        allowed, key=lambda index: candidate_metrics[index].warm_execution_seconds
+    )
+    selected = candidates[selected_index]
+    reason = (
+        f"minimum measured warm time among strategies allowed for "
+        f"{parameter_count} parameters"
+    )
+    return compiled_candidates[selected_index], GravityStrategySelection(
+        "auto",
+        selected.value,
+        reason,
+        tuple(candidate_metrics),
+        policy.jax_compilation_cache_directory is not None,
+        (
+            None
+            if policy.jax_compilation_cache_directory is None
+            else str(policy.jax_compilation_cache_directory.expanduser().resolve())
+        ),
+    )
+
+
+class _DeadlineStop(RuntimeError):
+    pass
+
+
+def estimate_gravity_model(
+    *,
+    problem: GravityObjectiveProblem,
+    compact_layout: CompactODAssignmentLayout,
+    initial_raw_parameters: object,
+    config: GravityEstimatorConfig = GravityEstimatorConfig(),
+    execution: GravityExecutionPolicy = GravityExecutionPolicy(),
+    resume: bool = False,
+    progress: Callable[[GravityEstimatorProgress], None] | None = None,
+    clock: Callable[[], float] = perf_counter,
+) -> GravityEstimationResult:
+    """Estimate the minimal model and checkpoint only at valid iterate boundaries."""
+    problem.features.validate_compact_layout(compact_layout)
+    if execution.jax_compilation_cache_directory is not None:
+        configure_jax_compilation_cache(execution.jax_compilation_cache_directory)
+    model_fingerprint = gravity_model_fingerprint(problem, compact_layout)
+    started = clock()
+    checkpoint = execution.checkpoint_path
+    resumed_elapsed = 0.0
+    completed_iterations = 0
+    if resume:
+        if checkpoint is None:
+            raise ValueError("resume requires checkpoint_path.")
+        raw_numpy, completed_iterations, resumed_elapsed = _load_checkpoint(
+            checkpoint, model_fingerprint, problem.parameter_layout.size
+        )
+        resumed = True
+    else:
+        raw_numpy = np.asarray(initial_raw_parameters, dtype=np.float64)
+        if raw_numpy.shape != (problem.parameter_layout.size,) or not np.all(
+            np.isfinite(raw_numpy)
+        ):
+            raise ValueError("initial_raw_parameters have the wrong shape or values.")
+        resumed = False
+        if checkpoint is not None:
+            if checkpoint.exists():
+                raise FileExistsError(
+                    f"gravity checkpoint already exists at {checkpoint}; "
+                    "resume it or choose another path."
+                )
+            _write_checkpoint(
+                checkpoint,
+                model_fingerprint=model_fingerprint,
+                raw_parameters=raw_numpy,
+                iterations=0,
+                elapsed_seconds=0.0,
+            )
+    deadline = (
+        None
+        if execution.wall_time_seconds is None
+        else started + execution.wall_time_seconds
+    )
+    raw_jax = jnp.asarray(raw_numpy, dtype=problem.features.dtype)
+    compiled, selection = _prepare_kernel(
+        execution.gradient_strategy, raw_jax, problem, execution, clock
+    )
+    latest_raw = raw_numpy.copy()
+    latest_evaluation: GravityObjectiveEvaluation | None = None
+    latest_gradient = np.zeros_like(raw_numpy)
+
+    def evaluate(value: np.ndarray) -> tuple[float, np.ndarray]:
+        nonlocal latest_raw, latest_evaluation, latest_gradient
+        evaluation, gradient = compiled(jnp.asarray(value, dtype=raw_jax.dtype))
+        jax.block_until_ready((evaluation, gradient))
+        latest_raw = np.asarray(value, dtype=np.float64).copy()
+        latest_evaluation = evaluation
+        latest_gradient = np.asarray(gradient, dtype=np.float64)
+        return float(evaluation.objective), latest_gradient
+
+    def callback(value: np.ndarray) -> None:
+        nonlocal completed_iterations
+        completed_iterations += 1
+        elapsed = resumed_elapsed + clock() - started
+        if checkpoint is not None:
+            _write_checkpoint(
+                checkpoint,
+                model_fingerprint=model_fingerprint,
+                raw_parameters=np.asarray(value),
+                iterations=completed_iterations,
+                elapsed_seconds=elapsed,
+            )
+        if (
+            progress is not None
+            and completed_iterations % execution.progress_interval == 0
+        ):
+            assert latest_evaluation is not None
+            progress(
+                GravityEstimatorProgress(
+                    completed_iterations,
+                    float(latest_evaluation.objective),
+                    float(np.max(np.abs(latest_gradient), initial=0.0)),
+                    elapsed,
+                    checkpoint is not None,
+                )
+            )
+        if deadline is not None and clock() >= deadline:
+            raise _DeadlineStop
+
+    status = "completed"
+    success = False
+    message = ""
+    if deadline is not None and clock() >= deadline:
+        status, message = (
+            "stopped_by_time_budget",
+            "wall-time budget reached before optimization",
+        )
+        evaluate(raw_numpy)
+    else:
+        remaining = max(0, config.maximum_iterations - completed_iterations)
+        if remaining == 0:
+            evaluate(raw_numpy)
+            status, message = (
+                "iteration_limit",
+                "configured iteration limit already reached",
+            )
+        else:
+            try:
+                solver = minimize(
+                    evaluate,
+                    raw_numpy,
+                    method="L-BFGS-B",
+                    jac=True,
+                    callback=callback,
+                    options={
+                        "maxiter": remaining,
+                        "gtol": config.gradient_tolerance,
+                        "ftol": config.objective_tolerance,
+                    },
+                )
+            except _DeadlineStop:
+                status, message = "stopped_by_time_budget", "wall-time budget reached"
+            else:
+                solver_raw = np.asarray(solver.x, dtype=np.float64)
+                if not np.array_equal(latest_raw, solver_raw):
+                    evaluate(solver_raw)
+                latest_raw = solver_raw
+                success = bool(solver.success)
+                status = "converged" if success else "iteration_limit"
+                message = str(solver.message)
+    assert latest_evaluation is not None
+    free_demand = np.asarray(latest_evaluation.demand)
+    active = np.zeros(compact_layout.num_active, dtype=free_demand.dtype)
+    active[np.asarray(compact_layout.free_compact_indices, dtype=np.int64)] = (
+        free_demand
+    )
+    active[np.asarray(compact_layout.fixed_compact_indices, dtype=np.int64)] = (
+        np.asarray(compact_layout.fixed_compact_values)
+    )
+    full = np.zeros(compact_layout.num_od_total, dtype=free_demand.dtype)
+    full[np.asarray(compact_layout.active_full_indices, dtype=np.int64)] = active
+    physical = np.asarray(problem.parameter_layout.physical_vector(latest_raw))
+    elapsed = resumed_elapsed + clock() - started
+    return GravityEstimationResult(
+        GRAVITY_RESULT_SCHEMA_VERSION,
+        status,
+        success,
+        message,
+        latest_raw,
+        physical,
+        free_demand,
+        active,
+        full,
+        np.asarray(latest_evaluation.measurement_mean),
+        float(latest_evaluation.objective),
+        float(latest_evaluation.data_log_likelihood),
+        latest_gradient,
+        completed_iterations,
+        elapsed,
+        model_fingerprint,
+        selection,
+        resumed,
+        checkpoint,
+    )

@@ -204,6 +204,39 @@ print(result.analysis.num_structural_zero)
 print(result.outputs.fixed_demand)
 ```
 
+Long-running applications can observe the complete workflow through the
+dependency-free callback API. Each immutable `StructuralZeroProgress` event
+contains `phase`, `completed`, `total`, `elapsed_seconds`, and an optional
+`message`. Stable workflow phases are `load_scenario`, `build_topology`,
+`destination_profiles`, `classify_cells`, `reconcile_fixed_demand`,
+`render_outputs`, `write_outputs`, and `complete`; small auxiliary rendering
+phases identify fixed-demand and summary preparation.
+
+```python
+from public_transportation.preprocessing import (
+    run_structural_zero_preprocessing,
+    structural_zero_tqdm_progress,
+)
+
+with structural_zero_tqdm_progress() as progress:
+    result = run_structural_zero_preprocessing(
+        "structural_zeros.toml",
+        progress=progress,
+    )
+```
+
+The numerical functions never print. `tqdm` is imported only when the adapter
+is enabled, and its bar is written to stderr so JSON on stdout remains clean.
+The documented CLI accepts `--progress` and `--no-progress`, defaulting to
+progress only on an interactive terminal.
+
+Destination, classification, and audit loops emit every item for at most 100
+items. Larger loops emit about every 1 percent, never more frequently than every
+25 items, while also emitting when ten seconds have passed. Every loop emits
+zero initially and its exact total finally. Callback exceptions propagate.
+Artifact payloads are completed before atomic per-file replacement, so an
+exception during rendering cannot replace an existing file with partial data.
+
 The service loads the scenario with `strict=True`, fingerprints its canonical
 domain content, rejects duplicate demand keys, builds the production assignment
 topology, computes and classifies metrics for the demand-key universe,

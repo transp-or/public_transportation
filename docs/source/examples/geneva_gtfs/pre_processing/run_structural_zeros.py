@@ -2,17 +2,33 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
+import sys
 
-from public_transportation.preprocessing import run_structural_zero_preprocessing
+from public_transportation.preprocessing import (
+    run_structural_zero_preprocessing,
+    structural_zero_tqdm_progress,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def main() -> None:
-    result = run_structural_zero_preprocessing(ROOT / "structural_zeros.toml")
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--progress",
+        action=argparse.BooleanOptionalAction,
+        default=sys.stderr.isatty(),
+        help="show phase progress on stderr (default: interactive terminals only)",
+    )
+    arguments = parser.parse_args()
+    with structural_zero_tqdm_progress(enabled=arguments.progress) as progress:
+        result = run_structural_zero_preprocessing(
+            ROOT / "structural_zeros.toml", progress=progress
+        )
     print(
         json.dumps(
             {

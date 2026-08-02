@@ -10,9 +10,10 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .config import StructuralZeroConfig
+from .progress import ProgressEmitter, StructuralZeroProgress, emit_phase
 from .reconciliation import FixedDemandReconciliationResult
 from .types import StructuralZeroAnalysisResult
 
@@ -39,6 +40,8 @@ def write_structural_zero_outputs(
     analysis: StructuralZeroAnalysisResult,
     reconciliation: FixedDemandReconciliationResult,
     config: StructuralZeroConfig,
+    *,
+    progress: Callable[[StructuralZeroProgress], None] | None = None,
 ) -> StructuralZeroOutputPaths:
     """Validate, render, and atomically replace every output artifact.
 
@@ -49,19 +52,30 @@ def write_structural_zero_outputs(
     _validate_consistency(analysis, reconciliation, config)
     include_retained = config.output.include_retained_cells_in_report
 
+    emit_phase(
+        progress, "render_fixed_demand", completed=0, message=FIXED_DEMAND_FILENAME
+    )
+    fixed_payload = _fixed_demand_csv(reconciliation).encode("utf-8")
+    emit_phase(
+        progress, "render_fixed_demand", completed=1, message=FIXED_DEMAND_FILENAME
+    )
+    audit_payload = _audit_csv(
+        analysis, include_retained=include_retained, progress=progress
+    ).encode("utf-8")
+    emit_phase(progress, "render_summary", completed=0, message=SUMMARY_FILENAME)
+    summary_payload = _json_bytes(
+        _summary_payload(
+            analysis,
+            reconciliation,
+            include_retained=include_retained,
+        )
+    )
+    emit_phase(progress, "render_summary", completed=1, message=SUMMARY_FILENAME)
     payloads: dict[str, bytes] = {
-        FIXED_DEMAND_FILENAME: _fixed_demand_csv(reconciliation).encode("utf-8"),
-        AUDIT_FILENAME: _audit_csv(analysis, include_retained=include_retained).encode(
-            "utf-8"
-        ),
+        FIXED_DEMAND_FILENAME: fixed_payload,
+        AUDIT_FILENAME: audit_payload,
         RESOLVED_CONFIG_FILENAME: config.to_resolved_toml().encode("utf-8"),
-        SUMMARY_FILENAME: _json_bytes(
-            _summary_payload(
-                analysis,
-                reconciliation,
-                include_retained=include_retained,
-            )
-        ),
+        SUMMARY_FILENAME: summary_payload,
     }
     artifact_hashes = {
         name: hashlib.sha256(payload).hexdigest() for name, payload in payloads.items()
@@ -79,8 +93,13 @@ def write_structural_zero_outputs(
 
     folder = config.output.folder
     folder.mkdir(parents=True, exist_ok=True)
-    for name, payload in payloads.items():
+    write_progress = ProgressEmitter(
+        progress, phase="write_outputs", total=len(payloads)
+    )
+    write_progress.start()
+    for index, (name, payload) in enumerate(payloads.items()):
         _atomic_write_bytes(folder / name, payload)
+        write_progress.update(index + 1)
 
     return StructuralZeroOutputPaths(
         folder=folder,
@@ -128,7 +147,10 @@ def _fixed_demand_csv(reconciliation: FixedDemandReconciliationResult) -> str:
 
 
 def _audit_csv(
-    analysis: StructuralZeroAnalysisResult, *, include_retained: bool
+    analysis: StructuralZeroAnalysisResult,
+    *,
+    include_retained: bool,
+    progress: Callable[[StructuralZeroProgress], None] | None = None,
 ) -> str:
     stream = io.StringIO(newline="")
     writer = csv.writer(stream, lineterminator="\n")
@@ -148,9 +170,19 @@ def _audit_csv(
             "earliest_arrival_seconds",
         )
     )
-    for record in analysis.records:
-        if not include_retained and not record.is_structural_zero:
-            continue
+    report_records = tuple(
+        record
+        for record in analysis.records
+        if include_retained or record.is_structural_zero
+    )
+    render_progress = ProgressEmitter(
+        progress,
+        phase="render_outputs",
+        total=len(report_records),
+        message=AUDIT_FILENAME,
+    )
+    render_progress.start()
+    for index, record in enumerate(report_records):
         metrics = record.metrics
         writer.writerow(
             (
@@ -166,6 +198,7 @@ def _audit_csv(
                 _optional_text(metrics.earliest_arrival_seconds),
             )
         )
+        render_progress.update(index + 1)
     return stream.getvalue()
 
 

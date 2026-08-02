@@ -51,9 +51,24 @@ from public_transportation.inference.sharded_sparse_operator import (
     ShardedSparseLinearOperator,
     shard_path,
 )
+from public_transportation.inference.sharded_fixed_routing import (
+    FixedRoutingPreparationConfig,
+    prepare_fixed_routing_sharded,
+)
+from public_transportation.inference.sharded_matrix_free_operator import (
+    ShardedMatrixFreeFixedRoutingMeasurementOperator,
+)
 from public_transportation.inference.od_parameter_layout import ODParameterLayout
 from public_transportation.inference.maximum_likelihood_pipeline import (
     build_od_theta_ml_problem,
+)
+from public_transportation.inference.gravity import (
+    GravityFeatures,
+    GravityLikelihood,
+    GravityModelSpecification,
+    GravityObjectiveProblem,
+    GravityParameterLayout,
+    gravity_value_and_gradient_adjoint,
 )
 from public_transportation.inference.pipeline import ODThetaEstimationRequest
 from public_transportation.measurement.likelihood_jax import (
@@ -137,6 +152,118 @@ def test_dense_operator_matches_fixed_loader_and_scaling(all_free_operator, scal
     reference = _reference(inputs, routing, spec, demand)
 
     np.testing.assert_allclose(direct, reference, rtol=3e-5, atol=3e-5)
+
+
+def test_sharded_matrix_free_products_match_complete_operator(
+    all_free_operator, tmp_path
+):
+    inputs, _, spec, complete_operator = all_free_operator
+    num_od = int(inputs.od_origin_node.shape[0])
+    layout = ODParameterLayout(
+        num_od_total=num_od,
+        od_keys=tuple((f"o{i}", "d", "t") for i in range(num_od)),
+        free_od_indices=tuple(range(num_od)),
+        fixed_od_indices=(),
+        fixed_od_values=(),
+        free_baseline_values=tuple(1.0 for _ in range(num_od)),
+        fixed_zero_indices=(),
+        fixed_positive_indices=(),
+    )
+    compact = build_compact_od_assignment_layout(parameter_layout=layout)
+    prepared = prepare_fixed_routing_sharded(
+        inputs=inputs,
+        theta=1.0,
+        config=FixedRoutingPreparationConfig(
+                maximum_groups_per_shard=2,
+                cache_directory=tmp_path,
+                checkpoint_directory=tmp_path / "checkpoint",
+                resident_shard_limit=1,
+        ),
+    )
+    operator = ShardedMatrixFreeFixedRoutingMeasurementOperator(
+        inputs=inputs,
+        routing=prepared.routing,
+        spec=spec,
+        compact_layout=compact,
+        resident_shard_limit=1,
+    )
+    demand = jnp.linspace(0.1, 5.0, num_od, dtype=jnp.float32)
+    weight = jnp.array([0.5, -0.2, 1.1], dtype=jnp.float32)
+
+    expected = complete_operator.jax_matvec(demand)
+    actual = operator.jax_matvec(demand)
+    np.testing.assert_allclose(actual, expected, rtol=4e-5, atol=4e-5)
+    np.testing.assert_allclose(
+        operator.jax_rmatvec(weight),
+        complete_operator.jax_rmatvec(weight),
+        rtol=4e-5,
+        atol=4e-5,
+    )
+    compiled = jax.jit(operator.jax_matvec)(demand)
+    np.testing.assert_allclose(compiled, expected, rtol=4e-5, atol=4e-5)
+    gradient = jax.grad(lambda value: jnp.vdot(operator.jax_matvec(value), weight))(
+        demand
+    )
+    np.testing.assert_allclose(
+        gradient,
+        complete_operator.jax_rmatvec(weight),
+        rtol=4e-5,
+        atol=4e-5,
+    )
+    assert operator.resident_shards <= 1
+    assert operator.is_matrix_free
+    assert operator.representation == "matrix_free_sharded"
+
+    features = GravityFeatures(
+        canonical_od_index=np.arange(num_od),
+        origin_index=np.arange(num_od),
+        destination_index=np.zeros(num_od, dtype=np.int32),
+        departure_time_index=np.zeros(num_od, dtype=np.int32),
+        origin_time_group_index=np.arange(num_od),
+        journey_time=np.linspace(1.0, 2.0, num_od),
+        transfer_count=np.zeros(num_od, dtype=np.int32),
+        structural_feasible=np.ones(num_od, dtype=bool),
+        origin_time_totals=np.linspace(1.0, 3.0, num_od),
+        destination_attractiveness=np.ones(num_od),
+        num_origins=num_od,
+        num_destinations=1,
+        num_departure_times=1,
+        od_layout_fingerprint=compact.fingerprint,
+        journey_time_scale=1.0,
+    )
+    parameter_layout = GravityParameterLayout(GravityModelSpecification())
+    raw = parameter_layout.raw_from_physical((0.5, 1.0, 10.0))
+    observations = np.asarray((2.0, 3.0, 1.0))
+    for likelihood in (GravityLikelihood.POISSON, GravityLikelihood.NEGATIVE_BINOMIAL):
+        complete_problem = GravityObjectiveProblem(
+            features=features,
+            parameter_layout=parameter_layout,
+            operator=complete_operator,
+            observations=observations,
+            likelihood=likelihood,
+        )
+        sharded_problem = GravityObjectiveProblem(
+            features=features,
+            parameter_layout=parameter_layout,
+            operator=operator,
+            observations=observations,
+            likelihood=likelihood,
+        )
+        expected_evaluation, expected_gradient = gravity_value_and_gradient_adjoint(
+            raw, problem=complete_problem
+        )
+        actual_evaluation, actual_gradient = gravity_value_and_gradient_adjoint(
+            raw, problem=sharded_problem
+        )
+        np.testing.assert_allclose(
+            actual_evaluation.measurement_mean,
+            expected_evaluation.measurement_mean,
+            rtol=4e-5,
+            atol=4e-5,
+        )
+        np.testing.assert_allclose(
+            actual_gradient, expected_gradient, rtol=5e-5, atol=5e-5
+        )
 
 
 def test_operator_preserves_superposition(all_free_operator):

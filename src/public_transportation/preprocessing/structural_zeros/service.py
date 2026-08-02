@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
+from typing import Callable
 
 from public_transportation.domain.scenario import Scenario
 
 from .classification import analyze_structural_zeros
 from .config import StructuralZeroConfig, load_structural_zero_config
 from .persistence import StructuralZeroOutputPaths, write_structural_zero_outputs
+from .progress import StructuralZeroProgress, emit_phase
 from .reconciliation import (
     FixedDemandReconciliationResult,
     load_and_reconcile_fixed_demand,
@@ -33,8 +36,12 @@ class StructuralZeroExecutionResult:
 
 def run_structural_zero_preprocessing(
     config_file: str | Path,
+    *,
+    progress: Callable[[StructuralZeroProgress], None] | None = None,
 ) -> StructuralZeroExecutionResult:
     """Execute the complete workflow using only a TOML configuration path."""
+    started = perf_counter()
+    emit_phase(progress, "load_scenario", completed=0)
     config = load_structural_zero_config(config_file)
     scenario = Scenario.from_folder(
         config.scenario.folder,
@@ -43,20 +50,32 @@ def run_structural_zero_preprocessing(
     )
     scenario_fingerprint = fingerprint_scenario(scenario)
     candidate_keys = _scenario_demand_keys(scenario)
+    emit_phase(progress, "load_scenario", completed=1, started=started)
+    phase_started = perf_counter()
+    emit_phase(progress, "build_topology", completed=0)
     topology = build_structural_zero_topology(scenario, config.assignment)
+    emit_phase(progress, "build_topology", completed=1, started=phase_started)
     analysis = analyze_structural_zeros(
         topology,
         config,
         scenario_fingerprint=scenario_fingerprint,
         keys=candidate_keys,
+        progress=progress,
     )
+    phase_started = perf_counter()
+    emit_phase(progress, "reconcile_fixed_demand", completed=0)
     reconciliation = load_and_reconcile_fixed_demand(
         analysis,
         config,
         scenario=scenario,
     )
-    outputs = write_structural_zero_outputs(analysis, reconciliation, config)
-    return StructuralZeroExecutionResult(
+    emit_phase(
+        progress, "reconcile_fixed_demand", completed=1, started=phase_started
+    )
+    outputs = write_structural_zero_outputs(
+        analysis, reconciliation, config, progress=progress
+    )
+    result = StructuralZeroExecutionResult(
         config=config,
         scenario_fingerprint=scenario_fingerprint,
         topology=topology,
@@ -64,6 +83,8 @@ def run_structural_zero_preprocessing(
         reconciliation=reconciliation,
         outputs=outputs,
     )
+    emit_phase(progress, "complete", completed=1, started=started)
+    return result
 
 
 def _scenario_demand_keys(scenario: Scenario) -> tuple[ODTimeKey, ...]:

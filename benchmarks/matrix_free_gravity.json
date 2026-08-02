@@ -1,0 +1,68 @@
+{
+  "checkpoint": {
+    "bytes": 238,
+    "iterations": 1,
+    "status": "iteration_limit"
+  },
+  "example": "simple_example_02",
+  "logical_operator": {
+    "avoided_dense_float32_bytes": 75600,
+    "entries": 18900,
+    "free_od": 70,
+    "global_matrix_constructed": false,
+    "measurements": 270
+  },
+  "memory": {
+    "peak_rss_bytes": 526286848,
+    "rss_before_bytes": 438763520
+  },
+  "objective": {
+    "compilation_seconds": 0.2083527910290286,
+    "first_execution_seconds": 0.004472041968256235,
+    "lowered_text_bytes": 1340984,
+    "lowering_seconds": 0.03245358297135681,
+    "tracing_seconds": 0.04492283391300589,
+    "warm_execution_seconds": 0.018242500023916364
+  },
+  "preparation": {
+    "backend": "cpu",
+    "captured_constant_bytes": null,
+    "deadline_exceeded": false,
+    "deadline_phase": null,
+    "devices": [
+      "cpu:0"
+    ],
+    "fixed_positive_cells": 2,
+    "forward_compilation_count": 1,
+    "forward_compilation_seconds": 0.06521029199939221,
+    "forward_execution_count": 2,
+    "forward_execution_seconds": 0.005732416990213096,
+    "forward_first_execution_seconds": 0.002951832953840494,
+    "forward_input_shape": [
+      70
+    ],
+    "forward_lowering_seconds": 0.011272375006228685,
+    "forward_tracing_seconds": 0.0019313329830765724,
+    "forward_warm_execution_seconds": 0.002780584036372602,
+    "indivisible_operation_overshoot": false,
+    "input_dtype": "float32",
+    "offset_compilation_seconds": 0.09889837494120002,
+    "offset_execution_seconds": 0.0030148340156301856,
+    "routing_preparation_seconds": 0.08775887498632073,
+    "total_preparation_seconds": 0.18975512497127056,
+    "transpose_compilation_count": 1,
+    "transpose_compilation_seconds": 0.06895658397115767,
+    "transpose_execution_count": 2,
+    "transpose_execution_seconds": 0.0024265829706564546,
+    "transpose_first_execution_seconds": 0.0013943749945610762,
+    "transpose_input_shape": [
+      270
+    ],
+    "transpose_lowering_seconds": 0.019901541993021965,
+    "transpose_tracing_seconds": 0.02937358303461224,
+    "transpose_warm_execution_seconds": 0.0010322079760953784,
+    "validation_seconds": 8.304102811962366e-05,
+    "zero_offset_fast_path": false
+  },
+  "schema_version": 1
+}

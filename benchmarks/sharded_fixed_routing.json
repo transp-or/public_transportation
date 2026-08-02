@@ -1,0 +1,84 @@
+{
+  "cache_bytes": 212754,
+  "cache_hits_on_reload": 4,
+  "cache_reload_seconds": 0.002394416951574385,
+  "compilation_count": 1,
+  "compilation_seconds": 0.10080412507522851,
+  "complete_seconds": 0.13879066705703735,
+  "construction_workers": 1,
+  "destination_groups": 7,
+  "forward_norm": 2.771305799484253,
+  "forward_seconds": 0.07701700006145984,
+  "global_measurement_matrix_constructed": false,
+  "groups_per_shard": 2,
+  "links": 5846,
+  "lowering_seconds": 0.013876082957722247,
+  "maximum_mask_difference": 0,
+  "maximum_probability_difference": 0.0,
+  "peak_rss_bytes": 452034560,
+  "predicted_shard_bytes": 58460,
+  "schema_version": 1,
+  "sharded_seconds": 0.19965441606473178,
+  "shards": 4,
+  "threads_per_worker": 1,
+  "tracing_seconds": 0.0024062501033768058,
+  "transpose_norm": 1.7320518493652344,
+  "transpose_seconds": 0.04406395799014717,
+  "warm_shard_diagnostics": {
+    "active_process_threads": null,
+    "argument_transfer_seconds": 8.025008719414473e-05,
+    "backend": "cpu",
+    "cleanup_seconds": 9.416020475327969e-06,
+    "device_synchronization_seconds": 0.001989167067222297,
+    "devices": [
+      "cpu:0"
+    ],
+    "enabled_link_fraction": 0.9066028053369826,
+    "enabled_links": 5300,
+    "estimated_temporary_bytes": 116920,
+    "graph_links_traversed": 11692,
+    "graph_nodes_traversed": 2324,
+    "host_destination_preparation_seconds": 0.011951207998208702,
+    "host_mask_preparation_seconds": 0.014839875046163797,
+    "host_transfer_seconds": 1.1916039511561394e-05,
+    "input_dtypes": [
+      "int32",
+      "bool"
+    ],
+    "input_shapes": [
+      [
+        2
+      ],
+      [
+        2,
+        5846
+      ]
+    ],
+    "kernel_execution_seconds": 3.1624920666217804e-05,
+    "manifest_persistence_seconds": 0.0004394159186631441,
+    "num_groups": 1,
+    "output_dtypes": [
+      "bool",
+      "float32"
+    ],
+    "output_shapes": [
+      [
+        1,
+        5846
+      ],
+      [
+        1,
+        5846
+      ]
+    ],
+    "output_slicing_seconds": 1.500011421740055e-06,
+    "probability_density": 0.9066028053369826,
+    "probability_nonzeros": 5300,
+    "process_cpu_utilization_percent": 99.9185857190225,
+    "retained_bytes": 29230,
+    "shard_index": 3,
+    "shard_persistence_seconds": 0.0007908330298960209,
+    "total_shard_seconds": 0.030246625072322786,
+    "validation_seconds": 4.812504630535841e-05
+  }
+}

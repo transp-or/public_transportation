@@ -1,0 +1,75 @@
+{
+  "backend": "cpu",
+  "dtype": "float32",
+  "example": "geneva_gtfs",
+  "holdout": {
+    "calibration_measurements": 8103,
+    "calibration_nb_deviance": 1030.1167848878997,
+    "calibration_rmse": 1.795483760167199,
+    "holdout_measurements": 864,
+    "holdout_nb_deviance": 116.75276603024888,
+    "holdout_rmse": 1.165905436195322,
+    "split_fingerprint": "d96c39befd14f6e5a06351a02643d792d44826199652557453ef296be45ce801"
+  },
+  "lineage": {
+    "child_status": "iteration_limit",
+    "nodes": 2,
+    "objective_change": -5.165283203125,
+    "selected_relaxation": "time_period",
+    "warm_start_maximum_prediction_difference": 0.0
+  },
+  "minimal": {
+    "iterations": 2,
+    "negative_binomial_deviance": 1236.651004484168,
+    "objective": 2239.31689453125,
+    "rmse": 1.8367279368409537,
+    "status": "iteration_limit"
+  },
+  "num_free_od": 96,
+  "num_measurements": 8967,
+  "num_od_total": 15128,
+  "operator": {
+    "construction_seconds": 14.848006207961589,
+    "density": 0.0055620608899297425,
+    "representation": "bcoo",
+    "stored_bytes": 95760
+  },
+  "recommendations": [
+    {
+      "added_parameters": null,
+      "applicable": false,
+      "approximate_gain": null,
+      "candidate": "destination_zone_attractiveness",
+      "strength": "none"
+    },
+    {
+      "added_parameters": 1,
+      "applicable": true,
+      "approximate_gain": 0.08888619538385817,
+      "candidate": "broad_time_period",
+      "strength": "none"
+    },
+    {
+      "added_parameters": null,
+      "applicable": false,
+      "approximate_gain": null,
+      "candidate": "origin_zone_production",
+      "strength": "none"
+    },
+    {
+      "added_parameters": null,
+      "applicable": false,
+      "approximate_gain": null,
+      "candidate": "journey_time_impedance",
+      "strength": "none"
+    },
+    {
+      "added_parameters": null,
+      "applicable": false,
+      "approximate_gain": null,
+      "candidate": "transfer_penalty",
+      "strength": "none"
+    }
+  ],
+  "schema_version": 1
+}

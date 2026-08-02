@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from typing import TypeVar
+from typing import Callable, TypeVar
 
 from .config import RulesConfig, StructuralZeroConfig
 from .path_metrics import compute_od_path_metrics
+from .progress import ProgressEmitter, StructuralZeroProgress
 from .topology import StructuralZeroTopology
 from .types import (
     ODPathMetricRecord,
@@ -35,6 +36,7 @@ def classify_structural_zeros(
     scenario_fingerprint: str,
     graph_fingerprint: str,
     configuration_fingerprint: str,
+    progress: Callable[[StructuralZeroProgress], None] | None = None,
 ) -> StructuralZeroAnalysisResult:
     """Apply enabled rules and return a deterministic immutable result.
 
@@ -43,7 +45,11 @@ def classify_structural_zeros(
     Consequently, equality is retained.
     """
     records: list[StructuralZeroRecord] = []
-    for metric_record in metric_records:
+    classification_progress = ProgressEmitter(
+        progress, phase="classify_cells", total=len(metric_records)
+    )
+    classification_progress.start()
+    for record_index, metric_record in enumerate(metric_records):
         key = metric_record.key
         metrics = metric_record.metrics
         triggered: set[StructuralZeroReason] = set()
@@ -54,34 +60,34 @@ def classify_structural_zeros(
             triggered.add(StructuralZeroReason.NO_FEASIBLE_PATH)
 
         if rules.enabled.maximum_transfers and metrics.feasible:
-            section = _required_rule_section(
+            transfer_rule = _required_rule_section(
                 rules.maximum_transfers, "maximum_transfers"
             )
             assert metrics.minimum_transfers is not None
-            if metrics.minimum_transfers > section.max_transfers:
+            if metrics.minimum_transfers > transfer_rule.max_transfers:
                 triggered.add(StructuralZeroReason.MAXIMUM_TRANSFERS_EXCEEDED)
 
         if rules.enabled.maximum_initial_wait and metrics.feasible:
-            section = _required_rule_section(
+            wait_rule = _required_rule_section(
                 rules.maximum_initial_wait, "maximum_initial_wait"
             )
             assert metrics.minimum_initial_wait_minutes is not None
-            if metrics.minimum_initial_wait_minutes > section.max_initial_wait_minutes:
+            if metrics.minimum_initial_wait_minutes > wait_rule.max_initial_wait_minutes:
                 triggered.add(StructuralZeroReason.MAXIMUM_INITIAL_WAIT_EXCEEDED)
 
         if rules.enabled.maximum_journey_time and metrics.feasible:
-            section = _required_rule_section(
+            journey_rule = _required_rule_section(
                 rules.maximum_journey_time, "maximum_journey_time"
             )
             assert metrics.minimum_journey_time_minutes is not None
-            if metrics.minimum_journey_time_minutes > section.max_journey_time_minutes:
+            if metrics.minimum_journey_time_minutes > journey_rule.max_journey_time_minutes:
                 triggered.add(StructuralZeroReason.MAXIMUM_JOURNEY_TIME_EXCEEDED)
 
         if rules.enabled.minimum_feasible_departures:
-            section = _required_rule_section(
+            departure_rule = _required_rule_section(
                 rules.minimum_feasible_departures, "minimum_feasible_departures"
             )
-            if metrics.feasible_departure_count < section.min_feasible_departures:
+            if metrics.feasible_departure_count < departure_rule.min_feasible_departures:
                 triggered.add(StructuralZeroReason.INSUFFICIENT_FEASIBLE_DEPARTURES)
 
         ordered_reasons = tuple(
@@ -96,6 +102,7 @@ def classify_structural_zeros(
                 metrics=metrics,
             )
         )
+        classification_progress.update(record_index + 1)
 
     return StructuralZeroAnalysisResult(
         records=tuple(sorted(records, key=lambda record: record.key)),
@@ -111,6 +118,7 @@ def analyze_structural_zeros(
     *,
     scenario_fingerprint: str,
     keys: tuple[ODTimeKey, ...] | None = None,
+    progress: Callable[[StructuralZeroProgress], None] | None = None,
 ) -> StructuralZeroAnalysisResult:
     """Compute path metrics and classify all OD/time cells."""
     if topology.assignment_config != config.assignment:
@@ -119,11 +127,12 @@ def analyze_structural_zeros(
             "rebuild the topology from this configuration."
         )
     return classify_structural_zeros(
-        compute_od_path_metrics(topology, keys=keys),
+        compute_od_path_metrics(topology, keys=keys, progress=progress),
         rules=config.rules,
         scenario_fingerprint=scenario_fingerprint,
         graph_fingerprint=topology.fingerprint,
         configuration_fingerprint=config.fingerprint,
+        progress=progress,
     )
 
 

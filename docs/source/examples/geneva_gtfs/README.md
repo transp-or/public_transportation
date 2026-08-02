@@ -139,3 +139,11 @@ python docs/source/examples/geneva_gtfs/tools/extract_geneva_gtfs.py \
 
 The extractor refuses an archive with a different checksum unless
 `--skip-checksum` is explicitly supplied.
+
+## Gravity integration validation
+
+`estimation/run_gravity_validation.py` runs the public reduced-dimensional gravity
+workflow on the 96 free OD cells and all 8,967 synthetic boarding/alighting counts.
+It covers full-data adequacy, recommendations, an explicitly selected broad-period
+child, immutable lineage, and grouped vehicle-journey holdout re-estimation. See
+`estimation/gravity_validation.md` for assumptions, bounded results, and the command.

@@ -146,3 +146,32 @@ def test_full_cartesian_product_is_sorted_and_unique() -> None:
     assert len(records) == 3 * 3 * 1
     assert keys == tuple(sorted(keys))
     assert len(keys) == len(set(keys))
+
+
+def test_destination_profile_progress_is_complete_and_monotonic() -> None:
+    topology = build_structural_zero_topology(
+        _scenario_with_transfer(), StructuralZeroAssignmentConfig()
+    )
+    events = []
+
+    compute_od_path_metrics(topology, progress=events.append)
+
+    profile_events = [
+        event for event in events if event.phase == "destination_profiles"
+    ]
+    assert [event.completed for event in profile_events] == [0, 1, 2, 3]
+    assert all(event.total == 3 for event in profile_events)
+    assert all(event.elapsed_seconds >= 0 for event in profile_events)
+
+
+def test_destination_progress_callback_exception_propagates() -> None:
+    topology = build_structural_zero_topology(
+        _scenario_with_transfer(), StructuralZeroAssignmentConfig()
+    )
+
+    def fail(event) -> None:
+        if event.completed == 1:
+            raise RuntimeError("stop requested")
+
+    with pytest.raises(RuntimeError, match="stop requested"):
+        compute_od_path_metrics(topology, progress=fail)

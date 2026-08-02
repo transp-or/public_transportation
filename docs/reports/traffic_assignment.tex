@@ -1278,6 +1278,256 @@ exactly.
 In a general formulation, an opt-out alternative can be introduced for each OD pair and departure interval. In the first implementation,
 opt-out alternatives are not included: all demand is assumed to be assigned to the public transportation network.
 
+\subsection{Reduced-dimensional gravity demand estimation}
+
+The public inference layer now provides a minimal dynamic gravity model on the
+canonical sparse list of feasible OD--departure-time cells.  For origin--time
+production $Q_{ot}$ and fixed positive destination attractiveness $A_{dt}$,
+\[
+ q_{odt}=Q_{ot}\frac{I_{odt}A_{dt}
+ \exp\{-\beta_{\mathrm{time}}\widetilde T_{odt}
+       -\beta_{\mathrm{transfer}}N_{odt}\}}
+ {\sum_{d'}I_{od't}A_{d't}
+ \exp\{-\beta_{\mathrm{time}}\widetilde T_{od't}
+       -\beta_{\mathrm{transfer}}N_{od't}\}}.
+\]
+Masked segmented JAX reductions preserve exact structural zeros and the
+production totals without materializing a dense origin--destination--time
+tensor.  The time and transfer coefficients, and the negative-binomial
+dispersion, are mapped from unconstrained optimizer coordinates through stable
+positive transformations.
+
+Gravity demand is passed directly through the existing dense or BCOO
+fixed-routing measurement operator, including its frozen-positive measurement
+offset.  The observation layer supports Poisson likelihood and the
+negative-binomial parameterization
+$\operatorname{Var}(Y_i)=\mu_i+\mu_i^2/r$.  For small parameter counts, a
+batched-forward derivative applies the routing operator to all demand
+directions together.  The adjoint alternative applies one routing transpose
+product and a JAX vector--Jacobian product.  Neither constructs a dense
+OD-by-parameter routing Jacobian.
+
+The minimal estimator uses an explicitly traced, lowered, and compiled JAX
+value-and-gradient kernel with L-BFGS.  Its automatic policy benchmarks first
+and warm executions of the two derivative strategies under a bounded
+preflight.  Atomic checkpoints are written at the initial state and after every
+completed iteration; their fingerprint covers gravity inputs, model and
+parameter layouts, routing and measurement provenance, observations, and
+likelihood semantics.  Resume reconstructs the full OD layout, including
+frozen-positive cells and structural zeros, while restarting non-portable
+L-BFGS history from the saved iterate.  Compilation, first execution, warm
+execution, strategy selection, persistent-cache configuration, and elapsed
+optimization time are exposed as structured diagnostics.
+
+A detailed OD table produced this way is not equivalent to estimating every OD
+cell independently: its detail is induced by the low-dimensional gravity
+structure and the fixed production and attractiveness inputs.
+
+The first validation mode is deliberately a full-calibration adequacy analysis,
+not predictive validation.  It compares reassigned counts with every
+observation used for fitting and reports observed and modeled totals,
+negative-binomial and Poisson deviances, MAE, RMSE, inverse-variance weighted
+RMSE, standardized negative-binomial residuals, configurable exceedance rates,
+and observed--modeled quantiles.  User-provided measurement-aligned labels
+produce residual summaries by measurement type, line, direction, stop, time
+period, origin zone, and destination zone.  Ordered vehicle-journey labels
+enable adjacent standardized-residual correlations.  Resulting flags distinguish
+possible demand restrictions, routing or timing patterns, isolated suspect
+observations, and systematic overdispersion cautiously: they do not establish
+causality and never modify the model automatically.
+
+Three atomic relaxations are available when the minimal model is inadequate.
+For $K$ user-defined groups, each introduces $K-1$ free deviations and derives
+the final component as the negative sum, so that the full effect vector is
+exactly centred.  The alternatives are destination-zone log-attractiveness
+deviations, broad time-period deviations multiplying
+$\beta_{\mathrm{time}}$, and multiplicative origin-zone corrections to
+$Q_{ot}$.  A time-period intercept is intentionally excluded because it would
+cancel within an origin--time softmax.  The zone and period mappings are
+application inputs and must be contiguous; origin-zone and period labels must
+also be constant within each origin--time group.
+
+Each child model is warm-started by copying its parent coordinates and setting
+the new deviations to zero, which reproduces the parent predictions exactly.
+A configurable ridge penalty on the complete centred effect vector is therefore
+zero at the parent.  Adding or removing one relaxation is explicit and reports
+its exact parameter count and execution impact.  These effects require only
+indexed cell or group operations and retain the same sparse demand, fixed-routing
+operator, gradient, checkpoint, and validation machinery.
+
+Candidate relaxations can be screened without fitting them.  At the fitted
+parent, each applicable child is initialized at its exact zero-deviation warm
+start.  With objective gradient $g_c$ and regularized Hessian block $H_c$ in the
+new child coordinates, the local estimated improvement is
+\[
+ \widehat{G}_c=\tfrac12 g_c^\top H_c^{-1}g_c.
+\]
+The implementation uses an eigendecomposition and floors non-positive or nearly
+singular curvature only for this approximation, while reporting the resulting
+identification warning.  The candidate record contains the score statistic,
+estimated deviance improvement, observation and group support, exact parameter
+increment, computational cost, recommendation strength, and a plain-language
+interpretation.  It also warns when the parent gradient is too large for an
+optimum-based diagnostic.
+
+The score is interpreted together with grouped standardized residuals by
+destination zone, period, and origin zone.  Correlations with journey-time and
+transfer sensitivities can motivate future impedance or transfer-penalty designs,
+but these are explicitly marked unavailable until a centred child model and its
+mapping are selected.  Coherent within-journey residuals instead warn about
+possible routing or timing errors, and isolated extremes warn about possible data
+problems.  The catalog is strictly advisory: it neither changes the specification
+nor estimates or applies a child model.
+
+Completed models are retained in an immutable lineage.  Every node has a
+deterministic identifier and records its parent and applied relaxation, complete
+specification and parameter layout, raw and physical estimates, feature and
+compact-layout fingerprints, assignment, graph, and measurement-mapping
+provenance, optimizer state, assigned-count adequacy diagnostics, runtime and
+stored-memory diagnostics, checkpoint path, and explicit calibration and
+validation measurement identities.  A child's declared atomic relaxation must
+remove cleanly to its parent specification.  The append-only lineage returns a
+new value when a child is added, preserving both completed estimation results.
+
+The progression API first loads a completed parent, lists applicable relaxations,
+and returns the advisory recommendation catalog.  It proceeds only after the user
+passes one explicit relaxation scope.  The resulting child layout is initialized
+from the parent and its predictions are checked against the parent before any
+optimization.  The child is then estimated and validated with the existing
+checkpointed machinery.  The comparison reports changes in objective, likelihood,
+negative-binomial and Poisson deviance, RMSE, parameter count, and runtime.
+Calibration and validation measurement identities must remain unchanged during
+this step.  No recommendation is selected automatically, and grouped holdout
+validation remains a separate subsequent workflow.
+
+After selecting a model structure, predictive validation uses deterministic
+grouped holdout re-estimation.  Complete vehicle journeys, stop-time series,
+lines, directions, broad time blocks, or explicit application groups are kept
+indivisible; independent random measurement-row holdout is not supported.  A
+seeded hash orders groups reproducibly.  Optional strata may combine measurement
+type, line, direction, stop, period, origin zone, and destination zone.  Groups
+that cross several stratum values remain intact and use their complete label
+signature.  The resulting complementary calibration and holdout masks, group
+labels, measurement identity, metadata identity, and policy are serialized under
+a content fingerprint and can be reused across model structures.
+
+For each selected structure, all parameters are re-estimated using calibration
+groups only.  The resulting complete OD demand is then assigned to the complete
+measurement operator, and the excluded groups are evaluated as predictions.
+Calibration and holdout results separately report totals, negative-binomial and
+reference Poisson deviance, likelihood, MAE, RMSE, and inverse-variance weighted
+RMSE.  The immutable report retains the split and model fingerprints, complete
+measurement predictions, free and full OD demand, and the fitted result.  Tests
+verify that changing only excluded observations changes holdout metrics but cannot
+change the estimated parameters.
+
+The recommended workflow is therefore to develop structure with full-data
+adequacy, select it explicitly, re-estimate under one reusable grouped split,
+compare predictive evidence, and revise only when that evidence warrants it.
+The accepted structure may subsequently be refitted on all observations, while
+the grouped holdout result is retained as the honest predictive assessment.
+
+A public synthetic performance benchmark exercises several gravity parameter
+counts with dense and BCOO measurement operators.  It records tracing, lowering,
+compilation, first and warm execution, changed-parameter reuse, forward and
+transpose routing, batched-forward and adjoint value-and-gradient execution,
+operator storage, process peak memory where measurable, and problem dimensions.
+The two gradients are checked numerically before timings are accepted.  Small-case
+CPU results show mixed strategy winners with differences often near timer noise;
+they do not justify raising the conservative eight-parameter guard above which
+automatic selection avoids a wide batched demand Jacobian.  Compiled-handle reuse
+under changed parameter values is counted directly.  Persistent JAX cache hits are
+reported only by a separate fresh-process protocol because the public in-process
+API provides no authoritative hit counter.
+
+The complete methodology has also been exercised on the committed public Geneva
+snapshot, whose OD truth and prior are synthetic.  Scheduled path metrics prepare
+journey times and transfers, while positive prior free demand prepares production
+and attractiveness offsets.  The case contains 96 free cells in a 15,128-cell
+full layout and 8,967 boarding/alighting measurements.  Because a
+node-by-measurement reverse state is unsuitable at that measurement dimension on
+the laptop, an exact scalar-column builder compiles the fixed-routing forward map
+once and constructs BCOO data and indices directly, without a dense operator.  The
+stored operator has 0.556\% density and occupies 95,760 bytes.
+
+A bounded two-iteration run completed minimal negative-binomial estimation,
+full-data adequacy, advisory diagnostics, an exact zero-difference warm start for
+a selected broad-period child, immutable two-node lineage, and grouped
+vehicle-journey holdout re-estimation.  The holdout contains 864 measurements and
+the calibration set 8,103.  These iteration-limited figures establish public
+end-to-end software integration; they are not converged estimates and provide no
+scientific model-selection conclusion.
+
+Two smaller synthetic examples provide worked applications of the same
+methodology.  Simple Example 01 contains four free cells and two
+frozen-positive cells.  Its run reconstructs both fixed cells exactly,
+exercising the fixed measurement offset; since every free origin--time group
+contains one destination, this is not evidence for behavioral identification.
+Simple Example 02 contains 70 free cells, two frozen-positive cells, and 270
+measurements.  Its sequence estimates the minimal model, constructs an
+explicitly selected broad-period child with an exact zero-difference warm
+start, records two-node lineage, and re-estimates the child on 208 calibration
+measurements before scoring 62 measurements held out by complete vehicle
+journey.  These summaries are instructional checks, not scientific
+model-selection conclusions.
+
+The gravity objective now consumes a device-native operator protocol rather
+than an explicit matrix.  Dense and BCOO operators retain their stored matrix
+for compatibility, while a matrix-free implementation exposes JAX forward,
+transpose, and bounded multiple-right-hand-side products backed directly by
+fixed-routing loading and measurement aggregation.  Thus a large logical
+measurement-by-OD matrix need never be constructed or transferred to the host.
+The adjoint value-and-gradient path performs one forward and one transpose
+product and reuses the routed mean when assembling diagnostics.  For a
+matrix-free operator, automatic derivative selection chooses adjoint directly,
+avoiding two cold compilations of the complete network; batched-forward remains
+an explicit small-parameter option.  A linear custom-JVP rule also supports
+forward-mode transformations without materializing the Jacobian.  Explicit
+deadline-governed preparation separates tracing, lowering, compilation, and
+first and warm execution for forward and transpose products and records the
+deadline phase, indivisible-operation overshoot, shapes, dtype, backend, and
+devices.  A bounded packaged-example benchmark records these diagnostics,
+process memory, adjoint objective timings, and checkpoint size while asserting
+that no global operator was constructed.
+
+Complete fixed-routing preparation itself can be too large when both the
+effective mask and probability arrays have destination-group-by-link shape.
+The bounded implementation partitions destination groups canonically, applies
+both a group-count and a byte ceiling, pads the final shard, and reuses one
+fixed-shape compiled routing kernel.  Each completed shard is flushed and
+atomically published with strict fingerprints covering the assignment, graph,
+costs, source masks, destinations, theta, dtype, numerical implementation,
+schema, package version, and shard plan.  An atomic manifest makes deadline or
+memory stops resumable without recomputing valid shards.
+
+The sharded matrix-free operator loads routing state on demand with bounded LRU
+residency.  Deterministic forward and reverse topological passes accumulate
+measurements and OD cotangents one shard at a time; no complete routing array,
+link-flow-by-shard stack, Jacobian, or measurement-by-OD matrix is assembled.
+Structured progress records shard and group completion, cache reuse, elapsed
+and estimated remaining time, memory, cache size, and deadline allowance.  On
+Simple Example 02, four shards covering seven destination groups reused one
+compiled shape and agreed exactly with complete masks and probabilities; a
+fresh reload reused all four persisted shards.
+
+Shard construction may use a bounded thread pool sharing the graph and one XLA
+executable. Before every dispatch, the parent accounts for current RSS,
+active-shard estimates, and a safety margin; progress and manifests are committed
+in canonical order even when execution finishes out of order. A rolling warm-
+shard estimate prevents launching work that clearly cannot finish before the
+absolute deadline. Synchronized diagnostics separate input preparation,
+transfer, kernel dispatch, device synchronization, host transfer, validation,
+persistence, and cleanup.
+
+Controlled DAG experiments varied groups, nodes, links, outgoing degree, and
+enabled density. Runtime was essentially unchanged between 10\% and 100\%
+enabled density but increased with graph size and group count, confirming
+full-graph traversal per group. The packaged example is approximately 91\%
+dense, so a compact-support schema is deferred until target-network diagnostics
+demonstrate sufficient sparsity. Serial, two-worker, and four-worker synthetic
+preparations produced identical probabilities and compiled one shared
+executable.
+
 \subsection{Implementation notes for fast JAX evaluation}
 
 The time-expanded network is fixed across evaluations. All graph connectivity data are precomputed once and stored as immutable arrays:
@@ -1476,6 +1726,18 @@ file is rendered and validated before atomic replacement.  Passing the
 generated fixed-demand file to estimation removes those structural-zero cells
 from the parameter vector altogether; they are not zero-valued dummy
 parameters.
+
+Potentially long phases expose an optional dependency-free progress callback.
+Immutable events report a stable phase name, completed and total work, elapsed
+time, and an optional artifact message.  The destination-profile,
+cell-classification, and audit-rendering loops report every item for small
+problems and use count- or ten-second throttling for large problems, always
+including zero and the exact final total.  A context-managed optional
+\texttt{tqdm} adapter displays one phase at a time on standard error, leaving
+standard output suitable for machine-readable JSON.  Callback exceptions
+propagate normally, and rendering failures occur before atomic file replacement,
+so progress reporting does not permit a partial file to replace a valid
+artifact.
 
 If $|\mathcal U|=0$ and $\theta$ is fixed, then $d=0$. This is treated as a
 deterministic evaluation rather than as an optimization or variational-inference

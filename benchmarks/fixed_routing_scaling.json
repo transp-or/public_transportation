@@ -1,0 +1,256 @@
+{
+  "backend": "cpu",
+  "cases": [
+    {
+      "enabled_density": 0.1,
+      "groups": 1,
+      "groups_enabled_links": 50,
+      "groups_links": 509,
+      "links": 509,
+      "maximum_out_degree": 2,
+      "median_warm_seconds": 0.000100292032584548,
+      "nodes": 256
+    },
+    {
+      "enabled_density": 0.5,
+      "groups": 1,
+      "groups_enabled_links": 254,
+      "groups_links": 509,
+      "links": 509,
+      "maximum_out_degree": 2,
+      "median_warm_seconds": 0.00012208300177007914,
+      "nodes": 256
+    },
+    {
+      "enabled_density": 1.0,
+      "groups": 1,
+      "groups_enabled_links": 509,
+      "groups_links": 509,
+      "links": 509,
+      "maximum_out_degree": 2,
+      "median_warm_seconds": 0.00011354195885360241,
+      "nodes": 256
+    },
+    {
+      "enabled_density": 0.1,
+      "groups": 4,
+      "groups_enabled_links": 203,
+      "groups_links": 2036,
+      "links": 509,
+      "maximum_out_degree": 2,
+      "median_warm_seconds": 0.00027004105504602194,
+      "nodes": 256
+    },
+    {
+      "enabled_density": 0.5,
+      "groups": 4,
+      "groups_enabled_links": 1018,
+      "groups_links": 2036,
+      "links": 509,
+      "maximum_out_degree": 2,
+      "median_warm_seconds": 0.0003179999766871333,
+      "nodes": 256
+    },
+    {
+      "enabled_density": 1.0,
+      "groups": 4,
+      "groups_enabled_links": 2036,
+      "groups_links": 2036,
+      "links": 509,
+      "maximum_out_degree": 2,
+      "median_warm_seconds": 0.00032116693910211325,
+      "nodes": 256
+    },
+    {
+      "enabled_density": 0.1,
+      "groups": 1,
+      "groups_enabled_links": 204,
+      "groups_links": 2045,
+      "links": 2045,
+      "maximum_out_degree": 2,
+      "median_warm_seconds": 0.0004338750150054693,
+      "nodes": 1024
+    },
+    {
+      "enabled_density": 0.5,
+      "groups": 1,
+      "groups_enabled_links": 1022,
+      "groups_links": 2045,
+      "links": 2045,
+      "maximum_out_degree": 2,
+      "median_warm_seconds": 0.0003773750504478812,
+      "nodes": 1024
+    },
+    {
+      "enabled_density": 1.0,
+      "groups": 1,
+      "groups_enabled_links": 2045,
+      "groups_links": 2045,
+      "links": 2045,
+      "maximum_out_degree": 2,
+      "median_warm_seconds": 0.0004063750384375453,
+      "nodes": 1024
+    },
+    {
+      "enabled_density": 0.1,
+      "groups": 4,
+      "groups_enabled_links": 818,
+      "groups_links": 8180,
+      "links": 2045,
+      "maximum_out_degree": 2,
+      "median_warm_seconds": 0.0013763330643996596,
+      "nodes": 1024
+    },
+    {
+      "enabled_density": 0.5,
+      "groups": 4,
+      "groups_enabled_links": 4090,
+      "groups_links": 8180,
+      "links": 2045,
+      "maximum_out_degree": 2,
+      "median_warm_seconds": 0.001429750001989305,
+      "nodes": 1024
+    },
+    {
+      "enabled_density": 1.0,
+      "groups": 4,
+      "groups_enabled_links": 8180,
+      "groups_links": 8180,
+      "links": 2045,
+      "maximum_out_degree": 2,
+      "median_warm_seconds": 0.0013899169862270355,
+      "nodes": 1024
+    },
+    {
+      "enabled_density": 0.1,
+      "groups": 1,
+      "groups_enabled_links": 818,
+      "groups_links": 8189,
+      "links": 8189,
+      "maximum_out_degree": 2,
+      "median_warm_seconds": 0.0025780420983210206,
+      "nodes": 4096
+    },
+    {
+      "enabled_density": 0.5,
+      "groups": 1,
+      "groups_enabled_links": 4094,
+      "groups_links": 8189,
+      "links": 8189,
+      "maximum_out_degree": 2,
+      "median_warm_seconds": 0.0026254579424858093,
+      "nodes": 4096
+    },
+    {
+      "enabled_density": 1.0,
+      "groups": 1,
+      "groups_enabled_links": 8189,
+      "groups_links": 8189,
+      "links": 8189,
+      "maximum_out_degree": 2,
+      "median_warm_seconds": 0.0025606249691918492,
+      "nodes": 4096
+    },
+    {
+      "enabled_density": 0.1,
+      "groups": 4,
+      "groups_enabled_links": 3275,
+      "groups_links": 32756,
+      "links": 8189,
+      "maximum_out_degree": 2,
+      "median_warm_seconds": 0.00999558309558779,
+      "nodes": 4096
+    },
+    {
+      "enabled_density": 0.5,
+      "groups": 4,
+      "groups_enabled_links": 16378,
+      "groups_links": 32756,
+      "links": 8189,
+      "maximum_out_degree": 2,
+      "median_warm_seconds": 0.010118042002432048,
+      "nodes": 4096
+    },
+    {
+      "enabled_density": 1.0,
+      "groups": 4,
+      "groups_enabled_links": 32756,
+      "groups_links": 32756,
+      "links": 8189,
+      "maximum_out_degree": 2,
+      "median_warm_seconds": 0.010002583032473922,
+      "nodes": 4096
+    },
+    {
+      "enabled_density": 0.25,
+      "groups": 4,
+      "groups_enabled_links": 1023,
+      "groups_links": 4092,
+      "links": 1023,
+      "maximum_out_degree": 1,
+      "median_warm_seconds": 0.0010489580454304814,
+      "nodes": 1024
+    },
+    {
+      "enabled_density": 0.25,
+      "groups": 4,
+      "groups_enabled_links": 4086,
+      "groups_links": 16344,
+      "links": 4086,
+      "maximum_out_degree": 4,
+      "median_warm_seconds": 0.0015949578955769539,
+      "nodes": 1024
+    },
+    {
+      "enabled_density": 0.25,
+      "groups": 4,
+      "groups_enabled_links": 8156,
+      "groups_links": 32624,
+      "links": 8156,
+      "maximum_out_degree": 8,
+      "median_warm_seconds": 0.0018809169996529818,
+      "nodes": 1024
+    }
+  ],
+  "devices": [
+    "cpu:0"
+  ],
+  "full_graph_traversal_confirmed_by_code": true,
+  "kernel_complexity": "O(groups * (nodes * max_out_degree + links))",
+  "parallel_cases": [
+    {
+      "compilation_count": 1,
+      "elapsed_seconds": 0.3179949159966782,
+      "groups_per_shard": 2,
+      "maximum_probability_difference": 0.0,
+      "parallel_efficiency": 1.0,
+      "peak_rss_bytes": 613957632,
+      "shards": 8,
+      "speedup": 1.0,
+      "workers": 1
+    },
+    {
+      "compilation_count": 1,
+      "elapsed_seconds": 0.08013887505512685,
+      "groups_per_shard": 2,
+      "maximum_probability_difference": 0.0,
+      "parallel_efficiency": 1.9840240818075634,
+      "peak_rss_bytes": 617365504,
+      "shards": 8,
+      "speedup": 3.968048163615127,
+      "workers": 2
+    },
+    {
+      "compilation_count": 1,
+      "elapsed_seconds": 0.04455612495075911,
+      "groups_per_shard": 2,
+      "maximum_probability_difference": 0.0,
+      "parallel_efficiency": 1.7842379490367934,
+      "peak_rss_bytes": 620003328,
+      "shards": 8,
+      "speedup": 7.136951796147174,
+      "workers": 4
+    }
+  ],
+  "schema_version": 1
+}

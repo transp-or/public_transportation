@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 import numpy as np
 
@@ -13,6 +14,7 @@ from public_transportation.assignment.graph_sentinels import (
     NODE_KIND_EVENT_ARR,
 )
 
+from .progress import ProgressEmitter, StructuralZeroProgress
 from .topology import StructuralZeroTopology
 from .types import ODPathMetricRecord, ODPathMetrics, ODTimeKey
 
@@ -28,6 +30,7 @@ def compute_od_path_metrics(
     topology: StructuralZeroTopology,
     *,
     keys: tuple[ODTimeKey, ...] | None = None,
+    progress: Callable[[StructuralZeroProgress], None] | None = None,
 ) -> tuple[ODPathMetricRecord, ...]:
     """Compute metrics for candidate keys or the full Cartesian product.
 
@@ -47,10 +50,21 @@ def compute_od_path_metrics(
     head = np.asarray(graph.head, dtype=np.int64)
     bin_start_min = np.asarray(graph.node_bin_start_min, dtype=float)
 
-    profiles = tuple(
-        _profile_for_destination(topology, destination_stop_index=destination_index)
-        for destination_index in range(len(topology.stop_ids))
+    profiles_list: list[_DestinationProfile] = []
+    profile_progress = ProgressEmitter(
+        progress,
+        phase="destination_profiles",
+        total=len(topology.stop_ids),
     )
+    profile_progress.start()
+    for destination_index in range(len(topology.stop_ids)):
+        profiles_list.append(
+            _profile_for_destination(
+                topology, destination_stop_index=destination_index
+            )
+        )
+        profile_progress.update(destination_index + 1)
+    profiles = tuple(profiles_list)
 
     candidates = _candidate_keys(topology, keys)
     stop_index = {stop_id: index for index, stop_id in enumerate(topology.stop_ids)}

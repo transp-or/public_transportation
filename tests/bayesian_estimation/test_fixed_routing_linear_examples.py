@@ -71,7 +71,33 @@ from public_transportation.inference.fixed_routing_matrix_free_operator import (
     MatrixFreePreparationDeadlineError,
     MatrixFreeFixedRoutingMeasurementOperator,
 )
+from public_transportation.inference.sharded_fixed_routing import (
+    FixedRoutingPreparationConfig,
+    prepare_fixed_routing_sharded,
+)
+from public_transportation.inference.sharded_matrix_free_operator import (
+    ShardedMatrixFreeFixedRoutingMeasurementOperator,
+)
 from public_transportation.inference.linear_operator import SparseLinearOperator
+from public_transportation.inference.gravity import (
+    GravityEstimatorConfig,
+    GravityExecutionPolicy,
+    GravityFeatures,
+    GravityGradientStrategy,
+    GravityHoldoutSplitConfig,
+    GravityLikelihood,
+    GravityModelSpecification,
+    GravityObjectiveProblem,
+    GravityParameterLayout,
+    GravityValidationMetadata,
+    build_gravity_holdout_split,
+    create_gravity_model_node,
+    estimate_and_validate_gravity_holdout,
+    estimate_gravity_model,
+    gravity_value_and_gradient,
+    gravity_measurement_identity,
+    validate_full_data_gravity_adequacy,
+)
 from public_transportation.inference.od_parameter_layout import (
     ODParameterLayout,
     build_od_parameter_layout,
@@ -216,6 +242,48 @@ def _assignment_prediction(
             spec_measurement_index=jnp.asarray(example.mapping_spec.measurement_index),
             spec_link_index=jnp.asarray(example.mapping_spec.link_index),
         )
+    )
+
+
+def test_serial_and_parallel_sharded_routing_on_packaged_examples(
+    prepared_example, tmp_path
+):
+    example = prepared_example
+    operators = []
+    for workers in (1, 2):
+        prepared = prepare_fixed_routing_sharded(
+            inputs=example.inputs,
+            theta=example.theta,
+            config=FixedRoutingPreparationConfig(
+                maximum_groups_per_shard=2,
+                construction_workers=workers,
+                cache_directory=tmp_path / f"cache-{workers}",
+                checkpoint_directory=tmp_path / f"checkpoint-{workers}",
+            ),
+        )
+        assert prepared.status == "completed"
+        operators.append(
+            ShardedMatrixFreeFixedRoutingMeasurementOperator(
+                inputs=example.inputs,
+                routing=prepared.routing,
+                spec=example.mapping_spec,
+                compact_layout=example.compact_layout,
+            )
+        )
+
+    demand = np.asarray(example.od_layout.free_baseline_values, dtype=np.float32)
+    expected = np.asarray(example.operator.jax_matvec(jnp.asarray(demand))) + np.asarray(
+        example.operator.fixed_measurement_offset
+    )
+    for operator in operators:
+        actual = operator.matvec(demand) + operator.fixed_measurement_offset
+        np.testing.assert_allclose(actual, expected, rtol=5.0e-5, atol=5.0e-5)
+    weight = np.linspace(-0.5, 0.5, example.operator.num_measurements)
+    np.testing.assert_allclose(
+        operators[1].rmatvec(weight),
+        operators[0].rmatvec(weight),
+        rtol=5.0e-5,
+        atol=5.0e-5,
     )
 
 
@@ -427,6 +495,245 @@ def test_matrix_free_products_match_dense_and_satisfy_adjoint_identity(
     assert operator.diagnostics.transpose_compilation_count == 1
 
 
+def test_matrix_free_device_products_support_jax_transformations(prepared_example):
+    example = prepared_example
+    operator = MatrixFreeFixedRoutingMeasurementOperator(
+        inputs=example.inputs,
+        routing=example.routing,
+        spec=example.mapping_spec,
+        compact_layout=example.compact_layout,
+    )
+    demand = jnp.asarray(
+        np.linspace(1.0, 2.0, operator.num_free_od), dtype=operator.dtype
+    )
+    weights = jnp.asarray(
+        np.linspace(-0.5, 0.5, operator.num_measurements), dtype=operator.dtype
+    )
+    directions = jnp.stack((demand, 0.5 * demand), axis=1)
+
+    forward = jax.jit(operator.jax_matvec)(demand)
+    transpose = jax.jit(operator.jax_rmatvec)(weights)
+    multiple = jax.jit(operator.jax_matmat)(directions)
+    _, pullback = jax.vjp(operator.jax_matvec, demand)
+    vjp_result = pullback(weights)[0]
+    gradient = jax.grad(
+        lambda value: jnp.sum(operator.jax_matvec(value) * weights)
+    )(demand)
+    jacobian = jax.jacfwd(operator.jax_matvec)(demand)
+    vmapped = jax.vmap(operator.jax_matvec)(directions.T).T
+
+    np.testing.assert_allclose(forward, operator.matvec(np.asarray(demand)), rtol=4e-5)
+    np.testing.assert_allclose(
+        transpose, operator.rmatvec(np.asarray(weights)), rtol=4e-5
+    )
+    np.testing.assert_allclose(multiple, vmapped, rtol=4e-5)
+    np.testing.assert_allclose(vjp_result, transpose, rtol=4e-5)
+    np.testing.assert_allclose(gradient, transpose, rtol=4e-5)
+    np.testing.assert_allclose(
+        jacobian.T @ weights, transpose, rtol=4e-5, atol=1e-7
+    )
+    assert operator.diagnostics.forward_compilation_count == 1
+    assert operator.diagnostics.transpose_compilation_count == 1
+
+
+def test_matrix_free_explicit_preparation_reports_cold_and_warm_phases(
+    prepared_example,
+):
+    example = prepared_example
+    operator = MatrixFreeFixedRoutingMeasurementOperator(
+        inputs=example.inputs,
+        routing=example.routing,
+        spec=example.mapping_spec,
+        compact_layout=example.compact_layout,
+    )
+    forward = operator.prepare_device_products(products="forward")
+    assert forward.forward_compilation_count == 1
+    assert forward.transpose_compilation_count == 0
+    assert forward.forward_execution_count == 2
+    assert forward.forward_tracing_seconds >= 0
+    assert forward.forward_lowering_seconds >= 0
+    assert forward.forward_compilation_seconds >= 0
+    assert forward.forward_first_execution_seconds >= 0
+    assert forward.forward_warm_execution_seconds >= 0
+    assert forward.forward_input_shape == (operator.num_free_od,)
+    assert forward.transpose_input_shape == (operator.num_measurements,)
+    assert forward.input_dtype == str(operator.dtype)
+    assert forward.backend == jax.default_backend()
+    assert forward.devices
+    complete = operator.prepare_device_products(products="forward_and_transpose")
+    assert complete.forward_compilation_count == 1
+    assert complete.transpose_compilation_count == 1
+    assert complete.transpose_execution_count == 2
+    assert complete.transpose_tracing_seconds >= 0
+    assert complete.transpose_lowering_seconds >= 0
+    assert complete.transpose_first_execution_seconds >= 0
+    assert complete.transpose_warm_execution_seconds >= 0
+
+
+def test_matrix_free_gravity_auto_selects_only_adjoint(prepared_example, tmp_path):
+    example = prepared_example
+    operator = MatrixFreeFixedRoutingMeasurementOperator(
+        inputs=example.inputs,
+        routing=example.routing,
+        spec=example.mapping_spec,
+        compact_layout=example.compact_layout,
+    )
+    count = operator.num_free_od
+    parameter_layout = GravityParameterLayout(GravityModelSpecification())
+    keys = [
+        example.od_layout.od_keys[index]
+        for index in example.od_layout.free_od_indices
+    ]
+    origins = sorted({key[0] for key in keys})
+    destinations = sorted({key[1] for key in keys})
+    periods = sorted({key[2] for key in keys})
+    origin_lookup = {value: index for index, value in enumerate(origins)}
+    destination_lookup = {value: index for index, value in enumerate(destinations)}
+    period_lookup = {value: index for index, value in enumerate(periods)}
+    groups = sorted({(key[0], key[2]) for key in keys})
+    group_lookup = {value: index for index, value in enumerate(groups)}
+    baseline = np.asarray(
+        example.compact_layout.free_baseline_values, dtype=np.float32
+    )
+    totals = np.zeros(len(groups), dtype=np.float32)
+    attractiveness: dict[tuple[str, str], float] = {}
+    for key, value in zip(keys, baseline, strict=True):
+        totals[group_lookup[(key[0], key[2])]] += value
+        destination_key = (key[1], key[2])
+        attractiveness[destination_key] = (
+            attractiveness.get(destination_key, 0.0) + float(value)
+        )
+    features = GravityFeatures(
+        canonical_od_index=np.asarray(example.od_layout.free_od_indices),
+        origin_index=np.asarray([origin_lookup[key[0]] for key in keys]),
+        destination_index=np.asarray(
+            [destination_lookup[key[1]] for key in keys]
+        ),
+        departure_time_index=np.asarray([period_lookup[key[2]] for key in keys]),
+        origin_time_group_index=np.asarray(
+            [group_lookup[(key[0], key[2])] for key in keys]
+        ),
+        journey_time=np.asarray(
+            [1.0 + index % 7 for index in range(count)], dtype=np.float32
+        ),
+        transfer_count=np.asarray([index % 3 for index in range(count)]),
+        structural_feasible=np.ones(count, dtype=bool),
+        origin_time_totals=totals,
+        destination_attractiveness=np.asarray(
+            [attractiveness[(key[1], key[2])] for key in keys], dtype=np.float32
+        ),
+        num_origins=len(origins),
+        num_destinations=len(destinations),
+        num_departure_times=len(periods),
+        od_layout_fingerprint=example.compact_layout.fingerprint,
+    )
+    problem = GravityObjectiveProblem(
+        features=features,
+        parameter_layout=parameter_layout,
+        operator=operator,
+        observations=example.observations,
+        likelihood=GravityLikelihood.POISSON,
+    )
+    explicit_problem = replace(problem, operator=example.operator)
+    initial = parameter_layout.raw_from_physical((0.5, 1.0, 10.0))
+    for strategy in GravityGradientStrategy:
+        matrix_free_evaluation, matrix_free_gradient = gravity_value_and_gradient(
+            initial, problem=problem, strategy=strategy
+        )
+        explicit_evaluation, explicit_gradient = gravity_value_and_gradient(
+            initial, problem=explicit_problem, strategy=strategy
+        )
+        np.testing.assert_allclose(
+            matrix_free_evaluation.measurement_mean,
+            explicit_evaluation.measurement_mean,
+            rtol=5e-5,
+            atol=5e-5,
+        )
+        np.testing.assert_allclose(
+            matrix_free_gradient, explicit_gradient, rtol=5e-5, atol=5e-5
+        )
+    checkpoint = tmp_path / f"{example.name}-matrix-free-gravity.json"
+    result = estimate_gravity_model(
+        problem=problem,
+        compact_layout=example.compact_layout,
+        initial_raw_parameters=initial,
+        config=GravityEstimatorConfig(maximum_iterations=1),
+        execution=GravityExecutionPolicy(
+            gradient_strategy="auto", checkpoint_path=checkpoint
+        ),
+    )
+    assert result.strategy_selection.selected == "adjoint"
+    assert len(result.strategy_selection.candidates) == 1
+    assert "matrix-free" in result.strategy_selection.reason
+    assert checkpoint.is_file()
+    resumed = estimate_gravity_model(
+        problem=problem,
+        compact_layout=example.compact_layout,
+        initial_raw_parameters=initial,
+        config=GravityEstimatorConfig(maximum_iterations=2),
+        execution=GravityExecutionPolicy(
+            gradient_strategy="adjoint", checkpoint_path=checkpoint
+        ),
+        resume=True,
+    )
+    assert resumed.resumed
+    explicit = estimate_gravity_model(
+        problem=explicit_problem,
+        compact_layout=example.compact_layout,
+        initial_raw_parameters=initial,
+        config=GravityEstimatorConfig(maximum_iterations=1),
+        execution=GravityExecutionPolicy(gradient_strategy="adjoint"),
+    )
+    np.testing.assert_allclose(result.raw_parameters, explicit.raw_parameters, rtol=5e-5)
+    assert result.objective == pytest.approx(explicit.objective, rel=5e-5)
+    adequacy = validate_full_data_gravity_adequacy(
+        result=result,
+        problem=problem,
+        compact_layout=example.compact_layout,
+        metadata=GravityValidationMetadata(operator.num_measurements),
+    )
+    assert adequacy.measurements == operator.num_measurements
+    assert np.isfinite(adequacy.negative_binomial_deviance)
+    identity = gravity_measurement_identity(
+        measurement_indices=np.arange(operator.num_measurements),
+        label=f"{example.name} matrix-free gravity test",
+    )
+    node = create_gravity_model_node(
+        result=result,
+        problem=problem,
+        compact_layout=example.compact_layout,
+        adequacy_report=adequacy,
+        calibration_measurement_identity=identity,
+        validation_measurement_identity=identity,
+    )
+    assert node.estimation_result.model_fingerprint == result.model_fingerprint
+    holdout_metadata = GravityValidationMetadata(
+        operator.num_measurements,
+        vehicle_journey=np.asarray(
+            [f"journey-{index // 2}" for index in range(operator.num_measurements)]
+        ),
+    )
+    split = build_gravity_holdout_split(
+        metadata=holdout_metadata,
+        measurement_identity=identity,
+        config=GravityHoldoutSplitConfig(
+            unit="vehicle_journey", holdout_fraction=0.25, seed=17
+        ),
+    )
+    holdout = estimate_and_validate_gravity_holdout(
+        problem=problem,
+        compact_layout=example.compact_layout,
+        split=split,
+        measurement_identity=identity,
+        initial_raw_parameters=result.raw_parameters,
+        estimator_config=GravityEstimatorConfig(maximum_iterations=1),
+        execution_policy=GravityExecutionPolicy(gradient_strategy="adjoint"),
+    )
+    assert holdout.calibration.measurements + holdout.holdout.measurements == (
+        operator.num_measurements
+    )
+
+
 def test_matrix_free_empty_fixed_layout_uses_exact_numpy_zero_fast_path(
     prepared_example, monkeypatch
 ):
@@ -507,6 +814,7 @@ def test_matrix_free_empty_fixed_layout_uses_exact_numpy_zero_fast_path(
     with pytest.raises(MatrixFreePreparationDeadlineError):
         deadline_operator.matvec(np.ones(deadline_operator.shape[1]))
     assert deadline_operator.diagnostics.deadline_exceeded
+    assert deadline_operator.diagnostics.deadline_phase == "forward compilation"
     assert deadline_operator.diagnostics.forward_compilation_count == 0
     assert jit_calls == 0
 
@@ -530,6 +838,7 @@ def test_matrix_free_expired_deadline_stops_before_numerical_preparation(
             clock=Clock(),
         )
     assert error.value.diagnostics.deadline_exceeded
+    assert error.value.diagnostics.deadline_phase == "contract validation"
     assert error.value.diagnostics.forward_compilation_count == 0
     assert error.value.diagnostics.transpose_compilation_count == 0
 

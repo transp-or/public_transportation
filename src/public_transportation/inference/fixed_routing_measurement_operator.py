@@ -119,6 +119,40 @@ class FixedRoutingMeasurementOperator:
     schema_version: int = _SCHEMA_VERSION
     package_version: str = __version__
 
+    @property
+    def is_matrix_free(self) -> bool:
+        return False
+
+    def jax_matvec(self, vector: jax.Array) -> jax.Array:
+        """Apply the explicit operator without leaving the JAX device."""
+        value = jnp.asarray(vector)
+        if value.shape != (self.num_free_od,):
+            raise ValueError(
+                f"forward vector must have shape ({self.num_free_od},), "
+                f"got {value.shape}."
+            )
+        return self.matrix @ value
+
+    def jax_rmatvec(self, vector: jax.Array) -> jax.Array:
+        """Apply the explicit transpose without leaving the JAX device."""
+        value = jnp.asarray(vector)
+        if value.shape != (self.num_measurements,):
+            raise ValueError(
+                f"transpose vector must have shape ({self.num_measurements},), "
+                f"got {value.shape}."
+            )
+        return self.matrix.T @ value
+
+    def jax_matmat(self, matrix: jax.Array) -> jax.Array:
+        """Apply the explicit operator to a small batch of right-hand sides."""
+        value = jnp.asarray(matrix)
+        if value.ndim != 2 or value.shape[0] != self.num_free_od:
+            raise ValueError(
+                "forward matrix must have shape "
+                f"({self.num_free_od}, k), got {value.shape}."
+            )
+        return self.matrix @ value
+
 
 def _mapping_slots(
     spec: AggregationSpec, num_links: int

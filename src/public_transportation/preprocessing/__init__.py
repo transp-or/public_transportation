@@ -12,6 +12,9 @@ from .structural_zeros import (
     StructuralZeroReason,
     StructuralZeroRecord,
     StructuralZeroOutputPaths,
+    StructuralZeroProgress,
+    StructuralZeroProgressCallback,
+    StructuralZeroTqdmProgress,
     StructuralZeroExecutionResult,
     StructuralZeroTopology,
     analyze_structural_zeros,
@@ -24,6 +27,7 @@ from .structural_zeros import (
     reconcile_fixed_demand,
     run_structural_zero_preprocessing,
     scenario_fingerprint_payload_json,
+    structural_zero_tqdm_progress,
     write_structural_zero_outputs,
 )
 from .structural_zeros.errors import StructuralZeroConfigError
@@ -41,6 +45,9 @@ __all__ = [
     "StructuralZeroReason",
     "StructuralZeroRecord",
     "StructuralZeroOutputPaths",
+    "StructuralZeroProgress",
+    "StructuralZeroProgressCallback",
+    "StructuralZeroTqdmProgress",
     "StructuralZeroExecutionResult",
     "StructuralZeroTopology",
     "analyze_structural_zeros",
@@ -53,5 +60,6 @@ __all__ = [
     "reconcile_fixed_demand",
     "run_structural_zero_preprocessing",
     "scenario_fingerprint_payload_json",
+    "structural_zero_tqdm_progress",
     "write_structural_zero_outputs",
 ]

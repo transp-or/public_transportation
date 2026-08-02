@@ -188,3 +188,44 @@ def test_validation_failure_has_no_filesystem_side_effect(tmp_path: Path) -> Non
         write_structural_zero_outputs(analysis, _reconciliation(analysis), config)
 
     assert not config.output.folder.exists()
+
+
+def test_audit_render_progress_ends_at_written_row_count(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    analysis = _analysis(config)
+    events = []
+
+    write_structural_zero_outputs(
+        analysis, _reconciliation(analysis), config, progress=events.append
+    )
+
+    audit = [
+        event
+        for event in events
+        if event.phase == "render_outputs"
+        and event.message == "structural_zero_audit.csv"
+    ]
+    assert [event.completed for event in audit] == [0, 1, 2]
+    assert audit[-1].total == 2
+
+
+def test_callback_failure_during_render_preserves_existing_artifacts(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    analysis = _analysis(config)
+    original = write_structural_zero_outputs(
+        analysis, _reconciliation(analysis), config
+    )
+    before = original.audit.read_bytes()
+
+    def fail(event) -> None:
+        if event.phase == "render_outputs" and event.completed == 1:
+            raise RuntimeError("cancel rendering")
+
+    with pytest.raises(RuntimeError, match="cancel rendering"):
+        write_structural_zero_outputs(
+            analysis, _reconciliation(analysis), config, progress=fail
+        )
+
+    assert original.audit.read_bytes() == before

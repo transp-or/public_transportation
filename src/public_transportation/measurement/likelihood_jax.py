@@ -64,7 +64,7 @@ def predict_measurements_from_link_flow(
     return y_pred
 
 
-def _nb_logpmf_mu_r(y: Array, mu: Array, r: Array) -> Array:
+def negbinom_logpmf_mu_r(y: Array, mu: Array, r: Array) -> Array:
     """Negative Binomial log pmf with mean mu and dispersion r (shape/size).
 
     Parameterization:
@@ -92,6 +92,15 @@ def _nb_logpmf_mu_r(y: Array, mu: Array, r: Array) -> Array:
     )
 
 
+# Retain the former private spelling for internal-source compatibility.
+_nb_logpmf_mu_r = negbinom_logpmf_mu_r
+
+
+def poisson_logpmf(y: Array, mu: Array) -> Array:
+    """Poisson log PMF with stable zero-count handling."""
+    return xlogy(y, mu) - mu - gammaln(y + 1.0)
+
+
 @jax.jit
 def negbinom_loglikelihood(
     *,
@@ -103,7 +112,12 @@ def negbinom_loglikelihood(
 
     y_obs should be nonnegative (integer-valued in principle).
     """
-    return jnp.sum(_nb_logpmf_mu_r(y_obs, mu, r))
+    return jnp.sum(negbinom_logpmf_mu_r(y_obs, mu, r))
+
+
+@jax.jit
+def poisson_loglikelihood(*, y_obs: Array, mu: Array) -> Array:
+    return jnp.sum(poisson_logpmf(y_obs, mu))
 
 
 @jax.jit(static_argnames=("spec_num_measurements",))

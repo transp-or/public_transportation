@@ -32,7 +32,8 @@ This lets JAX trace through computations while treating `graph` as static.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from time import perf_counter
+from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
@@ -53,6 +54,55 @@ from public_transportation.inference.compact_od_groups import compact_od_groups
 
 
 Array = jnp.ndarray
+Clock = Callable[[], float]
+
+
+@dataclass(frozen=True, slots=True)
+class FixedRoutingPreparationDiagnostics:
+    """Synchronized timings and resource estimates for complete preparation."""
+
+    profiling_enabled: bool
+    num_destination_groups: int
+    num_links: int
+    effective_mask_shape: tuple[int, int]
+    probability_shape: tuple[int, int]
+    effective_mask_dtype: str
+    probability_dtype: str
+    tracing_seconds: float
+    lowering_seconds: float
+    compilation_seconds: float
+    first_execution_seconds: float
+    host_device_transfer_seconds: float
+    synchronization_seconds: float
+    total_elapsed_seconds: float
+    estimated_retained_bytes: int
+    observed_retained_bytes: int
+    estimated_temporary_bytes: int
+    peak_rss_bytes: int | None
+    backend: str
+    devices: tuple[str, ...]
+    captured_constant_bytes: int | None
+    deadline_exceeded: bool
+    deadline_phase: str | None
+    indivisible_operation_overshoot: bool
+    deadline_overshoot_seconds: float
+
+
+FixedRoutingDiagnosticsCallback = Callable[[FixedRoutingPreparationDiagnostics], None]
+
+
+def _peak_rss_bytes() -> int | None:
+    """Return process peak RSS where the standard library exposes it."""
+    try:
+        import resource
+
+        value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except (ImportError, OSError, ValueError):
+        return None
+    # macOS reports bytes; Linux and other common Unix systems report KiB.
+    import sys
+
+    return value if sys.platform == "darwin" else value * 1024
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -291,12 +341,16 @@ def prepare_fixed_routing(
     *,
     inputs: AssignmentInputs,
     theta: float,
+    diagnostics_callback: FixedRoutingDiagnosticsCallback | None = None,
+    absolute_deadline: float | None = None,
+    clock: Clock = perf_counter,
 ) -> FixedRoutingInputs:
     """Prepare reusable routing for fixed positive dispersion.
 
     The returned cache is not yet selected by inference; Phase 3 introduces
     the corresponding demand-loading path.
     """
+    total_started = clock()
     theta_value = float(theta)
     if not np.isfinite(theta_value) or theta_value <= 0.0:
         raise ValueError("theta must be positive and finite.")
@@ -305,14 +359,128 @@ def prepare_fixed_routing(
     num_links = int(inputs.graph.num_links)
     dtype = inputs.base_link_cost.dtype
     theta_array = jnp.asarray(theta_value, dtype=dtype).reshape(())
+    tracing_seconds = 0.0
+    lowering_seconds = 0.0
+    compilation_seconds = 0.0
+    execution_seconds = 0.0
+    synchronization_seconds = 0.0
+    deadline_phase: str | None = None
+    indivisible_overshoot = False
+
+    def check_deadline(phase: str, *, after_indivisible: bool = False) -> None:
+        nonlocal deadline_phase, indivisible_overshoot
+        if absolute_deadline is None or clock() < absolute_deadline:
+            return
+        deadline_phase = phase
+        indivisible_overshoot = after_indivisible
+
+    profiling_enabled = diagnostics_callback is not None
     if num_groups == 0:
         effective_masks = jnp.empty((0, num_links), dtype=bool)
         probabilities = jnp.empty((0, num_links), dtype=dtype)
+    elif profiling_enabled:
+        check_deadline("tracing")
+        if deadline_phase is None:
+            started = clock()
+            traced = _prepare_fixed_routing_core.trace(
+                inputs=inputs,
+                theta=theta_array,
+            )
+            tracing_seconds = max(0.0, clock() - started)
+            check_deadline("tracing", after_indivisible=True)
+        else:
+            traced = None
+
+        if deadline_phase is None:
+            check_deadline("lowering")
+            started = clock()
+            assert traced is not None
+            lowered = traced.lower()
+            lowering_seconds = max(0.0, clock() - started)
+            check_deadline("lowering", after_indivisible=True)
+        else:
+            lowered = None
+
+        if deadline_phase is None:
+            check_deadline("compilation")
+            started = clock()
+            assert lowered is not None
+            compiled = lowered.compile()
+            compilation_seconds = max(0.0, clock() - started)
+            check_deadline("compilation", after_indivisible=True)
+        else:
+            compiled = None
+
+        if deadline_phase is None:
+            check_deadline("first execution")
+            started = clock()
+            assert compiled is not None
+            effective_masks, probabilities = compiled(inputs=inputs, theta=theta_array)
+            synchronization_started = clock()
+            jax.block_until_ready((effective_masks, probabilities))
+            synchronization_seconds = max(0.0, clock() - synchronization_started)
+            execution_seconds = max(0.0, clock() - started)
+            check_deadline("first execution", after_indivisible=True)
+        else:
+            # Diagnostics are published below before a bounded stop is raised.
+            effective_masks = jnp.empty((0, num_links), dtype=bool)
+            probabilities = jnp.empty((0, num_links), dtype=dtype)
     else:
         effective_masks, probabilities = _prepare_fixed_routing_core(
             inputs=inputs,
             theta=theta_array,
         )
+
+    retained_bytes = int(effective_masks.size * effective_masks.dtype.itemsize) + int(
+        probabilities.size * probabilities.dtype.itemsize
+    )
+    expected_retained_bytes = num_groups * num_links * (
+        np.dtype(bool).itemsize + np.dtype(dtype).itemsize
+    )
+    total_elapsed = max(0.0, clock() - total_started)
+    if diagnostics_callback is not None:
+        now = clock()
+        overshoot = (
+            max(0.0, now - absolute_deadline)
+            if absolute_deadline is not None and deadline_phase is not None
+            else 0.0
+        )
+        diagnostics_callback(
+            FixedRoutingPreparationDiagnostics(
+                profiling_enabled=True,
+                num_destination_groups=num_groups,
+                num_links=num_links,
+                effective_mask_shape=(num_groups, num_links),
+                probability_shape=(num_groups, num_links),
+                effective_mask_dtype=str(jnp.dtype(bool)),
+                probability_dtype=str(dtype),
+                tracing_seconds=tracing_seconds,
+                lowering_seconds=lowering_seconds,
+                compilation_seconds=compilation_seconds,
+                first_execution_seconds=execution_seconds,
+                host_device_transfer_seconds=0.0,
+                synchronization_seconds=synchronization_seconds,
+                total_elapsed_seconds=total_elapsed,
+                estimated_retained_bytes=expected_retained_bytes,
+                observed_retained_bytes=retained_bytes,
+                # At minimum, inputs and outputs may coexist. XLA-internal
+                # workspace is backend-specific and is not guessed here.
+                estimated_temporary_bytes=expected_retained_bytes,
+                peak_rss_bytes=_peak_rss_bytes(),
+                backend=jax.default_backend(),
+                devices=tuple(str(device) for device in jax.devices()),
+                captured_constant_bytes=None,
+                deadline_exceeded=deadline_phase is not None,
+                deadline_phase=deadline_phase,
+                indivisible_operation_overshoot=indivisible_overshoot,
+                deadline_overshoot_seconds=overshoot,
+            )
+        )
+        if deadline_phase is not None:
+            raise TimeoutError(
+                "fixed-routing preparation deadline reached during "
+                f"{deadline_phase}."
+            )
 
     return FixedRoutingInputs(
         theta=theta_array,

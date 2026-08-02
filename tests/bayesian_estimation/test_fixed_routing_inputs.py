@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 from dataclasses import replace
 from pathlib import Path
@@ -8,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import public_transportation.inference.sharded_fixed_routing as sharded_module
 
 from public_transportation.assignment import AssignmentConfig
 from public_transportation.assignment.assign import (
@@ -17,6 +19,7 @@ from public_transportation.assignment.assign import (
 from public_transportation.assignment.dial_dp import prepare_destination_routing
 from public_transportation.domain import Scenario
 from public_transportation.inference.assignment_adapter import (
+    FixedRoutingPreparationDiagnostics,
     FixedRoutingInputs,
     assign_link_flow,
     assign_link_flow_fixed_routing,
@@ -24,6 +27,11 @@ from public_transportation.inference.assignment_adapter import (
     build_assignment_inputs,
     prepare_fixed_routing,
     validate_fixed_routing_compatibility,
+)
+from public_transportation.inference.sharded_fixed_routing import (
+    FixedRoutingPreparationConfig,
+    load_fixed_routing_shard,
+    prepare_fixed_routing_sharded,
 )
 
 
@@ -76,6 +84,446 @@ def test_prepare_fixed_routing_shapes_values_and_pytree(assignment_inputs):
     assert isinstance(rebuilt, FixedRoutingInputs)
     assert np.array_equal(rebuilt.group_link_probability, probability)
     validate_fixed_routing_compatibility(inputs=assignment_inputs, routing=rebuilt)
+
+
+def test_prepare_fixed_routing_reports_synchronized_profile(assignment_inputs):
+    reports: list[FixedRoutingPreparationDiagnostics] = []
+
+    prepared = prepare_fixed_routing(
+        inputs=assignment_inputs,
+        theta=1.0,
+        diagnostics_callback=reports.append,
+    )
+
+    assert len(reports) == 1
+    report = reports[0]
+    expected_shape = (
+        int(assignment_inputs.group_dest_node.shape[0]),
+        assignment_inputs.graph.num_links,
+    )
+    assert report.profiling_enabled
+    assert report.effective_mask_shape == expected_shape
+    assert report.probability_shape == expected_shape
+    assert report.observed_retained_bytes == (
+        prepared.effective_group_link_mask.nbytes
+        + prepared.group_link_probability.nbytes
+    )
+    assert report.estimated_retained_bytes == report.observed_retained_bytes
+    assert report.tracing_seconds >= 0.0
+    assert report.lowering_seconds >= 0.0
+    assert report.compilation_seconds >= 0.0
+    assert report.first_execution_seconds >= 0.0
+    assert report.synchronization_seconds >= 0.0
+    assert report.total_elapsed_seconds >= 0.0
+    assert report.backend == jax.default_backend()
+    assert report.devices
+    assert report.captured_constant_bytes is None
+    assert not report.deadline_exceeded
+    assert report.deadline_phase is None
+
+
+def test_prepare_fixed_routing_reports_expired_deadline_before_tracing(
+    assignment_inputs,
+):
+    reports: list[FixedRoutingPreparationDiagnostics] = []
+
+    with pytest.raises(TimeoutError, match="during tracing"):
+        prepare_fixed_routing(
+            inputs=assignment_inputs,
+            theta=1.0,
+            diagnostics_callback=reports.append,
+            absolute_deadline=0.0,
+        )
+
+    assert len(reports) == 1
+    assert reports[0].deadline_exceeded
+    assert reports[0].deadline_phase == "tracing"
+    assert not reports[0].indivisible_operation_overshoot
+
+
+def test_sharded_preparation_matches_complete_and_resumes_from_cache(
+    assignment_inputs, tmp_path
+):
+    complete = prepare_fixed_routing(inputs=assignment_inputs, theta=1.0)
+    config = FixedRoutingPreparationConfig(
+        maximum_groups_per_shard=2,
+        cache_directory=tmp_path / "cache",
+        checkpoint_directory=tmp_path / "checkpoint",
+    )
+    events = []
+
+    first = prepare_fixed_routing_sharded(
+        inputs=assignment_inputs,
+        theta=1.0,
+        config=config,
+        progress=events.append,
+    )
+    shards = [
+        load_fixed_routing_shard(routing=first.routing, descriptor=descriptor)
+        for descriptor in first.plan.descriptors
+    ]
+    effective = np.concatenate(
+        [shard.effective_group_link_mask for shard in shards], axis=0
+    )
+    probability = np.concatenate(
+        [shard.group_link_probability for shard in shards], axis=0
+    )
+
+    assert first.status == "completed"
+    assert first.compilation_count == 1
+    np.testing.assert_array_equal(effective, complete.effective_group_link_mask)
+    np.testing.assert_allclose(
+        probability,
+        complete.group_link_probability,
+        rtol=1.0e-6,
+        atol=1.0e-7,
+    )
+    assert [event.completed_shards for event in events] == sorted(
+        event.completed_shards for event in events
+    )
+
+    resumed = prepare_fixed_routing_sharded(
+        inputs=assignment_inputs,
+        theta=1.0,
+        config=config,
+    )
+    assert resumed.status == "completed"
+    assert resumed.cache_hits == len(first.plan.descriptors)
+    assert resumed.cache_misses == 0
+    assert resumed.compilation_count == 0
+
+
+def test_sharded_detailed_profile_has_synchronized_warm_phase_diagnostics(
+    assignment_inputs, tmp_path
+):
+    result = prepare_fixed_routing_sharded(
+        inputs=assignment_inputs,
+        theta=1.0,
+        config=FixedRoutingPreparationConfig(
+            maximum_groups_per_shard=2,
+            detailed_profiling=True,
+            cache_directory=tmp_path / "cache",
+            checkpoint_directory=tmp_path / "checkpoint",
+        ),
+    )
+
+    assert len(result.shard_diagnostics) == result.routing.num_shards
+    diagnostic = result.shard_diagnostics[-1]
+    assert diagnostic.total_shard_seconds > 0.0
+    assert diagnostic.device_synchronization_seconds >= 0.0
+    assert diagnostic.graph_nodes_traversed == (
+        result.plan.groups_per_full_shard * result.routing.num_nodes
+    )
+    assert diagnostic.graph_links_traversed == (
+        result.plan.groups_per_full_shard * result.routing.num_links
+    )
+    assert 0.0 <= diagnostic.enabled_link_fraction <= 1.0
+    assert 0.0 <= diagnostic.probability_density <= 1.0
+    assert diagnostic.retained_bytes > 0
+
+
+def test_sharded_preparation_stops_cleanly_before_first_shard(
+    assignment_inputs, tmp_path
+):
+    result = prepare_fixed_routing_sharded(
+        inputs=assignment_inputs,
+        theta=1.0,
+        config=FixedRoutingPreparationConfig(
+            cache_directory=tmp_path / "cache",
+            checkpoint_directory=tmp_path / "checkpoint",
+        ),
+        absolute_deadline=0.0,
+    )
+
+    assert result.status == "deadline_reached"
+    assert result.completed_shards == 0
+    assert result.deadline_phase == "before shard"
+    assert not result.indivisible_operation_overshoot
+    manifest = tmp_path / "checkpoint" / "manifest.json"
+    assert manifest.exists()
+
+
+def test_sharded_preparation_rejects_incompatible_manifest(
+    assignment_inputs, tmp_path
+):
+    config = FixedRoutingPreparationConfig(
+        maximum_groups_per_shard=2,
+        cache_directory=tmp_path / "cache",
+        checkpoint_directory=tmp_path / "checkpoint",
+    )
+    prepare_fixed_routing_sharded(
+        inputs=assignment_inputs, theta=1.0, config=config
+    )
+
+    with pytest.raises(ValueError, match="manifest identity mismatch"):
+        prepare_fixed_routing_sharded(
+            inputs=assignment_inputs, theta=2.0, config=config
+        )
+
+    refreshed = prepare_fixed_routing_sharded(
+        inputs=assignment_inputs,
+        theta=2.0,
+        config=config,
+        cache_policy="refresh",
+    )
+    assert refreshed.status == "completed"
+
+
+def test_sharded_preparation_two_workers_matches_serial_and_reuses_cache(
+    assignment_inputs, tmp_path
+):
+    serial_config = FixedRoutingPreparationConfig(
+        maximum_groups_per_shard=2,
+        cache_directory=tmp_path / "serial-cache",
+        checkpoint_directory=tmp_path / "serial-checkpoint",
+    )
+    parallel_config = FixedRoutingPreparationConfig(
+        maximum_groups_per_shard=2,
+        construction_workers=2,
+        cache_directory=tmp_path / "parallel-cache",
+        checkpoint_directory=tmp_path / "parallel-checkpoint",
+    )
+    serial = prepare_fixed_routing_sharded(
+        inputs=assignment_inputs, theta=1.0, config=serial_config
+    )
+    events = []
+    parallel = prepare_fixed_routing_sharded(
+        inputs=assignment_inputs,
+        theta=1.0,
+        config=parallel_config,
+        progress=events.append,
+    )
+
+    assert parallel.status == "completed"
+    assert parallel.compilation_count == 1
+    persisted_indices = [
+        event.shard_index for event in events if event.phase == "shard_persisted"
+    ]
+    assert persisted_indices == sorted(persisted_indices)
+    assert all(event.admitted_worker_count == 2 for event in events)
+    assert parallel.routing.provenance.preparation_fingerprint == (
+        serial.routing.provenance.preparation_fingerprint
+    )
+    for descriptor in serial.plan.descriptors:
+        serial_shard = load_fixed_routing_shard(
+            routing=serial.routing, descriptor=descriptor
+        )
+        parallel_shard = load_fixed_routing_shard(
+            routing=parallel.routing, descriptor=descriptor
+        )
+        np.testing.assert_array_equal(
+            parallel_shard.effective_group_link_mask,
+            serial_shard.effective_group_link_mask,
+        )
+        np.testing.assert_allclose(
+            parallel_shard.group_link_probability,
+            serial_shard.group_link_probability,
+            rtol=1.0e-6,
+            atol=1.0e-7,
+        )
+
+    reload = prepare_fixed_routing_sharded(
+        inputs=assignment_inputs, theta=1.0, config=parallel_config
+    )
+    assert reload.cache_hits == parallel.routing.num_shards
+    assert reload.cache_misses == 0
+    assert reload.compilation_count == 0
+
+
+def test_parallel_detailed_profile_is_complete_ordered_and_cache_safe(
+    assignment_inputs, tmp_path, monkeypatch
+):
+    original = sharded_module.save_fixed_routing_shard
+
+    def delay_first(*, routing, shard, durable=True):
+        # Force completion order away from canonical order without a polling
+        # loop. The coordinator must still publish diagnostics canonically.
+        if shard.descriptor.shard_index == 0:
+            import time
+
+            time.sleep(0.02)
+        return original(routing=routing, shard=shard, durable=durable)
+
+    monkeypatch.setattr(sharded_module, "save_fixed_routing_shard", delay_first)
+    events = []
+    config = FixedRoutingPreparationConfig(
+        maximum_groups_per_shard=2,
+        construction_workers=2,
+        detailed_profiling=True,
+        cache_directory=tmp_path / "cache",
+        checkpoint_directory=tmp_path / "checkpoint",
+    )
+    result = prepare_fixed_routing_sharded(
+        inputs=assignment_inputs,
+        theta=1.0,
+        config=config,
+        progress=events.append,
+    )
+
+    diagnostics = result.shard_diagnostics
+    assert len(diagnostics) == result.routing.num_shards
+    assert [item.shard_index for item in diagnostics] == list(
+        range(result.routing.num_shards)
+    )
+    timing_names = (
+        "host_destination_preparation_seconds",
+        "host_mask_preparation_seconds",
+        "argument_transfer_seconds",
+        "kernel_execution_seconds",
+        "device_synchronization_seconds",
+        "host_transfer_seconds",
+        "output_slicing_seconds",
+        "validation_seconds",
+        "shard_persistence_seconds",
+        "manifest_persistence_seconds",
+        "cleanup_seconds",
+    )
+    for diagnostic in diagnostics:
+        phases = sum(getattr(diagnostic, name) for name in timing_names)
+        assert all(getattr(diagnostic, name) >= 0.0 for name in timing_names)
+        assert diagnostic.total_shard_seconds >= phases - 1.0e-6
+        assert diagnostic.total_shard_seconds <= phases + 0.25
+        assert diagnostic.input_shapes
+        assert diagnostic.input_dtypes
+        assert diagnostic.output_shapes
+        assert diagnostic.output_dtypes
+        assert diagnostic.retained_bytes > 0
+        assert diagnostic.estimated_temporary_bytes > 0
+        expected_enabled_fraction = (
+            diagnostic.enabled_links / diagnostic.graph_links_traversed
+            if diagnostic.graph_links_traversed
+            else 0.0
+        )
+        retained_domain = diagnostic.num_groups * result.routing.num_links
+        expected_probability_density = (
+            diagnostic.probability_nonzeros / retained_domain
+            if retained_domain
+            else 0.0
+        )
+        assert diagnostic.enabled_link_fraction == pytest.approx(
+            expected_enabled_fraction
+        )
+        assert diagnostic.probability_density == pytest.approx(
+            expected_probability_density
+        )
+
+    planning = [event for event in events if event.phase == "planning_cache_scan"]
+    dispatch = [event for event in events if event.phase == "dispatch"]
+    persisted = [event for event in events if event.phase == "shard_persisted"]
+    assert len(planning) == 1
+    assert planning[0].cache_hits == 0
+    assert planning[0].cache_misses == result.routing.num_shards
+    assert planning[0].queued_shards == result.routing.num_shards
+    assert planning[0].admitted_worker_count == 2
+    assert dispatch
+    assert all(event.current_shard_indices for event in dispatch)
+    assert [event.shard_index for event in persisted] == list(
+        range(result.routing.num_shards)
+    )
+    assert len(events) <= 2 * result.routing.num_shards + 2
+
+    cached = prepare_fixed_routing_sharded(
+        inputs=assignment_inputs, theta=1.0, config=config
+    )
+    assert cached.cache_hits == result.routing.num_shards
+    assert cached.cache_misses == 0
+    assert cached.shard_diagnostics == ()
+
+
+def test_parallel_profile_disabled_has_no_diagnostics(assignment_inputs, tmp_path):
+    result = prepare_fixed_routing_sharded(
+        inputs=assignment_inputs,
+        theta=1.0,
+        config=FixedRoutingPreparationConfig(
+            maximum_groups_per_shard=2,
+            construction_workers=2,
+            detailed_profiling=False,
+            cache_directory=tmp_path / "cache",
+            checkpoint_directory=tmp_path / "checkpoint",
+        ),
+    )
+
+    assert result.status == "completed"
+    assert result.shard_diagnostics == ()
+
+
+def test_parallel_predictive_deadline_guard_prevents_dispatch(
+    assignment_inputs, tmp_path
+):
+    result = prepare_fixed_routing_sharded(
+        inputs=assignment_inputs,
+        theta=1.0,
+        config=FixedRoutingPreparationConfig(
+            maximum_groups_per_shard=2,
+            construction_workers=2,
+            initial_predicted_shard_seconds=60.0,
+            dispatch_safety_margin_seconds=10.0,
+            cache_directory=tmp_path / "cache",
+            checkpoint_directory=tmp_path / "checkpoint",
+        ),
+        absolute_deadline=sharded_module.perf_counter() + 1.0,
+    )
+
+    assert result.status == "deadline_reached"
+    assert result.completed_shards == 0
+    assert result.dispatch_prevented_by_deadline
+    assert result.deadline_phase == "predictive dispatch guard"
+    assert not list((tmp_path / "cache").glob("routing-shard-*.npz"))
+
+
+def test_parallel_memory_admission_can_decline_before_compilation(
+    assignment_inputs, tmp_path
+):
+    result = prepare_fixed_routing_sharded(
+        inputs=assignment_inputs,
+        theta=1.0,
+        config=FixedRoutingPreparationConfig(
+            construction_workers=2,
+            maximum_process_rss_bytes=1,
+            cache_directory=tmp_path / "cache",
+            checkpoint_directory=tmp_path / "checkpoint",
+        ),
+    )
+
+    assert result.status == "memory_budget_reached"
+    assert result.completed_shards == 0
+    assert result.compilation_count == 0
+
+
+def test_parallel_worker_failure_preserves_valid_artifacts_and_manifest(
+    assignment_inputs, tmp_path, monkeypatch
+):
+    original = sharded_module.save_fixed_routing_shard
+
+    def fail_second(*, routing, shard, durable=True):
+        if shard.descriptor.shard_index == 2:
+            raise OSError("simulated worker persistence failure")
+        return original(routing=routing, shard=shard, durable=durable)
+
+    monkeypatch.setattr(sharded_module, "save_fixed_routing_shard", fail_second)
+    config = FixedRoutingPreparationConfig(
+        maximum_groups_per_shard=2,
+        construction_workers=2,
+        cache_directory=tmp_path / "cache",
+        checkpoint_directory=tmp_path / "checkpoint",
+    )
+
+    with pytest.raises(RuntimeError, match="worker failed for shard 2"):
+        prepare_fixed_routing_sharded(
+            inputs=assignment_inputs, theta=1.0, config=config
+        )
+
+    manifest = json.loads(
+        (tmp_path / "checkpoint" / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["status"] == "interrupted"
+    assert not list((tmp_path / "cache").glob("*.tmp"))
+    monkeypatch.setattr(sharded_module, "save_fixed_routing_shard", original)
+    resumed = prepare_fixed_routing_sharded(
+        inputs=assignment_inputs, theta=1.0, config=config
+    )
+    assert resumed.status == "completed"
+    assert resumed.cache_hits >= 2
 
 
 def test_fixed_routing_depends_on_theta_and_is_deterministic(assignment_inputs):
