@@ -11,6 +11,14 @@
   public gravity preflight, and a scalable synthetic operator benchmark. Added
   a conservative first-batch deadline estimate, an atomic run-manifest writer,
   and a shared durable JSONL sink for operator and optimizer progress.
+- Added bounded concurrent dispatch of independent compiled routing-shard
+  products. CPU, shard-count, and in-flight routing-byte ceilings constrain the
+  worker count, while canonical ordered accumulation preserves deterministic
+  forward, reverse, and matmat results. Whole-product deadline projection now
+  stops after a measured wave when all remaining work cannot finish. Public
+  8,192-node measurements improved warm forward throughput by 2.01 times with
+  eight workers; aggregate scan batching and vectorized-group loading remain
+  benchmarked alternatives.
 
 ### Structural-zero preprocessing progress
 

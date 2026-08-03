@@ -117,6 +117,19 @@ def build_gravity_run_manifest(
             "operator_shards_per_batch": getattr(
                 operator, "operator_shards_per_batch", None
             ),
+            "group_execution_strategy": getattr(
+                operator, "group_execution_strategy", None
+            ),
+            "shard_execution_strategy": getattr(
+                operator, "shard_execution_strategy", None
+            ),
+            "operator_concurrency": getattr(operator, "operator_concurrency", None),
+            "effective_operator_concurrency": getattr(
+                operator, "effective_operator_concurrency", None
+            ),
+            "maximum_concurrent_routing_bytes": getattr(
+                operator, "maximum_concurrent_routing_bytes", None
+            ),
             "resident_shard_limit": getattr(operator, "resident_shard_limit", None),
             "initial_predicted_batch_seconds": getattr(
                 operator, "initial_predicted_batch_seconds", None

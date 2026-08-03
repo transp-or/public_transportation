@@ -18,6 +18,8 @@ def test_sharded_gravity_benchmark_is_bounded_and_reports_all_products():
     assert report["dense_measurement_od_constructed"] is False
     assert report["complete_routing_array_materialized"] is False
     assert report["best_operator_shards_per_batch"] in (1, 2, 4)
+    assert report["best_shard_execution_strategy"] in {"aggregate", "concurrent"}
+    assert isinstance(report["material_forward_throughput_improvement"], bool)
     for case in report["cases"]:
         assert set(case["products"]) == {"matvec", "rmatvec", "matmat"}
         for product in case["products"].values():

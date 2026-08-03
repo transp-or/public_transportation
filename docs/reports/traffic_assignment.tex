@@ -1514,6 +1514,18 @@ Measurement scatter-add is fused into the compiled forward product, and the
 reverse kernel is its exact VJP.  No complete routing array, link-flow-by-shard
 stack, Jacobian, or measurement-by-OD matrix is assembled.
 
+The compiled assignment core expresses its destination-group dimension as a
+sequential \texttt{lax.scan}.  Consequently, merely enlarging an aggregate
+batch does not expose independent shard work to additional CPU cores.  The
+multicore implementation instead dispatches already-compiled single-shard scan
+kernels through a bounded worker pool.  Its concurrency is limited by an
+explicit request, the detected CPU and shard counts, and a ceiling on live
+in-flight routing bytes.  Results are accumulated in canonical shard order,
+preserving deterministic forward, transpose, and multiple-right-hand-side
+products.  A vectorized-group alternative exposed more cores but was slower on
+the larger public forward benchmark because it materialized group-by-link
+intermediates, so it remains experimental.
+
 Structured progress distinguishes product start, batch load, execution,
 accumulation, completion and deadline-prevented dispatch.  Before an
 indivisible batch, the operator compares remaining absolute-deadline allowance
@@ -1525,6 +1537,15 @@ Simple Example 02, four shards covering seven destination groups reused one
 compiled shape and agreed exactly with complete masks and probabilities; a
 fresh reload reused all four persisted shards.
 
+After the first measured batch or concurrent wave, deadline admission projects
+the duration of every remaining wave plus its safety margin.  If the complete
+product is infeasible, a \texttt{product\_deadline\_infeasible} event records
+completed and total shards, the measured wave, predicted remainder, deadline
+allowance, discarded partial-work duration, batch size, and concurrency before
+any further dispatch.  Since a partial operator product is not a valid
+objective evaluation, its accumulated vector is never returned or
+checkpointed.
+
 A public bounded preflight validates every cache shard and its fingerprints,
 then, at individually selectable safe boundaries, executes one forward
 product, one reverse product, both three-parameter objective-gradient
@@ -1535,6 +1556,15 @@ interval, and a laptop-versus-server recommendation.  The scalable synthetic
 benchmark varies graph, link, group, shard, OD, measurement, residency and
 operator-batch dimensions and reports synchronized forward, reverse and
 multiple-right-hand-side timing and resource decompositions.
+
+On the 8,192-node public synthetic case, the best aggregate scan required
+28.1~ms for a warm forward product at approximately one effective core.  Four
+concurrent scan workers reduced this to 14.7~ms at 2.28 effective cores, and
+eight workers to 13.9~ms at 2.74 effective cores, a 2.01-fold throughput gain.
+Reverse and three-column products improved similarly.  The benchmark emits a
+regression warning unless concurrent forward throughput exceeds the aggregate
+reference by at least ten percent.  These results establish the mechanism but
+do not substitute for a bounded target-cache preflight.
 
 Before the first measured batch is available, the caller may supply a
 conservative initial batch-duration prediction obtained from preflight.  It is

@@ -245,6 +245,45 @@ def _assign_fixed_routing_core(
 
 
 @jax.jit
+def _assign_fixed_routing_vectorized_core(
+    *,
+    graph: JaxGraph,
+    od_values: Array,
+    effective_group_link_mask: Array,
+    group_link_probability: Array,
+    od_origin_node: Array,
+    group_od_index_padded: Array,
+    group_od_mask: Array,
+) -> Array:
+    """Load independent destination groups with a bounded vectorized map.
+
+    Unlike :func:`_assign_fixed_routing_core`, this exposes the group dimension
+    to XLA rather than expressing it as a sequential ``lax.scan``. Callers must
+    bound the padded group count because intermediate group link flows have
+    shape ``(groups, links)`` before their deterministic reduction.
+    """
+
+    def group_flow(probability, enabled, od_indices, od_mask):
+        safe_indices = jnp.where(od_mask, od_indices, 0)
+        origin_nodes = od_origin_node[safe_indices]
+        flows = od_values[safe_indices]
+        initial = jnp.zeros((graph.num_nodes,), dtype=od_values.dtype)
+        initial = initial.at[jnp.where(od_mask, origin_nodes, 0)].add(
+            jnp.where(od_mask, flows, 0)
+        )
+        _, link_flow = load_flows(graph, probability, enabled, initial)
+        return link_flow
+
+    per_group = jax.vmap(group_flow)(
+        group_link_probability,
+        effective_group_link_mask,
+        group_od_index_padded,
+        group_od_mask,
+    )
+    return jnp.sum(per_group, axis=0)
+
+
+@jax.jit
 def _assign_fixed_routing_custom_adjoint_core(
     *,
     graph: JaxGraph,

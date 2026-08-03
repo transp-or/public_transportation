@@ -258,10 +258,115 @@ def test_sharded_matrix_free_products_match_complete_operator(
     with pytest.raises(ShardedOperatorProductInterrupted) as interrupted:
         operator.matvec(np.asarray(demand))
     assert interrupted.value.completed_shards == 0
-    assert predictive_progress[-1].phase == "deadline_prevented_dispatch"
+    assert predictive_progress[-1].phase == "product_deadline_infeasible"
     assert predictive_progress[-1].predicted_remaining_seconds is not None
     operator.absolute_deadline = None
     operator.initial_predicted_batch_seconds = None
+
+    for strategy, options in (
+        ("vectorized", {"operator_shards_per_batch": 3}),
+        (
+            "concurrent",
+            {
+                "shard_execution_strategy": "concurrent",
+                "operator_concurrency": 2,
+                "operator_shards_per_batch": 1,
+            },
+        ),
+    ):
+        candidate = ShardedMatrixFreeFixedRoutingMeasurementOperator(
+            inputs=inputs,
+            routing=prepared.routing,
+            spec=spec,
+            compact_layout=compact,
+            resident_shard_limit=1,
+            group_execution_strategy=(
+                "vectorized" if strategy == "vectorized" else "scan"
+            ),
+            **options,
+        )
+        first_result = candidate.matvec(np.asarray(demand))
+        second_result = candidate.matvec(np.asarray(demand))
+        np.testing.assert_array_equal(first_result, second_result)
+        np.testing.assert_allclose(first_result, expected, rtol=4e-5, atol=4e-5)
+        transpose = candidate.rmatvec(np.asarray(weight))
+        np.testing.assert_allclose(
+            transpose,
+            complete_operator.jax_rmatvec(weight),
+            rtol=4e-5,
+            atol=4e-5,
+        )
+        assert float(np.vdot(first_result, weight)) == pytest.approx(
+            float(np.vdot(demand, transpose)), rel=4e-5, abs=4e-5
+        )
+        np.testing.assert_allclose(
+            candidate._host_matmat(np.asarray(matrix)),
+            np.column_stack((first_result, 2.0 * first_result, np.zeros_like(first_result))),
+            rtol=4e-5,
+            atol=4e-5,
+        )
+        assert candidate.resident_shards <= candidate.resident_shard_limit
+        assert candidate.assignment_fingerprint == operator.assignment_fingerprint
+
+    memory_limited = ShardedMatrixFreeFixedRoutingMeasurementOperator(
+        inputs=inputs,
+        routing=prepared.routing,
+        spec=spec,
+        compact_layout=compact,
+        shard_execution_strategy="concurrent",
+        operator_concurrency=100,
+        maximum_concurrent_routing_bytes=1,
+    )
+    assert memory_limited.effective_operator_concurrency == 1
+
+    deadline_events = []
+
+    def make_remaining_product_infeasible(event):
+        deadline_events.append(event)
+        if event.phase == "batch_accumulated" and event.completed_shards == 2:
+            assert event.recent_batch_seconds is not None
+            concurrent_deadline.absolute_deadline = (
+                perf_counter() + 0.25 * event.recent_batch_seconds
+            )
+
+    concurrent_deadline = ShardedMatrixFreeFixedRoutingMeasurementOperator(
+        inputs=inputs,
+        routing=prepared.routing,
+        spec=spec,
+        compact_layout=compact,
+        resident_shard_limit=1,
+        shard_execution_strategy="concurrent",
+        operator_concurrency=2,
+        progress_callback=make_remaining_product_infeasible,
+    )
+    with pytest.raises(ShardedOperatorProductInterrupted) as stopped:
+        concurrent_deadline.matvec(np.asarray(demand))
+    assert stopped.value.reason == "product_deadline_infeasible"
+    assert stopped.value.completed_shards == 2
+    assert stopped.value.predicted_remaining_seconds is not None
+    assert stopped.value.discarded_partial_seconds > 0.0
+    assert [event.phase for event in deadline_events].count("batch_loaded") == 1
+    diagnostic = deadline_events[-1]
+    assert diagnostic.phase == "product_deadline_infeasible"
+    assert diagnostic.batch_size == 1
+    assert diagnostic.concurrency == 2
+    assert diagnostic.discarded_partial_seconds > 0.0
+
+    failing = ShardedMatrixFreeFixedRoutingMeasurementOperator(
+        inputs=inputs,
+        routing=prepared.routing,
+        spec=spec,
+        compact_layout=compact,
+        shard_execution_strategy="concurrent",
+        operator_concurrency=2,
+    )
+
+    def fail_kernel(*_):
+        raise RuntimeError("worker kernel failed")
+
+    failing._compiled_forward = fail_kernel
+    with pytest.raises(RuntimeError, match="worker kernel failed"):
+        failing.matvec(np.asarray(demand))
 
     features = GravityFeatures(
         canonical_od_index=np.arange(num_od),
@@ -654,6 +759,38 @@ def test_sharded_positive_fixed_flow_is_offset_only(artifacts, tmp_path):
         atol=5e-5,
     )
     assert sharded.shape[1] == layout.num_free
+
+    prepared_routing = prepare_fixed_routing_sharded(
+        inputs=inputs,
+        theta=1.0,
+        config=FixedRoutingPreparationConfig(
+            maximum_groups_per_shard=2,
+            cache_directory=tmp_path / "routing-probabilities",
+            checkpoint_directory=tmp_path / "routing-checkpoints",
+        ),
+    )
+    concurrent = ShardedMatrixFreeFixedRoutingMeasurementOperator(
+        inputs=inputs,
+        routing=prepared_routing.routing,
+        spec=spec,
+        compact_layout=compact,
+        resident_shard_limit=1,
+        shard_execution_strategy="concurrent",
+        operator_concurrency=2,
+    )
+    np.testing.assert_allclose(
+        concurrent.matvec(demand) + concurrent.fixed_measurement_offset,
+        np.asarray(reference.matrix) @ demand
+        + np.asarray(reference.fixed_measurement_offset),
+        rtol=5e-5,
+        atol=5e-5,
+    )
+    np.testing.assert_allclose(
+        concurrent.fixed_measurement_offset,
+        reference.fixed_measurement_offset,
+        rtol=5e-5,
+        atol=5e-5,
+    )
 
 
 def test_sharded_preflight_rejects_unsafe_kernel(all_free_operator):

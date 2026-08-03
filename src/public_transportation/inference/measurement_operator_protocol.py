@@ -17,6 +17,7 @@ class GravityOperatorCapabilities:
     cancellation: bool = False
     resident_cache_diagnostics: bool = False
     batched_shards: bool = False
+    concurrent_shards: bool = False
     matmat: bool = True
 
 

@@ -526,6 +526,23 @@ execution; the final partial batch is padded. The operator constructs neither
 complete routing arrays, a link-flow-by-shard stack, nor a measurement-by-OD
 matrix.
 
+Aggregate batching still evaluates destination groups through the assignment
+kernel's sequential `lax.scan`; private full-network measurements and public
+synthetic benchmarks show that enlarging this scan does not materially improve
+CPU utilization. For multicore execution, use
+`shard_execution_strategy="concurrent"` with
+`group_execution_strategy="scan"`. This dispatches already-compiled
+single-shard kernels through a bounded worker pool and accumulates completed
+results in canonical shard order. `operator_concurrency` is limited by the
+available CPU count, shard count, and `maximum_concurrent_routing_bytes`; when
+unspecified, its conservative requested ceiling is four. LRU residency and
+live in-flight routing bytes are diagnosed separately.
+
+A vectorized group strategy is available for controlled experiments. Although
+it exposed more CPU parallelism, it was substantially slower for forward
+loading on the larger public benchmark because it materializes a group-by-link
+intermediate. It is therefore not the recommended full-network strategy.
+
 The common `GravityMeasurementOperator` protocol documents numerical products,
 fingerprints, fixed offsets and operational capabilities. The sharded operator
 supports structured product progress, absolute deadlines, cancellation and LRU
@@ -534,6 +551,14 @@ batch using its recent predicted duration plus the configured safety margin.
 Interruption raises `ShardedOperatorProductInterrupted`; no partial product is
 returned as complete. Gravity estimation propagates its wall-time deadline into
 the operator and checkpoints only completed optimizer iterates.
+
+After one representative batch or concurrent wave, the deadline guard projects
+the time for every remaining wave, not merely the next dispatch. If the complete
+product cannot finish with its safety margin, it emits
+`product_deadline_infeasible` and discards the partial sum before launching more
+work. The diagnostic includes completed/total shards, measured wave duration,
+predicted remaining time, deadline allowance, discarded work, batch size, and
+concurrency.
 
 For the first product of a new process, set
 `initial_predicted_batch_seconds` from the corresponding preflight measurement.
@@ -592,6 +617,13 @@ hits and misses; both minimal three-parameter gradient strategies; and projected
 optimizer times. Batch selection uses aggregate warm product time. The report
 also records explicitly that neither a dense measurement-by-OD matrix nor a
 complete routing array was materialized.
+
+The representative 8,192-node public comparison is recorded in
+`benchmarks/sharded_gravity_concurrency.md`. Four concurrent scan workers
+improved warm forward time from 28.1 ms to 14.7 ms and eight workers to 13.9 ms,
+while effective CPU use increased from approximately one to 2.28 and 2.74 cores
+respectively. These measurements satisfy the public throughput acceptance
+criterion but do not replace a short private-cache preflight.
 
 Long runs should publish an atomic manifest and use one durable JSONL sink for
 both operator and optimizer progress:

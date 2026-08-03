@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
+import os
 from threading import RLock
 from time import perf_counter, process_time
 from typing import Callable, Literal
@@ -13,7 +15,10 @@ import jax.numpy as jnp
 import numpy as np
 
 from public_transportation.measurement.mapping import AggregationSpec
-from public_transportation.assignment.assign import _assign_fixed_routing_core
+from public_transportation.assignment.assign import (
+    _assign_fixed_routing_core,
+    _assign_fixed_routing_vectorized_core,
+)
 
 from .assignment_adapter import AssignmentInputs
 from .compact_od_assignment_layout import CompactODAssignmentLayout
@@ -28,6 +33,8 @@ from .sharded_fixed_routing import (
 
 
 Operation = Literal["matvec", "matmat", "rmatvec"]
+GroupExecutionStrategy = Literal["scan", "vectorized"]
+ShardExecutionStrategy = Literal["aggregate", "concurrent"]
 
 
 def _peak_rss() -> int | None:
@@ -44,13 +51,30 @@ def _peak_rss() -> int | None:
 class ShardedOperatorProductInterrupted(RuntimeError):
     """Raised only at a safe batch boundary; no partial vector is returned."""
 
-    def __init__(self, operation: Operation, completed_shards: int) -> None:
+    def __init__(
+        self,
+        operation: Operation,
+        completed_shards: int,
+        *,
+        reason: str = "dispatch_prevented",
+        predicted_remaining_seconds: float | None = None,
+        deadline_remaining_seconds: float | None = None,
+        discarded_partial_seconds: float = 0.0,
+        batch_size: int = 1,
+        concurrency: int = 1,
+    ) -> None:
         super().__init__(
             f"{operation} operator product stopped before a shard batch; "
             f"completed partial shards={completed_shards}, result discarded"
         )
         self.operation = operation
         self.completed_shards = completed_shards
+        self.reason = reason
+        self.predicted_remaining_seconds = predicted_remaining_seconds
+        self.deadline_remaining_seconds = deadline_remaining_seconds
+        self.discarded_partial_seconds = discarded_partial_seconds
+        self.batch_size = batch_size
+        self.concurrency = concurrency
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +93,10 @@ class ShardedOperatorProgress:
     cache_hits: int
     cache_misses: int
     effective_cpu_cores: float | None = None
+    safety_margin_seconds: float = 0.0
+    discarded_partial_seconds: float = 0.0
+    batch_size: int = 1
+    concurrency: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +121,13 @@ class ShardedMatrixFreeMetrics:
     product_count: int = 0
     compilation_count: int = 0
     compilation_seconds: float = 0.0
+    tracing_seconds: float = 0.0
+    lowering_seconds: float = 0.0
+    input_assembly_seconds: float = 0.0
+    accumulation_seconds: float = 0.0
+    group_rows_processed: int = 0
+    support_entries_processed: int = 0
+    inflight_routing_bytes_peak: int = 0
 
 
 @dataclass(slots=True)
@@ -110,6 +145,10 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
     compact_layout: CompactODAssignmentLayout
     resident_shard_limit: int = 1
     operator_shards_per_batch: int = 1
+    group_execution_strategy: GroupExecutionStrategy = "scan"
+    shard_execution_strategy: ShardExecutionStrategy = "aggregate"
+    operator_concurrency: int | None = None
+    maximum_concurrent_routing_bytes: int = 1024 * 1024 * 1024
     progress_callback: Callable[[ShardedOperatorProgress], None] | None = field(
         default=None, repr=False
     )
@@ -144,6 +183,16 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
             raise ValueError("resident_shard_limit must be positive.")
         if self.operator_shards_per_batch <= 0:
             raise ValueError("operator_shards_per_batch must be positive.")
+        if self.group_execution_strategy not in {"scan", "vectorized"}:
+            raise ValueError("group_execution_strategy must be 'scan' or 'vectorized'.")
+        if self.shard_execution_strategy not in {"aggregate", "concurrent"}:
+            raise ValueError(
+                "shard_execution_strategy must be 'aggregate' or 'concurrent'."
+            )
+        if self.operator_concurrency is not None and self.operator_concurrency <= 0:
+            raise ValueError("operator_concurrency must be positive when provided.")
+        if self.maximum_concurrent_routing_bytes <= 0:
+            raise ValueError("maximum_concurrent_routing_bytes must be positive.")
         if self.deadline_safety_margin_seconds < 0.0:
             raise ValueError("deadline_safety_margin_seconds must be nonnegative.")
         if (
@@ -175,10 +224,16 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
         graph = self.inputs.graph
         origins = self.inputs.od_origin_node
 
+        assignment_core = (
+            _assign_fixed_routing_core
+            if self.group_execution_strategy == "scan"
+            else _assign_fixed_routing_vectorized_core
+        )
+
         def compiled_forward(
             active, probabilities, masks, group_od_indices, group_od_masks
         ):
-            link_flow = _assign_fixed_routing_core(
+            link_flow = assignment_core(
                 graph=graph,
                 od_values=active,
                 effective_group_link_mask=masks,
@@ -304,6 +359,7 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
             cancellation=True,
             resident_cache_diagnostics=True,
             batched_shards=True,
+            concurrent_shards=True,
             matmat=True,
         )
 
@@ -335,6 +391,27 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
     def resident_shards(self) -> int:
         with self._lock:
             return len(self._cache)
+
+    @property
+    def effective_operator_concurrency(self) -> int:
+        if self.shard_execution_strategy == "aggregate":
+            return 1
+        requested = self.operator_concurrency or min(4, os.cpu_count() or 1)
+        bytes_per_shard = (
+            self._groups_per_shard
+            * self.routing.num_links
+            * (self.dtype.itemsize + np.dtype(bool).itemsize)
+        )
+        memory_limit = max(1, self.maximum_concurrent_routing_bytes // bytes_per_shard)
+        return max(
+            1,
+            min(
+                requested,
+                os.cpu_count() or 1,
+                memory_limit,
+                len(self.routing.shard_partition),
+            ),
+        )
 
     def validate_routing_cache(self) -> int:
         """Read and validate every persisted shard under the residency bound."""
@@ -490,8 +567,9 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
     def _groups_per_shard(self) -> int:
         return max((item.num_groups for item in self.routing.shard_partition), default=1)
 
-    def _batch_arrays(self, descriptors):
-        groups = self.operator_shards_per_batch * self._groups_per_shard
+    def _batch_arrays(self, descriptors, *, padded_shards=None):
+        padded = self.operator_shards_per_batch if padded_shards is None else padded_shards
+        groups = padded * self._groups_per_shard
         links = self.routing.num_links
         width = int(self.inputs.group_od_index_padded.shape[1])
         probability = np.zeros((groups, links), dtype=self.dtype)
@@ -512,13 +590,28 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
             )
         return probability, enabled, indices, valid
 
-    def _emit(self, phase, operation, completed, current, started, recent, cores=None):
+    def _emit(
+        self,
+        phase,
+        operation,
+        completed,
+        current,
+        started,
+        recent,
+        cores=None,
+        discarded=0.0,
+    ):
         if self.progress_callback is None:
             return
         predicted = self._predicted_batch_seconds.get(
             operation, self.initial_predicted_batch_seconds
         )
         remaining = len(self.routing.shard_partition) - completed
+        dispatch_width = (
+            self.operator_shards_per_batch
+            if self.shard_execution_strategy == "aggregate"
+            else self.effective_operator_concurrency
+        )
         self.progress_callback(
             ShardedOperatorProgress(
                 phase=phase,
@@ -531,7 +624,7 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
                 predicted_remaining_seconds=(
                     None
                     if predicted is None
-                    else np.ceil(remaining / self.operator_shards_per_batch) * predicted
+                    else np.ceil(remaining / dispatch_width) * predicted
                 ),
                 deadline_remaining_seconds=(
                     None
@@ -543,29 +636,83 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
                 cache_hits=self._metrics.cache_hits,
                 cache_misses=self._metrics.cache_misses,
                 effective_cpu_cores=cores,
+                safety_margin_seconds=self.deadline_safety_margin_seconds,
+                discarded_partial_seconds=discarded,
+                batch_size=(
+                    self.operator_shards_per_batch
+                    if self.shard_execution_strategy == "aggregate"
+                    else 1
+                ),
+                concurrency=self.effective_operator_concurrency,
             )
         )
 
-    def _check_dispatch(self, operation, completed):
+    def _check_dispatch(self, operation, completed, started):
         if self.cancellation_requested is not None and self.cancellation_requested():
-            raise ShardedOperatorProductInterrupted(operation, completed)
+            raise ShardedOperatorProductInterrupted(
+                operation,
+                completed,
+                reason="cancelled",
+                discarded_partial_seconds=perf_counter() - started,
+                batch_size=self.operator_shards_per_batch,
+            )
         if self.absolute_deadline is None:
             return
         predicted = self._predicted_batch_seconds.get(
             operation, self.initial_predicted_batch_seconds
         )
         allowance = self.absolute_deadline - perf_counter()
-        required = self.deadline_safety_margin_seconds + (predicted or 0.0)
-        if allowance <= 0.0 or (predicted is not None and allowance < required):
+        remaining_shards = len(self.routing.shard_partition) - completed
+        dispatch_width = (
+            self.operator_shards_per_batch
+            if self.shard_execution_strategy == "aggregate"
+            else self.effective_operator_concurrency
+        )
+        remaining_batches = int(
+            np.ceil(remaining_shards / dispatch_width)
+        )
+        predicted_remaining = (
+            None if predicted is None else remaining_batches * predicted
+        )
+        complete_required = self.deadline_safety_margin_seconds + (
+            predicted_remaining or 0.0
+        )
+        next_required = self.deadline_safety_margin_seconds + (predicted or 0.0)
+        whole_product_infeasible = (
+            predicted_remaining is not None and allowance < complete_required
+        )
+        next_dispatch_infeasible = allowance <= 0.0 or (
+            predicted is not None and allowance < next_required
+        )
+        if whole_product_infeasible or next_dispatch_infeasible:
+            phase = (
+                "product_deadline_infeasible"
+                if whole_product_infeasible
+                else "deadline_prevented_dispatch"
+            )
             self._emit(
-                "deadline_prevented_dispatch",
+                phase,
                 operation,
                 completed,
                 (),
-                perf_counter(),
-                None,
+                started,
+                predicted,
+                discarded=perf_counter() - started,
             )
-            raise ShardedOperatorProductInterrupted(operation, completed)
+            raise ShardedOperatorProductInterrupted(
+                operation,
+                completed,
+                reason=phase,
+                predicted_remaining_seconds=predicted_remaining,
+                deadline_remaining_seconds=max(0.0, allowance),
+                discarded_partial_seconds=perf_counter() - started,
+                batch_size=(
+                    self.operator_shards_per_batch
+                    if self.shard_execution_strategy == "aggregate"
+                    else 1
+                ),
+                concurrency=self.effective_operator_concurrency,
+            )
 
     def _compile(self, operation, arguments):
         executable = (
@@ -573,9 +720,15 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
         )
         if not hasattr(executable, "lower"):
             return executable
-        started = perf_counter()
-        executable = executable.lower(*arguments).compile()
-        seconds = perf_counter() - started
+        tracing_started = perf_counter()
+        traced = executable.trace(*arguments)
+        tracing = perf_counter() - tracing_started
+        lowering_started = perf_counter()
+        lowered = traced.lower()
+        lowering = perf_counter() - lowering_started
+        compilation_started = perf_counter()
+        executable = lowered.compile()
+        compilation = perf_counter() - compilation_started
         if operation == "matvec":
             self._compiled_forward = executable
         else:
@@ -583,12 +736,16 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
         self._metrics = replace(
             self._metrics,
             compilation_count=self._metrics.compilation_count + 1,
-            compilation_seconds=self._metrics.compilation_seconds + seconds,
+            compilation_seconds=self._metrics.compilation_seconds + compilation,
+            tracing_seconds=self._metrics.tracing_seconds + tracing,
+            lowering_seconds=self._metrics.lowering_seconds + lowering,
         )
         return executable
 
     def _host_active_matvec(self, active: np.ndarray) -> np.ndarray:
         active = np.asarray(active, dtype=self.dtype)
+        if self.shard_execution_strategy == "concurrent":
+            return self._host_concurrent_product("matvec", active)
         result = np.zeros(self.num_measurements, dtype=self.dtype)
         descriptors = self.routing.shard_partition
         started = perf_counter()
@@ -596,10 +753,14 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
         completed = 0
         self._emit("product_started", "matvec", 0, (), started, None)
         for first in range(0, len(descriptors), self.operator_shards_per_batch):
-            self._check_dispatch("matvec", completed)
+            self._check_dispatch("matvec", completed, started)
             batch = tuple(descriptors[first : first + self.operator_shards_per_batch])
             current = tuple(item.shard_index for item in batch)
+            assembly_started = perf_counter()
             arrays = self._batch_arrays(batch)
+            assembly = perf_counter() - assembly_started
+            support_entries = int(np.count_nonzero(arrays[1]))
+            inflight_bytes = sum(item.nbytes for item in arrays)
             self._emit("batch_loaded", "matvec", completed, current, started, None)
             transfer_started = perf_counter()
             arguments = (jnp.asarray(active), *(jnp.asarray(item) for item in arrays))
@@ -625,8 +786,11 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
                 perf_counter() - batch_started,
             )
             host_started = perf_counter()
-            result += np.asarray(contribution)
+            host_contribution = np.asarray(contribution)
             host = perf_counter() - host_started
+            accumulation_started = perf_counter()
+            result += host_contribution
+            accumulation = perf_counter() - accumulation_started
             recent = perf_counter() - batch_started
             self._predicted_batch_seconds["matvec"] = recent
             completed += len(batch)
@@ -638,6 +802,15 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
                 + execution,
                 synchronization_seconds=self._metrics.synchronization_seconds + synchronization,
                 device_to_host_seconds=self._metrics.device_to_host_seconds + host,
+                input_assembly_seconds=self._metrics.input_assembly_seconds + assembly,
+                accumulation_seconds=self._metrics.accumulation_seconds + accumulation,
+                group_rows_processed=self._metrics.group_rows_processed
+                + arrays[0].shape[0],
+                support_entries_processed=self._metrics.support_entries_processed
+                + support_entries,
+                inflight_routing_bytes_peak=max(
+                    self._metrics.inflight_routing_bytes_peak, inflight_bytes
+                ),
             )
             self._emit(
                 "batch_accumulated",
@@ -670,6 +843,9 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
 
     def _host_rmatvec(self, measurement_cotangent: np.ndarray) -> np.ndarray:
         cotangent = np.asarray(measurement_cotangent, dtype=self.dtype)
+        if self.shard_execution_strategy == "concurrent":
+            active = self._host_concurrent_product("rmatvec", cotangent)
+            return active[np.asarray(self.compact_layout.free_compact_indices)]
         active = np.zeros(self.compact_layout.num_active, dtype=self.dtype)
         descriptors = self.routing.shard_partition
         started = perf_counter()
@@ -677,10 +853,14 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
         completed = 0
         self._emit("product_started", "rmatvec", 0, (), started, None)
         for first in range(0, len(descriptors), self.operator_shards_per_batch):
-            self._check_dispatch("rmatvec", completed)
+            self._check_dispatch("rmatvec", completed, started)
             batch = tuple(descriptors[first : first + self.operator_shards_per_batch])
             current = tuple(item.shard_index for item in batch)
+            assembly_started = perf_counter()
             arrays = self._batch_arrays(batch)
+            assembly = perf_counter() - assembly_started
+            support_entries = int(np.count_nonzero(arrays[1]))
+            inflight_bytes = sum(item.nbytes for item in arrays)
             self._emit("batch_loaded", "rmatvec", completed, current, started, None)
             transfer_started = perf_counter()
             arguments = (jnp.asarray(cotangent), *(jnp.asarray(item) for item in arrays))
@@ -706,8 +886,11 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
                 perf_counter() - batch_started,
             )
             host_started = perf_counter()
-            active += np.asarray(contribution)
+            host_contribution = np.asarray(contribution)
             host = perf_counter() - host_started
+            accumulation_started = perf_counter()
+            active += host_contribution
+            accumulation = perf_counter() - accumulation_started
             recent = perf_counter() - batch_started
             self._predicted_batch_seconds["rmatvec"] = recent
             completed += len(batch)
@@ -720,6 +903,15 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
                 synchronization_seconds=self._metrics.synchronization_seconds
                 + synchronization,
                 device_to_host_seconds=self._metrics.device_to_host_seconds + host,
+                input_assembly_seconds=self._metrics.input_assembly_seconds + assembly,
+                accumulation_seconds=self._metrics.accumulation_seconds + accumulation,
+                group_rows_processed=self._metrics.group_rows_processed
+                + arrays[0].shape[0],
+                support_entries_processed=self._metrics.support_entries_processed
+                + support_entries,
+                inflight_routing_bytes_peak=max(
+                    self._metrics.inflight_routing_bytes_peak, inflight_bytes
+                ),
             )
             self._emit(
                 "batch_accumulated",
@@ -743,11 +935,176 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
         self._emit("product_completed", "rmatvec", completed, (), started, elapsed)
         return active[np.asarray(self.compact_layout.free_compact_indices)]
 
+    def _host_concurrent_product(
+        self, operation: Operation, value: np.ndarray
+    ) -> np.ndarray:
+        """Dispatch independent single-shard executables with bounded concurrency."""
+        descriptors = self.routing.shard_partition
+        concurrency = self.effective_operator_concurrency
+        if operation == "matvec":
+            output_shape = (self.num_measurements,)
+        elif operation == "rmatvec":
+            output_shape = (self.compact_layout.num_active,)
+        else:
+            output_shape = (self.num_measurements, value.shape[1])
+        result = np.zeros(output_shape, dtype=self.dtype)
+        started = perf_counter()
+        cpu_started = process_time()
+        completed = 0
+        self._emit("product_started", operation, 0, (), started, None)
+
+        def execute(executable, arguments):
+            dispatch_started = perf_counter()
+            contribution = executable(*arguments)
+            dispatch = perf_counter() - dispatch_started
+            execution_started = perf_counter()
+            jax.block_until_ready(contribution)
+            execution = perf_counter() - execution_started
+            synchronization_started = perf_counter()
+            jax.block_until_ready(contribution)
+            synchronization = perf_counter() - synchronization_started
+            host_started = perf_counter()
+            host_contribution = np.asarray(contribution)
+            host = perf_counter() - host_started
+            return host_contribution, dispatch, execution, synchronization, host
+
+        with ThreadPoolExecutor(
+            max_workers=concurrency,
+            thread_name_prefix="routing-product",
+        ) as executor:
+            for first in range(0, len(descriptors), concurrency):
+                self._check_dispatch(operation, completed, started)
+                wave = tuple(descriptors[first : first + concurrency])
+                current = tuple(item.shard_index for item in wave)
+                assembly_started = perf_counter()
+                arrays_by_shard = tuple(
+                    self._batch_arrays((descriptor,), padded_shards=1)
+                    for descriptor in wave
+                )
+                assembly = perf_counter() - assembly_started
+                support_entries = sum(
+                    int(np.count_nonzero(arrays[1])) for arrays in arrays_by_shard
+                )
+                inflight_bytes = sum(
+                    item.nbytes
+                    for arrays in arrays_by_shard
+                    for item in arrays
+                )
+                self._emit("batch_loaded", operation, completed, current, started, None)
+                transfer_started = perf_counter()
+                arguments = tuple(
+                    (jnp.asarray(value), *(jnp.asarray(item) for item in arrays))
+                    for arrays in arrays_by_shard
+                )
+                jax.block_until_ready(arguments)
+                transfer = perf_counter() - transfer_started
+                if operation == "matmat":
+                    columns = value.shape[1]
+                    executable = self._compiled_matmat.get(columns)
+                    if executable is None:
+                        forward = self._forward_kernel
+                        matmat = jax.jit(
+                            lambda active_value, probability, enabled, indices, valid: jax.vmap(
+                                lambda column: forward(
+                                    column, probability, enabled, indices, valid
+                                ),
+                                in_axes=1,
+                                out_axes=1,
+                            )(active_value)
+                        )
+                        tracing_started = perf_counter()
+                        traced = matmat.trace(*arguments[0])
+                        tracing = perf_counter() - tracing_started
+                        lowering_started = perf_counter()
+                        lowered = traced.lower()
+                        lowering = perf_counter() - lowering_started
+                        compilation_started = perf_counter()
+                        executable = lowered.compile()
+                        compilation = perf_counter() - compilation_started
+                        self._compiled_matmat[columns] = executable
+                        self._metrics = replace(
+                            self._metrics,
+                            compilation_count=self._metrics.compilation_count + 1,
+                            compilation_seconds=self._metrics.compilation_seconds
+                            + compilation,
+                            tracing_seconds=self._metrics.tracing_seconds + tracing,
+                            lowering_seconds=self._metrics.lowering_seconds + lowering,
+                        )
+                else:
+                    executable = self._compile(operation, arguments[0])
+                wave_started = perf_counter()
+                futures = tuple(
+                    executor.submit(execute, executable, item) for item in arguments
+                )
+                contributions = tuple(future.result() for future in futures)
+                recent = perf_counter() - wave_started
+                self._emit(
+                    "batch_executed",
+                    operation,
+                    completed,
+                    current,
+                    started,
+                    recent,
+                )
+                accumulation_started = perf_counter()
+                for contribution, *_ in contributions:
+                    result += contribution
+                accumulation = perf_counter() - accumulation_started
+                self._predicted_batch_seconds[operation] = recent
+                completed += len(wave)
+                self._metrics = replace(
+                    self._metrics,
+                    host_to_device_seconds=self._metrics.host_to_device_seconds
+                    + transfer,
+                    dispatch_seconds=self._metrics.dispatch_seconds
+                    + sum(item[1] for item in contributions),
+                    compiled_execution_seconds=self._metrics.compiled_execution_seconds
+                    + sum(item[2] for item in contributions),
+                    synchronization_seconds=self._metrics.synchronization_seconds
+                    + sum(item[3] for item in contributions),
+                    device_to_host_seconds=self._metrics.device_to_host_seconds
+                    + sum(item[4] for item in contributions),
+                    input_assembly_seconds=self._metrics.input_assembly_seconds
+                    + assembly,
+                    accumulation_seconds=self._metrics.accumulation_seconds
+                    + accumulation,
+                    group_rows_processed=self._metrics.group_rows_processed
+                    + len(wave) * self._groups_per_shard,
+                    support_entries_processed=self._metrics.support_entries_processed
+                    + support_entries,
+                    inflight_routing_bytes_peak=max(
+                        self._metrics.inflight_routing_bytes_peak, inflight_bytes
+                    ),
+                )
+                self._emit(
+                    "batch_accumulated",
+                    operation,
+                    completed,
+                    current,
+                    started,
+                    recent,
+                    (process_time() - cpu_started)
+                    / max(perf_counter() - started, np.finfo(float).eps),
+                )
+        elapsed = perf_counter() - started
+        cpu = process_time() - cpu_started
+        self._metrics = replace(
+            self._metrics,
+            process_cpu_seconds=self._metrics.process_cpu_seconds + cpu,
+            effective_cpu_cores=cpu / max(elapsed, np.finfo(float).eps),
+            peak_rss_bytes=_peak_rss(),
+            product_count=self._metrics.product_count + 1,
+        )
+        self._emit("product_completed", operation, completed, (), started, elapsed)
+        return result
+
     def _host_matmat(self, matrix: np.ndarray) -> np.ndarray:
         value = np.asarray(matrix, dtype=self.dtype)
         columns = value.shape[1]
         active = np.zeros((self.compact_layout.num_active, columns), dtype=self.dtype)
         active[np.asarray(self.compact_layout.free_compact_indices)] = value
+        if self.shard_execution_strategy == "concurrent":
+            return self._host_concurrent_product("matmat", active)
         result = np.zeros((self.num_measurements, columns), dtype=self.dtype)
         descriptors = self.routing.shard_partition
         started = perf_counter()
@@ -756,10 +1113,14 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
         self._emit("product_started", "matmat", 0, (), started, None)
         executable = self._compiled_matmat.get(columns)
         for first in range(0, len(descriptors), self.operator_shards_per_batch):
-            self._check_dispatch("matmat", completed)
+            self._check_dispatch("matmat", completed, started)
             batch = tuple(descriptors[first : first + self.operator_shards_per_batch])
             current = tuple(item.shard_index for item in batch)
+            assembly_started = perf_counter()
             arrays = self._batch_arrays(batch)
+            assembly = perf_counter() - assembly_started
+            support_entries = int(np.count_nonzero(arrays[1]))
+            inflight_bytes = sum(item.nbytes for item in arrays)
             self._emit("batch_loaded", "matmat", completed, current, started, None)
             transfer_started = perf_counter()
             arguments = (jnp.asarray(active), *(jnp.asarray(item) for item in arrays))
@@ -805,8 +1166,11 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
                 perf_counter() - batch_started,
             )
             host_started = perf_counter()
-            result += np.asarray(contribution)
+            host_contribution = np.asarray(contribution)
             host = perf_counter() - host_started
+            accumulation_started = perf_counter()
+            result += host_contribution
+            accumulation = perf_counter() - accumulation_started
             recent = perf_counter() - batch_started
             self._predicted_batch_seconds["matmat"] = recent
             completed += len(batch)
@@ -819,6 +1183,15 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
                 synchronization_seconds=self._metrics.synchronization_seconds
                 + synchronization,
                 device_to_host_seconds=self._metrics.device_to_host_seconds + host,
+                input_assembly_seconds=self._metrics.input_assembly_seconds + assembly,
+                accumulation_seconds=self._metrics.accumulation_seconds + accumulation,
+                group_rows_processed=self._metrics.group_rows_processed
+                + arrays[0].shape[0],
+                support_entries_processed=self._metrics.support_entries_processed
+                + support_entries,
+                inflight_routing_bytes_peak=max(
+                    self._metrics.inflight_routing_bytes_peak, inflight_bytes
+                ),
             )
             self._emit(
                 "batch_accumulated",

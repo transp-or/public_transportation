@@ -127,6 +127,9 @@ def _measure(operator, operation: str, value: np.ndarray) -> dict[str, object]:
     metrics["peak_rss_bytes"] = operator.metrics.peak_rss_bytes
     metrics["resident_routing_bytes"] = operator.metrics.resident_routing_bytes
     metrics["effective_cpu_cores"] = operator.metrics.effective_cpu_cores
+    metrics["inflight_routing_bytes_peak"] = (
+        operator.metrics.inflight_routing_bytes_peak
+    )
     shards = operator.routing.num_shards
     metrics.update(
         total_elapsed_seconds=elapsed,
@@ -195,6 +198,9 @@ def run_benchmark(
     measurements: int = 64,
     resident_shard_limit: int = 2,
     operator_batch_sizes: tuple[int, ...] = (1, 2, 4, 8),
+    group_execution_strategies: tuple[str, ...] = ("scan", "vectorized"),
+    shard_execution_strategies: tuple[str, ...] = ("aggregate", "concurrent"),
+    operator_concurrencies: tuple[int, ...] = (1, 2, 4, 8),
 ) -> dict[str, object]:
     inputs = _inputs(
         nodes=nodes,
@@ -221,60 +227,31 @@ def run_benchmark(
             ),
         )
         cases = []
-        for batch_size in operator_batch_sizes:
-            operator = ShardedMatrixFreeFixedRoutingMeasurementOperator(
-                inputs=inputs,
-                routing=prepared.routing,
-                spec=spec,
-                compact_layout=compact,
-                resident_shard_limit=resident_shard_limit,
-                operator_shards_per_batch=batch_size,
-            )
-            demand = np.linspace(0.1, 2.0, od_cells, dtype=np.float32)
-            cotangent = np.linspace(-1.0, 1.0, measurements, dtype=np.float32)
-            jacobian = np.column_stack((demand, 0.5 * demand, -demand))
-            operator.matvec(demand)
-            operator.rmatvec(cotangent)
-            operator._host_matmat(jacobian)
-            products = {
-                "matvec": _measure(operator, "matvec", demand),
-                "rmatvec": _measure(operator, "rmatvec", cotangent),
-                "matmat": _measure(operator, "_host_matmat", jacobian),
-            }
-            problem, raw = _problem(operator)
-            decomposition = _objective_decomposition(problem, raw)
-            preflight = run_gravity_preflight(
-                problem=problem,
-                raw_parameters=raw,
-                stop_after=GravityPreflightPhase.RECOMMENDATION,
-            )
-            assert preflight.recommendation is not None
-            recommendation = asdict(preflight.recommendation)
-            recommendation["gradient_strategy"] = (
-                preflight.recommendation.gradient_strategy.value
-            )
-            cases.append(
-                {
-                    "operator_shards_per_batch": batch_size,
-                    "products": products,
-                    "objective_gradient": {
-                        "timings_seconds": dict(preflight.timings_seconds),
-                        "decomposition_seconds": {
-                            **decomposition,
-                            "reverse_operator_seconds": products["rmatvec"][
-                                "total_elapsed_seconds"
-                            ],
-                            "jacobian_operator_seconds": products["matmat"][
-                                "total_elapsed_seconds"
-                            ],
-                        },
-                        "gradient_max_abs_difference": (
-                            preflight.gradient_max_abs_difference
-                        ),
-                        "recommendation": recommendation,
-                    },
-                }
-            )
+        for shard_strategy in shard_execution_strategies:
+            if shard_strategy not in {"aggregate", "concurrent"}:
+                raise ValueError("unsupported shard execution strategy.")
+            for strategy in group_execution_strategies:
+                if strategy not in {"scan", "vectorized"}:
+                    raise ValueError("unsupported group execution strategy.")
+                execution_shapes = (
+                    tuple((batch_size, 1) for batch_size in operator_batch_sizes)
+                    if shard_strategy == "aggregate"
+                    else tuple((1, concurrency) for concurrency in operator_concurrencies)
+                )
+                for batch_size, concurrency in execution_shapes:
+                    cases.append(
+                        _benchmark_operator_case(
+                            inputs=inputs,
+                            routing=prepared.routing,
+                            spec=spec,
+                            compact=compact,
+                            resident_shard_limit=resident_shard_limit,
+                            batch_size=batch_size,
+                            strategy=strategy,
+                            shard_strategy=shard_strategy,
+                            operator_concurrency=concurrency,
+                        )
+                    )
     fastest = min(
         cases,
         key=lambda case: sum(
@@ -282,8 +259,35 @@ def run_benchmark(
             for product in case["products"].values()
         ),
     )
+    aggregate_scan = min(
+        (
+            case
+            for case in cases
+            if case["shard_execution_strategy"] == "aggregate"
+            and case["group_execution_strategy"] == "scan"
+        ),
+        key=lambda case: case["products"]["matvec"]["total_elapsed_seconds"],
+        default=None,
+    )
+    concurrent_scan = min(
+        (
+            case
+            for case in cases
+            if case["shard_execution_strategy"] == "concurrent"
+            and case["group_execution_strategy"] == "scan"
+        ),
+        key=lambda case: case["products"]["matvec"]["total_elapsed_seconds"],
+        default=None,
+    )
+    forward_speedup = (
+        None
+        if aggregate_scan is None or concurrent_scan is None
+        else aggregate_scan["products"]["matvec"]["total_elapsed_seconds"]
+        / concurrent_scan["products"]["matvec"]["total_elapsed_seconds"]
+    )
+    material_improvement = forward_speedup is not None and forward_speedup >= 1.1
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "backend": jax.default_backend(),
         "nodes": nodes,
         "links": inputs.graph.num_links,
@@ -295,6 +299,15 @@ def run_benchmark(
         "resident_shard_limit": resident_shard_limit,
         "cases": cases,
         "best_operator_shards_per_batch": fastest["operator_shards_per_batch"],
+        "best_group_execution_strategy": fastest["group_execution_strategy"],
+        "best_shard_execution_strategy": fastest["shard_execution_strategy"],
+        "concurrent_forward_speedup_over_aggregate_scan": forward_speedup,
+        "material_forward_throughput_improvement": material_improvement,
+        "performance_regression_warning": (
+            None
+            if material_improvement
+            else "bounded concurrency did not improve warm forward throughput by 10%"
+        ),
         "dense_measurement_od_constructed": False,
         "complete_routing_array_materialized": False,
         "measurement_aggregation_timing": "fused into compiled forward execution",
@@ -303,6 +316,77 @@ def run_benchmark(
             "JAX exposes no authoritative public persistent-cache hit counter; "
             "compilation counts and times are reported without inferring hits."
         ),
+    }
+
+
+def _benchmark_operator_case(
+    *,
+    inputs,
+    routing,
+    spec,
+    compact,
+    resident_shard_limit,
+    batch_size,
+    strategy,
+    shard_strategy,
+    operator_concurrency,
+) -> dict[str, object]:
+    operator = ShardedMatrixFreeFixedRoutingMeasurementOperator(
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        compact_layout=compact,
+        resident_shard_limit=resident_shard_limit,
+        operator_shards_per_batch=batch_size,
+        group_execution_strategy=strategy,
+        shard_execution_strategy=shard_strategy,
+        operator_concurrency=operator_concurrency,
+    )
+    demand = np.linspace(0.1, 2.0, operator.num_free_od, dtype=np.float32)
+    cotangent = np.linspace(
+        -1.0, 1.0, operator.num_measurements, dtype=np.float32
+    )
+    jacobian = np.column_stack((demand, 0.5 * demand, -demand))
+    operator.matvec(demand)
+    operator.rmatvec(cotangent)
+    operator._host_matmat(jacobian)
+    products = {
+        "matvec": _measure(operator, "matvec", demand),
+        "rmatvec": _measure(operator, "rmatvec", cotangent),
+        "matmat": _measure(operator, "_host_matmat", jacobian),
+    }
+    problem, raw = _problem(operator)
+    decomposition = _objective_decomposition(problem, raw)
+    preflight = run_gravity_preflight(
+        problem=problem,
+        raw_parameters=raw,
+        stop_after=GravityPreflightPhase.RECOMMENDATION,
+    )
+    assert preflight.recommendation is not None
+    recommendation = asdict(preflight.recommendation)
+    recommendation["gradient_strategy"] = (
+        preflight.recommendation.gradient_strategy.value
+    )
+    return {
+        "operator_shards_per_batch": batch_size,
+        "group_execution_strategy": strategy,
+        "shard_execution_strategy": shard_strategy,
+        "effective_operator_concurrency": operator.effective_operator_concurrency,
+        "products": products,
+        "objective_gradient": {
+            "timings_seconds": dict(preflight.timings_seconds),
+            "decomposition_seconds": {
+                **decomposition,
+                "reverse_operator_seconds": products["rmatvec"][
+                    "total_elapsed_seconds"
+                ],
+                "jacobian_operator_seconds": products["matmat"][
+                    "total_elapsed_seconds"
+                ],
+            },
+            "gradient_max_abs_difference": preflight.gradient_max_abs_difference,
+            "recommendation": recommendation,
+        },
     }
 
 
@@ -316,6 +400,19 @@ def main() -> None:
     parser.add_argument("--measurements", type=int, default=64)
     parser.add_argument("--resident-shard-limit", type=int, default=2)
     parser.add_argument("--operator-batch-sizes", nargs="+", type=int, default=[1, 2, 4, 8])
+    parser.add_argument(
+        "--group-execution-strategies",
+        nargs="+",
+        default=["scan", "vectorized"],
+    )
+    parser.add_argument(
+        "--shard-execution-strategies",
+        nargs="+",
+        default=["aggregate", "concurrent"],
+    )
+    parser.add_argument(
+        "--operator-concurrencies", nargs="+", type=int, default=[1, 2, 4, 8]
+    )
     parser.add_argument("--output", type=Path)
     arguments = parser.parse_args()
     report = run_benchmark(
@@ -327,6 +424,9 @@ def main() -> None:
         measurements=arguments.measurements,
         resident_shard_limit=arguments.resident_shard_limit,
         operator_batch_sizes=tuple(arguments.operator_batch_sizes),
+        group_execution_strategies=tuple(arguments.group_execution_strategies),
+        shard_execution_strategies=tuple(arguments.shard_execution_strategies),
+        operator_concurrencies=tuple(arguments.operator_concurrencies),
     )
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if arguments.output is None:
