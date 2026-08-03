@@ -459,8 +459,16 @@ completed shards without recomputation; corrupt or mismatching artifacts raise
 Structured `FixedRoutingShardProgress` events report groups, shards, cache
 hits/misses, elapsed and recent time, estimated remaining time, RSS, cache bytes,
 and deadline allowance. Parallel runs emit one planning/cache-scan event,
-bounded dispatch events when worker batches start, and canonical
-`shard_persisted` events only after manifest commit; they do not poll workers.
+bounded dispatch events when worker batches start, buffered `shard_completed`
+events, canonical `shard_persisted` events only after manifest commit,
+predictive-guard events, and one terminal event; they do not poll workers.
+Every snapshot uses the coordinator's complete state. `active_workers` and
+`current_shard_indices` describe all executing futures, `buffered_shards`
+counts finished results awaiting canonical manifest commit, and `queued_shards`
+counts only missing shards never submitted. Consequently
+`completed_shards + active_workers + buffered_shards + queued_shards +
+failed_shards == total_shards` at every event, while `remaining_shards` is
+`total_shards - completed_shards`.
 Applications may render those events with `tqdm` on stderr while reserving
 stdout for JSON. `cache_misses` means every planned shard absent at the initial
 scan, including work left unattempted by a bounded invocation;
@@ -471,6 +479,34 @@ After warm timings exist, predictive dispatch declines new work when the
 remaining allowance is shorter than the rolling shard estimate plus a safety
 margin. Active indivisible work may still overshoot and is reported explicitly.
 
+Worker admission distinguishes memory and CPU-count ceilings from demonstrated
+throughput. The portable default remains one worker, and explicit concurrency
+is admitted within those resource ceilings. Because throughput depends on the
+graph and CPU memory hierarchy, `throughput_effective_worker_count` remains
+unknown unless a representative target benchmark establishes it. In public
+warm-executable tests, four callers improved aggregate throughput despite
+higher individual latency; the private large-network evidence did not. The
+configuration's `threads_per_worker` value is scheduling metadata and does not
+control XLA's internal CPU pool.
+
+An opt-in `execution_strategy="batched"` preparation path evaluates
+`shards_per_execution_batch` bounded shards in one fixed-shape compiled call.
+The final batch retains the same padded shape, results are sliced and committed
+as canonical individual shard artifacts, and a manifest update follows every
+individual commit. Thus either strategy can reuse the other strategy's routing
+cache, and a restart after partial batch persistence resumes at the first
+missing shard. The batch's temporary-storage estimate must pass admission
+before dispatch, and the predictive deadline guard treats the complete batch
+as indivisible. Batch width affects compiled-kernel identity and diagnostics,
+but not the numerical preparation fingerprint. Public CPU measurements show no
+throughput benefit from batching, so `thread_pool` remains the default.
+
+Worker recommendations report separate memory-admissible,
+CPU-count-admissible, and empirically throughput-effective concurrency. Without
+representative measured throughput, the recommendation is deliberately one
+worker. Optional calibration maps may select a worker count and batch size only
+within the resource ceilings.
+
 The present dynamic program visits every graph node and all links for every
 destination group. Controlled experiments from 10% through 100% enabled density
 have nearly unchanged runtime, establishing full-graph rather than
@@ -480,10 +516,38 @@ reduction. Measure a target network with detailed diagnostics before selecting
 a sparse-support cache schema.
 
 `ShardedMatrixFreeFixedRoutingMeasurementOperator` loads at most the configured
-number of routing shards and applies deterministic forward and reverse
-topological passes. Its custom VJP uses the explicit bounded transpose. It
-constructs neither complete routing arrays, a link-flow-by-shard stack, nor a
-measurement-by-OD matrix. Use the adjoint gravity strategy for large problems.
+number of routing shards. Production products no longer traverse graph nodes in
+Python. Fixed-shape compiled JAX forward and reverse kernels process every
+padded group in a shard using the persisted effective masks and probabilities;
+they do not recompute paths or routing probabilities. Measurement aggregation
+is fused into the forward kernel, and the reverse is its VJP. Set
+`operator_shards_per_batch` to process a bounded number of shards per compiled
+execution; the final partial batch is padded. The operator constructs neither
+complete routing arrays, a link-flow-by-shard stack, nor a measurement-by-OD
+matrix.
+
+The common `GravityMeasurementOperator` protocol documents numerical products,
+fingerprints, fixed offsets and operational capabilities. The sharded operator
+supports structured product progress, absolute deadlines, cancellation and LRU
+residency diagnostics. A deadline is checked before each indivisible shard
+batch using its recent predicted duration plus the configured safety margin.
+Interruption raises `ShardedOperatorProductInterrupted`; no partial product is
+returned as complete. Gravity estimation propagates its wall-time deadline into
+the operator and checkpoints only completed optimizer iterates.
+
+For the first product of a new process, set
+`initial_predicted_batch_seconds` from the corresponding preflight measurement.
+Until a batch completes, this conservative value participates in the same
+deadline test as the rolling empirical prediction. The measured duration then
+replaces it. This operational value does not change routing or model
+fingerprints.
+
+Use `run_gravity_preflight` before a large estimation. It validates all routing
+shards and fingerprints, then can stop after validation, forward, reverse,
+objective-gradient, projection, or recommendation. A complete preflight times
+warm adjoint and batched-forward gradients and recommends a strategy, current
+operator batch and residency settings, expected evaluation time and memory,
+wall-time budget, checkpoint interval, and laptop versus server execution.
 
 Run the public structural benchmark with:
 
@@ -513,6 +577,51 @@ the small benchmark does not justify materializing wider demand Jacobians on lar
 OD systems. JAX exposes no authoritative public in-process persistent-cache hit
 counter, so persistent reuse is reported only through an explicit fresh-process
 populate/reuse protocol and is never inferred from elapsed time.
+
+For persisted routing shards, run:
+
+```bash
+uv run python benchmarks/benchmark_sharded_gravity_operator.py \
+  --operator-batch-sizes 1 2 4 8 --output sharded-gravity.json
+```
+
+This scalable synthetic benchmark reports synchronized matvec, rmatvec and
+matmat timings; shard loading, dispatch, compiled execution, synchronization,
+transfers, aggregation and eviction counters; CPU and RSS diagnostics; cache
+hits and misses; both minimal three-parameter gradient strategies; and projected
+optimizer times. Batch selection uses aggregate warm product time. The report
+also records explicitly that neither a dense measurement-by-OD matrix nor a
+complete routing array was materialized.
+
+Long runs should publish an atomic manifest and use one durable JSONL sink for
+both operator and optimizer progress:
+
+```python
+sink = GravityJSONLProgressSink(run_directory / "progress.jsonl", durable=True)
+operator.progress_callback = sink
+manifest = build_gravity_run_manifest(
+    problem=problem,
+    compact_layout=compact_layout,
+    estimator_config=estimator_config,
+    execution=execution,
+    repository_revision=repository_revision,
+    preflight=preflight,
+)
+write_gravity_run_manifest(run_directory / "manifest.json", manifest)
+result = estimate_gravity_model(
+    problem=problem,
+    compact_layout=compact_layout,
+    initial_raw_parameters=initial_raw,
+    config=estimator_config,
+    execution=execution,
+    progress=sink,
+)
+```
+
+The manifest records revisions, numerical fingerprints, dimensions, dtype,
+theta, batching, residency, estimator policy, JAX devices and relevant thread
+environment. Progress records are append-only, timestamped, flushed and
+optionally `fsync`-committed. Resume with the same manifest and configuration.
 
 The committed public Geneva integration exercises the complete workflow on 96 free
 cells, 15,128 full-layout cells, and 8,967 boarding/alighting measurements. Scheduled

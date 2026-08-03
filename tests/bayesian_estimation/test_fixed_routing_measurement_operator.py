@@ -4,6 +4,7 @@ import json
 import shutil
 from dataclasses import replace
 from pathlib import Path
+from time import perf_counter
 
 import jax
 import jax.numpy as jnp
@@ -56,7 +57,11 @@ from public_transportation.inference.sharded_fixed_routing import (
     prepare_fixed_routing_sharded,
 )
 from public_transportation.inference.sharded_matrix_free_operator import (
+    ShardedOperatorProductInterrupted,
     ShardedMatrixFreeFixedRoutingMeasurementOperator,
+)
+from public_transportation.inference.measurement_operator_protocol import (
+    GravityMeasurementOperator,
 )
 from public_transportation.inference.od_parameter_layout import ODParameterLayout
 from public_transportation.inference.maximum_likelihood_pipeline import (
@@ -186,6 +191,7 @@ def test_sharded_matrix_free_products_match_complete_operator(
         spec=spec,
         compact_layout=compact,
         resident_shard_limit=1,
+        operator_shards_per_batch=3,
     )
     demand = jnp.linspace(0.1, 5.0, num_od, dtype=jnp.float32)
     weight = jnp.array([0.5, -0.2, 1.1], dtype=jnp.float32)
@@ -213,6 +219,49 @@ def test_sharded_matrix_free_products_match_complete_operator(
     assert operator.resident_shards <= 1
     assert operator.is_matrix_free
     assert operator.representation == "matrix_free_sharded"
+    assert isinstance(operator, GravityMeasurementOperator)
+    assert operator.product_capabilities.absolute_deadline
+    assert operator.metrics.compilation_count == 2
+    assert operator.metrics.product_count >= 2
+
+    matrix = jnp.column_stack((demand, 2.0 * demand, jnp.zeros_like(demand)))
+    np.testing.assert_allclose(
+        operator.jax_matmat(matrix),
+        jnp.column_stack(
+            [complete_operator.jax_matvec(matrix[:, index]) for index in range(3)]
+        ),
+        rtol=4e-5,
+        atol=4e-5,
+    )
+
+    progress = []
+    operator.progress_callback = progress.append
+    operator.matvec(np.asarray(demand))
+    assert progress[0].phase == "product_started"
+    assert progress[-1].phase == "product_completed"
+    assert progress[-1].completed_shards == progress[-1].total_shards
+    assert all(
+        event.completed_shards <= event.total_shards for event in progress
+    )
+    assert operator.resident_shards <= operator.resident_shard_limit
+
+    operator.absolute_deadline = 0.0
+    with pytest.raises(ShardedOperatorProductInterrupted):
+        operator.matvec(np.asarray(demand))
+    operator.absolute_deadline = None
+
+    predictive_progress = []
+    operator.progress_callback = predictive_progress.append
+    operator.initial_predicted_batch_seconds = 10.0
+    operator._predicted_batch_seconds.clear()
+    operator.absolute_deadline = perf_counter() + 1.0
+    with pytest.raises(ShardedOperatorProductInterrupted) as interrupted:
+        operator.matvec(np.asarray(demand))
+    assert interrupted.value.completed_shards == 0
+    assert predictive_progress[-1].phase == "deadline_prevented_dispatch"
+    assert predictive_progress[-1].predicted_remaining_seconds is not None
+    operator.absolute_deadline = None
+    operator.initial_predicted_batch_seconds = None
 
     features = GravityFeatures(
         canonical_od_index=np.arange(num_od),

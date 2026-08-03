@@ -116,6 +116,7 @@ class GravityEstimationResult:
     strategy_selection: GravityStrategySelection
     resumed: bool
     checkpoint_path: Path | None
+    deadline_phase: str | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != GRAVITY_RESULT_SCHEMA_VERSION:
@@ -341,7 +342,9 @@ def _prepare_kernel(
 
 
 class _DeadlineStop(RuntimeError):
-    pass
+    def __init__(self, phase: str) -> None:
+        super().__init__(phase)
+        self.phase = phase
 
 
 def estimate_gravity_model(
@@ -396,6 +399,7 @@ def estimate_gravity_model(
         if execution.wall_time_seconds is None
         else started + execution.wall_time_seconds
     )
+    evaluation_deadline = deadline
     raw_jax = jnp.asarray(raw_numpy, dtype=problem.features.dtype)
     compiled, selection = _prepare_kernel(
         execution.gradient_strategy, raw_jax, problem, execution, clock
@@ -403,19 +407,49 @@ def estimate_gravity_model(
     latest_raw = raw_numpy.copy()
     latest_evaluation: GravityObjectiveEvaluation | None = None
     latest_gradient = np.zeros_like(raw_numpy)
+    valid_raw = raw_numpy.copy()
+    valid_evaluation: GravityObjectiveEvaluation | None = None
+    valid_gradient = np.zeros_like(raw_numpy)
+    deadline_phase: str | None = None
 
     def evaluate(value: np.ndarray) -> tuple[float, np.ndarray]:
         nonlocal latest_raw, latest_evaluation, latest_gradient
-        evaluation, gradient = compiled(jnp.asarray(value, dtype=raw_jax.dtype))
-        jax.block_until_ready((evaluation, gradient))
+        nonlocal valid_evaluation, valid_gradient
+        if evaluation_deadline is not None and clock() >= evaluation_deadline:
+            raise _DeadlineStop("before objective-and-gradient evaluation")
+        if hasattr(problem.operator, "absolute_deadline"):
+            problem.operator.absolute_deadline = evaluation_deadline
+        try:
+            evaluation, gradient = compiled(jnp.asarray(value, dtype=raw_jax.dtype))
+            jax.block_until_ready((evaluation, gradient))
+        except Exception as error:
+            message = str(error)
+            if "operator product stopped before a shard batch" in message:
+                if "rmatvec operator product" in message:
+                    phase = "during reverse operator product"
+                elif "matvec operator product" in message or (
+                    "matmat operator product" in message
+                ):
+                    phase = "during forward operator product"
+                else:
+                    phase = "during operator product"
+                raise _DeadlineStop(phase) from error
+            raise
         latest_raw = np.asarray(value, dtype=np.float64).copy()
         latest_evaluation = evaluation
         latest_gradient = np.asarray(gradient, dtype=np.float64)
+        if np.array_equal(latest_raw, valid_raw):
+            valid_evaluation = evaluation
+            valid_gradient = latest_gradient.copy()
         return float(evaluation.objective), latest_gradient
 
     def callback(value: np.ndarray) -> None:
-        nonlocal completed_iterations
+        nonlocal completed_iterations, valid_raw, valid_evaluation, valid_gradient
         completed_iterations += 1
+        valid_raw = np.asarray(value, dtype=np.float64).copy()
+        if np.array_equal(latest_raw, valid_raw):
+            valid_evaluation = latest_evaluation
+            valid_gradient = latest_gradient.copy()
         elapsed = resumed_elapsed + clock() - started
         if checkpoint is not None:
             _write_checkpoint(
@@ -440,7 +474,7 @@ def estimate_gravity_model(
                 )
             )
         if deadline is not None and clock() >= deadline:
-            raise _DeadlineStop
+            raise _DeadlineStop("after a completed optimizer iteration")
 
     status = "completed"
     success = False
@@ -450,7 +484,14 @@ def estimate_gravity_model(
             "stopped_by_time_budget",
             "wall-time budget reached before optimization",
         )
-        evaluate(raw_numpy)
+        # No evaluation can safely start. The checkpoint remains the only valid
+        # resumable state; callers should resume with a larger budget.
+        if valid_evaluation is None:
+            evaluation_deadline = None
+            if hasattr(problem.operator, "absolute_deadline"):
+                problem.operator.absolute_deadline = None
+            evaluate(raw_numpy)
+            deadline_phase = "before objective-and-gradient evaluation"
     else:
         remaining = max(0, config.maximum_iterations - completed_iterations)
         if remaining == 0:
@@ -473,8 +514,15 @@ def estimate_gravity_model(
                         "ftol": config.objective_tolerance,
                     },
                 )
-            except _DeadlineStop:
-                status, message = "stopped_by_time_budget", "wall-time budget reached"
+            except _DeadlineStop as stop:
+                deadline_phase = stop.phase
+                status, message = (
+                    "stopped_by_time_budget",
+                    f"wall-time budget reached {stop.phase}",
+                )
+                latest_raw = valid_raw.copy()
+                latest_evaluation = valid_evaluation
+                latest_gradient = valid_gradient.copy()
             else:
                 solver_raw = np.asarray(solver.x, dtype=np.float64)
                 if not np.array_equal(latest_raw, solver_raw):
@@ -516,4 +564,5 @@ def estimate_gravity_model(
         selection,
         resumed,
         checkpoint,
+        deadline_phase,
     )

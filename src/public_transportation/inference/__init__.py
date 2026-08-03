@@ -37,6 +37,7 @@ from .sharded_fixed_routing import (  # noqa: F401
     FixedRoutingShardCacheProvenance,
     FixedRoutingShardDescriptor,
     FixedRoutingShardExecutionDiagnostics,
+    FixedRoutingBatchExecutionDiagnostics,
     FixedRoutingShardPlan,
     FixedRoutingShardProgress,
     FixedRoutingWorkerRecommendation,
@@ -69,6 +70,7 @@ from .gravity import (  # noqa: F401
     GravityHoldoutSplitConfig,
     GravityHoldoutUnit,
     GravityHoldoutValidationReport,
+    GravityJSONLProgressSink,
     GravityJourneyCorrelationSummary,
     GravityLineageProgressionResult,
     GravityLikelihood,
@@ -79,6 +81,9 @@ from .gravity import (  # noqa: F401
     GravityObjectiveEvaluation,
     GravityObjectiveProblem,
     GravityParameterLayout,
+    GravityPreflightPhase,
+    GravityPreflightRecommendation,
+    GravityPreflightResult,
     GravityRecommendationConfig,
     GravityRelaxationInfo,
     GravityRelaxationRecommendation,
@@ -90,9 +95,12 @@ from .gravity import (  # noqa: F401
     GravityCompilationDiagnostics,
     GravityStrategySelection,
     GravityValidationMetadata,
+    GRAVITY_PROGRESS_SCHEMA_VERSION,
+    GRAVITY_RUN_MANIFEST_SCHEMA_VERSION,
     MinimalGravityParameters,
     add_gravity_relaxation,
     build_gravity_holdout_split,
+    build_gravity_run_manifest,
     compare_gravity_model_nodes,
     construct_gravity_child_warm_start,
     create_gravity_model_node,
@@ -111,9 +119,11 @@ from .gravity import (  # noqa: F401
     progress_gravity_model_lineage,
     recommend_gravity_relaxations,
     remove_gravity_relaxation,
+    run_gravity_preflight,
     validate_gravity_relaxation_features,
     validate_full_data_gravity_adequacy,
     warm_start_gravity_parameters,
+    write_gravity_run_manifest,
 )
 from .block_coordinate import *  # noqa: F401,F403
 from .fixed_routing_measurement_operator import (  # noqa: F401
@@ -136,6 +146,13 @@ from .fixed_routing_matrix_free_operator import (  # noqa: F401
 from .sharded_matrix_free_operator import (  # noqa: F401
     ShardedMatrixFreeFixedRoutingMeasurementOperator,
     ShardedMatrixFreeMetrics,
+    ShardedOperatorProductInterrupted,
+    ShardedOperatorProgress,
+)
+from .measurement_operator_protocol import (  # noqa: F401
+    GravityMeasurementOperator,
+    GravityOperatorCapabilities,
+    GravityOperatorMetrics,
 )
 from .fixed_routing_linear_backend import (  # noqa: F401
     LinearMeasurementBackendMetrics,

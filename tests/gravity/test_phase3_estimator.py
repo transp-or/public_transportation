@@ -17,14 +17,20 @@ from public_transportation.inference.fixed_routing_measurement_operator import (
 )
 from public_transportation.inference.gravity import (
     GravityEstimatorConfig,
+    GravityEstimatorProgress,
     GravityExecutionPolicy,
     GravityFeatures,
     GravityLikelihood,
     GravityModelSpecification,
     GravityObjectiveProblem,
     GravityParameterLayout,
+    GravityPreflightPhase,
+    GravityJSONLProgressSink,
+    build_gravity_run_manifest,
     estimate_gravity_model,
     predict_gravity_measurements,
+    run_gravity_preflight,
+    write_gravity_run_manifest,
 )
 
 
@@ -192,6 +198,63 @@ def test_deadline_preserves_valid_initial_checkpoint(tmp_path):
         assert payload["model_fingerprint"] == result.model_fingerprint
 
 
+def test_deadline_after_valid_iteration_resumes_to_uninterrupted_result(tmp_path):
+    with jax.enable_x64():
+        problem, layout, _ = setup_problem()
+
+        class Clock:
+            value = 0.0
+
+            def __call__(self):
+                self.value += 1.0
+                return self.value
+
+        common = dict(
+            problem=problem,
+            compact_layout=layout,
+            initial_raw_parameters=np.zeros(3),
+            config=GravityEstimatorConfig(maximum_iterations=80),
+        )
+        uninterrupted = estimate_gravity_model(
+            **common,
+            execution=GravityExecutionPolicy(gradient_strategy="adjoint"),
+        )
+        checkpoint = tmp_path / "deadline-resume.json"
+        interrupted = estimate_gravity_model(
+            **common,
+            execution=GravityExecutionPolicy(
+                gradient_strategy="adjoint",
+                checkpoint_path=checkpoint,
+                wall_time_seconds=15.0,
+            ),
+            clock=Clock(),
+        )
+        payload = json.loads(checkpoint.read_text())
+        assert interrupted.status == "stopped_by_time_budget"
+        assert interrupted.iterations >= 1
+        assert payload["iterations"] == interrupted.iterations
+        assert interrupted.deadline_phase in {
+            "before objective-and-gradient evaluation",
+            "after a completed optimizer iteration",
+        }
+
+        resumed = estimate_gravity_model(
+            **common,
+            execution=GravityExecutionPolicy(
+                gradient_strategy="adjoint", checkpoint_path=checkpoint
+            ),
+            resume=True,
+        )
+        np.testing.assert_allclose(
+            resumed.raw_parameters, uninterrupted.raw_parameters, atol=2e-5
+        )
+        np.testing.assert_allclose(
+            resumed.predicted_measurements,
+            uninterrupted.predicted_measurements,
+            atol=1e-4,
+        )
+
+
 def test_auto_strategy_reports_bounded_preflight_and_is_deterministic():
     with jax.enable_x64():
         problem, layout, _ = setup_problem()
@@ -221,6 +284,84 @@ def test_auto_strategy_reports_bounded_preflight_and_is_deterministic():
             results[1].predicted_measurements,
             atol=1e-10,
         )
+
+
+def test_public_preflight_stops_at_boundaries_and_recommends_measured_strategy():
+    with jax.enable_x64():
+        problem, _, _ = setup_problem()
+        raw = np.zeros(3)
+        forward_only = run_gravity_preflight(
+            problem=problem,
+            raw_parameters=raw,
+            stop_after=GravityPreflightPhase.FORWARD,
+        )
+        assert forward_only.completed_phase is GravityPreflightPhase.FORWARD
+        assert set(forward_only.timings_seconds) == {"validation", "forward"}
+        assert forward_only.recommendation is None
+
+        complete = run_gravity_preflight(problem=problem, raw_parameters=raw)
+        assert complete.completed_phase is GravityPreflightPhase.RECOMMENDATION
+        assert complete.gradient_max_abs_difference == pytest.approx(0.0, abs=1e-9)
+        assert complete.recommendation is not None
+        selected = complete.recommendation.gradient_strategy.value
+        assert complete.recommendation.expected_evaluation_seconds == pytest.approx(
+            complete.timings_seconds[selected]
+        )
+        assert complete.recommendation.suggested_checkpoint_interval == 1
+
+
+def test_run_manifest_and_progress_log_are_durable_and_serializable(tmp_path):
+    with jax.enable_x64():
+        problem, layout, _ = setup_problem()
+    config = GravityEstimatorConfig(maximum_iterations=7)
+    execution = GravityExecutionPolicy(
+        gradient_strategy="adjoint",
+        checkpoint_path=tmp_path / "checkpoint.json",
+        jax_compilation_cache_directory=tmp_path / "jax-cache",
+    )
+    manifest = build_gravity_run_manifest(
+        problem=problem,
+        compact_layout=layout,
+        estimator_config=config,
+        execution=execution,
+        repository_revision="test-revision",
+        extra={"purpose": "unit-test"},
+    )
+    manifest_path = tmp_path / "run-manifest.json"
+    write_gravity_run_manifest(manifest_path, manifest)
+    loaded = json.loads(manifest_path.read_text())
+    assert loaded["repository_revision"] == "test-revision"
+    assert loaded["model_fingerprint"] == manifest["model_fingerprint"]
+    assert loaded["execution"]["checkpoint_path"] == str(
+        execution.checkpoint_path
+    )
+    assert loaded["operator"]["num_free_od"] == problem.operator.num_free_od
+
+    progress_path = tmp_path / "progress.jsonl"
+    sink = GravityJSONLProgressSink(
+        progress_path, durable=True, context={"run_id": "test-run"}
+    )
+    sink(
+        GravityEstimatorProgress(
+            iteration=1,
+            objective=2.0,
+            gradient_inf_norm=0.5,
+            elapsed_seconds=3.0,
+            checkpoint_written=True,
+        )
+    )
+    sink(
+        GravityEstimatorProgress(
+            iteration=2,
+            objective=1.0,
+            gradient_inf_norm=0.25,
+            elapsed_seconds=4.0,
+            checkpoint_written=True,
+        )
+    )
+    records = [json.loads(line) for line in progress_path.read_text().splitlines()]
+    assert [record["event"]["iteration"] for record in records] == [1, 2]
+    assert all(record["run_id"] == "test-run" for record in records)
 
 
 def test_negative_binomial_synthetic_fit_recovers_all_minimal_parameters():

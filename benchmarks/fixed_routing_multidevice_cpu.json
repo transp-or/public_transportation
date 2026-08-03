@@ -1,0 +1,23 @@
+{
+  "backend": "cpu",
+  "effective_average_cpu_cores": 4.769695963259066,
+  "explicit_pmap": true,
+  "links": 131062,
+  "logical_devices": [
+    "cpu:0",
+    "cpu:1"
+  ],
+  "maximum_mask_difference": 0,
+  "maximum_probability_difference": 0.0,
+  "nodes": 32768,
+  "placed_devices": [
+    "cpu:0",
+    "cpu:1"
+  ],
+  "process_cpu_seconds": 5.15197,
+  "requested_devices": 2,
+  "schema_version": 1,
+  "shards_per_second": 1.8516008296861457,
+  "wall_seconds": 1.0801464159740135,
+  "xla_flags": "--xla_force_host_platform_device_count=2"
+}

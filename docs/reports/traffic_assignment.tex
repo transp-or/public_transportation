@@ -1471,11 +1471,13 @@ measurements before scoring 62 measurements held out by complete vehicle
 journey.  These summaries are instructional checks, not scientific
 model-selection conclusions.
 
-The gravity objective now consumes a device-native operator protocol rather
-than an explicit matrix.  Dense and BCOO operators retain their stored matrix
-for compatibility, while a matrix-free implementation exposes JAX forward,
-transpose, and bounded multiple-right-hand-side products backed directly by
-fixed-routing loading and measurement aggregation.  Thus a large logical
+The gravity objective now consumes a documented operator protocol rather than
+an explicit matrix.  The protocol includes dimensions, fixed offsets,
+fingerprints, representation, JAX forward, transpose and optional
+multiple-right-hand-side products, plus declared progress, deadline,
+cancellation and cache-diagnostic capabilities.  Dense and BCOO operators
+retain their stored matrix for compatibility, while matrix-free
+implementations satisfy the same contract without materialization.  Thus a large logical
 measurement-by-OD matrix need never be constructed or transferred to the host.
 The adjoint value-and-gradient path performs one forward and one transpose
 product and reuses the routed mean when assembling diagnostics.  For a
@@ -1501,14 +1503,51 @@ schema, package version, and shard plan.  An atomic manifest makes deadline or
 memory stops resumable without recomputing valid shards.
 
 The sharded matrix-free operator loads routing state on demand with bounded LRU
-residency.  Deterministic forward and reverse topological passes accumulate
-measurements and OD cotangents one shard at a time; no complete routing array,
-link-flow-by-shard stack, Jacobian, or measurement-by-OD matrix is assembled.
-Structured progress records shard and group completion, cache reuse, elapsed
-and estimated remaining time, memory, cache size, and deadline allowance.  On
+residency.  Its former Python traversal of every graph node for every group is
+retained only as a small-case numerical reference.  Production forward and
+reverse products use fixed-shape compiled JAX kernels over all padded groups in
+a shard, consuming the persisted effective masks and routing probabilities.
+They neither recompute paths nor routing probabilities.  An optional bounded
+execution batch processes several independent routing shards in one compiled
+call; a partial final batch is padded without changing canonical OD order.
+Measurement scatter-add is fused into the compiled forward product, and the
+reverse kernel is its exact VJP.  No complete routing array, link-flow-by-shard
+stack, Jacobian, or measurement-by-OD matrix is assembled.
+
+Structured progress distinguishes product start, batch load, execution,
+accumulation, completion and deadline-prevented dispatch.  Before an
+indivisible batch, the operator compares remaining absolute-deadline allowance
+with its recent batch prediction plus a safety margin.  Cancellation or an
+insufficient allowance raises a dedicated interruption exception and discards
+the partial sum.  The estimator propagates its deadline into these products and
+checkpoints only complete optimizer iterates.  On
 Simple Example 02, four shards covering seven destination groups reused one
 compiled shape and agreed exactly with complete masks and probabilities; a
 fresh reload reused all four persisted shards.
+
+A public bounded preflight validates every cache shard and its fingerprints,
+then, at individually selectable safe boundaries, executes one forward
+product, one reverse product, both three-parameter objective-gradient
+strategies, runtime projection, and an execution recommendation.  It reports
+the measured warm strategy, current shard batch and residency settings,
+expected evaluation time and memory, suggested wall time and checkpoint
+interval, and a laptop-versus-server recommendation.  The scalable synthetic
+benchmark varies graph, link, group, shard, OD, measurement, residency and
+operator-batch dimensions and reports synchronized forward, reverse and
+multiple-right-hand-side timing and resource decompositions.
+
+Before the first measured batch is available, the caller may supply a
+conservative initial batch-duration prediction obtained from preflight.  It is
+used by the same pre-dispatch deadline inequality and is replaced by the first
+completed empirical duration.  This operational estimate does not participate
+in routing or model fingerprints.  For unattended execution, an atomic run
+manifest records repository and package revisions, numerical fingerprints,
+dimensions, dtype, theta, operator batching and residency, estimator policy,
+JAX devices and relevant thread environment.  A shared append-only JSONL sink
+accepts both operator and optimizer progress, timestamps and flushes each
+record, and optionally synchronizes it to durable storage.  Consequently a
+terminated process leaves both its last complete optimizer checkpoint and a
+diagnostic record of the active product boundary.
 
 Shard construction may use a bounded thread pool sharing the graph and one XLA
 executable. Before every dispatch, the parent accounts for current RSS,

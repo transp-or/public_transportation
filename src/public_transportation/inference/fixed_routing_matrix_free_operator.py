@@ -28,6 +28,7 @@ from .fixed_routing_measurement_operator import (
     assignment_inputs_fingerprint,
     measurement_mapping_fingerprint,
 )
+from .measurement_operator_protocol import GravityOperatorCapabilities
 
 Array = np.ndarray
 JaxProduct = Callable[[jnp.ndarray], jnp.ndarray]
@@ -156,6 +157,10 @@ class MatrixFreeFixedRoutingMeasurementOperator:
         init=False, default=0.0, repr=False
     )
     _deadline_phase: str | None = field(init=False, default=None, repr=False)
+
+    @property
+    def product_capabilities(self) -> GravityOperatorCapabilities:
+        return GravityOperatorCapabilities()
 
     def __post_init__(self) -> None:
         if self.preparation_deadline is not None and not math.isfinite(

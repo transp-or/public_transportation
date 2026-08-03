@@ -27,6 +27,7 @@ SHARDED_FIXED_ROUTING_SCHEMA_VERSION = 1
 SHARDED_FIXED_ROUTING_IMPLEMENTATION_VERSION = "dial-dp-fixed-routing-v1"
 ProgressCallback = Callable[["FixedRoutingShardProgress"], None]
 CachePolicy = Literal["reuse", "refresh"]
+ExecutionStrategy = Literal["thread_pool", "batched"]
 
 
 def _array_fingerprint(*values: object) -> str:
@@ -89,6 +90,8 @@ class FixedRoutingPreparationConfig:
     dispatch_safety_margin_seconds: float = 30.0
     initial_predicted_shard_seconds: float | None = None
     jax_compilation_cache_directory: Path | None = None
+    execution_strategy: ExecutionStrategy = "thread_pool"
+    shards_per_execution_batch: int = 1
 
     def __post_init__(self) -> None:
         positive = {
@@ -99,6 +102,7 @@ class FixedRoutingPreparationConfig:
             "construction_workers": self.construction_workers,
             "threads_per_worker": self.threads_per_worker,
             "resident_shard_limit": self.resident_shard_limit,
+            "shards_per_execution_batch": self.shards_per_execution_batch,
         }
         for name, value in positive.items():
             if value <= 0:
@@ -117,6 +121,10 @@ class FixedRoutingPreparationConfig:
         ):
             raise ValueError(
                 "initial_predicted_shard_seconds must be positive when provided."
+            )
+        if self.execution_strategy not in {"thread_pool", "batched"}:
+            raise ValueError(
+                "execution_strategy must be 'thread_pool' or 'batched'."
             )
         object.__setattr__(self, "checkpoint_directory", Path(self.checkpoint_directory))
         object.__setattr__(self, "cache_directory", Path(self.cache_directory))
@@ -145,6 +153,10 @@ class FixedRoutingWorkerRecommendation:
     memory_limit: int
     estimated_bytes_per_worker: int
     reason: str
+    memory_admissible_workers: int | None = None
+    cpu_admissible_workers: int | None = None
+    throughput_effective_workers: int | None = None
+    recommended_batch_size: int = 1
 
 
 def recommend_fixed_routing_workers(
@@ -154,6 +166,8 @@ def recommend_fixed_routing_workers(
     cpu_count: int,
     memory_fraction: float = 0.7,
     server: bool = False,
+    measured_throughput_by_workers: dict[int, float] | None = None,
+    measured_throughput_by_batch_size: dict[int, float] | None = None,
 ) -> FixedRoutingWorkerRecommendation:
     """Recommend bounded construction concurrency from CPU and memory limits."""
     if available_ram_bytes <= 0 or cpu_count <= 0:
@@ -170,16 +184,63 @@ def recommend_fixed_routing_workers(
     )
     # Leave CPU capacity for XLA and I/O. Laptops default more conservatively.
     cpu_limit = max(1, cpu_count // (2 if server else 4))
-    workers = max(1, min(len(plan.descriptors) or 1, memory_limit, cpu_limit))
+    resource_limit = max(
+        1, min(len(plan.descriptors) or 1, memory_limit, cpu_limit)
+    )
+    throughput_workers = None
+    if measured_throughput_by_workers:
+        admissible = {
+            int(workers): float(throughput)
+            for workers, throughput in measured_throughput_by_workers.items()
+            if 0 < int(workers) <= resource_limit
+            and np.isfinite(throughput)
+            and throughput > 0.0
+        }
+        if admissible:
+            throughput_workers = min(
+                (
+                    workers
+                    for workers, throughput in admissible.items()
+                    if throughput == max(admissible.values())
+                ),
+                default=1,
+            )
+    workers = 1 if throughput_workers is None else throughput_workers
+    batch_size = 1
+    if measured_throughput_by_batch_size:
+        admissible_batches = {
+            int(size): float(throughput)
+            for size, throughput in measured_throughput_by_batch_size.items()
+            if 0 < int(size) <= (len(plan.descriptors) or 1)
+            and np.isfinite(throughput)
+            and throughput > 0.0
+            and int(size) * bytes_per_worker
+            <= int(available_ram_bytes * memory_fraction)
+        }
+        if admissible_batches:
+            batch_size = min(
+                (
+                    size
+                    for size, throughput in admissible_batches.items()
+                    if throughput == max(admissible_batches.values())
+                ),
+                default=1,
+            )
     return FixedRoutingWorkerRecommendation(
         workers=workers,
         cpu_limit=cpu_limit,
         memory_limit=memory_limit,
         estimated_bytes_per_worker=bytes_per_worker,
         reason=(
-            "bounded by destination shards, available memory and reserved CPU "
-            f"capacity ({'server' if server else 'laptop'} policy)"
+            "measured throughput calibration within memory and CPU ceilings"
+            if throughput_workers is not None
+            else "no representative throughput calibration; conservative "
+            "single-worker default"
         ),
+        memory_admissible_workers=memory_limit,
+        cpu_admissible_workers=cpu_limit,
+        throughput_effective_workers=throughput_workers,
+        recommended_batch_size=batch_size,
     )
 
 
@@ -443,7 +504,9 @@ class FixedRoutingShardProgress:
     retained_cache_bytes: int
     deadline_remaining_seconds: float | None
     active_workers: int = 0
+    buffered_shards: int = 0
     queued_shards: int = 0
+    remaining_shards: int = 0
     failed_shards: int = 0
     current_shard_indices: tuple[int, ...] = ()
     rolling_mean_shard_seconds: float | None = None
@@ -458,6 +521,15 @@ class FixedRoutingShardProgress:
     cpu_limited_worker_count: int = 0
     worker_architecture: str = "serial"
     effective_threads_per_worker: int | None = None
+    throughput_effective_worker_count: int | None = None
+    batch_shard_indices: tuple[int, ...] = ()
+    batch_size: int = 0
+    padded_batch_size: int = 0
+    batch_execution_seconds: float | None = None
+    batch_persistence_seconds: float | None = None
+    aggregate_shards_per_second: float | None = None
+    predicted_next_batch_seconds: float | None = None
+    effective_cpu_cores: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -495,6 +567,29 @@ class FixedRoutingShardExecutionDiagnostics:
     probability_density: float
     effective_probability_nonzeros: int = 0
     effective_probability_density: float = 0.0
+    jax_execution_wait_seconds: float = 0.0
+    concurrent_jax_executions: int = 1
+    voluntary_context_switches: int | None = None
+    involuntary_context_switches: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FixedRoutingBatchExecutionDiagnostics:
+    """Synchronized resource and throughput measurements for one shard batch."""
+
+    batch_index: int
+    shard_indices: tuple[int, ...]
+    batch_size: int
+    padded_batch_size: int
+    execution_seconds: float
+    persistence_seconds: float
+    wall_seconds: float
+    process_cpu_seconds: float
+    effective_cpu_cores: float
+    shards_per_second: float
+    peak_rss_bytes: int | None
+    voluntary_context_switches: int | None = None
+    involuntary_context_switches: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -528,6 +623,10 @@ class ShardedFixedRoutingPreparationResult:
     compiled_kernel_identity: str | None = None
     persistent_compilation_cache_enabled: bool = False
     persistent_compilation_cache_directory: str | None = None
+    throughput_effective_worker_count: int | None = None
+    execution_strategy: ExecutionStrategy = "thread_pool"
+    shards_per_execution_batch: int = 1
+    batch_diagnostics: tuple[FixedRoutingBatchExecutionDiagnostics, ...] = ()
 
     @property
     def newly_constructed_shards(self) -> int:
@@ -571,6 +670,18 @@ def _active_process_threads() -> int | None:
     # undercount native runtime threads, so it is not presented as an XLA
     # threads-per-worker measurement.
     return threading.active_count()
+
+
+def _process_context_switches() -> tuple[int, int] | None:
+    """Return process-wide voluntary and involuntary context-switch counts."""
+
+    try:
+        import resource
+
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        return int(usage.ru_nvcsw), int(usage.ru_nivcsw)
+    except (ImportError, OSError, ValueError):
+        return None
 
 
 def _device_memory_statistics() -> tuple[dict[str, object] | None, ...]:
@@ -863,33 +974,34 @@ def _prepare_fixed_routing_sharded_threads(
 
     if not missing:
         elapsed = clock() - started
+        planning_event = None
         if progress is not None:
-            progress(
-                FixedRoutingShardProgress(
-                    phase="planning_cache_scan",
-                    status="completed",
-                    completed_groups=routing.num_destination_groups,
-                    total_groups=routing.num_destination_groups,
-                    completed_shards=len(completed),
-                    total_shards=routing.num_shards,
-                    shard_index=None,
-                    cache_hits=cache_hits,
-                    cache_misses=cache_misses,
-                    elapsed_seconds=elapsed,
-                    recent_shard_seconds=None,
-                    estimated_remaining_seconds=0.0,
-                    peak_rss_bytes=peak_rss,
-                    retained_cache_bytes=cache_bytes,
-                    deadline_remaining_seconds=(
-                        None
-                        if absolute_deadline is None
-                        else max(0.0, absolute_deadline - clock())
-                    ),
-                    queued_shards=0,
-                    admitted_worker_count=0,
-                    worker_architecture="shared-executable-thread-pool",
-                )
+            planning_event = FixedRoutingShardProgress(
+                phase="planning_cache_scan",
+                status="completed",
+                completed_groups=routing.num_destination_groups,
+                total_groups=routing.num_destination_groups,
+                completed_shards=len(completed),
+                total_shards=routing.num_shards,
+                shard_index=None,
+                cache_hits=cache_hits,
+                cache_misses=cache_misses,
+                elapsed_seconds=elapsed,
+                recent_shard_seconds=None,
+                estimated_remaining_seconds=0.0,
+                peak_rss_bytes=peak_rss,
+                retained_cache_bytes=cache_bytes,
+                deadline_remaining_seconds=(
+                    None
+                    if absolute_deadline is None
+                    else max(0.0, absolute_deadline - clock())
+                ),
+                queued_shards=0,
+                remaining_shards=0,
+                admitted_worker_count=0,
+                worker_architecture="shared-executable-thread-pool",
             )
+            progress(planning_event)
         _write_manifest(
             routing=routing,
             completed=completed,
@@ -897,6 +1009,8 @@ def _prepare_fixed_routing_sharded_threads(
             elapsed_seconds=elapsed,
             durable=config.durable_progress,
         )
+        if progress is not None and planning_event is not None:
+            progress(replace(planning_event, phase="terminal"))
         return ShardedFixedRoutingPreparationResult(
             routing=routing,
             plan=plan,
@@ -943,39 +1057,40 @@ def _prepare_fixed_routing_sharded_threads(
         admitted_workers = min(admitted_workers, int(memory_workers))
     if admitted_workers <= 0:
         elapsed = clock() - started
+        planning_event = None
         if progress is not None:
-            progress(
-                FixedRoutingShardProgress(
-                    phase="planning_cache_scan",
-                    status="memory_budget_reached",
-                    completed_groups=sum(
-                        plan.descriptors[index].num_groups for index in completed
-                    ),
-                    total_groups=routing.num_destination_groups,
-                    completed_shards=len(completed),
-                    total_shards=routing.num_shards,
-                    shard_index=None,
-                    cache_hits=cache_hits,
-                    cache_misses=cache_misses,
-                    elapsed_seconds=elapsed,
-                    recent_shard_seconds=None,
-                    estimated_remaining_seconds=None,
-                    peak_rss_bytes=peak_rss,
-                    retained_cache_bytes=cache_bytes,
-                    deadline_remaining_seconds=(
-                        None
-                        if absolute_deadline is None
-                        else max(0.0, absolute_deadline - clock())
-                    ),
-                    queued_shards=len(missing),
-                    configured_rss_ceiling=config.maximum_process_rss_bytes,
-                    estimated_worker_peak_bytes=estimated_worker_peak,
-                    admitted_worker_count=0,
-                    memory_limited_worker_count=memory_limited_workers,
-                    cpu_limited_worker_count=cpu_limited_workers,
-                    worker_architecture="shared-executable-thread-pool",
-                )
+            planning_event = FixedRoutingShardProgress(
+                phase="planning_cache_scan",
+                status="memory_budget_reached",
+                completed_groups=sum(
+                    plan.descriptors[index].num_groups for index in completed
+                ),
+                total_groups=routing.num_destination_groups,
+                completed_shards=len(completed),
+                total_shards=routing.num_shards,
+                shard_index=None,
+                cache_hits=cache_hits,
+                cache_misses=cache_misses,
+                elapsed_seconds=elapsed,
+                recent_shard_seconds=None,
+                estimated_remaining_seconds=None,
+                peak_rss_bytes=peak_rss,
+                retained_cache_bytes=cache_bytes,
+                deadline_remaining_seconds=(
+                    None
+                    if absolute_deadline is None
+                    else max(0.0, absolute_deadline - clock())
+                ),
+                queued_shards=len(missing),
+                remaining_shards=routing.num_shards - len(completed),
+                configured_rss_ceiling=config.maximum_process_rss_bytes,
+                estimated_worker_peak_bytes=estimated_worker_peak,
+                admitted_worker_count=0,
+                memory_limited_worker_count=memory_limited_workers,
+                cpu_limited_worker_count=cpu_limited_workers,
+                worker_architecture="shared-executable-thread-pool",
             )
+            progress(planning_event)
         _write_manifest(
             routing=routing,
             completed=completed,
@@ -983,6 +1098,8 @@ def _prepare_fixed_routing_sharded_threads(
             elapsed_seconds=elapsed,
             durable=config.durable_progress,
         )
+        if progress is not None and planning_event is not None:
+            progress(replace(planning_event, phase="terminal"))
         return ShardedFixedRoutingPreparationResult(
             routing=routing,
             plan=plan,
@@ -1012,19 +1129,42 @@ def _prepare_fixed_routing_sharded_threads(
             persistent_compilation_cache_directory=persistent_cache_directory,
         )
 
+    active: dict[Future[_ThreadShardResult], FixedRoutingShardDescriptor] = {}
+    buffered: dict[int, _ThreadShardResult] = {}
+    submitted_shards = 0
+    failed_shards = 0
+    shard_times: list[float] = list(shard_duration_map.values())
+    dispatch_prevented = False
+    dispatch_guard_emitted = False
+
     def emit_progress(
         *,
         phase: str,
         status_value: str,
         shard_index: int | None = None,
         recent_seconds: float | None = None,
-        current_indices: tuple[int, ...] = (),
-        active_workers: int = 0,
-        queued_shards: int | None = None,
         predicted_seconds: float | None = None,
     ) -> None:
         if progress is None:
             return
+        current_indices = tuple(
+            sorted(item.shard_index for item in active.values())
+        )
+        active_workers = len(active)
+        queued_shards = max(0, len(missing) - submitted_shards)
+        remaining_shards = routing.num_shards - len(completed)
+        accounted = (
+            len(completed)
+            + active_workers
+            + len(buffered)
+            + queued_shards
+            + failed_shards
+        )
+        if accounted != routing.num_shards:
+            raise RuntimeError(
+                "invalid fixed-routing progress accounting: "
+                f"{accounted} != {routing.num_shards}."
+            )
         elapsed = max(0.0, clock() - started)
         rolling = (
             float(np.mean(list(shard_duration_map.values())[-5:]))
@@ -1061,12 +1201,10 @@ def _prepare_fixed_routing_sharded_threads(
                     else max(0.0, absolute_deadline - clock())
                 ),
                 active_workers=active_workers,
-                queued_shards=(
-                    max(0, len(missing) - (len(completed) - cache_hits))
-                    if queued_shards is None
-                    else queued_shards
-                ),
-                failed_shards=0,
+                buffered_shards=len(buffered),
+                queued_shards=queued_shards,
+                remaining_shards=remaining_shards,
+                failed_shards=failed_shards,
                 current_shard_indices=current_indices,
                 rolling_mean_shard_seconds=rolling,
                 peak_parent_rss_bytes=peak_rss,
@@ -1074,6 +1212,7 @@ def _prepare_fixed_routing_sharded_threads(
                     active_workers * estimated_worker_peak
                 ),
                 predicted_next_shard_seconds=predicted_seconds,
+                dispatch_prevented_by_deadline=dispatch_prevented,
                 configured_rss_ceiling=config.maximum_process_rss_bytes,
                 estimated_worker_peak_bytes=estimated_worker_peak,
                 admitted_worker_count=admitted_workers,
@@ -1087,7 +1226,6 @@ def _prepare_fixed_routing_sharded_threads(
     emit_progress(
         phase="planning_cache_scan",
         status_value="completed",
-        queued_shards=len(missing),
     )
 
     def deadline_stop(
@@ -1105,6 +1243,10 @@ def _prepare_fixed_routing_sharded_threads(
             status="deadline_reached",
             elapsed_seconds=elapsed,
             durable=config.durable_progress,
+        )
+        emit_progress(
+            phase="terminal",
+            status_value="deadline_reached",
         )
         overshoot = (
             0.0
@@ -1179,7 +1321,11 @@ def _prepare_fixed_routing_sharded_threads(
         )
     del prototype
 
+    execution_state_lock = threading.Lock()
+    active_jax_executions = 0
+
     def construct(descriptor: FixedRoutingShardDescriptor) -> _ThreadShardResult:
+        nonlocal active_jax_executions
         item_started = clock()
         if not config.detailed_profiling:
             shard_inputs = _padded_shard_inputs(
@@ -1208,6 +1354,7 @@ def _prepare_fixed_routing_sharded_threads(
                 peak_rss_bytes=_peak_rss(),
             )
         cpu_started = process_time()
+        context_switches_started = _process_context_switches()
         count = descriptor.num_groups
         padded_count = plan.groups_per_full_shard
         phase_started = clock()
@@ -1232,12 +1379,23 @@ def _prepare_fixed_routing_sharded_threads(
             group_dest_node=destination_device,
             group_link_mask=masks_device,
         )
-        phase_started = clock()
-        effective, probability = executable(inputs=shard_inputs, theta=theta_array)
-        kernel_execution_seconds = clock() - phase_started
-        phase_started = clock()
-        jax.block_until_ready((effective, probability))
-        synchronization_seconds = clock() - phase_started
+        execution_wait_started = clock()
+        with execution_state_lock:
+            active_jax_executions += 1
+            concurrent_jax_executions = active_jax_executions
+        jax_execution_wait_seconds = clock() - execution_wait_started
+        try:
+            phase_started = clock()
+            effective, probability = executable(
+                inputs=shard_inputs, theta=theta_array
+            )
+            kernel_execution_seconds = clock() - phase_started
+            phase_started = clock()
+            jax.block_until_ready((effective, probability))
+            synchronization_seconds = clock() - phase_started
+        finally:
+            with execution_state_lock:
+                active_jax_executions -= 1
         phase_started = clock()
         effective_host = np.asarray(effective)
         probability_host = np.asarray(probability)
@@ -1283,6 +1441,19 @@ def _prepare_fixed_routing_sharded_threads(
         diagnostic = None
         if config.detailed_profiling:
             cpu_seconds = max(0.0, process_time() - cpu_started)
+            context_switches_finished = _process_context_switches()
+            voluntary_context_switches = None
+            involuntary_context_switches = None
+            if (
+                context_switches_started is not None
+                and context_switches_finished is not None
+            ):
+                voluntary_context_switches = max(
+                    0, context_switches_finished[0] - context_switches_started[0]
+                )
+                involuntary_context_switches = max(
+                    0, context_switches_finished[1] - context_switches_started[1]
+                )
             graph_links_traversed = padded_count * routing.num_links
             retained_domain = count * routing.num_links
             diagnostic = FixedRoutingShardExecutionDiagnostics(
@@ -1335,6 +1506,10 @@ def _prepare_fixed_routing_sharded_threads(
                     if retained_domain
                     else 0.0
                 ),
+                jax_execution_wait_seconds=jax_execution_wait_seconds,
+                concurrent_jax_executions=concurrent_jax_executions,
+                voluntary_context_switches=voluntary_context_switches,
+                involuntary_context_switches=involuntary_context_switches,
             )
         return _ThreadShardResult(
             descriptor=descriptor,
@@ -1344,12 +1519,6 @@ def _prepare_fixed_routing_sharded_threads(
             diagnostic=diagnostic,
         )
 
-    pending_descriptors = iter(missing)
-    active: dict[Future[_ThreadShardResult], FixedRoutingShardDescriptor] = {}
-    buffered: dict[int, _ThreadShardResult] = {}
-    shard_times: list[float] = list(shard_duration_map.values())
-    failed_shards = 0
-    dispatch_prevented = False
     status = "completed"
     deadline_phase: str | None = None
     next_emit = min(item.shard_index for item in missing)
@@ -1410,27 +1579,26 @@ def _prepare_fixed_routing_sharded_threads(
                     deadline_phase = "predictive dispatch guard"
                     exhausted = True
                     break
-                try:
-                    descriptor = next(pending_descriptors)
-                except StopIteration:
+                if submitted_shards >= len(missing):
                     exhausted = True
                     break
+                descriptor = missing[submitted_shards]
                 active[pool.submit(construct, descriptor)] = descriptor
+                submitted_shards += 1
                 dispatched.append(descriptor.shard_index)
             if dispatched:
                 emit_progress(
                     phase="dispatch",
                     status_value="started",
-                    current_indices=tuple(sorted(dispatched)),
-                    active_workers=len(active),
-                    queued_shards=max(
-                        0,
-                        len(missing)
-                        - (len(completed) - cache_hits)
-                        - len(active),
-                    ),
                     predicted_seconds=predicted,
                 )
+            if dispatch_prevented and not dispatch_guard_emitted:
+                emit_progress(
+                    phase="predictive_dispatch_guard",
+                    status_value="deadline_reached",
+                    predicted_seconds=predicted,
+                )
+                dispatch_guard_emitted = True
             if not active:
                 break
             done, _ = wait(active, return_when=FIRST_COMPLETED)
@@ -1443,12 +1611,24 @@ def _prepare_fixed_routing_sharded_threads(
                     status = "interrupted"
                     for pending in active:
                         pending.cancel()
+                    emit_progress(
+                        phase="worker_failed",
+                        status_value="interrupted",
+                        shard_index=descriptor.shard_index,
+                        predicted_seconds=predicted,
+                    )
                     _write_manifest(
                         routing=routing,
                         completed=completed,
                         status=status,
                         elapsed_seconds=clock() - started,
                         durable=config.durable_progress,
+                    )
+                    emit_progress(
+                        phase="terminal",
+                        status_value="interrupted",
+                        shard_index=descriptor.shard_index,
+                        predicted_seconds=predicted,
                     )
                     raise RuntimeError(
                         "routing worker failed for shard "
@@ -1470,6 +1650,11 @@ def _prepare_fixed_routing_sharded_threads(
                     status = "deadline_reached"
                     deadline_phase = "active shard execution"
                     exhausted = True
+            emit_progress(
+                phase="shard_completed",
+                status_value="buffered",
+                predicted_seconds=predicted,
+            )
             while next_emit in buffered:
                 result = buffered.pop(next_emit)
                 completed.append(next_emit)
@@ -1500,10 +1685,6 @@ def _prepare_fixed_routing_sharded_threads(
                     status_value="completed",
                     shard_index=result.descriptor.shard_index,
                     recent_seconds=result.elapsed_seconds + manifest_seconds,
-                    current_indices=tuple(
-                        sorted(item.shard_index for item in active.values())
-                    ),
-                    active_workers=len(active),
                     predicted_seconds=predicted,
                 )
                 next_emit += 1
@@ -1517,6 +1698,11 @@ def _prepare_fixed_routing_sharded_threads(
         status=status,
         elapsed_seconds=elapsed,
         durable=config.durable_progress,
+    )
+    emit_progress(
+        phase="terminal",
+        status_value=status,
+        predicted_seconds=predicted,
     )
     overshoot = (
         max(0.0, clock() - absolute_deadline)
@@ -1558,6 +1744,410 @@ def _prepare_fixed_routing_sharded_threads(
     )
 
 
+def _padded_batch_inputs(
+    *,
+    inputs: AssignmentInputs,
+    descriptors: tuple[FixedRoutingShardDescriptor, ...],
+    padded_batch_size: int,
+    groups_per_shard: int,
+    num_links: int,
+) -> AssignmentInputs:
+    """Build one bounded fixed-shape input containing independent shards."""
+
+    total_groups = padded_batch_size * groups_per_shard
+    destination = np.zeros(total_groups, dtype=np.int32)
+    masks = np.zeros((total_groups, num_links), dtype=bool)
+    for slot, descriptor in enumerate(descriptors):
+        start = slot * groups_per_shard
+        stop = start + descriptor.num_groups
+        destination[start:stop] = np.asarray(
+            inputs.group_dest_node[descriptor.group_start : descriptor.group_stop]
+        )
+        masks[start:stop] = np.asarray(
+            inputs.group_link_mask[descriptor.group_start : descriptor.group_stop]
+        )
+    destination_device = jnp.asarray(destination)
+    masks_device = jnp.asarray(masks)
+    jax.block_until_ready((destination_device, masks_device))
+    return replace(
+        inputs,
+        group_dest_node=destination_device,
+        group_link_mask=masks_device,
+    )
+
+
+def _prepare_fixed_routing_sharded_batched(
+    *,
+    inputs: AssignmentInputs,
+    theta: float,
+    config: FixedRoutingPreparationConfig,
+    absolute_deadline: float | None,
+    progress: ProgressCallback | None,
+    cache_policy: CachePolicy,
+    clock: Callable[[], float],
+    started: float,
+    plan: FixedRoutingShardPlan,
+    routing: ShardedFixedRoutingInputs,
+    compiled_kernel_identity: str,
+    persistent_cache_enabled: bool,
+    persistent_cache_directory: str | None,
+) -> ShardedFixedRoutingPreparationResult:
+    """Evaluate a bounded group of independent routing shards per invocation."""
+
+    completed: list[int] = []
+    missing: list[FixedRoutingShardDescriptor] = []
+    durations = _manifest_shard_durations(routing)
+    cache_hits = cache_misses = reconstructed = cache_bytes = 0
+    peak_rss = _peak_rss()
+    for descriptor in plan.descriptors:
+        path = fixed_routing_shard_path(routing, descriptor)
+        if path.exists() and cache_policy == "reuse":
+            load_fixed_routing_shard(routing=routing, descriptor=descriptor)
+            completed.append(descriptor.shard_index)
+            cache_hits += 1
+            cache_bytes += path.stat().st_size
+        else:
+            cache_misses += 1
+            reconstructed += int(path.exists())
+            missing.append(descriptor)
+
+    padded_batch_size = config.shards_per_execution_batch
+    estimated_batch_temporary = (
+        padded_batch_size
+        * plan.groups_per_full_shard
+        * plan.estimated_temporary_bytes_per_group
+    )
+    tracing = lowering = compilation = 0.0
+    compilation_count = 0
+    compiled = None
+    batch_diagnostics: list[FixedRoutingBatchExecutionDiagnostics] = []
+    predicted_batch_seconds = (
+        None
+        if config.initial_predicted_shard_seconds is None
+        else config.initial_predicted_shard_seconds * padded_batch_size
+    )
+    dispatch_prevented = False
+    status = "completed"
+    deadline_phase = None
+    failed_shards = 0
+
+    def emit(
+        *,
+        phase: str,
+        batch: tuple[FixedRoutingShardDescriptor, ...] = (),
+        buffered: int = 0,
+        execution_seconds: float | None = None,
+        persistence_seconds: float | None = None,
+        effective_cores: float | None = None,
+        shard_index: int | None = None,
+    ) -> None:
+        if progress is None:
+            return
+        active_indices = tuple(item.shard_index for item in batch)
+        completed_set = set(completed)
+        active_set = set(active_indices)
+        queued = sum(
+            descriptor.shard_index not in completed_set | active_set
+            for descriptor in missing
+        )
+        accounted = (
+            len(completed) + len(active_indices) + buffered + queued + failed_shards
+        )
+        # Finished batch outputs are either active or buffered, never both.
+        if buffered:
+            accounted -= len(active_indices)
+        if accounted != routing.num_shards:
+            raise RuntimeError(
+                "invalid batched fixed-routing progress accounting: "
+                f"{accounted} != {routing.num_shards}."
+            )
+        elapsed = max(0.0, clock() - started)
+        progress(
+            FixedRoutingShardProgress(
+                phase=phase,
+                status=status,
+                completed_groups=sum(
+                    plan.descriptors[index].num_groups for index in completed
+                ),
+                total_groups=routing.num_destination_groups,
+                completed_shards=len(completed),
+                total_shards=routing.num_shards,
+                shard_index=shard_index,
+                cache_hits=cache_hits,
+                cache_misses=cache_misses,
+                elapsed_seconds=elapsed,
+                recent_shard_seconds=None,
+                estimated_remaining_seconds=(
+                    None
+                    if predicted_batch_seconds is None
+                    else np.ceil(queued / padded_batch_size)
+                    * predicted_batch_seconds
+                ),
+                peak_rss_bytes=peak_rss,
+                retained_cache_bytes=cache_bytes,
+                deadline_remaining_seconds=(
+                    None
+                    if absolute_deadline is None
+                    else max(0.0, absolute_deadline - clock())
+                ),
+                active_workers=int(bool(batch) and not buffered),
+                buffered_shards=buffered,
+                queued_shards=queued,
+                remaining_shards=routing.num_shards - len(completed),
+                failed_shards=failed_shards,
+                current_shard_indices=(active_indices if not buffered else ()),
+                peak_parent_rss_bytes=peak_rss,
+                estimated_total_worker_rss_bytes=estimated_batch_temporary,
+                predicted_next_shard_seconds=(
+                    None
+                    if predicted_batch_seconds is None
+                    else predicted_batch_seconds / padded_batch_size
+                ),
+                dispatch_prevented_by_deadline=dispatch_prevented,
+                configured_rss_ceiling=config.maximum_process_rss_bytes,
+                estimated_worker_peak_bytes=estimated_batch_temporary,
+                admitted_worker_count=1,
+                worker_architecture="single-device-batched",
+                batch_shard_indices=active_indices,
+                batch_size=len(batch),
+                padded_batch_size=padded_batch_size,
+                batch_execution_seconds=execution_seconds,
+                batch_persistence_seconds=persistence_seconds,
+                aggregate_shards_per_second=(
+                    None
+                    if execution_seconds is None or execution_seconds <= 0.0
+                    else len(batch) / execution_seconds
+                ),
+                predicted_next_batch_seconds=predicted_batch_seconds,
+                effective_cpu_cores=effective_cores,
+            )
+        )
+
+    if not missing:
+        emit(phase="planning_cache_scan")
+    elif estimated_batch_temporary > config.maximum_temporary_bytes:
+        status = "memory_budget_reached"
+        emit(phase="batch_memory_admission")
+    else:
+        emit(phase="planning_cache_scan")
+
+    theta_array = jnp.asarray(theta, dtype=inputs.base_link_cost.dtype).reshape(())
+    for batch_index, first in enumerate(
+        range(0, len(missing), padded_batch_size)
+    ):
+        if status != "completed":
+            break
+        batch = tuple(missing[first : first + padded_batch_size])
+        if absolute_deadline is not None:
+            allowance = absolute_deadline - clock()
+            required = (
+                0.0
+                if predicted_batch_seconds is None
+                else predicted_batch_seconds + config.dispatch_safety_margin_seconds
+            )
+            if allowance <= 0.0 or (
+                predicted_batch_seconds is not None and allowance < required
+            ):
+                status = "deadline_reached"
+                deadline_phase = "predictive batch dispatch guard"
+                dispatch_prevented = True
+                emit(phase="predictive_batch_dispatch_guard")
+                break
+        rss = _peak_rss()
+        if rss is not None:
+            peak_rss = rss if peak_rss is None else max(peak_rss, rss)
+        if (
+            config.maximum_process_rss_bytes is not None
+            and rss is not None
+            and rss + estimated_batch_temporary
+            > config.maximum_process_rss_bytes
+        ):
+            status = "memory_budget_reached"
+            emit(phase="batch_memory_admission")
+            break
+        emit(phase="batch_dispatch", batch=batch)
+        batch_inputs = _padded_batch_inputs(
+            inputs=inputs,
+            descriptors=batch,
+            padded_batch_size=padded_batch_size,
+            groups_per_shard=plan.groups_per_full_shard,
+            num_links=routing.num_links,
+        )
+        if compiled is None:
+            phase_started = clock()
+            traced = _prepare_fixed_routing_core.trace(
+                inputs=batch_inputs, theta=theta_array
+            )
+            tracing = clock() - phase_started
+            phase_started = clock()
+            lowered = traced.lower()
+            lowering = clock() - phase_started
+            phase_started = clock()
+            compiled = lowered.compile()
+            compilation = clock() - phase_started
+            compilation_count = 1
+
+        batch_started = clock()
+        cpu_started = process_time()
+        switches_started = _process_context_switches()
+        try:
+            effective, probability = compiled(
+                inputs=batch_inputs, theta=theta_array
+            )
+            jax.block_until_ready((effective, probability))
+        except Exception:
+            failed_shards = len(batch)
+            status = "batch_failed"
+            emit(phase="batch_failed", batch=batch)
+            _write_manifest(
+                routing=routing,
+                completed=completed,
+                status=status,
+                elapsed_seconds=clock() - started,
+                durable=config.durable_progress,
+                shard_durations=durations,
+            )
+            raise
+        execution_seconds = clock() - batch_started
+        cpu_seconds = max(0.0, process_time() - cpu_started)
+        effective_cores = cpu_seconds / max(
+            execution_seconds, np.finfo(float).eps
+        )
+        effective_host = np.asarray(effective)
+        probability_host = np.asarray(probability)
+        emit(
+            phase="batch_completed",
+            batch=batch,
+            buffered=len(batch),
+            execution_seconds=execution_seconds,
+            effective_cores=effective_cores,
+        )
+        persistence_started = clock()
+        for slot, descriptor in enumerate(batch):
+            row_start = slot * plan.groups_per_full_shard
+            row_stop = row_start + descriptor.num_groups
+            shard = FixedRoutingShard(
+                descriptor=descriptor,
+                effective_group_link_mask=effective_host[row_start:row_stop],
+                group_link_probability=probability_host[row_start:row_stop],
+            )
+            if (
+                config.maximum_cache_bytes is not None
+                and cache_bytes + shard.retained_bytes > config.maximum_cache_bytes
+            ):
+                status = "memory_budget_reached"
+                break
+            shard_started = clock()
+            path = save_fixed_routing_shard(
+                routing=routing,
+                shard=shard,
+                durable=config.durable_progress,
+            )
+            cache_bytes += path.stat().st_size
+            completed.append(descriptor.shard_index)
+            durations[descriptor.shard_index] = clock() - shard_started
+            _write_manifest(
+                routing=routing,
+                completed=completed,
+                status="in_progress",
+                elapsed_seconds=clock() - started,
+                durable=config.durable_progress,
+                shard_durations=durations,
+            )
+            emit(
+                phase="shard_persisted",
+                batch=tuple(batch[slot + 1 :]),
+                buffered=len(batch) - slot - 1,
+                execution_seconds=execution_seconds,
+                persistence_seconds=clock() - persistence_started,
+                effective_cores=effective_cores,
+                shard_index=descriptor.shard_index,
+            )
+        persistence_seconds = clock() - persistence_started
+        switches_finished = _process_context_switches()
+        voluntary = involuntary = None
+        if switches_started is not None and switches_finished is not None:
+            voluntary = max(0, switches_finished[0] - switches_started[0])
+            involuntary = max(0, switches_finished[1] - switches_started[1])
+        wall_seconds = clock() - batch_started
+        batch_diagnostics.append(
+            FixedRoutingBatchExecutionDiagnostics(
+                batch_index=batch_index,
+                shard_indices=tuple(item.shard_index for item in batch),
+                batch_size=len(batch),
+                padded_batch_size=padded_batch_size,
+                execution_seconds=execution_seconds,
+                persistence_seconds=persistence_seconds,
+                wall_seconds=wall_seconds,
+                process_cpu_seconds=cpu_seconds,
+                effective_cpu_cores=effective_cores,
+                shards_per_second=len(batch) / max(
+                    wall_seconds, np.finfo(float).eps
+                ),
+                peak_rss_bytes=_peak_rss(),
+                voluntary_context_switches=voluntary,
+                involuntary_context_switches=involuntary,
+            )
+        )
+        predicted_batch_seconds = float(
+            np.mean(
+                [item.execution_seconds for item in batch_diagnostics[-3:]]
+            )
+        )
+        if status != "completed":
+            break
+
+    elapsed = clock() - started
+    _write_manifest(
+        routing=routing,
+        completed=completed,
+        status=status,
+        elapsed_seconds=elapsed,
+        durable=config.durable_progress,
+        shard_durations=durations,
+    )
+    emit(phase="terminal")
+    overshoot = (
+        0.0
+        if absolute_deadline is None or deadline_phase is None
+        else max(0.0, clock() - absolute_deadline)
+    )
+    return ShardedFixedRoutingPreparationResult(
+        routing=routing,
+        plan=plan,
+        status=status,
+        completed_shards=len(completed),
+        cache_hits=cache_hits,
+        cache_misses=cache_misses,
+        reconstructed_shards=reconstructed,
+        elapsed_seconds=elapsed,
+        retained_cache_bytes=cache_bytes,
+        peak_rss_bytes=peak_rss,
+        deadline_phase=deadline_phase,
+        indivisible_operation_overshoot=bool(overshoot),
+        deadline_overshoot_seconds=overshoot,
+        compilation_count=compilation_count,
+        tracing_seconds=tracing,
+        lowering_seconds=lowering,
+        compilation_seconds=compilation,
+        predicted_next_shard_seconds=(
+            None
+            if predicted_batch_seconds is None
+            else predicted_batch_seconds / padded_batch_size
+        ),
+        dispatch_prevented_by_deadline=dispatch_prevented,
+        admitted_worker_count=1,
+        estimated_worker_peak_bytes=estimated_batch_temporary,
+        worker_architecture="single-device-batched",
+        compiled_kernel_identity=compiled_kernel_identity,
+        persistent_compilation_cache_enabled=persistent_cache_enabled,
+        persistent_compilation_cache_directory=persistent_cache_directory,
+        execution_strategy="batched",
+        shards_per_execution_batch=padded_batch_size,
+        batch_diagnostics=tuple(batch_diagnostics),
+    )
+
+
 def prepare_fixed_routing_sharded(
     *,
     inputs: AssignmentInputs,
@@ -1585,18 +2175,42 @@ def prepare_fixed_routing_sharded(
         cache_directory=config.cache_directory,
         checkpoint_directory=config.checkpoint_directory,
     )
-    compiled_kernel_identity = fingerprint(
-        {
-            "implementation_version": SHARDED_FIXED_ROUTING_IMPLEMENTATION_VERSION,
-            "graph_fingerprint": routing.graph_fingerprint,
-            "groups_per_full_shard": plan.groups_per_full_shard,
-            "num_nodes": routing.num_nodes,
-            "num_links": routing.num_links,
-            "dtype": routing.probability_dtype,
-            "backend": jax.default_backend(),
-        }
-    )
+    compiled_identity_payload = {
+        "implementation_version": SHARDED_FIXED_ROUTING_IMPLEMENTATION_VERSION,
+        "graph_fingerprint": routing.graph_fingerprint,
+        "groups_per_full_shard": plan.groups_per_full_shard,
+        "num_nodes": routing.num_nodes,
+        "num_links": routing.num_links,
+        "dtype": routing.probability_dtype,
+        "backend": jax.default_backend(),
+    }
+    if config.execution_strategy == "batched":
+        compiled_identity_payload.update(
+            {
+                "execution_strategy": "batched",
+                "shards_per_execution_batch": config.shards_per_execution_batch,
+                "compiled_groups": plan.groups_per_full_shard
+                * config.shards_per_execution_batch,
+            }
+        )
+    compiled_kernel_identity = fingerprint(compiled_identity_payload)
     _validate_existing_manifest(routing=routing, cache_policy=cache_policy)
+    if config.execution_strategy == "batched":
+        return _prepare_fixed_routing_sharded_batched(
+            inputs=inputs,
+            theta=theta,
+            config=config,
+            absolute_deadline=absolute_deadline,
+            progress=progress,
+            cache_policy=cache_policy,
+            clock=clock,
+            started=started,
+            plan=plan,
+            routing=routing,
+            compiled_kernel_identity=compiled_kernel_identity,
+            persistent_cache_enabled=compilation_cache.enabled,
+            persistent_cache_directory=compilation_cache.directory,
+        )
     if config.construction_workers > 1:
         return _prepare_fixed_routing_sharded_threads(
             inputs=inputs,
@@ -1654,10 +2268,10 @@ def prepare_fixed_routing_sharded(
                     None if absolute_deadline is None else max(0.0, absolute_deadline - clock())
                 ),
                 active_workers=0,
+                buffered_shards=0,
                 queued_shards=max(0, routing.num_shards - len(completed)),
-                current_shard_indices=(
-                    () if descriptor is None else (descriptor.shard_index,)
-                ),
+                remaining_shards=routing.num_shards - len(completed),
+                current_shard_indices=(),
                 rolling_mean_shard_seconds=rolling_mean,
                 peak_parent_rss_bytes=peak_rss,
                 predicted_next_shard_seconds=rolling_mean,

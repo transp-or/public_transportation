@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Formalized a common gravity measurement-operator protocol and replaced the
+  sharded operator's production Python graph traversal with reusable
+  fixed-shape compiled forward, reverse, and multi-right-hand-side kernels over
+  persisted routing probabilities. Added bounded shard execution batches,
+  structured product progress, predictive deadlines and cancellation, detailed
+  timing/residency metrics, estimator deadline propagation, a phase-bounded
+  public gravity preflight, and a scalable synthetic operator benchmark. Added
+  a conservative first-batch deadline estimate, an atomic run-manifest writer,
+  and a shared durable JSONL sink for operator and optimizer progress.
+
 ### Structural-zero preprocessing progress
 
 - Added immutable structured progress events and optional callbacks across
@@ -103,6 +113,20 @@
   synchronized phase and density diagnostics, the coordinator attaches the
   canonical manifest-commit time, and planning/cache-scan plus bounded dispatch
   progress events make long warm-shard runs observable.
+- Corrected parallel progress to derive active, buffered, queued, failed, and
+  completed counts from the complete coordinator state, with an exact lifecycle
+  invariant and full sorted active-shard tuples. Added warm shared-executable
+  concurrency measurements and context-switch diagnostics without changing
+  production kernel or cache identity.
+- Added an experimental fixed-shape batched routing-shard execution strategy,
+  synchronized batch CPU diagnostics, partial-batch padding, per-shard atomic
+  persistence/resume, predictive batch deadlines, and temporary-memory
+  admission. Existing thread-produced shards remain reusable because execution
+  strategy changes compiled shape identity but not routing-data identity.
+- Extended worker recommendations with optional measured-throughput calibration
+  while retaining a conservative one-worker default when target measurements
+  are unavailable. Public benchmarks now cover default and controlled external
+  thread environments plus explicit two-device CPU `pmap` placement.
 
 - Fixed matrix-free initialization for layouts without positive fixed demand:
   the exact fixed offset is now a read-only zero vector and triggers no routing

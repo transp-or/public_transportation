@@ -98,6 +98,9 @@ from public_transportation.inference.gravity import (
     gravity_measurement_identity,
     validate_full_data_gravity_adequacy,
 )
+from public_transportation.inference.measurement_operator_protocol import (
+    GravityMeasurementOperator,
+)
 from public_transportation.inference.od_parameter_layout import (
     ODParameterLayout,
     build_od_parameter_layout,
@@ -451,6 +454,7 @@ def test_matrix_free_products_match_dense_and_satisfy_adjoint_identity(
         compact_layout=example.compact_layout,
     )
     assert operator.shape == example.problem.measurement_operator.shape
+    assert isinstance(operator, GravityMeasurementOperator)
     assert not hasattr(operator, "matrix")
     assert operator.diagnostics.forward_compilation_count == 0
     assert operator.diagnostics.transpose_compilation_count == 0

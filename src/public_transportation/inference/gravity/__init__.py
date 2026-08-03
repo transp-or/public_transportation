@@ -71,6 +71,19 @@ from .objective import (
     predict_gravity_measurements,
 )
 from .operator import GravityMeasurementOperator
+from .operations import (
+    GRAVITY_PROGRESS_SCHEMA_VERSION,
+    GRAVITY_RUN_MANIFEST_SCHEMA_VERSION,
+    GravityJSONLProgressSink,
+    build_gravity_run_manifest,
+    write_gravity_run_manifest,
+)
+from .preflight import (
+    GravityPreflightPhase,
+    GravityPreflightRecommendation,
+    GravityPreflightResult,
+    run_gravity_preflight,
+)
 from .specification import GravityEffectScope, GravityModelSpecification
 from .relaxations import (
     GravityRelaxationInfo,

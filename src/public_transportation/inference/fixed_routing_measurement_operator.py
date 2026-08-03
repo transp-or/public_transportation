@@ -33,6 +33,7 @@ from .assignment_adapter import (
     validate_fixed_routing_compatibility,
 )
 from .compact_od_assignment_layout import CompactODAssignmentLayout
+from .measurement_operator_protocol import GravityOperatorCapabilities
 
 Array = jnp.ndarray
 OperatorRepresentation = Literal["dense", "bcoo"]
@@ -118,6 +119,10 @@ class FixedRoutingMeasurementOperator:
     zero_tolerance: float = 0.0
     schema_version: int = _SCHEMA_VERSION
     package_version: str = __version__
+
+    @property
+    def product_capabilities(self) -> GravityOperatorCapabilities:
+        return GravityOperatorCapabilities()
 
     @property
     def is_matrix_free(self) -> bool:

@@ -1,0 +1,213 @@
+{
+  "backend": "cpu",
+  "batched": [
+    {
+      "compilation": {
+        "compilation_seconds": 1.1791940778493881e-05,
+        "lowering_seconds": 5.366699770092964e-05,
+        "tracing_seconds": 8.637504652142525e-05
+      },
+      "compilation_count_during_execution": 0,
+      "effective_average_cpu_cores": 2.4294482693289727,
+      "equivalent_shards_per_second": 1.143466719128556,
+      "execution_seconds": 0.8745335419662297,
+      "involuntary_context_switches": 135013,
+      "padded_batch_size": 1,
+      "peak_rss_bytes": 423886848,
+      "persistence_performed": false,
+      "persistence_seconds": 0.0,
+      "process_cpu_seconds": 2.1246339999999933,
+      "shards_per_execution_batch": 1,
+      "voluntary_context_switches": 0
+    },
+    {
+      "compilation": {
+        "compilation_seconds": 0.10561025002971292,
+        "lowering_seconds": 0.016849332954734564,
+        "tracing_seconds": 0.002813833998516202
+      },
+      "compilation_count_during_execution": 0,
+      "effective_average_cpu_cores": 2.402931271158299,
+      "equivalent_shards_per_second": 1.1156550290219283,
+      "execution_seconds": 1.7926688339794055,
+      "involuntary_context_switches": 272432,
+      "padded_batch_size": 2,
+      "peak_rss_bytes": 434241536,
+      "persistence_performed": false,
+      "persistence_seconds": 0.0,
+      "process_cpu_seconds": 4.3076599999999985,
+      "shards_per_execution_batch": 2,
+      "voluntary_context_switches": 0
+    },
+    {
+      "compilation": {
+        "compilation_seconds": 0.10788874991703779,
+        "lowering_seconds": 0.01654429198242724,
+        "tracing_seconds": 0.002615374978631735
+      },
+      "compilation_count_during_execution": 0,
+      "effective_average_cpu_cores": 2.410392621209089,
+      "equivalent_shards_per_second": 1.1180872509688151,
+      "execution_seconds": 3.5775383330183104,
+      "involuntary_context_switches": 542867,
+      "padded_batch_size": 4,
+      "peak_rss_bytes": 449085440,
+      "persistence_performed": false,
+      "persistence_seconds": 0.0,
+      "process_cpu_seconds": 8.623272,
+      "shards_per_execution_batch": 4,
+      "voluntary_context_switches": 0
+    }
+  ],
+  "compilation": {
+    "compilation_seconds": 0.114166333922185,
+    "lowering_seconds": 0.01887945900671184,
+    "tracing_seconds": 0.03847975004464388
+  },
+  "concurrency": [
+    {
+      "active_process_threads_after_batch": 1,
+      "batch_wall_seconds": 6.811464416095987,
+      "compilation_count_during_batch": 0,
+      "effective_average_cpu_cores": 2.4518946264380883,
+      "involuntary_context_switches": 1071835,
+      "maximum_active_python_threads": 2,
+      "maximum_numerical_difference": 0.0,
+      "peak_rss_bytes": 414957568,
+      "per_shard_seconds": {
+        "maximum": 0.9433779589598998,
+        "median": 0.8386138749774545,
+        "minimum": 0.821763165993616
+      },
+      "persistence_performed": false,
+      "persistence_seconds": 0.0,
+      "phase_medians_seconds": {
+        "dispatch_seconds": 9.199994383379817e-05,
+        "host_transfer_seconds": 2.4228997062891722e-05,
+        "synchronization_seconds": 0.8384832289302722
+      },
+      "process_cpu_seconds": 16.700993,
+      "process_cpu_utilization_percent": 245.18946264380884,
+      "shards_per_second": 1.1744904636212172,
+      "shared_executable": true,
+      "tasks": 8,
+      "voluntary_context_switches": 0,
+      "workers": 1
+    },
+    {
+      "active_process_threads_after_batch": 1,
+      "batch_wall_seconds": 4.611179166007787,
+      "compilation_count_during_batch": 0,
+      "effective_average_cpu_cores": 4.527723440873289,
+      "involuntary_context_switches": 1177987,
+      "maximum_active_python_threads": 3,
+      "maximum_numerical_difference": 0.0,
+      "peak_rss_bytes": 417136640,
+      "per_shard_seconds": {
+        "maximum": 1.2010490419343114,
+        "median": 1.1447516250191256,
+        "minimum": 1.1144503329414874
+      },
+      "persistence_performed": false,
+      "persistence_seconds": 0.0,
+      "phase_medians_seconds": {
+        "dispatch_seconds": 8.575001265853643e-05,
+        "host_transfer_seconds": 2.3645989131182432e-05,
+        "synchronization_seconds": 1.1446022085146978
+      },
+      "process_cpu_seconds": 20.878144,
+      "process_cpu_utilization_percent": 452.77234408732886,
+      "shards_per_second": 1.7349141536233446,
+      "shared_executable": true,
+      "tasks": 8,
+      "voluntary_context_switches": 0,
+      "workers": 2
+    },
+    {
+      "active_process_threads_after_batch": 1,
+      "batch_wall_seconds": 2.480214332928881,
+      "compilation_count_during_batch": 0,
+      "effective_average_cpu_cores": 7.606092646728098,
+      "involuntary_context_switches": 777347,
+      "maximum_active_python_threads": 5,
+      "maximum_numerical_difference": 0.0,
+      "peak_rss_bytes": 423886848,
+      "per_shard_seconds": {
+        "maximum": 1.2669056250015274,
+        "median": 1.2321161044528708,
+        "minimum": 1.2126338330563158
+      },
+      "persistence_performed": false,
+      "persistence_seconds": 0.0,
+      "phase_medians_seconds": {
+        "dispatch_seconds": 0.00011568749323487282,
+        "host_transfer_seconds": 1.8896011169999838e-05,
+        "synchronization_seconds": 1.2319353334605694
+      },
+      "process_cpu_seconds": 18.864739999999998,
+      "process_cpu_utilization_percent": 760.6092646728098,
+      "shards_per_second": 3.225527686775688,
+      "shared_executable": true,
+      "tasks": 8,
+      "voluntary_context_switches": 0,
+      "workers": 4
+    }
+  ],
+  "devices": [
+    "cpu:0"
+  ],
+  "experimental_four_shard_batch": {
+    "compilation": {
+      "compilation_seconds": 0.10788874991703779,
+      "lowering_seconds": 0.01654429198242724,
+      "tracing_seconds": 0.002615374978631735
+    },
+    "compilation_count_during_execution": 0,
+    "compiled_kernel_identity_changes_with_shape": true,
+    "effective_average_cpu_cores": 2.410392621209089,
+    "equivalent_shards_per_second": 1.1180872509688151,
+    "execution_seconds": 3.5775383330183104,
+    "groups": 8,
+    "involuntary_context_switches": 542867,
+    "padded_batch_size": 4,
+    "peak_rss_bytes": 449085440,
+    "persistence_performed": false,
+    "persistence_seconds": 0.0,
+    "process_cpu_seconds": 8.623272,
+    "production_routing_fingerprint_changed": false,
+    "shards_per_execution_batch": 4,
+    "voluntary_context_switches": 0
+  },
+  "groups_per_shard": 2,
+  "links": 131062,
+  "maximum_out_degree": 4,
+  "nodes": 32768,
+  "schema_version": 2,
+  "system": {
+    "active_process_threads": 1,
+    "active_python_threads": 1,
+    "affinity_cpu_count": null,
+    "allocated_or_visible_cpu_count": 12,
+    "backend": "cpu",
+    "environment": {
+      "MKL_NUM_THREADS": "1",
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "XLA_FLAGS": "--xla_cpu_multi_thread_eigen=true"
+    },
+    "jax_version": "0.11.0",
+    "jaxlib_version": "0.11.0",
+    "logical_devices": [
+      "cpu:0"
+    ],
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "process_cpu_affinity": null,
+    "scheduler_cpu_allocation": {
+      "SLURM_CPUS_PER_TASK": null,
+      "SLURM_JOB_CPUS_PER_NODE": null
+    }
+  },
+  "tasks": 8,
+  "threads_per_worker_controls_xla_threads": false,
+  "warmup_completed": true
+}
