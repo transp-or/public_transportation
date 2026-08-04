@@ -1,6 +1,39 @@
 # Release notes
 
+- Added progressive-fidelity gravity objective and gradient evaluation with a
+  validated 1--100 effort contract, deterministic nested stratified shard
+  selection, Horvitz--Thompson additive-count expansion, matching sampled
+  adjoints, replicate-group quality estimates, measurement coverage, reusable
+  control-variate anchors, atomic checkpoints, progress, deadlines, and exact
+  deterministic resume. Effort 100 preserves the established exact adjoint
+  API. A public benchmark documents improving accuracy but no speed advantage
+  on a small dense problem, where fixed dispatch overhead dominates.
+
 ## Unreleased
+
+### Parallel partial-routing foundation
+
+- Added versioned execution contracts for routing work units, microshard plans,
+  fixed batches, and selected-work plans.
+- Added non-invasive per-batch instrumentation for the existing exact sharded
+  operator.
+- Added metadata-only routing cost estimation and deterministic balanced
+  microshard planning. The active numerical backend is unchanged.
+- Added a persistent public routing worker pool, reusable fixed-shape partial
+  forward/reverse kernels, and cost-prioritized dynamic batch scheduling as a
+  comparison backend. Production gravity execution remains unchanged pending
+  the exact-equivalence performance gate.
+- Added the formal parallel-exact promotion gate and a complete gravity adjoint
+  adapter. The public gate passes numerical equivalence and eight-lane usage but
+  retains the established backend because its measured 1.010 speedup is below
+  the required 1.10 threshold.
+- Added deterministic fixed-budget nested partial selection, matched weighted
+  parallel forward/reverse products, and bounded prepared-batch retention. The
+  public partial gate passes from 10% through 75% effort; the feature remains
+  experimental and the established backend remains mandatory at 100%.
+- Added strict, serializable exact gravity anchors and delta-demand
+  control-variate evaluation. The public benchmark reduces 25%-effort gradient
+  error from 8.31% to 0.60% while remaining 2.26 times faster than exact.
 
 - Formalized a common gravity measurement-operator protocol and replaced the
   sharded operator's production Python graph traversal with reusable

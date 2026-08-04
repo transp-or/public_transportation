@@ -22,9 +22,9 @@ class TimeBin:
     def __post_init__(self) -> None:
         """Allow start/end to be provided as "HH:MM:SS" strings."""
         if isinstance(self.start, str):
-            object.__setattr__(self, "start", TimeOfDay.from_string(self.start))
+            object.__setattr__(self, "start", TimeOfDay.parse(self.start))
         if isinstance(self.end, str):
-            object.__setattr__(self, "end", TimeOfDay.from_string(self.end))
+            object.__setattr__(self, "end", TimeOfDay.parse(self.end))
 
     def validate(self) -> ValidationReport:
         """

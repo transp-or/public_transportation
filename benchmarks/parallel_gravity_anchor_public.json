@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "problem": {
+    "nodes": 2048,
+    "links": 4093,
+    "destination_groups": 256,
+    "od_cells": 8192,
+    "measurements": 512,
+    "routing_shards": 128,
+    "microshards": 256
+  },
+  "execution": {
+    "workers": 8,
+    "repetitions": 5,
+    "parameter_perturbation": [0.03, -0.02, 0.01],
+    "exact_median_wall_seconds": 0.21660366700962186
+  },
+  "results": [
+    {
+      "effort_percent": 25.0,
+      "unanchored_gradient_relative_error": 0.08312024921178818,
+      "anchored_gradient_relative_error": 0.006027913186699152,
+      "unanchored_count_relative_error": 0.08741451799869537,
+      "anchored_count_relative_error": 0.00013218588719610125,
+      "unanchored_speedup": 3.1473865365817524,
+      "anchored_speedup": 2.259348722738906
+    },
+    {
+      "effort_percent": 50.0,
+      "unanchored_gradient_relative_error": 0.033072520047426224,
+      "anchored_gradient_relative_error": 0.002390902256593108,
+      "unanchored_count_relative_error": 0.045498326420784,
+      "anchored_count_relative_error": 0.00006010892320773564,
+      "unanchored_speedup": 1.6901167072435577,
+      "anchored_speedup": 1.4100343932469879
+    },
+    {
+      "effort_percent": 75.0,
+      "unanchored_gradient_relative_error": 0.011499677784740925,
+      "anchored_gradient_relative_error": 0.0009387099416926503,
+      "unanchored_count_relative_error": 0.016768870875239372,
+      "anchored_count_relative_error": 0.00002209471131209284,
+      "unanchored_speedup": 1.2917828201298995,
+      "anchored_speedup": 1.1127265081971645
+    }
+  ],
+  "decision": "Anchors materially improve accuracy at equal effort and retain a speed advantage over exact evaluation."
+}

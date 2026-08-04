@@ -23,6 +23,86 @@ The modes may share scenario preparation, OD ordering, fixed-demand handling,
 routing preparation, and measurement mapping. They do not share an
 optimization objective.
 
+## What “fixed routing” means
+
+The implementation uses a **time-expanded timetable graph**, not a canonical
+physical route stored once per OD pair. The following terms have distinct
+meanings:
+
+- A **route/path alternative** is any feasible sequence of access, ride,
+  dwell, transfer, and egress links through the time-expanded DAG. It may
+  therefore identify particular scheduled trips, not merely a physical stop
+  sequence or line sequence.
+- An **OD-time cell** is one origin, destination, and departure-time bin. Its
+  demand is injected at a centroid-in node specific to the origin and bin.
+- A **departure cohort** would be a finer subdivision of that cell. The current
+  model has no such index: all demand in one OD-time cell receives the same
+  distribution over its accessible departure events.
+- A **routing probability** is the conditional transition probability on a
+  time-expanded link for one destination. The implied probability of a whole
+  path is the product of its transition probabilities.
+- **Dynamic assignment**, in the current API, recomputes the destination value
+  functions and link probabilities during an assignment evaluation and then
+  loads demand.
+- **Fixed routing** computes those value functions and probabilities once for
+  a fixed graph, timetable, generalized-cost vector, destination masks, and
+  dispersion parameter, then repeatedly loads different demand vectors.
+
+The complete timetable graph contains event nodes for individual scheduled
+trips. A separate centroid-in node is built for every stop and departure-time
+bin. Its access links reach only trips departing within the configured access
+window, and their costs include early/late schedule-deviation penalties.
+Consequently, two cells with the same physical OD but different time bins need
+not expose the same lines, trips, or complete path set. Even when their line or
+physical stop sequence is the same, their scheduled trips can differ. Cached
+link probabilities can therefore differ by time bin. There is no further
+within-bin cohort-specific probability.
+
+The implementation builds no explicit candidate-path table. Feasible
+alternatives are implicit in the enabled links of the timetable-wide DAG. OD
+records are grouped only by destination; the destination value function covers
+all origin/time-bin centroids in that group. The fixed cache retains, for each
+destination group, its effective link mask and one probability per graph link,
+plus compatibility state (graph, destination indices, source masks, costs, and
+dispersion). Sharded caches persist contiguous subsets of the same group/link
+arrays. They do not replace the probabilities with line shares or a single
+route. Matrix-free, concurrent, and gravity operators all load or apply these
+same persisted probabilities; the gravity layer changes how OD demand is
+generated, not how routing is defined.
+
+Four superficially similar claims must not be conflated:
+
+1. **“The route set is constant throughout the day” is false in general.** A
+   common timetable graph is built once, but the origin/time-bin access links
+   can make different scheduled alternatives reachable.
+2. **“Route-choice probabilities are constant throughout the day” is false in
+   general.** Different time-bin centroids can have different accessible trips,
+   schedule penalties, and resulting probabilities.
+3. **“Routing probabilities are held fixed during estimation” is true in
+   fixed-routing estimation.** They remain fixed after the cache is prepared.
+4. **“Routing is independent of demand and crowding” is true for the current
+   assignment model.** Demand affects only flow loading. Nominal capacities are
+   stored on ride links but are not used to cap boarding, create denied
+   boarding, alter downstream propagation, or enter route-choice utility.
+
+With unchanged timetable, graph, cost coefficients, destination masks, and
+dispersion, recomputing routing after changing demand produces the same
+probabilities. Dynamic and fixed loading therefore agree up to numerical
+tolerance under those assumptions. Fixed routing ceases to be an exact
+substitution if costs or probabilities depend endogenously on flows, crowding,
+capacity, denied boarding, or an estimated routing parameter.
+
+One possible capacity-aware extension would use an outer fixed point:
+
+1. estimate demand with the current routing cache;
+2. run a capacity- and crowding-aware dynamic assignment;
+3. rebuild routing probabilities from the resulting state;
+4. re-estimate demand; and
+5. repeat until demand and assigned flows stabilize.
+
+Such an extension would also need an explicit behavioral model for waiting,
+denied boarding, and downstream propagation. It is not implemented today.
+
 ## Linear measurement model
 
 Let

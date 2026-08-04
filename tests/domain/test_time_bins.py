@@ -35,6 +35,13 @@ def test_valid_time_bin_has_no_issues():
     assert report.issues == []
 
 
+def test_time_bin_accepts_documented_string_times():
+    tb = TimeBin(bin_id="T1", start="08:00", end="08:15:30")
+
+    assert tb.start == TimeOfDay(seconds_from_midnight=8 * 3600)
+    assert tb.end == TimeOfDay(seconds_from_midnight=8 * 3600 + 15 * 60 + 30)
+
+
 def test_end_strictly_after_start_required():
     start = TimeOfDay(seconds_from_midnight=8 * 3600)
 

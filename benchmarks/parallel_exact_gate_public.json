@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "problem": {
+    "nodes": 2048,
+    "links": 4093,
+    "destination_groups": 256,
+    "od_cells": 8192,
+    "measurements": 512,
+    "routing_shards": 128,
+    "microshards": 256
+  },
+  "benchmark": {
+    "repetitions": 5,
+    "existing_exact_gravity_median_seconds": 0.21817579201888293,
+    "parallel_exact_gravity_median_seconds": 0.2159103750018403,
+    "parallel_workers": 8,
+    "observed_worker_lanes": 8,
+    "supported_group_batch_sizes": [1, 2, 4, 8, 16, 32, 64]
+  },
+  "promotion_gate": {
+    "schema_version": 1,
+    "numerical_equivalence_passed": true,
+    "performance_passed": false,
+    "worker_utilization_passed": true,
+    "promotion_passed": false,
+    "recommendation": "retain_existing",
+    "forward_max_abs_error": 0.00018310546875,
+    "reverse_max_abs_error": 0.0,
+    "objective_abs_error": 0.0,
+    "gradient_relative_error": 1.128324456090013e-07,
+    "existing_exact_seconds": 0.21817579201888293,
+    "parallel_exact_seconds": 0.2159103750018403,
+    "measured_speedup": 1.0104923953609146,
+    "requested_workers": 8,
+    "observed_worker_lanes": 8,
+    "reasons": [
+      "measured speedup 1.010 is below 1.100"
+    ],
+    "config": {
+      "forward_max_abs_tolerance": 0.0005,
+      "reverse_max_abs_tolerance": 0.00001,
+      "objective_abs_tolerance": 0.001,
+      "gradient_relative_tolerance": 0.00001,
+      "minimum_speedup": 1.1,
+      "require_all_worker_lanes": true
+    }
+  },
+  "decision": "The established exact backend remains the production backend."
+}

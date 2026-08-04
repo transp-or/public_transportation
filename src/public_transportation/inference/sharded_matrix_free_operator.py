@@ -168,7 +168,15 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
     _compiled_forward: object = field(init=False, repr=False)
     _forward_kernel: object = field(init=False, repr=False)
     _compiled_reverse: object = field(init=False, repr=False)
+    _fidelity_compiled_forward: object = field(init=False, repr=False)
+    _fidelity_compiled_reverse: object = field(init=False, repr=False)
     _compiled_matmat: dict[int, object] = field(
+        init=False, default_factory=dict, repr=False
+    )
+    _partial_compiled_forward: dict[int, object] = field(
+        init=False, default_factory=dict, repr=False
+    )
+    _partial_compiled_reverse: dict[int, object] = field(
         init=False, default_factory=dict, repr=False
     )
     _metrics: ShardedMatrixFreeMetrics = field(
@@ -247,6 +255,7 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
 
         self._forward_kernel = compiled_forward
         self._compiled_forward = jax.jit(compiled_forward)
+        self._fidelity_compiled_forward = jax.jit(compiled_forward)
 
         def compiled_reverse(
             cotangent, probabilities, masks, group_od_indices, group_od_masks
@@ -268,6 +277,7 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
             return pullback(cotangent)[0]
 
         self._compiled_reverse = jax.jit(compiled_reverse)
+        self._fidelity_compiled_reverse = jax.jit(compiled_reverse)
 
         output_spec = jax.ShapeDtypeStruct(
             (self.num_measurements,), self.inputs.base_link_cost.dtype
@@ -589,6 +599,186 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
                 self.inputs.group_od_mask[descriptor.group_start : descriptor.group_stop]
             )
         return probability, enabled, indices, valid
+
+    def _destination_group_arrays(
+        self,
+        destination_group_indices: tuple[int, ...],
+        *,
+        padded_groups: int,
+        group_weights: tuple[float, ...] | None = None,
+    ):
+        """Load arbitrary destination groups into one fixed-shape batch."""
+        if not destination_group_indices:
+            raise ValueError("a partial routing batch must contain destination groups.")
+        if len(set(destination_group_indices)) != len(destination_group_indices):
+            raise ValueError("a partial routing batch must not duplicate groups.")
+        if padded_groups < len(destination_group_indices):
+            raise ValueError("padded_groups cannot be smaller than the selected groups.")
+        if group_weights is None:
+            group_weights = (1.0,) * len(destination_group_indices)
+        if len(group_weights) != len(destination_group_indices):
+            raise ValueError("group_weights must align with destination groups.")
+        if any(not np.isfinite(value) or value <= 0.0 for value in group_weights):
+            raise ValueError("group_weights must be positive and finite.")
+        if any(
+            group < 0 or group >= self.routing.num_destination_groups
+            for group in destination_group_indices
+        ):
+            raise ValueError("destination-group index is outside the routing layout.")
+        links = self.routing.num_links
+        width = int(self.inputs.group_od_index_padded.shape[1])
+        probability = np.zeros((padded_groups, links), dtype=self.dtype)
+        enabled = np.zeros((padded_groups, links), dtype=bool)
+        indices = np.zeros((padded_groups, width), dtype=np.int32)
+        valid = np.zeros((padded_groups, width), dtype=bool)
+        descriptors = self.routing.shard_partition
+        for row, group in enumerate(destination_group_indices):
+            descriptor = next(
+                item
+                for item in descriptors
+                if item.group_start <= group < item.group_stop
+            )
+            shard = self._load(descriptor)
+            local = group - descriptor.group_start
+            probability[row] = shard.group_link_probability[local]
+            enabled[row] = shard.effective_group_link_mask[local]
+            indices[row] = np.asarray(self.inputs.group_od_index_padded[group])
+            valid[row] = np.asarray(self.inputs.group_od_mask[group])
+        return probability, enabled, indices, valid
+
+    def _partial_active_weights(
+        self,
+        destination_group_indices: tuple[int, ...],
+        group_weights: tuple[float, ...] | None,
+    ) -> np.ndarray:
+        if group_weights is None:
+            group_weights = (1.0,) * len(destination_group_indices)
+        if len(group_weights) != len(destination_group_indices):
+            raise ValueError("group_weights must align with destination groups.")
+        weights = np.ones(self.compact_layout.num_active, dtype=self.dtype)
+        seen: set[int] = set()
+        for group, weight in zip(
+            destination_group_indices, group_weights, strict=True
+        ):
+            indices = np.asarray(self.inputs.group_od_index_padded[group])
+            valid = np.asarray(self.inputs.group_od_mask[group])
+            active_indices = indices[valid]
+            overlap = seen.intersection(int(item) for item in active_indices)
+            if overlap:
+                raise ValueError("destination groups overlap active OD cells.")
+            seen.update(int(item) for item in active_indices)
+            weights[active_indices] = weight
+        return weights
+
+    def prepare_partial_batch(
+        self,
+        *,
+        destination_group_indices: tuple[int, ...],
+        padded_groups: int,
+        group_weights: tuple[float, ...] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Prepare reusable host arrays for matched partial forward and reverse."""
+        return self._destination_group_arrays(
+            destination_group_indices,
+            padded_groups=padded_groups,
+            group_weights=group_weights,
+        )
+
+    def _partial_executable(self, operation: str, padded_groups: int):
+        cache = (
+            self._partial_compiled_forward
+            if operation == "matvec"
+            else self._partial_compiled_reverse
+        )
+        with self._lock:
+            executable = cache.get(padded_groups)
+            if executable is not None:
+                return executable
+            if operation == "matvec":
+                executable = jax.jit(self._forward_kernel)
+            elif operation == "rmatvec":
+                forward = self._forward_kernel
+
+                def reverse(cotangent, probabilities, masks, indices, valid):
+                    zero = jnp.zeros(
+                        (self.compact_layout.num_active,),
+                        dtype=self.inputs.base_link_cost.dtype,
+                    )
+                    _, pullback = jax.vjp(
+                        lambda active: forward(
+                            active, probabilities, masks, indices, valid
+                        ),
+                        zero,
+                    )
+                    return pullback(cotangent)[0]
+
+                executable = jax.jit(reverse)
+            else:
+                raise ValueError(f"unsupported partial operation: {operation!r}.")
+            cache[padded_groups] = executable
+            return executable
+
+    def partial_matvec(
+        self,
+        vector: object,
+        *,
+        destination_group_indices: tuple[int, ...],
+        padded_groups: int,
+        group_weights: tuple[float, ...] | None = None,
+        prepared_arrays: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        | None = None,
+    ) -> np.ndarray:
+        """Apply one reusable fixed-shape destination-group forward batch."""
+        value = np.asarray(vector, dtype=self.dtype)
+        if value.shape != (self.num_free_od,):
+            raise ValueError(f"forward vector must have shape ({self.num_free_od},).")
+        active = np.zeros(self.compact_layout.num_active, dtype=self.dtype)
+        active[np.asarray(self.compact_layout.free_compact_indices)] = value
+        active *= self._partial_active_weights(
+            destination_group_indices, group_weights
+        )
+        arrays = prepared_arrays or self.prepare_partial_batch(
+            destination_group_indices=destination_group_indices,
+            padded_groups=padded_groups,
+            group_weights=group_weights,
+        )
+        executable = self._partial_executable("matvec", padded_groups)
+        result = executable(
+            jnp.asarray(active), *(jnp.asarray(item) for item in arrays)
+        )
+        jax.block_until_ready(result)
+        return np.asarray(result)
+
+    def partial_rmatvec(
+        self,
+        vector: object,
+        *,
+        destination_group_indices: tuple[int, ...],
+        padded_groups: int,
+        group_weights: tuple[float, ...] | None = None,
+        prepared_arrays: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        | None = None,
+    ) -> np.ndarray:
+        """Apply the transpose of one fixed-shape destination-group batch."""
+        value = np.asarray(vector, dtype=self.dtype)
+        if value.shape != (self.num_measurements,):
+            raise ValueError(
+                f"transpose vector must have shape ({self.num_measurements},)."
+            )
+        arrays = prepared_arrays or self.prepare_partial_batch(
+            destination_group_indices=destination_group_indices,
+            padded_groups=padded_groups,
+            group_weights=group_weights,
+        )
+        executable = self._partial_executable("rmatvec", padded_groups)
+        active = executable(
+            jnp.asarray(value), *(jnp.asarray(item) for item in arrays)
+        )
+        jax.block_until_ready(active)
+        weighted_active = np.asarray(active) * self._partial_active_weights(
+            destination_group_indices, group_weights
+        )
+        return weighted_active[np.asarray(self.compact_layout.free_compact_indices)]
 
     def _emit(
         self,
@@ -1228,6 +1418,62 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
                 f"transpose vector must have shape ({self.num_measurements},)."
             )
         return self._host_rmatvec(value)
+
+    def fidelity_shard_statistics(self) -> tuple[dict[str, object], ...]:
+        """Return load-free predicted-work metadata for progressive fidelity.
+
+        Exact enabled-link counts live inside persisted shards and would require
+        loading every shard merely to plan a low-effort evaluation. The public
+        adapter therefore uses destination-group/link slots as the predicted
+        work measure and the corresponding retained array bytes.
+        """
+        bytes_per_entry = self.dtype.itemsize + np.dtype(bool).itemsize
+        return tuple(
+            {
+                "shard_id": f"routing-{descriptor.shard_index}",
+                "shard_index": descriptor.shard_index,
+                "support_entries": descriptor.num_groups * self.routing.num_links,
+                "routing_bytes": descriptor.num_groups
+                * self.routing.num_links
+                * bytes_per_entry,
+                "stratum": "destination-groups",
+            }
+            for descriptor in self.routing.shard_partition
+        )
+
+    def jax_matvec_fidelity_shard(
+        self, shard_index: int, vector: jax.Array
+    ) -> jax.Array:
+        """Apply one persisted routing shard without loading any other shard."""
+        value = np.asarray(vector, dtype=self.dtype)
+        if value.shape != (self.num_free_od,):
+            raise ValueError(f"forward vector must have shape ({self.num_free_od},).")
+        descriptor = self.routing.shard_partition[int(shard_index)]
+        active = np.zeros(self.compact_layout.num_active, dtype=self.dtype)
+        active[np.asarray(self.compact_layout.free_compact_indices)] = value
+        arrays = self._batch_arrays((descriptor,), padded_shards=1)
+        contribution = self._fidelity_compiled_forward(
+            jnp.asarray(active), *(jnp.asarray(item) for item in arrays)
+        )
+        return jnp.asarray(contribution)
+
+    def jax_rmatvec_fidelity_shard(
+        self, shard_index: int, vector: jax.Array
+    ) -> jax.Array:
+        """Apply the transpose of one persisted routing shard."""
+        value = np.asarray(vector, dtype=self.dtype)
+        if value.shape != (self.num_measurements,):
+            raise ValueError(
+                f"transpose vector must have shape ({self.num_measurements},)."
+            )
+        descriptor = self.routing.shard_partition[int(shard_index)]
+        arrays = self._batch_arrays((descriptor,), padded_shards=1)
+        active = self._fidelity_compiled_reverse(
+            jnp.asarray(value), *(jnp.asarray(item) for item in arrays)
+        )
+        return jnp.asarray(active)[
+            jnp.asarray(self.compact_layout.free_compact_indices)
+        ]
 
     def jax_matvec(self, vector: jax.Array) -> jax.Array:
         value = jnp.asarray(vector, dtype=self.inputs.base_link_cost.dtype)

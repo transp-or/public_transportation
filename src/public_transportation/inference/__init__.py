@@ -149,6 +149,48 @@ from .sharded_matrix_free_operator import (  # noqa: F401
     ShardedOperatorProductInterrupted,
     ShardedOperatorProgress,
 )
+from .parallel_partial_execution import (  # noqa: F401
+    FixedBudgetRoutingSelection,
+    PARALLEL_PARTIAL_EXECUTION_SCHEMA_VERSION,
+    PartialExecutionBatch,
+    PartialExecutionPlan,
+    RoutingCostModel,
+    RoutingMicroshardPlan,
+    RoutingWorkObservation,
+    RoutingWorkUnit,
+    ShardedWorkInstrumentation,
+    build_balanced_microshard_plan,
+    plan_fixed_budget_routing_selection,
+    routing_group_work_units,
+)
+from .parallel_routing_executor import (  # noqa: F401
+    ParallelApproximateRoutingOperator,
+    ParallelExactRoutingOperator,
+    ParallelRoutingExecutionInterrupted,
+    ParallelRoutingExecutionResult,
+    ParallelRoutingExecutorConfig,
+    PersistentParallelRoutingExecutor,
+    RoutingBatchExecutionObservation,
+    RoutingExecutionBatch,
+    plan_fixed_shape_routing_batches,
+)
+from .parallel_exact_gate import (  # noqa: F401
+    ParallelExactGateConfig,
+    ParallelExactGateReport,
+    assess_parallel_exact_gate,
+)
+from .parallel_partial_gate import (  # noqa: F401
+    DEFAULT_PARTIAL_EFFORT_REQUIREMENTS,
+    ParallelPartialGateReport,
+    PartialEffortGateResult,
+    PartialEffortRequirement,
+    assess_parallel_partial_gate,
+)
+from .parallel_gravity_anchor import (  # noqa: F401
+    ParallelGravityAnchor,
+    create_parallel_gravity_anchor,
+    parallel_anchored_value_and_gradient,
+)
 from .measurement_operator_protocol import (  # noqa: F401
     GravityMeasurementOperator,
     GravityOperatorCapabilities,

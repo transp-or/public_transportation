@@ -16,6 +16,26 @@ from .diagnostics import (
     recommend_gravity_relaxations,
 )
 from .features import GravityFeatures
+from .fidelity import (
+    GravityApproximationQuality,
+    GravityFidelityAnchor,
+    GravityFidelityContext,
+    GravityFidelityDiagnostics,
+    GravityFidelityEvaluationInterrupted,
+    GravityFidelityExecution,
+    GravityFidelityPlan,
+    GravityFidelityProgress,
+    GravityFidelityRequest,
+    GravityFidelityShard,
+    GravityFidelityShardProduct,
+    GravityFidelityStrategy,
+    GravityObjectiveGradientResult,
+    build_gravity_fidelity_anchor,
+    build_gravity_fidelity_context,
+    gravity_fidelity_problem_identity,
+    gravity_value_and_gradient_progressive,
+    plan_gravity_fidelity,
+)
 from .lineage import (
     GravityAssignedCountDiagnostics,
     GravityChildWarmStart,

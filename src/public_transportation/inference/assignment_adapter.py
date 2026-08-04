@@ -190,12 +190,18 @@ class AssignmentInputs:
 @jax.tree_util.register_pytree_node_class
 @dataclass(frozen=True, slots=True)
 class FixedRoutingInputs:
-    """Prepared routing probabilities for every active destination group.
+    """Prepared timetable-link probabilities for every destination group.
 
     This immutable cache contains only demand-independent state needed by the
     future fixed-routing loading path. ``source_group_link_mask`` preserves the
     original mask so compatibility with ``AssignmentInputs`` can be checked
     before the cache is used.
+
+    ``Fixed`` means that these probabilities are held fixed across demand
+    evaluations. It does not mean that every OD departure-time bin uses the
+    same line or scheduled trip: each bin has its own origin centroid and
+    access links in the time-expanded graph. There is no within-bin departure
+    cohort index and no capacity or crowding feedback in this cache.
     """
 
     theta: Array
@@ -345,10 +351,11 @@ def prepare_fixed_routing(
     absolute_deadline: float | None = None,
     clock: Clock = perf_counter,
 ) -> FixedRoutingInputs:
-    """Prepare reusable routing for fixed positive dispersion.
+    """Prepare reusable destination/link probabilities for fixed dispersion.
 
-    The returned cache is not yet selected by inference; Phase 3 introduces
-    the corresponding demand-loading path.
+    Probabilities depend on the graph, timetable-derived links, generalized
+    costs, destination masks, and ``theta``. They do not depend on demand or
+    nominal vehicle capacities in the current assignment model.
     """
     total_started = clock()
     theta_value = float(theta)

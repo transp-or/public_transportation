@@ -1,5 +1,10 @@
 # Reduced-dimensional gravity estimation
 
+Progressive-fidelity objective and gradient evaluation, including deterministic
+shard sampling, quality diagnostics, control-variate anchors, and resumable
+execution, is documented in
+[`progressive_fidelity_gravity.md`](progressive_fidelity_gravity.md).
+
 ## Phase 1: demand contracts
 
 The gravity package represents a complete dynamic OD table as a sparse

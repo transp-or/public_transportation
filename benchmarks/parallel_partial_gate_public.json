@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "problem": {
+    "nodes": 2048,
+    "links": 4093,
+    "destination_groups": 256,
+    "od_cells": 8192,
+    "measurements": 512,
+    "routing_shards": 128,
+    "microshards": 256
+  },
+  "execution": {
+    "workers": 8,
+    "repetitions": 5,
+    "maximum_retained_batch_bytes": 536870912,
+    "exact_median_wall_seconds": 0.21798029204364866
+  },
+  "results": [
+    {
+      "requested_effort_percent": 10.0,
+      "realized_effort_percent": 10.15625,
+      "speedup_over_exact": 4.350220238622778,
+      "gradient_relative_norm_error": 0.08031062036752701,
+      "gradient_cosine_similarity": 0.999998152256012,
+      "predicted_count_relative_error": 0.14886023104190826
+    },
+    {
+      "requested_effort_percent": 25.0,
+      "realized_effort_percent": 25.0,
+      "speedup_over_exact": 3.1206690306157707,
+      "gradient_relative_norm_error": 0.08314235508441925,
+      "gradient_cosine_similarity": 0.9999997615814209,
+      "predicted_count_relative_error": 0.08739455044269562
+    },
+    {
+      "requested_effort_percent": 50.0,
+      "realized_effort_percent": 50.0,
+      "speedup_over_exact": 1.665428944279021,
+      "gradient_relative_norm_error": 0.033149637281894684,
+      "gradient_cosine_similarity": 0.9999998807907104,
+      "predicted_count_relative_error": 0.045497480779886246
+    },
+    {
+      "requested_effort_percent": 75.0,
+      "realized_effort_percent": 75.0,
+      "speedup_over_exact": 1.2798344996231565,
+      "gradient_relative_norm_error": 0.01151896733790636,
+      "gradient_cosine_similarity": 0.9999998807907104,
+      "predicted_count_relative_error": 0.016768990084528923
+    }
+  ],
+  "retention_speedup": {
+    "25_percent": 1.184793,
+    "50_percent": 1.317506,
+    "75_percent": 1.344877
+  },
+  "gate_passed": true,
+  "decision": "Enable only as an experimental sub-100% backend; retain the established exact backend at 100%."
+}

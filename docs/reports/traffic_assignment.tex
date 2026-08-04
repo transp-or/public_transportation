@@ -477,6 +477,37 @@ are therefore performed without congestion or overload effects.
 Introducing capacity-aware penalties while preserving differentiability (e.g., using smooth overload functions such
 as softplus penalties) is a natural future extension, but it is not part of the current version of the software.
 
+\subsubsection{Meaning of fixed routing}
+
+The software does not store one canonical physical route per OD pair. It builds one time-expanded graph for the
+complete timetable, with event nodes tied to scheduled trips and one origin centroid for every stop and departure-time
+bin. Feasible alternatives are implicit link sequences in this graph rather than an enumerated path table. Access links
+from a time-bin centroid reach only departures in its configured time window and carry the corresponding schedule-
+deviation costs. Thus, the same physical OD in two time bins can face different lines and scheduled trips; even if its
+physical stop or line sequence is unchanged, its trip sequence can differ.
+
+For each destination, the Dial recursion produces one conditional probability per enabled time-expanded link. A demand
+time bin is an aggregation interval: all demand in one OD-time cell is injected at the same time-bin centroid and shares
+its distribution over accessible departure events. The current model contains no finer within-bin departure-cohort
+index.
+
+In the ordinary assignment call these destination value functions and link probabilities are recomputed before demand
+is loaded. In \emph{fixed routing}, the effective link masks and probabilities are computed once for a fixed graph,
+timetable, generalized-cost vector, destination masks, and dispersion parameter $\theta$, then reused for every demand
+evaluation. Complete, sharded, concurrent, matrix-free, and gravity-model operators preserve this same routing contract.
+The gravity model changes how OD-time demand is generated; it does not define different routing probabilities.
+
+Consequently, ``the route set is constant throughout the day'' and ``route-choice probabilities are constant throughout
+the day'' are false in general. ``Routing probabilities are held fixed during fixed-routing estimation'' is true.
+Furthermore, routing is currently independent of demand and crowding: nominal ride-link capacities are stored as
+metadata but do not cap boarding, generate denied boarding, change passenger propagation, or enter utility. Changing
+only OD demand therefore leaves probabilities unchanged, and fixed loading agrees with a freshly recomputed assignment
+when all routing-sensitive inputs are unchanged.
+
+If crowding or capacity becomes endogenous, fixed routing would no longer be exact. A possible outer fixed-point scheme
+would alternate demand estimation, capacity-aware dynamic assignment, routing-cache reconstruction, and re-estimation
+until demand and assigned flows stabilize.
+
 
 \subsubsection{Logit routing model}
 
@@ -1322,6 +1353,49 @@ optimization time are exposed as structured diagnostics.
 A detailed OD table produced this way is not equivalent to estimating every OD
 cell independently: its detail is induced by the low-dimensional gravity
 structure and the fixed production and attractiveness inputs.
+
+\subsubsection{Progressive-fidelity objective and gradient}
+
+For exploratory optimization steps, the gravity layer can request an effort
+level between 1 and 100.  Routing-cache shards are selected by immutable,
+seeded hashes within declared strata, so selections are deterministic, nested,
+and reproducible.  Selection probabilities include mandatory nonempty-stratum
+representation, and inverse probabilities provide Horvitz--Thompson expansion
+weights.  Realized support entries and routing bytes are reported because
+unequal shard sizes can make effective effort differ from the request.
+
+Since the likelihood is nonlinear in the complete predicted-count vector, the
+implementation does not scale separate shard likelihoods.  It first estimates
+the complete additive routed-count vector, includes fixed measurement offsets
+exactly, evaluates the likelihood at that approximate vector, and applies the
+same sampled and weighted transpose operator to its cotangent.  The resulting
+gradient therefore corresponds to the reported approximate objective.  Direct
+parameter transformations, regularization, and dispersion terms remain exact.
+Only effort 100 is called exact; it uses every shard once with unit weight and
+delegates to the established complete adjoint calculation.
+
+Deterministic replicate groups estimate objective, predicted-count, gradient-
+norm, and gradient-direction errors without an exact reference or repeated
+routing products.  Measurement coverage and realized support also enter a
+quality score in $[0,1]$.  These quantities are diagnostic estimates, not
+guaranteed bounds, and shared sampling bias can make replicate uncertainty
+optimistic at low effort.  A reusable anchor can instead estimate routed-demand
+differences around an exact or documented-fidelity prediction.  Operator,
+routing-cache, parameter, package, and schema identities prevent incompatible
+reuse.  Atomic checkpoints preserve the subset, weights, accumulators, quality
+groups, and anchor identity; cancellation or deadline expiration never
+publishes a partial result as complete.
+
+A public dense benchmark with 200 OD cells, 60 measurements, and 32 synthetic
+shards shows improving accuracy but no runtime gain: fixed dispatch and quality
+overhead dominate the inexpensive dense multiplication.  At approximately
+76\% realized support, gradient relative error is about 3.1\% and gradient
+cosine similarity is 0.99994, whereas very-low-effort gradients can point in
+the wrong direction.  Large persisted routing caches require a separate timing
+campaign before any speedup is claimed.  A conservative future trust-region
+policy should escalate fidelity when coverage is incomplete, quality is below
+0.70, estimated relative gradient error exceeds 0.10, or cosine confidence is
+below 0.90, and must require effort 100 before convergence is declared.
 
 The first validation mode is deliberately a full-calibration adequacy analysis,
 not predictive validation.  It compares reassigned counts with every

@@ -1,0 +1,73 @@
+{
+  "cases": [
+    {
+      "combined_median_seconds": 0.2188745419261977,
+      "effective_workers": 1,
+      "forward_max_abs_error": 0.00018310546875,
+      "forward_median_seconds": 0.10672099993098527,
+      "forward_worker_lanes_used": 1,
+      "requested_workers": 1,
+      "reverse_max_abs_error": 0.0,
+      "reverse_median_seconds": 0.11215354199521244,
+      "reverse_worker_lanes_used": 1,
+      "speedup_over_existing_exact": 0.8402661789527393
+    },
+    {
+      "combined_median_seconds": 0.1864835841115564,
+      "effective_workers": 2,
+      "forward_max_abs_error": 0.00018310546875,
+      "forward_median_seconds": 0.09359041706193238,
+      "forward_worker_lanes_used": 2,
+      "requested_workers": 2,
+      "reverse_max_abs_error": 0.0,
+      "reverse_median_seconds": 0.09289316704962403,
+      "reverse_worker_lanes_used": 2,
+      "speedup_over_existing_exact": 0.9862148236294015
+    },
+    {
+      "combined_median_seconds": 0.1844985409406945,
+      "effective_workers": 4,
+      "forward_max_abs_error": 0.00018310546875,
+      "forward_median_seconds": 0.09175645792856812,
+      "forward_worker_lanes_used": 4,
+      "requested_workers": 4,
+      "reverse_max_abs_error": 0.0,
+      "reverse_median_seconds": 0.09274208301212639,
+      "reverse_worker_lanes_used": 4,
+      "speedup_over_existing_exact": 0.9968256338323809
+    },
+    {
+      "combined_median_seconds": 0.1824729589279741,
+      "effective_workers": 8,
+      "forward_max_abs_error": 0.00018310546875,
+      "forward_median_seconds": 0.09145962493494153,
+      "forward_worker_lanes_used": 8,
+      "requested_workers": 8,
+      "reverse_max_abs_error": 0.0,
+      "reverse_median_seconds": 0.09101333399303257,
+      "reverse_worker_lanes_used": 8,
+      "speedup_over_existing_exact": 1.007891120387605
+    }
+  ],
+  "existing_exact": {
+    "combined_median_seconds": 0.18391287501435727,
+    "forward_median_seconds": 0.08891849999781698,
+    "reverse_median_seconds": 0.09499437501654029
+  },
+  "notes": [
+    "Compilation warm-up is excluded from steady-state timings.",
+    "Every parallel case executes 100% of routing work.",
+    "This is a public synthetic CPU benchmark, not a TPG result."
+  ],
+  "problem": {
+    "destination_groups": 256,
+    "links": 4093,
+    "measurements": 512,
+    "microshards": 256,
+    "nodes": 2048,
+    "od_cells": 8192,
+    "routing_shards": 128
+  },
+  "repetitions": 3,
+  "schema_version": 1
+}

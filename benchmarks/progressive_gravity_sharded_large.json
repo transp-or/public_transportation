@@ -1,0 +1,96 @@
+{
+  "backend": "cpu",
+  "exact": {
+    "median_wall_seconds": 0.06077666697092354,
+    "wall_seconds": [
+      0.05918145796749741,
+      0.06122545793186873,
+      0.06077666697092354
+    ]
+  },
+  "execution": {
+    "group_execution_strategy": "scan",
+    "operator_concurrency": 1,
+    "operator_shards_per_batch": 4,
+    "shard_execution_strategy": "aggregate"
+  },
+  "notes": [
+    "Preparation and compilation warm-up are excluded from steady-state timings.",
+    "Approximation errors are measured against the exact adjoint at identical parameters.",
+    "Synthetic topology is public and reproducible; it is not a claim about TPG runtime."
+  ],
+  "peak_rss_bytes": 671760384,
+  "preparation_seconds": 0.2361194589175284,
+  "problem": {
+    "destination_groups": 64,
+    "links": 1021,
+    "measurements": 256,
+    "nodes": 512,
+    "od_cells": 2048,
+    "resident_shard_limit": 2,
+    "routing_shards": 32
+  },
+  "repetitions": 3,
+  "results": [
+    {
+      "effective_effort_percent": 3.125,
+      "gradient_cosine_similarity_median": 0.9999949932098389,
+      "gradient_relative_norm_error_median": 0.634172520661157,
+      "median_wall_seconds": 0.03383075003512204,
+      "objective_absolute_error_median": 1480.0175170898438,
+      "predicted_count_relative_error_median": 0.8391146353682732,
+      "quality_score": 0.0,
+      "requested_effort_percent": 10.0,
+      "selected_shards": 1,
+      "speedup_over_exact": 1.7964918574913973,
+      "total_shards": 32
+    },
+    {
+      "effective_effort_percent": 9.375,
+      "gradient_cosine_similarity_median": 0.999974250793457,
+      "gradient_relative_norm_error_median": 0.3127079674586777,
+      "median_wall_seconds": 0.047959916992112994,
+      "objective_absolute_error_median": 69.86529541015625,
+      "predicted_count_relative_error_median": 0.6489887133890216,
+      "quality_score": 0.21132127913774387,
+      "requested_effort_percent": 25.0,
+      "selected_shards": 3,
+      "speedup_over_exact": 1.26723878569094,
+      "total_shards": 32
+    },
+    {
+      "effective_effort_percent": 31.25,
+      "gradient_cosine_similarity_median": 0.9999977350234985,
+      "gradient_relative_norm_error_median": 0.06706811725206611,
+      "median_wall_seconds": 0.0747769590234384,
+      "objective_absolute_error_median": 42.13189697265625,
+      "predicted_count_relative_error_median": 0.2893844057551961,
+      "quality_score": 0.4286608197673872,
+      "requested_effort_percent": 50.0,
+      "selected_shards": 10,
+      "speedup_over_exact": 0.8127726476797947,
+      "total_shards": 32
+    },
+    {
+      "effective_effort_percent": 75.0,
+      "gradient_cosine_similarity_median": 0.9999999403953552,
+      "gradient_relative_norm_error_median": 0.005863723124354339,
+      "median_wall_seconds": 0.12858062505256385,
+      "objective_absolute_error_median": 77.91131591796875,
+      "predicted_count_relative_error_median": 0.02159936113478197,
+      "quality_score": 0.796265279899352,
+      "requested_effort_percent": 75.0,
+      "selected_shards": 24,
+      "speedup_over_exact": 0.4726736002883638,
+      "total_shards": 32
+    }
+  ],
+  "schema_version": 1,
+  "warmup_seconds": {
+    "10.0": 2.5335552089381963,
+    "100.0": 0.3915711250156164,
+    "25.0": 0.05412287497892976,
+    "50.0": 0.09698025009129196,
+    "75.0": 0.12059291696641594
+  }
+}
