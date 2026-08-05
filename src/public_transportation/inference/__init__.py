@@ -191,6 +191,15 @@ from .parallel_gravity_anchor import (  # noqa: F401
     create_parallel_gravity_anchor,
     parallel_anchored_value_and_gradient,
 )
+from .stochastic_gravity import (  # noqa: F401
+    StochasticGravityConfig,
+    StochasticGravityResult,
+    StochasticQualityDiagnostics,
+    StochasticShardProgress,
+    StochasticShardSelection,
+    select_stochastic_routing_shards,
+    stochastic_gravity_value_and_gradient,
+)
 from .measurement_operator_protocol import (  # noqa: F401
     GravityMeasurementOperator,
     GravityOperatorCapabilities,

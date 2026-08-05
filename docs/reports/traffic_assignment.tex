@@ -1356,13 +1356,16 @@ structure and the fixed production and attractiveness inputs.
 
 \subsubsection{Progressive-fidelity objective and gradient}
 
-For exploratory optimization steps, the gravity layer can request an effort
-level between 1 and 100.  Routing-cache shards are selected by immutable,
-seeded hashes within declared strata, so selections are deterministic, nested,
-and reproducible.  Selection probabilities include mandatory nonempty-stratum
-representation, and inverse probabilities provide Horvitz--Thompson expansion
-weights.  Realized support entries and routing bytes are reported because
-unequal shard sizes can make effective effort differ from the request.
+For exploratory optimization steps, the gravity layer provides a deliberately
+simple stochastic calculation at an effort level between 1 and 100.  Its
+sampling units are the routing shards that already exist in the persistent
+fixed-routing cache; it does not repartition destination groups into transient
+microshards.  A seeded random permutation of the persistent shard identities
+is generated once conceptually, and an effort level selects a prefix of that
+permutation.  Selections are consequently deterministic, nested, and
+reproducible for a fixed seed.  If $k$ of $N$ shards are selected, every shard
+contribution receives the Horvitz--Thompson expansion weight $N/k$.  The result
+reports both the requested effort and the realized fraction $k/N$.
 
 Since the likelihood is nonlinear in the complete predicted-count vector, the
 implementation does not scale separate shard likelihoods.  It first estimates
@@ -1374,28 +1377,53 @@ parameter transformations, regularization, and dispersion terms remain exact.
 Only effort 100 is called exact; it uses every shard once with unit weight and
 delegates to the established complete adjoint calculation.
 
-Deterministic replicate groups estimate objective, predicted-count, gradient-
-norm, and gradient-direction errors without an exact reference or repeated
-routing products.  Measurement coverage and realized support also enter a
-quality score in $[0,1]$.  These quantities are diagnostic estimates, not
-guaranteed bounds, and shared sampling bias can make replicate uncertainty
-optimistic at low effort.  A reusable anchor can instead estimate routed-demand
-differences around an exact or documented-fidelity prediction.  Operator,
-routing-cache, parameter, package, and schema identities prevent incompatible
-reuse.  Atomic checkpoints preserve the subset, weights, accumulators, quality
-groups, and anchor identity; cancellation or deadline expiration never
-publishes a partial result as complete.
+The calculation is a streaming two-pass adjoint.  During the forward pass it
+loads one selected persistent shard, adds its weighted measurement
+contribution to one accumulator, synchronizes outstanding device work, and
+evicts the shard before loading the next one.  It then evaluates the nonlinear
+likelihood once on the assembled approximate count vector.  During the reverse
+pass it reloads the same selected shards in the same order, immediately pulls
+each weighted measurement cotangent back to one demand-space accumulator, and
+again releases all shard-local arrays.  One JAX vector--Jacobian pullback maps
+the completed accumulator to the small gravity-parameter space after the last
+shard.  Prepared forward batches, futures,
+and per-shard measurement vectors are not retained.  Concurrency one is the
+safe default and currently the only admitted mode; larger concurrency must not
+be enabled until measured memory, including allocator reserves and temporary
+buffers, can be bounded conservatively.
 
-A public dense benchmark with 200 OD cells, 60 measurements, and 32 synthetic
-shards shows improving accuracy but no runtime gain: fixed dispatch and quality
-overhead dominate the inexpensive dense multiplication.  At approximately
-76\% realized support, gradient relative error is about 3.1\% and gradient
-cosine similarity is 0.99994, whereas very-low-effort gradients can point in
-the wrong direction.  Large persisted routing caches require a separate timing
-campaign before any speedup is claimed.  A conservative future trust-region
-policy should escalate fidelity when coverage is incomplete, quality is below
-0.70, estimated relative gradient error exceeds 0.10, or cosine confidence is
-below 0.90, and must require effort 100 before convergence is declared.
+A reusable exact anchor replaces the unanchored estimate of $A x$ by the
+control-variate estimate
+\[
+  A x_0 + \widehat{A(x-x_0)}.
+\]
+It uses the same sampled shards and weights in both passes and reproduces the
+anchor exactly when $x=x_0$.  Operator, routing-cache, compact-layout,
+measurement, parameter, and likelihood identities prevent incompatible anchor
+reuse.  An effort request of exactly 100 never follows this sampled path: it
+delegates to the established complete adjoint implementation.
+
+The implementation records RSS before dispatch and at every shard boundary,
+the current phase and shard, completed work, a conservative estimate for the
+next shard, wall time, coverage, maximum shard influence, and scalar sampling-
+dispersion indicators for measurements and gradients.  A configured RSS
+ceiling and safety margin can prevent the next shard from being loaded and
+return a structured, resumable interruption instead of relying on an
+out-of-memory kill.  The quality labels derived from the dispersion indicators
+are internal sampling diagnostics, not exact error bounds.  In particular,
+low dispersion among selected shards does not rule out bias from omitted
+shards.  Convergence must therefore be confirmed with effort 100.
+
+On the small public persisted-shard benchmark, separating compilation from
+warm execution reveals the intended runtime ordering.  The 10\%, 25\%, and
+50\% evaluations take approximately 0.032, 0.033, and 0.041 seconds,
+respectively, compared with 0.043 seconds for the warm exact evaluation.  Their
+peak RSS remains essentially constant near 614 MB, while the exact evaluation
+reaches approximately 663 MB.  The first sampled call nevertheless takes about
+2.6 seconds because it compiles the common forward and reverse shard kernels.
+These small-case timings demonstrate removal of per-shard dispatch and garbage-
+collection overhead; they do not predict the speedup or approximation error on
+the full network.
 
 The first validation mode is deliberately a full-calibration adequacy analysis,
 not predictive validation.  It compares reassigned counts with every

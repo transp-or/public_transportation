@@ -1,0 +1,96 @@
+{
+  "configuration": {
+    "concurrency": 1,
+    "destination_groups": 32,
+    "exact_warmup_seconds": 0.4210008750669658,
+    "measurements": 128,
+    "od_cells": 256,
+    "persisted_shards": 16,
+    "prepared_batch_retention": false,
+    "sampled_warmup_effort_percent": 10.0,
+    "sampled_warmup_seconds": 2.6372339169029146
+  },
+  "results": [
+    {
+      "compiled_forward_shapes": 1,
+      "compiled_reverse_shapes": 1,
+      "effort_percent": 10.0,
+      "exact": false,
+      "forward_seconds": 0.002229499979875982,
+      "gradient_relative_error": 0.031497761607170105,
+      "measurement_relative_error": 0.18203610181808472,
+      "peak_rss_bytes": 613580800,
+      "quality": {
+        "effective_sampled_support_fraction": 0.125,
+        "gradient_standard_error_indicator": 7.483315467834473,
+        "maximum_shard_influence": 0.5623698116954015,
+        "measurement_coverage_fraction": 0.90625,
+        "measurement_standard_error_indicator": 2.179671049118042,
+        "status": "poor"
+      },
+      "realized_effort_percent": 12.5,
+      "reverse_seconds": 0.003700624918565154,
+      "selected_shards": 2,
+      "wall_time_seconds": 0.03152983309701085
+    },
+    {
+      "compiled_forward_shapes": 1,
+      "compiled_reverse_shapes": 1,
+      "effort_percent": 25.0,
+      "exact": false,
+      "forward_seconds": 0.0034356670221313834,
+      "gradient_relative_error": 0.0016784208128228784,
+      "measurement_relative_error": 0.15779152512550354,
+      "peak_rss_bytes": 613597184,
+      "quality": {
+        "effective_sampled_support_fraction": 0.25,
+        "gradient_standard_error_indicator": 3.464101791381836,
+        "maximum_shard_influence": 0.3246844187879826,
+        "measurement_coverage_fraction": 1.0,
+        "measurement_standard_error_indicator": 0.6885790228843689,
+        "status": "poor"
+      },
+      "realized_effort_percent": 25.0,
+      "reverse_seconds": 0.004861333058215678,
+      "selected_shards": 4,
+      "wall_time_seconds": 0.03312808298505843
+    },
+    {
+      "compiled_forward_shapes": 1,
+      "compiled_reverse_shapes": 1,
+      "effort_percent": 50.0,
+      "exact": false,
+      "forward_seconds": 0.006532917032018304,
+      "gradient_relative_error": 0.03011862002313137,
+      "measurement_relative_error": 0.09080992639064789,
+      "peak_rss_bytes": 613662720,
+      "quality": {
+        "effective_sampled_support_fraction": 0.5,
+        "gradient_standard_error_indicator": 1.4142135381698608,
+        "maximum_shard_influence": 0.18783362080222504,
+        "measurement_coverage_fraction": 1.0,
+        "measurement_standard_error_indicator": 0.2015017867088318,
+        "status": "poor"
+      },
+      "realized_effort_percent": 50.0,
+      "reverse_seconds": 0.009033250040374696,
+      "selected_shards": 8,
+      "wall_time_seconds": 0.04090783395804465
+    },
+    {
+      "compiled_forward_shapes": 1,
+      "compiled_reverse_shapes": 1,
+      "effort_percent": 100.0,
+      "exact": true,
+      "forward_seconds": 0.0,
+      "gradient_relative_error": 0.0,
+      "measurement_relative_error": 0.0,
+      "peak_rss_bytes": 663191552,
+      "quality": null,
+      "realized_effort_percent": 100.0,
+      "reverse_seconds": 0.0,
+      "selected_shards": 16,
+      "wall_time_seconds": 0.04342141700908542
+    }
+  ]
+}

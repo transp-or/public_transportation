@@ -402,6 +402,12 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
         with self._lock:
             return len(self._cache)
 
+    def evict_resident_shards(self) -> None:
+        """Release every cached routing shard at a safe product boundary."""
+        with self._lock:
+            self._cache.clear()
+            self._metrics = replace(self._metrics, resident_routing_bytes=0)
+
     @property
     def effective_operator_concurrency(self) -> int:
         if self.shard_execution_strategy == "aggregate":
