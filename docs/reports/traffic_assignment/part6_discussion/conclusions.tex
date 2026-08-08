@@ -1,0 +1,34 @@
+% Mechanical relocation generated from the preservation ledger.
+% Existing prose is included byte-for-byte from preserved blocks.
+
+\input{traffic_assignment/preserved/101_3047_3058_discussion.tex}
+
+\section{Conclusions and Recommended Use}
+
+The central difficulty is not only computational scale but intrinsic
+underdetermination: boarding and alighting counts observe events along journeys
+rather than complete passenger trajectories. A credible solution must combine
+a transparent forward model, explicit structural zeros, a scientifically
+defensible demand restriction, regularization, and validation at observable
+counts.
+
+For the full network, the recommended primary workflow is fixed-routing,
+conditional-gravity MAP estimation. Fixed routing makes the response additive;
+gravity replaces one parameter per OD-time cell with a small set of shared
+behavioral and production coefficients; MAP stabilizes directions weakly
+informed by counts. ML remains the principal prior-sensitivity reference, and
+variational Bayesian inference is appropriate when posterior uncertainty is
+required and its approximation can be validated.
+
+This recommendation is conditional, not universal. Route-level IPF and
+entropic transport remain useful audits and initializers, while cell-level MAP
+is valuable on small examples and for justified local refinement. Final
+acceptance requires reproducible optimization, adequate grouped residuals,
+reasonable curvature and prior sensitivity, grouped holdout, and agreement
+with detailed assignment under matching assumptions.
+
+The next scientific extensions are evidence-led model relaxations, explicit
+measurement-design analysis, and capacity- or crowding-aware routing where the
+data require it. Until then, results should be reported as estimates under the
+stated timetable, routing, production, attractiveness, likelihood, and prior
+assumptions, with weakly informed quantities identified rather than hidden.

@@ -1,0 +1,24 @@
+\subsubsection{Scalability limits for very large OD layouts}
+
+The direct operator is not suitable when its dimensions or its construction
+state exceed the available memory. In the TPG full-network case there are
+$628{,}164$ free OD cells and $426{,}436$ measurements. A dense float32
+operator would require approximately 998~GiB. More importantly, the reverse
+operator construction described above would require a destination-local state
+proportional to the number of graph nodes times the number of reachable
+measurements. Measurements from a sampled destination cover approximately
+$213{,}000$ observations, implying about 344~GiB of value state for one
+destination. The explicit builder must therefore not be used for this layout.
+
+Six isolated full-network destinations spanning 9, 137, 276, 465, 770, and
+1,181 free cells were measured under a 24~GiB process ceiling. Warm forward
+loading was 5.98--6.08~s and ordinary value--gradient evaluation was
+12.07--12.38~s; peak resident memory was 16.02--18.16~GiB. The near-constant
+runtime over a 131-fold change in OD count shows that graph traversal, not
+demand injection, dominates. These measurements establish that destination
+streaming alone is not a viable large-scale solver: it repeats expensive graph
+traversals and does not exploit the linear structure available when routing is
+fixed. The large-scale mode should instead expose the fixed-routing assignment
+as a sparse linear operator and solve the resulting explicitly regularized,
+bound-constrained least-squares problem.
+

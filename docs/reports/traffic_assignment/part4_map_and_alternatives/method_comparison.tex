@@ -1,0 +1,20 @@
+% Mechanical relocation generated from the preservation ledger.
+% Existing prose is included byte-for-byte from preserved blocks.
+
+\input{traffic_assignment/preserved/095_2997_3002_comparison_of_estimation_methods_introduction.tex}
+\input{traffic_assignment/preserved/096_3003_3010_ml_versus_map.tex}
+\input{traffic_assignment/preserved/097_3011_3018_map_versus_bayesian_inference.tex}
+\input{traffic_assignment/preserved/098_3019_3031_variational_approximation_comparison.tex}
+\input{traffic_assignment/preserved/099_3032_3037_when_estimates_should_be_close.tex}
+\input{traffic_assignment/preserved/100_3038_3046_recommended_comparisons.tex}
+
+\subsection{Decision Rule for the Present Application}
+
+The full-network default is conditional-gravity MAP with fixed routing. The ML
+fit should be retained as a sensitivity reference whenever it is numerically
+stable. Local Hessian uncertainty is a diagnostic, not a replacement for a
+posterior. Variational inference is reserved for questions that require
+posterior uncertainty and for problem sizes where its approximation and runtime
+are acceptable. Cell-level linear MAP remains useful for smaller validation
+problems and targeted refinements, but is not the default for unrestricted
+full-network OD recovery.

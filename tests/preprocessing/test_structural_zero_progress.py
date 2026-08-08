@@ -15,9 +15,19 @@ from public_transportation.preprocessing.structural_zeros.progress import (
 
 def test_progress_event_validates_counts() -> None:
     event = StructuralZeroProgress("phase", 1, 2, 0.5, "working")
+    assert event.throughput_units_per_second == pytest.approx(2.0)
+    assert event.estimated_remaining_seconds == pytest.approx(0.5)
+    assert event.eta_confidence == "low"
     assert event.completed == 1
     with pytest.raises(ValueError, match="0 <= completed <= total"):
         StructuralZeroProgress("phase", 3, 2, 0.0)
+
+
+def test_progress_eta_is_unavailable_until_work_completes() -> None:
+    event = StructuralZeroProgress("phase", 0, 100, 2.0)
+    assert event.throughput_units_per_second is None
+    assert event.estimated_remaining_seconds is None
+    assert event.eta_confidence == "unavailable"
 
 
 def test_tqdm_adapter_changes_phase_and_closes() -> None:

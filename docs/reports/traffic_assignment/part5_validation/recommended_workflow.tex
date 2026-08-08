@@ -1,0 +1,46 @@
+% Mechanical relocation generated from the preservation ledger.
+% Existing prose is included byte-for-byte from preserved blocks.
+
+\section{Recommended Validation Workflow}
+\label{sec:recommended-validation-workflow}
+
+The following sequence keeps structural, statistical, numerical, and
+predictive questions separate.
+\begin{enumerate}
+  \item \textbf{Validate inputs.} Check timetable and stop identities,
+        physical-stop mapping, observations, time alignment, units, structural
+        zeros, frozen demand, and fingerprints.
+  \item \textbf{Validate the response on a small case.} Compare reduced or
+        fixed-routing predictions and adjoints with an explicit construction;
+        verify frozen offsets and finite-difference derivatives.
+  \item \textbf{Fit the minimal gravity MAP model.} Record initialization,
+        objective components, bounds, stopping criteria, iterations, gradient
+        norm, elapsed time, and completion status.
+  \item \textbf{Establish numerical reproducibility.} Repeat from dispersed
+        starts, verify prediction and objective agreement, inspect active
+        bounds, verify the actual arithmetic precision and tolerance
+        resolvability, and check sensitivity to tighter tolerances.
+  \item \textbf{Assess adequacy and identification separately.} Examine
+        grouped residuals and deviances, then curvature, profiles, prior
+        sensitivity, and weak directions.
+  \item \textbf{Compare likelihoods and priors.} Fit Poisson and
+        negative-binomial models on the same prepared artifacts, then compare
+        ML with named MAP prior scenarios. Explain material differences through
+        dispersion, regularization, weak information, bounds, or distinct
+        local optima rather than requiring equality.
+  \item \textbf{Run grouped holdout.} Refit without complete operational groups
+        and report calibration and holdout metrics under the same model.
+  \item \textbf{Consider one justified relaxation at a time.} Verify nesting,
+        refit, and retain it only if the combined evidence improves.
+  \item \textbf{Perform detailed-assignment validation.} Reconstruct the full
+        OD table only for the final candidate and compare event and link
+        predictions under matching routing assumptions.
+  \item \textbf{Report scope and uncertainty.} State which quantities are
+        informed by counts, which depend mainly on assumptions, and which
+        behavioral effects are outside the model.
+\end{enumerate}
+
+Passing one step does not waive a later one. Optimizer convergence is not
+evidence of identification, calibration fit is not holdout validity, and
+agreement with fixed routing is not validation of the fixed-routing behavioral
+assumption.

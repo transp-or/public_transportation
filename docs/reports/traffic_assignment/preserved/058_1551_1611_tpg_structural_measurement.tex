@@ -1,0 +1,61 @@
+\paragraph{TPG structural measurement.}
+For the TPG case, the operator has shape $3{,}690\times15{,}772$, or
+$58{,}198{,}680$ logical entries. Only 158,219 entries are nonzero, giving a
+density of 0.271860\%. The logical dense float32 size is 222.01 MiB, whereas
+the direct BCOO representation occupies 1.811 MiB. This observed sparsity,
+rather than an a-priori assumption, motivates BCOO as the automatic
+representation.
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{rrrrrr}
+\hline
+Chunk & Calls & Compile (s) & Build (s) & Process peak (GiB) & Warm value--gradient (s) \\
+\hline
+128  & 184 & 0.237 & 116.587 & 4.212 & 0.001115 \\
+256  & 124 & 0.238 & 79.264  & 4.220 & 0.001133 \\
+512  & 113 & 0.241 & 71.999  & 4.222 & 0.001075 \\
+1024 & 113 & 0.238 & 72.781  & 4.224 & 0.001164 \\
+2048 & 113 & 0.244 & 72.544  & 4.210 & 0.001104 \\
+\hline
+\end{tabular}
+\caption{TPG direct-BCOO construction by fixed OD chunk size. The 2048 case
+was the largest tested safe value. At 512 and above every destination group
+fits in one call, so larger chunks do not reduce the 113 calls.}
+\label{tab:tpg-operator-construction}
+\end{table}
+
+These measurements were rerun on the EPFL Scitas Jed server with Python 3.14.5,
+JAX 0.11.0, and NumPyro 0.21.0. At chunk size 1024, device synchronization
+accounted for 71.316 s of the 72.781 s construction; NumPy transfer took only
+0.0065 s and compilation occurred exactly once. Relative to the 3.3866 s Jed
+reference evaluation, the measured construction break-even is approximately
+21.5 evaluations. Fresh processes validated and loaded the persistent cache in
+0.0203--0.0210 s. The chunk-1024 construction process peaked at 4.224 GiB RSS;
+the complete sequential benchmark batch peaked at 6.16 GiB.
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{rrrrrr}
+\hline
+Iterations & Evaluations & Loader (s) & Cached BCOO (s) & Speedup & Objective difference \\
+\hline
+1  & 4  & 14.814  & 0.950 & $15.6\times$ & 0.0000 \\
+5  & 8  & 34.514  & 7.127 & $4.8\times$  & 0.0039 \\
+20 & 24 & 104.566 & 17.413 & $6.0\times$  & 0.0078 \\
+\hline
+\end{tabular}
+\caption{Fresh-process TPG optimizer timings from the unchanged profiling
+harness on Jed. Compilation is reported separately by that harness. Warm cached
+BCOO value-and-gradient time was 0.001007--0.001276 s, versus
+3.378727--3.657539 s for the fixed-routing loader.}
+\label{tab:tpg-operator-harness}
+\end{table}
+
+Across three distinct demand vectors, the maximum absolute differences were
+0.00390625 for the objective, 0.001953125 for the likelihood, and
+$2.861\times10^{-6}$ for any gradient coordinate, consistent with float32
+rounding. Tests also cover raw measurement predictions, frozen-zero cells,
+positive frozen offsets, cache round trips, corrupt-cache rebuilds, and
+provenance mismatch rejection.
+

@@ -1,0 +1,27 @@
+\paragraph{OD blocks without network cuts.}
+For problems too large for a monolithic solve, the package partitions only the
+free OD columns.  The default deterministic order is destination group, time
+bin, and then free-column index, with deterministic subdivision of oversized
+groups and optional merging of small compatible groups.  Every block uses the
+complete time-expanded network; partitioning never removes links or prevents a
+path from traversing another part of the service.  User-defined partitions are
+accepted only if every free column occurs exactly once and no frozen column is
+present.  Block membership and the complete partition are fingerprinted.
+
+Let $B$ be the active block, $A_B$ its independently constructible operator,
+and $\widehat{\bm y}$ the current complete prediction.  A trial changes only
+$\bm f_B$ and is evaluated incrementally as
+\[
+\widehat{\bm y}_{\mathrm{trial}}
+=\widehat{\bm y}+A_B
+ (\bm f_B^{\mathrm{trial}}-\bm f_B).
+\]
+The remaining OD variables are held fixed.  An update is accepted only if it is
+finite, respects the bounds, and does not increase the complete objective beyond
+the numerical acceptance tolerance.  Damping and backtracking are applied when
+needed.  Rejected updates leave the complete state unchanged.  Separable
+quadratic priors are evaluated conditionally; unsupported cross-block prior or
+constraint coupling is rejected rather than ignored.  Exact full products are
+performed at configurable validation boundaries to detect incremental drift,
+not after every block.
+

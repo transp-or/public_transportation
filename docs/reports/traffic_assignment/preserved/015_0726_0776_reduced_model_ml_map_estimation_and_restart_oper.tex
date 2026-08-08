@@ -1,0 +1,51 @@
+\subsubsection{Reduced-model ML/MAP estimation and restart operations}
+\label{sec:reduced-od-estimator}
+
+Phase~10 fits the minimal gravity model through
+\path{public_transportation.inference.reduced_od.estimator}.  Maximum
+likelihood minimizes the negative log likelihood from
+Section~\ref{sec:reduced-od-minimal-gravity}.  MAP uses the same compiled
+objective and adds independent Gaussian penalties on the \emph{raw},
+unconstrained parameter vector $\bm\eta$:
+\[
+  Q_{\mathrm{MAP}}(\bm\eta)
+  =-\ell(\bm\eta)
+   +\frac12\sum_j
+    \left(\frac{\eta_j-m_j}{s_j}\right)^2.
+\]
+The softplus transformation described above is applied after this raw-vector
+prior.  Thus a prior intended for a transformed behavioral coefficient must be
+converted deliberately rather than being interpreted as a raw Gaussian.
+Setting every $s_j=+\infty$ gives an exactly flat penalty and makes MAP
+numerically identical to ML.  A finite informative prior generally changes the
+estimate, especially in weakly identified directions; neither estimate should
+be expected to equal a Bayesian posterior mean.
+
+SciPy L-BFGS-B drives a JIT-compiled JAX value-and-gradient calculation.  The
+optimizer dimension is the small number of gravity and production-basis
+parameters, not the number of feasible OD cells.  Objective evaluations retain
+only grouped demand and compact response arrays.  They cannot call detailed
+assignment, reconstruct a full OD vector, or write per-cell iteration output.
+Compilation and optimization times, evaluation and iteration counts, final
+gradient norm, likelihood, prior contribution, method, and model fingerprint
+are recorded separately.
+
+The operational layer in \path{operations.py} defines immutable fit manifests
+and atomic JSON checkpoints.  A checkpoint contains the model fingerprint,
+method, parameter dimension, latest raw parameters, objective, iteration, and
+elapsed time.  Resume first requires exact manifest compatibility; a cache from
+a different problem, statistical model, method, or dimension fails closed.
+Progress callbacks and checkpoint writes occur only at declared iteration
+boundaries.  A deadline produces status \texttt{deadline}, saves a resumable
+checkpoint, and never claims successful completion.  Result files likewise
+carry an explicit \texttt{complete}, \texttt{deadline}, or \texttt{failed}
+status.
+
+On the public 20,000-cell, 2,000-measurement synthetic benchmark, the
+two-parameter ML fit compiled in about 0.13 seconds and completed 12 L-BFGS
+iterations (30 value/gradient evaluations) in about 0.021 seconds after
+compilation.  Writing a small checkpoint at every iteration did not dominate
+this run; the final checkpoint was 237 bytes.  These figures demonstrate that
+the operational wrapper has no visible cell-wise Python loop, but they remain
+machine-dependent and do not replace the full-network admission benchmark.
+

@@ -1,0 +1,15 @@
+\subsection{Numerical optimization and local uncertainty}
+
+The current point-estimation implementation minimizes $Q_w$ with gradient-based
+SciPy optimizers such as BFGS or L-BFGS-B. Gradients are supplied by JAX automatic
+differentiation. Because the objective need not be globally convex, convergence
+to the global optimum is not guaranteed; initialization, stopping tolerances, and
+local curvature should therefore be inspected.
+
+When requested, the software computes the Hessian of $Q_w$ at the optimum and
+uses its inverse as a local covariance approximation. For ML this is an asymptotic
+likelihood-based approximation; for MAP it is a Laplace-style local approximation
+to posterior curvature. These standard errors are not equivalent to a complete
+posterior distribution and may be unreliable for weakly identified, asymmetric,
+bounded, or multimodal problems.
+

@@ -1,0 +1,9 @@
+\paragraph{Activation policy.}
+The modes are \texttt{off}, \texttt{auto}, \texttt{dense}, and \texttt{bcoo}.
+Explicit modes are preserved. In automatic mode, a valid BCOO cache is reused
+immediately. Without a valid cache, construction is selected only when the
+expected number of evaluations multiplied by the measured per-evaluation saving
+exceeds the expected construction time. Missing construction evidence or a
+nonpositive saving keeps the ordinary fixed-routing loader active. Estimated
+dispersion always disables the operator irrespective of this policy.
+

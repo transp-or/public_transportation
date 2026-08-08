@@ -1,0 +1,51 @@
+\section{Free and Frozen OD Demand Cells}
+
+An estimation run may hold a selected subset of OD/time-bin cells at predefined
+nonnegative values. Let $\mathcal{I}=\{1,\ldots,n_{\mathrm{OD}}\}$ be the full
+assignment indexing, and partition it into the free set $\mathcal{U}$ and the
+frozen set $\mathcal{F}$, with
+$\mathcal{U}\cap\mathcal{F}=\varnothing$ and
+$\mathcal{U}\cup\mathcal{F}=\mathcal{I}$. For each $i\in\mathcal{F}$, let
+$c_i\geq 0$ denote its predefined flow. The demand reconstruction is
+\[
+f_i(\bm z_{\mathcal U})=
+\begin{cases}
+f_i^{(0)}\exp(z_i), & i\in\mathcal{U},\\
+c_i, & i\in\mathcal{F}.
+\end{cases}
+\]
+The smooth bounded transformation described previously is applied to the raw
+coordinate associated with each $z_i$, $i\in\mathcal U$.
+
+The frozen cells are not represented by dummy parameters. They occur neither in
+the optimizer vector nor in the Bayesian guide, prior, gradient, Hessian, or
+covariance matrix. The full vector $\bm f$ is reconstructed only at the boundary
+of the assignment model, because assignment necessarily consumes all OD cells.
+Thus the statistical dimension is exactly
+\[
+d=|\mathcal U|+\mathbf{1}\{\theta\text{ is estimated}\},
+\]
+independently of $|\mathcal F|$. A frozen value may be zero or positive. In
+contrast, a free cell requires a strictly positive baseline $f_i^{(0)}$, since
+the multiplicative parameterization cannot move away from a zero baseline.
+
+Frozen values are supplied by a sparse CSV file with columns
+\path{origin_stop_id}, \path{dest_stop_id}, \path{time_bin_id}, and optionally
+\path{fixed_flow}. A missing or blank \path{fixed_flow} denotes zero. Keys are
+validated against the scenario,
+duplicates are rejected, and the free/frozen partition is constructed in the
+canonical assignment order. The same immutable partition is passed to ML, MAP,
+and Bayesian VI. Saved results include the free indices, frozen indices, and
+frozen values so that downstream processing can verify the invariant.
+The layout also has its own canonical SHA-256 fingerprint, computed from the OD
+keys, partition indices, free baselines, and frozen values. This fingerprint is
+stored separately from the network/assignment fingerprint: changing only the
+frozen-demand file must therefore change the layout identity even though the
+network identity remains unchanged. The canonical JSON payload used to compute
+the digest is persisted with the result. On loading, the digest is recomputed
+from that payload to detect corruption or manual modification. During
+post-processing, the layout is rebuilt from the current scenario and
+\path{fixed_demand.csv}; its fingerprint must match the result fingerprint
+before assignment or report generation proceeds. The network fingerprint and
+layout fingerprint are checked independently.
+

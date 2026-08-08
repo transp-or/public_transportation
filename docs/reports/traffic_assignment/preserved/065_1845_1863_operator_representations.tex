@@ -1,0 +1,19 @@
+\paragraph{Operator representations.}
+All solvers use a common forward--transpose protocol.  Small problems may use a
+dense reference operator.  Production alternatives include a native sparse
+operator with versioned persistence, a matrix-free operator that performs fixed
+routing during each product, and a sharded sparse operator whose construction
+and resident storage are bounded.  The fixed offset $\bm c$ is assembled once.
+Cache identities cover the assignment and OD layouts, fixed demand,
+measurement mapping, routing parameter, numeric representation, construction
+configuration, schema, and package version.  Cache writes are atomic and an
+incomplete, corrupt, or incompatible artifact is never accepted as complete.
+
+The monolithic solver interface currently provides a dense reference backend
+and a bound-constrained TRF/LSMR backend.  Results are returned in physical
+demand units with objective components, residuals, gradients, bound KKT
+diagnostics, elapsed time, and available forward/transpose product counts.
+Exact rank and resolution analysis is reserved for small problems.  The
+scalable path instead uses reproducible spectral and randomized probes and
+reports their convergence and Monte Carlo uncertainty explicitly.
+

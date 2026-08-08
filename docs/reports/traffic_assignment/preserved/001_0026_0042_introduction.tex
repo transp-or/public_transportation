@@ -1,0 +1,17 @@
+\section{Introduction}
+
+This document describes the modeling assumptions, mathematical formulation, and inference components implemented in the software. It is intended as technical documentation for users and developers of the package.
+
+The objective of this software is to infer an aggregate representation of public transportation demand from operational data. The demand is characterized by a flow for each origin--destination (OD) pair and each desired departure time interval.
+
+The software follows four main steps:
+\begin{enumerate}
+\item Develop a detailed network representation of the public transportation system.
+\item Formulate an assignment model that maps an OD matrix to passenger flows on the network.
+\item Define measurement equations linking model outputs to observed data,
+yielding either a likelihood or an explicitly weighted linear objective.
+\item Detect topology-driven structural-zero OD cells before estimation.
+\item Estimate demand using ML, MAP, fixed-routing linear and block-coordinate
+methods, or Bayesian variational inference.
+\end{enumerate}
+

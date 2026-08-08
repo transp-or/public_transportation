@@ -1,0 +1,22 @@
+\subsubsection{Flow propagation}
+
+Fix an OD pair $q=(s_o,s_d)$ and a departure time interval $t\in\mathcal{T}$.
+The corresponding demand $f_q^t$ is injected at the origin centroid-in node $(s_o,t)^{\mathrm{in}}$.
+
+Let $y_i$ denote the flow reaching node $i$ during the forward pass. Initialization is
+\[
+y_{(s_o,t)^{\mathrm{in}}}=f_q^t,
+\qquad
+y_i=0 \quad \text{for all } i \neq (s_o,t)^{\mathrm{in}}.
+\]
+Given transition probabilities $P_\ell(i)$ on outgoing links $\ell=(i\to j)$, link flows are
+\[
+x_\ell = y_i\, P_\ell(i),
+\qquad \ell=(i\to j),
+\]
+and node flows are propagated in topological order by
+\[
+y_j \leftarrow y_j + x_\ell,
+\qquad \ell=(i\to j).
+\]
+

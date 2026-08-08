@@ -1,0 +1,13 @@
+\paragraph{Variational approximation.}
+The implemented Bayesian procedure reports means and other summaries computed from
+the variational approximation $q_\phi$, not from the exact posterior. Differences
+between MAP and VI results can therefore arise from three distinct sources:
+\begin{enumerate}
+\item the intrinsic difference between a posterior mode and a posterior mean;
+\item approximation error introduced by the selected variational guide; and
+\item optimization and finite posterior-sampling error in the VI procedure.
+\end{enumerate}
+The posterior draws used to compute VI summaries introduce Monte Carlo variability,
+but this is not the only, and often not the dominant, reason for differences between
+the estimates.
+

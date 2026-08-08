@@ -30,6 +30,7 @@ from public_transportation.inference.assignment_adapter import (
 )
 from public_transportation.inference.sharded_fixed_routing import (
     FixedRoutingPreparationConfig,
+    fixed_routing_shard_path,
     load_fixed_routing_shard,
     plan_fixed_routing_shards,
     prepare_fixed_routing_sharded,
@@ -193,6 +194,20 @@ def test_sharded_preparation_matches_complete_and_resumes_from_cache(
     assert resumed.cache_hits == len(first.plan.descriptors)
     assert resumed.cache_misses == 0
     assert resumed.compilation_count == 0
+
+    damaged = fixed_routing_shard_path(
+        first.routing, first.plan.descriptors[0]
+    )
+    damaged.write_bytes(b"corrupt routing batch")
+    repaired = prepare_fixed_routing_sharded(
+        inputs=assignment_inputs,
+        theta=1.0,
+        config=config,
+    )
+    assert repaired.status == "completed"
+    assert repaired.reconstructed_shards == 1
+    assert repaired.cache_hits == len(first.plan.descriptors) - 1
+    assert list(damaged.parent.glob(f"{damaged.name}.invalid-*"))
 
 
 def test_sharded_detailed_profile_has_synchronized_warm_phase_diagnostics(

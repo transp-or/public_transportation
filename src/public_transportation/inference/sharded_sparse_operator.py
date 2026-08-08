@@ -229,7 +229,12 @@ def save_sparse_shard(
                 offset_indices=offset_positions,
                 offset_values=offset_values,
             )
+            stream.flush()
+            os.fsync(stream.fileno())
         serialization_seconds = perf_counter() - serialization_start
+        load_sparse_shard(
+            Path(temporary), expected_provenance_hash=provenance_hash
+        )
         filesystem_start = perf_counter()
         os.replace(temporary, destination)
         filesystem_seconds = perf_counter() - filesystem_start

@@ -1,0 +1,60 @@
+\subsection{Passenger journeys, vehicle legs, and observed events}
+\label{sec:journey-leg-event-contract}
+
+The OD demand $f_q^t$ is interpreted as \emph{passenger journey demand}.  A
+journey begins when a passenger first boards the public transport system at
+$s_o$ and ends when that passenger finally alights at $s_d$.  It may contain
+one or more \emph{vehicle legs}.  A vehicle leg is the movement on one vehicle
+trip between a boarding event and its corresponding alighting event.  Two
+consecutive legs are connected by a transfer; a journey with $L$ legs has
+$L-1$ transfers.  Boarding the first vehicle is not a transfer.
+
+This distinction is essential when boarding and alighting counts are used for
+OD estimation.  One unit of demand assigned to an $L$-leg journey contributes
+one boarding and one alighting on every leg.  It therefore generates one
+initial boarding, one final alighting, $L-1$ transfer alightings, and $L-1$
+transfer boardings.  A transfer boarding is not a new journey origin, and a
+transfer alighting is not a final journey destination.  Consequently, total
+boardings and alightings are generally not journey-origin and
+journey-destination marginals in a network with transfers.
+
+The atomic boarding or alighting observation is associated with one timetable
+event identified by measurement method, event type, stop, clock time, and a
+trip or an unambiguous line reference.  Platform, physical-stop, route-period,
+or other aggregates are derived views and require an explicit, versioned
+mapping.  The initial reduced-dimensional backend accepts boarding and
+alighting events; the existing \texttt{load} schema value is outside that
+backend until a corresponding response contract is implemented and tested.
+
+An absent record denotes an unobserved event and creates no likelihood term.  A
+present record whose value is zero is an observed zero and remains in the
+likelihood.  Duplicate, negative, non-finite, unmatched, and ambiguous records
+are errors; APC cleaning, outage exclusion, and imputation occur before the
+immutable observation table is constructed and are recorded as input
+provenance.
+
+The external OD key remains the triplet comprising
+\path{origin_stop_id}, \path{dest_stop_id}, and \path{time_bin_id}.  A
+platform-to-physical-stop mapping may be used for transfer construction, but it
+is an explicit, fingerprinted input.  An authoritative operator or GTFS
+parent-station mapping is preferred; a generated mapping requires review and
+cannot be accepted silently.  Published output remains at scenario-stop level
+unless an explicit aggregation policy requests physical stops.
+
+For a reduced conditional destination model, let $Q_{ot}$ denote the number of
+journeys whose first boarding occurs at origin $o$ in desired-departure bin
+$t$.  It must not be set equal to all boarding counts at $(o,t)$ when transfer
+boardings may be present.  The first reduced implementation therefore admits
+either externally provided journey-entry totals or productions estimated
+through a declared low-dimensional nonnegative basis with regularization.  It
+does not provide a raw-boarding production mode.  Which productions,
+attractiveness terms, route shares, detection parameters, and dispersion
+parameters are fixed, normalized, estimated, or regularized must be declared
+by every model specification.
+
+These definitions constitute the observation contract for the planned
+reduced-dimensional backend.  They do not redirect or replace the existing
+detailed assignment and estimation APIs.  The time-expanded assignment remains
+the explicit validation backend and is not evaluated inside the reduced
+objective or gradient.
+

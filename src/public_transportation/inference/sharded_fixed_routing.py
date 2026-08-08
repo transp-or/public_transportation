@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import tempfile
 import threading
+import uuid
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path
 from time import perf_counter, process_time
-from typing import Any, Callable, Literal
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal
 
 import numpy as np
 import jax
@@ -23,7 +25,10 @@ from public_transportation.compilation_cache import configure_jax_compilation_ca
 from .assignment_adapter import AssignmentInputs, _prepare_fixed_routing_core
 from .block_coordinate._canonical import fingerprint
 
-SHARDED_FIXED_ROUTING_SCHEMA_VERSION = 1
+if TYPE_CHECKING:
+    from .assignment_adapter import FixedRoutingInputs
+
+SHARDED_FIXED_ROUTING_SCHEMA_VERSION = 2
 SHARDED_FIXED_ROUTING_IMPLEMENTATION_VERSION = "dial-dp-fixed-routing-v1"
 ProgressCallback = Callable[["FixedRoutingShardProgress"], None]
 CachePolicy = Literal["reuse", "refresh"]
@@ -76,6 +81,7 @@ class FixedRoutingPreparationConfig:
     maximum_groups_per_shard: int = 8
     maximum_retained_bytes_per_shard: int = 256 * 1024 * 1024
     maximum_temporary_bytes: int = 1024 * 1024 * 1024
+    temporary_workspace_multiplier: float = 2.0
     maximum_process_rss_bytes: int | None = None
     maximum_cache_bytes: int | None = None
     maximum_elapsed_seconds: float | None = None
@@ -115,6 +121,13 @@ class FixedRoutingPreparationConfig:
             raise ValueError("maximum_elapsed_seconds must be positive when provided.")
         if self.dispatch_safety_margin_seconds < 0.0:
             raise ValueError("dispatch_safety_margin_seconds must be nonnegative.")
+        if (
+            not np.isfinite(self.temporary_workspace_multiplier)
+            or self.temporary_workspace_multiplier < 1.0
+        ):
+            raise ValueError(
+                "temporary_workspace_multiplier must be finite and at least one."
+            )
         if (
             self.initial_predicted_shard_seconds is not None
             and self.initial_predicted_shard_seconds <= 0.0
@@ -255,7 +268,9 @@ def plan_fixed_routing_shards(
     )
     # Routing preparation retains its output and uses at least one same-sized
     # working pair. This conservative public estimate is validated by benchmarks.
-    temporary_per_group = retained_per_group * 2
+    temporary_per_group = math.ceil(
+        retained_per_group * config.temporary_workspace_multiplier
+    )
     if retained_per_group > config.maximum_retained_bytes_per_shard:
         raise ValueError("one destination group exceeds the retained-byte ceiling.")
     if temporary_per_group > config.maximum_temporary_bytes:
@@ -735,6 +750,13 @@ def fixed_routing_shard_path(
     return routing.provenance.cache_directory / f"routing-shard-{descriptor.shard_index:06d}.npz"
 
 
+def fixed_routing_shard_content_hash(shard: FixedRoutingShard) -> str:
+    """Return the deterministic hash of one routing shard's scientific arrays."""
+    return _array_fingerprint(
+        shard.effective_group_link_mask, shard.group_link_probability
+    )
+
+
 def save_fixed_routing_shard(
     *,
     routing: ShardedFixedRoutingInputs,
@@ -754,16 +776,30 @@ def save_fixed_routing_shard(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
     )
     try:
+        content_hash = fixed_routing_shard_content_hash(shard)
         with os.fdopen(descriptor, "wb") as stream:
             np.savez(
                 stream,
                 identity=np.asarray(json.dumps(_shard_identity(routing, shard.descriptor), sort_keys=True)),
+                content_hash=np.asarray(content_hash),
                 effective_group_link_mask=shard.effective_group_link_mask,
                 group_link_probability=shard.group_link_probability,
             )
             stream.flush()
             if durable:
                 os.fsync(stream.fileno())
+        with np.load(temporary_name, allow_pickle=False) as staged:
+            staged_shard = FixedRoutingShard(
+                descriptor=shard.descriptor,
+                effective_group_link_mask=staged["effective_group_link_mask"],
+                group_link_probability=staged["group_link_probability"],
+            )
+            if str(staged["content_hash"].item()) != fixed_routing_shard_content_hash(
+                staged_shard
+            ):
+                raise FixedRoutingShardCacheError(
+                    "staged routing shard content hash mismatch."
+                )
         os.replace(temporary_name, path)
     except BaseException:
         Path(temporary_name).unlink(missing_ok=True)
@@ -788,6 +824,12 @@ def load_fixed_routing_shard(
                 effective_group_link_mask=payload["effective_group_link_mask"],
                 group_link_probability=payload["group_link_probability"],
             )
+            if str(payload["content_hash"].item()) != fixed_routing_shard_content_hash(
+                shard
+            ):
+                raise FixedRoutingShardCacheError(
+                    f"routing shard {descriptor.shard_index} content hash mismatch."
+                )
     except FixedRoutingShardCacheError:
         raise
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
@@ -799,6 +841,107 @@ def load_fixed_routing_shard(
     if str(shard.group_link_probability.dtype) != routing.probability_dtype:
         raise FixedRoutingShardCacheError("routing shard payload dtype mismatch.")
     return shard
+
+
+def _reuse_or_quarantine_fixed_routing_shard(
+    *, routing: ShardedFixedRoutingInputs, descriptor: FixedRoutingShardDescriptor
+) -> FixedRoutingShard | None:
+    path = fixed_routing_shard_path(routing, descriptor)
+    if not path.exists():
+        return None
+    try:
+        return load_fixed_routing_shard(routing=routing, descriptor=descriptor)
+    except FixedRoutingShardCacheError:
+        quarantine = path.with_name(f"{path.name}.invalid-{uuid.uuid4().hex}")
+        os.replace(path, quarantine)
+        return None
+
+
+def validate_sharded_fixed_routing_compatibility(
+    *, inputs: AssignmentInputs, routing: ShardedFixedRoutingInputs
+) -> None:
+    """Reject a sharded source prepared from different assignment inputs."""
+    if routing.graph is not inputs.graph:
+        raise ValueError("Sharded fixed routing was prepared for a different graph.")
+    identity = sharded_fixed_routing_identity(
+        inputs=inputs,
+        theta=routing.theta,
+        shard_partition=routing.shard_partition,
+    )
+    expected = fingerprint(identity)
+    if expected != routing.provenance.preparation_fingerprint:
+        raise ValueError("Sharded fixed routing is incompatible with assignment inputs.")
+
+
+def fixed_routing_descriptor_for_group(
+    routing: ShardedFixedRoutingInputs, group: int
+) -> FixedRoutingShardDescriptor:
+    """Return the unique shard descriptor containing one destination group."""
+    if group < 0 or group >= routing.num_destination_groups:
+        raise IndexError("destination group is outside the routing source.")
+    for descriptor in routing.shard_partition:
+        if descriptor.group_start <= group < descriptor.group_stop:
+            return descriptor
+    raise RuntimeError("routing partition does not cover the destination group.")
+
+
+def iter_fixed_routing_shards(
+    routing: ShardedFixedRoutingInputs,
+) -> Iterator[FixedRoutingShard]:
+    """Load validated shards in canonical order.
+
+    At most the yielded shard is retained by this generator itself.
+    """
+    for descriptor in routing.shard_partition:
+        yield load_fixed_routing_shard(routing=routing, descriptor=descriptor)
+
+
+def materialize_sharded_fixed_routing_dense(
+    *,
+    routing: ShardedFixedRoutingInputs,
+    inputs: AssignmentInputs,
+    memory_limit_bytes: int,
+) -> "FixedRoutingInputs":
+    """Explicitly materialize a small sharded source after a memory guard."""
+    from .assignment_adapter import FixedRoutingInputs
+
+    validate_sharded_fixed_routing_compatibility(inputs=inputs, routing=routing)
+    if memory_limit_bytes <= 0:
+        raise ValueError("memory_limit_bytes must be positive.")
+    required = routing.num_destination_groups * routing.num_links * (
+        np.dtype(bool).itemsize + np.dtype(routing.probability_dtype).itemsize
+    )
+    if required > memory_limit_bytes:
+        raise MemoryError(
+            "dense fixed-routing materialization requires "
+            f"{required} bytes, above the explicit {memory_limit_bytes}-byte limit."
+        )
+    masks = np.empty(
+        (routing.num_destination_groups, routing.num_links), dtype=bool
+    )
+    probabilities = np.empty(
+        (routing.num_destination_groups, routing.num_links),
+        dtype=np.dtype(routing.probability_dtype),
+    )
+    for descriptor in routing.shard_partition:
+        shard = load_fixed_routing_shard(routing=routing, descriptor=descriptor)
+        masks[descriptor.group_start : descriptor.group_stop] = (
+            shard.effective_group_link_mask
+        )
+        probabilities[descriptor.group_start : descriptor.group_stop] = (
+            shard.group_link_probability
+        )
+    return FixedRoutingInputs(
+        theta=jnp.asarray(routing.theta, dtype=inputs.base_link_cost.dtype),
+        graph=inputs.graph,
+        source_base_link_cost=inputs.base_link_cost,
+        group_dest_node=inputs.group_dest_node,
+        source_group_link_mask=inputs.group_link_mask,
+        effective_group_link_mask=jnp.asarray(masks),
+        group_link_probability=jnp.asarray(probabilities),
+        num_nodes=routing.num_nodes,
+        num_links=routing.num_links,
+    )
 
 
 def _manifest_path(routing: ShardedFixedRoutingInputs) -> Path:
@@ -963,14 +1106,18 @@ def _prepare_fixed_routing_sharded_threads(
     for descriptor in plan.descriptors:
         path = fixed_routing_shard_path(routing, descriptor)
         if path.exists() and cache_policy == "reuse":
-            load_fixed_routing_shard(routing=routing, descriptor=descriptor)
-            completed.append(descriptor.shard_index)
-            cache_hits += 1
-            cache_bytes += path.stat().st_size
-        else:
-            cache_misses += 1
-            reconstructed += int(path.exists())
-            missing.append(descriptor)
+            cached = _reuse_or_quarantine_fixed_routing_shard(
+                routing=routing, descriptor=descriptor
+            )
+            if cached is not None:
+                completed.append(descriptor.shard_index)
+                cache_hits += 1
+                cache_bytes += path.stat().st_size
+                continue
+            reconstructed += 1
+        cache_misses += 1
+        reconstructed += int(path.exists() and cache_policy != "reuse")
+        missing.append(descriptor)
 
     if not missing:
         elapsed = clock() - started
@@ -1802,14 +1949,18 @@ def _prepare_fixed_routing_sharded_batched(
     for descriptor in plan.descriptors:
         path = fixed_routing_shard_path(routing, descriptor)
         if path.exists() and cache_policy == "reuse":
-            load_fixed_routing_shard(routing=routing, descriptor=descriptor)
-            completed.append(descriptor.shard_index)
-            cache_hits += 1
-            cache_bytes += path.stat().st_size
-        else:
-            cache_misses += 1
-            reconstructed += int(path.exists())
-            missing.append(descriptor)
+            cached = _reuse_or_quarantine_fixed_routing_shard(
+                routing=routing, descriptor=descriptor
+            )
+            if cached is not None:
+                completed.append(descriptor.shard_index)
+                cache_hits += 1
+                cache_bytes += path.stat().st_size
+                continue
+            reconstructed += 1
+        cache_misses += 1
+        reconstructed += int(path.exists() and cache_policy != "reuse")
+        missing.append(descriptor)
 
     padded_batch_size = config.shards_per_execution_batch
     estimated_batch_temporary = (
@@ -2303,17 +2454,17 @@ def prepare_fixed_routing_sharded(
             break
         path = fixed_routing_shard_path(routing, descriptor)
         if path.exists() and cache_policy == "reuse":
-            try:
-                shard = load_fixed_routing_shard(routing=routing, descriptor=descriptor)
-            except FixedRoutingShardCacheError:
-                _write_manifest(routing=routing, completed=completed, status="cache_mismatch", elapsed_seconds=clock() - started, durable=config.durable_progress)
-                raise
-            hits += 1
-            cache_bytes += path.stat().st_size
-            completed.append(descriptor.shard_index)
-            emit("cache_load", "cache_hit", descriptor, 0.0)
-            del shard
-            continue
+            shard = _reuse_or_quarantine_fixed_routing_shard(
+                routing=routing, descriptor=descriptor
+            )
+            if shard is not None:
+                hits += 1
+                cache_bytes += path.stat().st_size
+                completed.append(descriptor.shard_index)
+                emit("cache_load", "cache_hit", descriptor, 0.0)
+                del shard
+                continue
+            reconstructed += 1
         misses += 1
         if path.exists():
             reconstructed += 1
@@ -2340,31 +2491,42 @@ def prepare_fixed_routing_sharded(
             group_link_mask=masks_device,
         )
         if compiled is None:
+            emit("trace", "started", descriptor, None)
             phase_started = clock()
             traced = _prepare_fixed_routing_core.trace(inputs=shard_inputs, theta=theta_array)
             tracing += clock() - phase_started
+            emit("trace", "completed", descriptor, tracing)
             if absolute_deadline is not None and clock() >= absolute_deadline:
                 status, deadline_phase, indivisible_overshoot = "deadline_reached", "tracing", True
                 break
+            emit("lowering", "started", descriptor, None)
             phase_started = clock()
             lowered = traced.lower()
             lowering += clock() - phase_started
+            emit("lowering", "completed", descriptor, lowering)
             if absolute_deadline is not None and clock() >= absolute_deadline:
                 status, deadline_phase, indivisible_overshoot = "deadline_reached", "lowering", True
                 break
+            emit("compilation", "started", descriptor, None)
             phase_started = clock()
             compiled = lowered.compile()
             compilation += clock() - phase_started
             compilation_count += 1
+            emit("compilation", "completed", descriptor, compilation)
             if absolute_deadline is not None and clock() >= absolute_deadline:
                 status, deadline_phase, indivisible_overshoot = "deadline_reached", "compilation", True
                 break
+        emit("batch_execution", "started", descriptor, None)
         phase_started = clock()
         effective, probability = compiled(inputs=shard_inputs, theta=theta_array)
         kernel_execution_seconds = clock() - phase_started
+        emit(
+            "batch_execution", "completed", descriptor, kernel_execution_seconds
+        )
         phase_started = clock()
         jax.block_until_ready((effective, probability))
         synchronization_seconds = clock() - phase_started
+        emit("synchronization", "completed", descriptor, synchronization_seconds)
         if absolute_deadline is not None and clock() >= absolute_deadline:
             status, deadline_phase, indivisible_overshoot = "deadline_reached", "shard execution", True
             break
@@ -2372,6 +2534,7 @@ def prepare_fixed_routing_sharded(
         effective_host = np.asarray(effective)
         probability_host = np.asarray(probability)
         host_transfer_seconds = clock() - phase_started
+        emit("host_transfer", "completed", descriptor, host_transfer_seconds)
         phase_started = clock()
         effective_slice = effective_host[:count]
         probability_slice = probability_host[:count]

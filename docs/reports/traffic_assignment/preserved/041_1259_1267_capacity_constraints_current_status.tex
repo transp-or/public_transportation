@@ -1,0 +1,9 @@
+\subsubsection{Capacity constraints (current status)}
+
+Although ride links are associated with nominal capacities $u_\ell$ in the data structure, the current
+implementation does not incorporate capacity-dependent penalties into generalized costs. All assignment computations
+are therefore performed without congestion or overload effects.
+
+Introducing capacity-aware penalties while preserving differentiability (e.g., using smooth overload functions such
+as softplus penalties) is a natural future extension, but it is not part of the current version of the software.
+

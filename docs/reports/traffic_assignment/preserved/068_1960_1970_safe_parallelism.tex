@@ -1,0 +1,11 @@
+\paragraph{Safe parallelism.}
+Independent block operators can be constructed and cached concurrently.  For
+block solves, the software builds a conflict graph whose nodes are blocks and
+whose edges represent shared measurement support or declared prior/constraint
+coupling.  A deterministic coloring gives batches with disjoint exact update
+support.  Such blocks may be solved concurrently and their deltas are merged
+atomically in deterministic order.  Overlapping proposals are never treated as
+independent Gauss--Seidel updates.  Construction workers, solver workers, and
+threads per worker are explicit, and their product is checked against the
+available CPUs; native numerical thread pools are bounded as well.
+

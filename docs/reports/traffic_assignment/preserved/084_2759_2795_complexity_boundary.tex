@@ -1,0 +1,37 @@
+\paragraph{Complexity boundary.}
+The software exposes a structural complexity profile so that dimensionality can
+be audited without relying on machine-dependent timings. For reduced dimension
+$d$ and effective low rank $r_q^{\mathrm{eff}}$, the principal statistical
+state sizes are
+\[
+\begin{array}{c|c}
+\text{state} & \text{number of scalar entries}\\ \hline
+\text{optimizer vector or gradient} & d\\
+\text{diagonal Gaussian guide} & 2d\\
+\text{low-rank Gaussian guide} & 2d+d r_q^{\mathrm{eff}}\\
+\text{full Gaussian guide} & d+d(d+1)/2\\
+\text{dense Hessian or covariance} & d^2.
+\end{array}
+\]
+These statistical quantities depend only on the free cells and optional
+$\theta$, not on the number of frozen cells.
+
+There is a separate deterministic cost boundary. Each likelihood evaluation
+passes a compact demand vector containing the $n_{\mathrm{free}}$ free cells and
+the $n_{\mathrm{fixed},+}$ strictly positive frozen cells. Frozen-zero cells are
+absent from that vector, from the padded OD group arrays, and from assignment
+demand injection. A destination group is also removed when it contains no
+remaining cell. Thus the assignment demand-vector size is
+$n_{\mathrm{free}}+n_{\mathrm{fixed},+}$ rather than $n_{\mathrm{OD}}$.
+The time-expanded graph and other scenario-wide static arrays remain unchanged,
+so forward runtime still depends on the graph and on the surviving destination
+groups. Positive frozen flows must participate in assignment predictions; when
+$\theta$ is estimated, even their route-choice probabilities change with the
+estimated parameter. The full $n_{\mathrm{OD}}$ vector is reconstructed only
+after estimation for persistence and reporting.
+For every VI, ML, or MAP problem, the implementation reports the total, free,
+frozen-zero, and frozen-positive OD counts; the compact assignment-vector size;
+and the original, surviving, and removed destination-group counts. These
+structural metrics accompany elapsed time so that runtime differences can be
+interpreted in terms of the work actually performed by the assignment model.
+

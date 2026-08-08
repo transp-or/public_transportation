@@ -1,0 +1,30 @@
+% Mechanical relocation generated from the preservation ledger.
+% Existing prose is included byte-for-byte from preserved blocks.
+
+\input{traffic_assignment/preserved/089_2895_2913_bayesian_inference_via_vi_introduction.tex}
+\input{traffic_assignment/preserved/090_2914_2929_variational_approximation.tex}
+\input{traffic_assignment/preserved/091_2930_2942_guide_family.tex}
+\paragraph{Positive route-choice dispersion.}
+When $\theta$ is estimated, an unconstrained variable $\widetilde u$ is mapped
+smoothly by
+\[
+ u=u_{\max}\tanh(\widetilde u/u_{\max}),
+ \qquad \theta=\exp(u),
+\]
+and a Gaussian prior is placed on $\widetilde u$. If a requested prior center
+$\mu_u$ is specified in effective log-dispersion space, its raw center is
+\[
+ \mu_{\widetilde u}
+ =u_{\max}\operatorname{arctanh}(\mu_u/u_{\max}),
+ \qquad |\mu_u|<u_{\max}.
+\]
+\input{traffic_assignment/preserved/093_2975_2992_posterior_transformation_and_reporting.tex}
+
+\subsection{Interpretation of the Variational Result}
+
+Bayesian inference targets a distribution rather than a point. Posterior means,
+medians, modes, and transformed summaries need not equal ML or MAP. Variational
+inference adds another approximation by restricting the posterior to a declared
+guide family. Its uncertainty estimates must therefore be checked for
+optimization stability and, where possible, against simulation, local
+curvature, or a more accurate reference on a reduced problem.

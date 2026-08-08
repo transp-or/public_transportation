@@ -1,5 +1,47 @@
 # Release notes
 
+## Desired-departure response averaging
+
+- Added supply-independent uniform-midpoint sampling of desired passenger
+  departure times, completed-journey feasibility conditioning, deterministic
+  weighted path/response merging, controlled infeasibility reasons, sampling
+  preflight and convergence reports, pre-estimation observation diagnostics,
+  advisory recommendations, structured progress, and phase-specific persistent
+  invalidation. The legacy one-representative-departure mode remains available
+  only as an explicitly low-fidelity comparison.
+
+## Composable reduced-dimensional demand family
+
+- Added a resolved specification with independently selectable production,
+  attraction, impedance, low-rank interaction, and Poisson/NB/ZIP/ZINB blocks;
+  deterministic named layouts and warm starts; generic hierarchical grouping;
+  and evidence-versus-assumption diagnostics. The former minimal gravity API
+  remains available as the reproducibility baseline.
+
+## Reduced-OD numerical and model-admission hardening
+
+- Likelihood comparison now accepts separate Poisson and negative-binomial fit
+  configurations, resolves optional named bounds against canonical raw
+  parameter names, records resolved layouts and bounds, and emits structured
+  compilation, optimization, checkpoint, deadline, and scenario progress.
+- Added an explicit float64-required precision contract with compiled dtype and
+  objective-scale tolerance-resolution diagnostics. Float32 demotion cannot
+  silently satisfy an unrepresentable L-BFGS-B function tolerance.
+- Separated raw optimizer termination from finite projected-gradient numerical
+  convergence and caller-controlled scientific admission, while preserving
+  SciPy status and messages.
+- Added transformed parameter, compact origin-period production, bounds, MAP
+  contribution, symmetric Hessian, rank, condition, and named weak-direction
+  diagnostics.
+- Added reusable Poisson/negative-binomial comparison and deterministic prior
+  sensitivity utilities that operate on one prepared compact problem.
+- Split preprocessing configuration identities by phase. Model-only changes
+  reuse timetable, journey choices, measurement response, equivalence, and the
+  reduced response operator; production changes rebuild only dependent compact
+  features, while journey-policy changes reuse the timetable and rebuild
+  downstream phases.
+- Added throttled structured progress inside the journey-query loop.
+
 - Added progressive-fidelity gravity objective and gradient evaluation with a
   validated 1--100 effort contract, deterministic nested stratified shard
   selection, Horvitz--Thompson additive-count expansion, matching sampled
@@ -10,6 +52,14 @@
   on a small dense problem, where fixed dispatch overhead dominates.
 
 ## Unreleased
+
+- Documented the 2026-08-05 full-network stochastic-gravity validation. The
+  sequential streaming evaluator reduced internal peak RSS from 98.67 GiB
+  exact to about 8.5 GiB, validating its memory bound. Uniform persisted-shard
+  sampling did not provide an optimization-quality tradeoff: 10% effort had
+  19.2% relative gradient error, while 25% effort was slower than exact and
+  still had 17.2% gradient error. Sub-100% uniform evaluation remains an
+  experimental diagnostic capability; quality indicators are not error bounds.
 
 ### Parallel partial-routing foundation
 
@@ -225,3 +275,12 @@
 - Added a public 512-column synthetic benchmark. Automatic batching reduced
   graph evaluations from 512 to 1 and numerical construction time from 0.361 s
   to 0.101 s (3.58×) while producing exactly identical sparse operators.
+- Corrected desired-departure integration to preserve canonical free,
+  fixed-zero, and fixed-positive cell status independently of timetable
+  feasibility. Sampling now accepts exact sparse origin-period support, cache
+  identity includes that support and fixed values, fixed-only groups do not
+  create production requirements, and preflight reports avoided Cartesian
+  queries. Legacy diagnostic payloads that no longer match the installed
+  dataclass schema are now reported as incompatible caches, allowing
+  `reuse_or_build` to rebuild them safely instead of leaking a decoding
+  `TypeError`.

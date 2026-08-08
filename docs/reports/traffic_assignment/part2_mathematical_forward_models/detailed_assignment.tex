@@ -1,0 +1,72 @@
+% Mechanical relocation generated from the preservation ledger.
+% Existing prose is included byte-for-byte from preserved blocks.
+
+\section{Detailed Assignment Model}
+
+This model provides the most explicit representation of passenger movements
+used in the report. Its purpose is to define the behavioral reference against
+which reduced or fixed-routing responses are interpreted and validated. The
+section first states its scope, then constructs the time-expanded network and
+costs, and finally derives route probabilities and flow propagation.
+
+\subsection{Scope and Assumptions}
+
+The detailed forward model maps passenger-journey demand to expected movements
+and observed events on a scheduled public-transport network.  Its mathematical
+interpretation relies on the following assumptions.
+\begin{enumerate}
+  \item The timetable, stop geography, admissible access window, transfer
+        rules, and generalized link costs are exogenous during one assignment.
+  \item Demand is indexed by origin, final destination, and desired-departure
+        interval.  It represents complete passenger journeys, not individual
+        vehicle legs.
+  \item Route choice follows the stated Dial--logit construction on the
+        admissible time-expanded graph.  The dispersion parameter and all cost
+        coefficients are common inputs unless a model explicitly defines
+        segmentation.
+  \item Passengers do not alter travel times, vehicle capacity, or route-choice
+        probabilities.  There is no denied boarding or crowding feedback in
+        the current model.
+  \item Conditional on demand and routing probabilities, expected flows are
+        additive across OD-time cells.  This is an expectation model; it does
+        not preserve individual simulated passenger identities.
+\end{enumerate}
+These assumptions define the domain in which fixed-routing loading is exact.
+Changing a routing-sensitive input requires a new routing calculation, while
+changing demand alone does not.
+
+Fixed routing does not impose one route or one vector of route shares on a
+physical OD pair for the entire day. Each departure-time cell accesses its own
+scheduled trips and connections and can therefore have different alternatives
+and probabilities. ``Fixed'' means only that these cell-specific probabilities
+are held constant while demand parameters change. Because crowding, capacity,
+and denied boarding do not currently feed back into costs or availability,
+this is consistent with the present assignment. A capacity-dependent model
+would instead require routing and demand estimation to be coupled.
+
+\subsection{Departure-Time and Access Assumptions}
+
+\input{traffic_assignment/preserved/023_0954_0960_desired_departure_interval_and_boarding_window.tex}
+\input{traffic_assignment/preserved/024_0961_0972_admissible_access_links.tex}
+\input{traffic_assignment/preserved/025_0973_0994_schedule_deviation_penalty.tex}
+\input{traffic_assignment/preserved/027_1004_1069_network_representation.tex}
+\input{traffic_assignment/preserved/028_1070_1161_remark_following_network_representation.tex}
+\input{traffic_assignment/preserved/029_1162_1176_generalized_cost_introduction.tex}
+\input{traffic_assignment/preserved/030_1177_1181_link_type_specific_cost_formulation.tex}
+\input{traffic_assignment/preserved/031_1182_1192_ride_links.tex}
+\input{traffic_assignment/preserved/032_1193_1202_dwell_continue_links.tex}
+\input{traffic_assignment/preserved/033_1203_1214_transfer_links.tex}
+\input{traffic_assignment/preserved/034_1215_1231_access_links.tex}
+\input{traffic_assignment/preserved/035_1232_1234_egress_links.tex}
+\input{traffic_assignment/preserved/036_1235_1241_interpretation_of_cost_coefficients.tex}
+\input{traffic_assignment/preserved/037_1242_1243_assignment_model_introduction.tex}
+\input{traffic_assignment/preserved/038_1244_1247_assignment_input.tex}
+\input{traffic_assignment/preserved/039_1248_1253_assignment_procedure.tex}
+\input{traffic_assignment/preserved/040_1254_1258_differentiable_dial_style_assignment.tex}
+\input{traffic_assignment/preserved/041_1259_1267_capacity_constraints_current_status.tex}
+\input{traffic_assignment/preserved/042_1268_1299_meaning_of_fixed_routing.tex}
+\input{traffic_assignment/preserved/043_1300_1311_logit_routing_model.tex}
+\input{traffic_assignment/preserved/044_1312_1316_computational_and_behavioral_motivation.tex}
+\input{traffic_assignment/preserved/046_1348_1369_flow_propagation.tex}
+\input{traffic_assignment/preserved/047_1370_1373_destination_gating.tex}
+\input{traffic_assignment/preserved/055_1519_1528_validity_and_fallback.tex}

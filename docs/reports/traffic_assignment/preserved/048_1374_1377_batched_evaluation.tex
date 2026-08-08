@@ -1,0 +1,4 @@
+\paragraph{Batched evaluation.}
+For computational efficiency, value functions and flow propagation are computed in batches for OD groups sharing the same destination
+(and, depending on the implementation, the same departure interval), enabling vectorized evaluation with JAX.
+

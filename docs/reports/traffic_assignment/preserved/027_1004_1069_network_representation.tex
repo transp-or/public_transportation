@@ -1,0 +1,66 @@
+\subsection{Network Representation}
+
+The public transportation system is represented as a directed
+time-expanded graph. All timetable times (arrival/departure event times) are expressed in minutes on the same time axis as the departure-time intervals.
+
+A key modeling choice is (i) the separation of each stop centroid into two
+distinct nodes (an origin \emph{centroid-in} and a destination \emph{centroid-out}),
+and (ii) the split of each timetable event into an \emph{arrival} and a
+\emph{departure} node. This second split prevents ill-defined instantaneous
+moves (e.g., transferring or boarding at the exact same time as arrival) and
+ensures that all links respect a strict chronological (or lexicographic) order,
+so that the resulting time-expanded network is acyclic.
+
+\begin{definition}[Nodes]
+The node set consists of three families of nodes:
+\begin{itemize}
+  \item \textbf{Centroid-in nodes (non time-tagged, indexed by departure interval):}
+      for each stop $s\in\mathcal{S}$ and for each departure interval $t\in\mathcal{T}$,
+      a node
+      \[
+      (s,t)^{\mathrm{in}}
+      \]
+      used as a demand-injection handle for passengers departing from stop $s$
+      with desired departure interval $t$. These nodes do not correspond to a physical
+      time instant; they are placed \emph{before all event nodes} in the topological
+      order (conceptually at $-\infty$). The interval index $t$ is used only to
+      (i) select admissible boarding events through the access-window rule, and
+      (ii) compute schedule-deviation penalties.
+  \item \textbf{Centroid-out nodes (non time-tagged):} for each stop $s\in\mathcal{S}$,
+      a node $s^{\mathrm{out}}$ representing the point where passengers arriving at stop
+      $s$ exit the network. These nodes are not associated with a physical time; they
+      are placed \emph{after all event nodes} in the topological order (conceptually
+      at $+\infty$) so that the global graph remains acyclic.
+  \item \textbf{Timetable event nodes (trip-specific, split into arrival and departure):}
+      for each stop $s$, each scheduled arrival time $\tau^{\mathrm{arr}}$ and departure time
+      $\tau^{\mathrm{dep}}$ associated with a given vehicle run (trip), we create two nodes
+      \[
+      (s,\tau^{\mathrm{arr}})^{\mathrm{arr}}
+      \qquad\text{and}\qquad
+      (s,\tau^{\mathrm{dep}})^{\mathrm{dep}}.
+      \]
+      These nodes are \emph{trip-specific}: if two trips serve the same stop at the same
+      clock time, they still correspond to different event nodes.
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Lines and event-to-line mapping]
+Let $\mathcal{L}$ denote the set of public transport lines. Each timetable event node
+(arrival or departure) is associated with exactly one operated line, captured by the mapping
+\[
+\lambda:\mathcal{V}^{\mathrm{event}}\rightarrow\mathcal{L},
+\qquad v\mapsto \lambda(v),
+\]
+where $\mathcal{V}^{\mathrm{event}}$ is the set of timetable event nodes.
+In practice, $\lambda(v)$ is derived from the timetable: event nodes created from a given
+trip inherit the line identifier of that trip. Therefore, for a given trip at stop $s$,
+the corresponding arrival and departure nodes share the same line label.
+\end{definition}
+
+Centroid-in nodes are not time-tagged: they are placed before all timetable
+event nodes (conceptually at $-\infty$) so that access links can connect to
+departure events that occur either before or after the desired departure window
+without violating acyclicity. Centroid-out nodes are not time-tagged and
+are placed after all event nodes (conceptually at $+\infty$), preserving a global
+topological order.
+

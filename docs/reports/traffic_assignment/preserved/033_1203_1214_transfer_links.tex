@@ -1,0 +1,12 @@
+\paragraph{Transfer links (inter-line, bounded waiting).}
+Consider a transfer link $\ell:(s,\tau_1)^{\mathrm{arr}}\rightarrow(s,\tau_2)^{\mathrm{dep}}$
+with $\tau_2>\tau_1$.
+Such a link is included only if (i) the two events correspond to \emph{different lines}
+and (ii) the waiting time $\tau_2-\tau_1$ does not exceed the user-defined threshold
+$\Delta_{\max}^{\mathrm{transfer}}$.
+When included, its generalized cost is
+\[
+c_\ell = \beta_{\mathrm{transfer}}\,(\tau_2-\tau_1),
+\]
+where $\beta_{\mathrm{transfer}}>0$ is a user-defined coefficient.
+

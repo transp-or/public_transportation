@@ -1,0 +1,41 @@
+% Mechanical relocation generated from the preservation ledger.
+% Existing prose is included byte-for-byte from preserved blocks.
+
+\section{Maximum Likelihood as a Reference Estimator}
+
+ML removes the explicit prior contribution while retaining the same
+parameterization and likelihood as the corresponding nonlinear MAP problem.
+It is therefore the appropriate diagnostic for prior sensitivity. A large
+ML--MAP difference is expected when the likelihood is weak, the prior is
+informative, or the optimum lies near a bound. Conversely, numerical agreement
+does not prove identification.
+
+The public interface \texttt{compare\_reduced\_od\_likelihoods} fits Poisson
+and negative-binomial specifications from the same gravity features and
+response operator. The shared artifact fingerprint establishes that the
+comparison changes the observation model rather than the underlying network
+problem, while distinct model fingerprints prevent accidental result reuse.
+Poisson is primarily a dispersion diagnostic: a material improvement from the
+negative-binomial model indicates variation beyond the Poisson mean--variance
+relationship, but does not by itself establish that the gravity specification
+is adequate.
+
+The companion \texttt{run\_reduced\_od\_prior\_sensitivity} operation first
+computes ML and then warm-starts named MAP scenarios from the ML solution.
+Each scenario records its prior fingerprint and displacement from ML. This
+makes weak, moderate, and informative prior comparisons reproducible without
+silently changing the likelihood or prepared response artifacts.
+
+Because the negative-binomial raw vector contains a dispersion coordinate that
+is absent from Poisson, one aligned bounds vector cannot safely configure both
+fits. The comparison interface therefore accepts likelihood-specific fit
+configurations. Bounds may be keyed by canonical raw parameter name and are
+resolved against each actual layout before compilation. Shared parameter names
+receive the same declared intervals, while the dispersion interval applies
+only to negative binomial. Returned entries retain the resolved ordering,
+initial point, bounds, shared prepared-artifact fingerprint, and distinct model
+fingerprint. Structured callbacks expose compilation, optimization iterations,
+checkpoint writes, deadlines, and model completion without adding objective
+evaluations.
+
+\input{traffic_assignment/preserved/086_2814_2851_maximum_likelihood_estimation.tex}

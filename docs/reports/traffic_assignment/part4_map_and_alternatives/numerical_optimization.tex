@@ -1,0 +1,51 @@
+% Mechanical relocation generated from the preservation ledger.
+% Existing prose is included byte-for-byte from preserved blocks.
+
+\begingroup
+\hbadness=10000
+\input{traffic_assignment/preserved/088_2880_2894_numerical_optimization_and_local_uncertainty.tex}
+
+\subsection{Precision, Bounds, and Convergence Semantics}
+\label{sec:reduced-od-numerical-contract}
+
+The reduced-OD estimator uses double precision by default. In the
+\texttt{float64\_required} mode, estimation stops before compilation unless
+JAX 64-bit support is active; it can be enabled by setting
+\texttt{JAX\_ENABLE\_X64=true} before starting the process or by calling
+\texttt{jax.config.update('jax\_enable\_x64', True)} before creating JAX
+arrays. The less restrictive \texttt{float64\_preferred} and
+\texttt{allow\_float32} modes are explicit choices. The result records the
+requested NumPy type, actual JAX input type, compiled objective and gradient
+types, and whether 64-bit support was enabled.
+
+A requested function tolerance is checked against floating-point resolution.
+If $Q_0$ is the initial objective, the implementation compares
+\[
+  \texttt{ftol}\max(1,|Q_0|)
+\]
+with a conservative multiple of
+$\epsilon_{\mathrm{mach}}\max(1,|Q_0|)$. An unresolvable tolerance is rejected
+by default and may instead be admitted with an explicit warning. This avoids
+reporting convergence from a stopping threshold finer than the arithmetic can
+represent.
+
+Optional lower and upper bounds apply to the raw optimization parameters.
+Their dimensions and the initial point are validated before SciPy is called.
+Convergence at a bound is assessed using the projected gradient: components
+that point outside the feasible region at an active bound are removed, while
+the remaining infinity norm is compared with the declared gradient tolerance.
+Non-finite objectives or gradients fail immediately.
+
+Three conclusions are deliberately distinct:
+\begin{description}
+  \item[Optimizer termination] records SciPy's status, success flag, and
+        message without reinterpretation.
+  \item[Numerical convergence] additionally requires finite quantities, a
+        resolvable tolerance, and a sufficiently small projected gradient.
+  \item[Scientific admissibility] is not assigned automatically. It remains a
+        user decision informed by adequacy, identification, production, and
+        sensitivity diagnostics.
+\end{description}
+Consequently, an optimizer success flag alone is not reported as a successful
+scientific estimate.
+\endgroup

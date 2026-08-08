@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
+import os
 from dataclasses import dataclass
+from pathlib import Path
+import tempfile
 from time import perf_counter
 
 import numpy as np
@@ -16,8 +20,22 @@ from .assignment_adapter import (
     FixedRoutingInputs,
     validate_fixed_routing_compatibility,
 )
+from .construction_control import (
+    ConstructionDeadline,
+    ConstructionPhase,
+    ConstructionProgressReporter,
+    deadline_stop,
+)
 from .compact_od_assignment_layout import CompactODAssignmentLayout
 from .fixed_routing_measurement_operator import FixedRoutingMeasurementOperator
+from .sharded_fixed_routing import (
+    ShardedFixedRoutingInputs,
+    fixed_routing_descriptor_for_group,
+    load_fixed_routing_shard,
+    validate_sharded_fixed_routing_compatibility,
+)
+
+ORIGIN_SUPPORT_GROUP_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +144,101 @@ def _support_fingerprint(
     return digest.hexdigest()
 
 
+def _group_content_hash(arrays: dict[str, np.ndarray]) -> str:
+    digest = hashlib.sha256()
+    for name, value in sorted(arrays.items()):
+        array = np.ascontiguousarray(value)
+        digest.update(name.encode())
+        digest.update(str(array.dtype).encode())
+        digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+        digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
+def _group_checkpoint_path(directory: Path, group: int) -> Path:
+    return Path(directory) / "support_groups" / f"group-{group:06d}.npz"
+
+
+def _save_group_checkpoint(
+    *,
+    directory: Path,
+    group: int,
+    provenance_hash: str,
+    summary: GroupOriginSupportSummary,
+    free_rows: np.ndarray,
+    free_columns: np.ndarray,
+    fixed_rows: np.ndarray,
+    fixed_columns: np.ndarray,
+) -> Path:
+    arrays = {
+        "free_rows": np.asarray(free_rows, dtype=np.int64),
+        "free_columns": np.asarray(free_columns, dtype=np.int64),
+        "fixed_rows": np.asarray(fixed_rows, dtype=np.int64),
+        "fixed_columns": np.asarray(fixed_columns, dtype=np.int64),
+    }
+    metadata = {
+        "schema_version": ORIGIN_SUPPORT_GROUP_SCHEMA_VERSION,
+        "provenance_hash": provenance_hash,
+        "group": group,
+        "summary": {
+            name: getattr(summary, name) for name in summary.__dataclass_fields__
+        },
+        "content_hash": _group_content_hash(arrays),
+    }
+    destination = _group_checkpoint_path(directory, group)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    )
+    os.close(descriptor)
+    try:
+        with open(temporary, "wb") as stream:
+            np.savez(stream, metadata=np.asarray(json.dumps(metadata)), **arrays)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _load_group_checkpoint(
+            Path(temporary), group=group, provenance_hash=provenance_hash
+        )
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return destination
+
+
+def _load_group_checkpoint(
+    path: Path, *, group: int, provenance_hash: str
+) -> tuple[
+    GroupOriginSupportSummary, np.ndarray, np.ndarray, np.ndarray, np.ndarray
+]:
+    with np.load(path, allow_pickle=False) as archive:
+        metadata = json.loads(str(archive["metadata"]))
+        arrays = {
+            name: np.asarray(archive[name])
+            for name in archive.files
+            if name != "metadata"
+        }
+    if metadata.get("schema_version") != ORIGIN_SUPPORT_GROUP_SCHEMA_VERSION:
+        raise ValueError("origin-support group schema is incompatible.")
+    if metadata.get("provenance_hash") != provenance_hash:
+        raise ValueError("origin-support group provenance is incompatible.")
+    if metadata.get("group") != group:
+        raise ValueError("origin-support group identity is incompatible.")
+    if metadata.get("content_hash") != _group_content_hash(arrays):
+        raise ValueError("origin-support group content hash is invalid.")
+    try:
+        summary = GroupOriginSupportSummary(**metadata["summary"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("origin-support group summary is invalid.") from error
+    return (
+        summary,
+        arrays["free_rows"],
+        arrays["free_columns"],
+        arrays["fixed_rows"],
+        arrays["fixed_columns"],
+    )
+
+
 def _chunk_reachability(
     *,
     origins: np.ndarray,
@@ -153,14 +266,33 @@ def _chunk_reachability(
 def analyze_fixed_routing_origin_support(
     *,
     inputs: AssignmentInputs,
-    routing: FixedRoutingInputs,
+    routing: FixedRoutingInputs | ShardedFixedRoutingInputs,
     spec,
     compact_layout: CompactODAssignmentLayout,
     config: OriginSupportConfig | None = None,
+    checkpoint_directory: str | Path | None = None,
+    checkpoint_provenance_hash: str | None = None,
+    deadline: ConstructionDeadline | None = None,
+    reporter: ConstructionProgressReporter | None = None,
 ) -> OriginSpecificMeasurementSupport:
     """Discover support without evaluating passenger-flow values."""
     config = OriginSupportConfig() if config is None else config
-    validate_fixed_routing_compatibility(inputs=inputs, routing=routing)
+    if (checkpoint_directory is None) != (checkpoint_provenance_hash is None):
+        raise ValueError(
+            "checkpoint_directory and checkpoint_provenance_hash must be provided together."
+        )
+    checkpoint_root = (
+        None if checkpoint_directory is None else Path(checkpoint_directory)
+    )
+    if checkpoint_root is not None:
+        group_directory = checkpoint_root / "support_groups"
+        if group_directory.exists():
+            for abandoned in group_directory.glob(".*.tmp"):
+                abandoned.unlink(missing_ok=True)
+    if isinstance(routing, ShardedFixedRoutingInputs):
+        validate_sharded_fixed_routing_compatibility(inputs=inputs, routing=routing)
+    else:
+        validate_fixed_routing_compatibility(inputs=inputs, routing=routing)
     num_active = int(inputs.od_origin_node.shape[0])
     if compact_layout.num_active != num_active:
         raise ValueError("compact layout and assignment active dimensions differ.")
@@ -199,8 +331,36 @@ def analyze_fixed_routing_origin_support(
     out_mask = np.asarray(inputs.graph.out_mask, dtype=bool)
     head = np.asarray(inputs.graph.head, dtype=np.int64)
     tail = np.asarray(inputs.graph.tail, dtype=np.int64)
-    probabilities = np.asarray(routing.group_link_probability)
-    effective = np.asarray(routing.effective_group_link_mask, dtype=bool)
+    probabilities = (
+        None
+        if isinstance(routing, ShardedFixedRoutingInputs)
+        else np.asarray(routing.group_link_probability)
+    )
+    effective = (
+        None
+        if isinstance(routing, ShardedFixedRoutingInputs)
+        else np.asarray(routing.effective_group_link_mask, dtype=bool)
+    )
+    resident_descriptor = None
+    resident_shard = None
+
+    def routing_for_group(group: int) -> tuple[np.ndarray, np.ndarray]:
+        nonlocal resident_descriptor, resident_shard
+        if not isinstance(routing, ShardedFixedRoutingInputs):
+            assert probabilities is not None and effective is not None
+            return probabilities[group], effective[group]
+        descriptor = fixed_routing_descriptor_for_group(routing, group)
+        if resident_descriptor != descriptor:
+            resident_shard = load_fixed_routing_shard(
+                routing=routing, descriptor=descriptor
+            )
+            resident_descriptor = descriptor
+        assert resident_shard is not None
+        local = group - descriptor.group_start
+        return (
+            resident_shard.group_link_probability[local],
+            resident_shard.effective_group_link_mask[local],
+        )
 
     free_rows: list[np.ndarray] = []
     free_columns: list[np.ndarray] = []
@@ -210,13 +370,83 @@ def analyze_fixed_routing_origin_support(
     reachability_seconds = projection_seconds = 0.0
     total_start = perf_counter()
     total_origin_specific = total_group_bound = 0
+    recent_group_seconds: list[float] = []
     for group in range(int(inputs.group_dest_node.shape[0])):
+        predicted_group = (
+            float(np.mean(recent_group_seconds[-3:]))
+            if recent_group_seconds
+            else None
+        )
+        if deadline is not None and not deadline.may_start(predicted_group):
+            raise deadline_stop(
+                deadline,
+                phase=ConstructionPhase.SUPPORT_DISCOVERY,
+                reason="next destination support group cannot start safely",
+                completed_units=group,
+                total_units=int(inputs.group_dest_node.shape[0]),
+                next_resumable_position=f"group-{group:06d}",
+                checkpoint_location=(
+                    None if checkpoint_root is None else str(checkpoint_root)
+                ),
+                checkpoint_reusable=group > 0,
+                predicted_next_seconds=predicted_group,
+            )
+        group_started = deadline.clock() if deadline is not None else perf_counter()
+        cached = None
+        group_path = (
+            None
+            if checkpoint_root is None
+            else _group_checkpoint_path(checkpoint_root, group)
+        )
+        if group_path is not None and group_path.exists():
+            try:
+                cached = _load_group_checkpoint(
+                    group_path,
+                    group=group,
+                    provenance_hash=str(checkpoint_provenance_hash),
+                )
+            except (KeyError, OSError, ValueError, json.JSONDecodeError):
+                quarantine = group_path.with_name(
+                    f"{group_path.name}.invalid-{os.getpid()}"
+                )
+                os.replace(group_path, quarantine)
+        if cached is not None:
+            (
+                summary,
+                group_free_rows,
+                group_free_columns,
+                group_fixed_rows,
+                group_fixed_columns,
+            ) = cached
+            free_rows.append(group_free_rows)
+            free_columns.append(group_free_columns)
+            fixed_rows.append(group_fixed_rows)
+            fixed_columns.append(group_fixed_columns)
+            summaries.append(summary)
+            total_origin_specific += summary.origin_specific_entries
+            total_group_bound += summary.group_level_candidate_entries
+            recent_group_seconds.append(0.0)
+            if reporter is not None:
+                reporter.emit(
+                    phase=ConstructionPhase.SUPPORT_DISCOVERY,
+                    status="running",
+                    force=True,
+                    completed_units=group + 1,
+                    total_units=int(inputs.group_dest_node.shape[0]),
+                    current_unit=f"group-{group:06d}",
+                    recent_unit_seconds=0.0,
+                    checkpoint_location=str(checkpoint_root),
+                    cache_hits=1,
+                    cache_misses=0,
+                )
+            continue
         active_indices = group_indices[group][group_masks[group]]
         active_indices = active_indices[selected[active_indices]].astype(
             np.int64, copy=False
         )
-        enabled = effective[group] & (
-            probabilities[group] > config.probability_tolerance
+        group_probability, group_effective = routing_for_group(group)
+        enabled = group_effective & (
+            group_probability > config.probability_tolerance
         )
         eligible_mapping = enabled[mapping_links]
         group_measurements = np.unique(mapping_measurements[eligible_mapping])
@@ -224,7 +454,24 @@ def analyze_fixed_routing_origin_support(
         group_entries = 0
         group_free = int(np.count_nonzero(free_column[active_indices] >= 0))
         group_fixed = int(np.count_nonzero(fixed_column[active_indices] >= 0))
+        group_free_rows_parts: list[np.ndarray] = []
+        group_free_column_parts: list[np.ndarray] = []
+        group_fixed_rows_parts: list[np.ndarray] = []
+        group_fixed_column_parts: list[np.ndarray] = []
         for first in range(0, active_indices.size, config.origin_chunk_size):
+            if deadline is not None and deadline.expired:
+                raise deadline_stop(
+                    deadline,
+                    phase=ConstructionPhase.SUPPORT_DISCOVERY,
+                    reason="deadline reached inside a destination support group",
+                    completed_units=group,
+                    total_units=int(inputs.group_dest_node.shape[0]),
+                    next_resumable_position=f"group-{group:06d}",
+                    checkpoint_location=(
+                        None if checkpoint_root is None else str(checkpoint_root)
+                    ),
+                    checkpoint_reusable=group > 0,
+                )
             chunk = active_indices[first : first + config.origin_chunk_size]
             start = perf_counter()
             reachable = _chunk_reachability(
@@ -248,26 +495,83 @@ def analyze_fixed_routing_origin_support(
                     continue
                 free = free_column[active_index]
                 if free >= 0:
-                    free_rows.append(rows)
-                    free_columns.append(np.full(rows.size, free, dtype=np.int64))
+                    group_free_rows_parts.append(rows)
+                    group_free_column_parts.append(
+                        np.full(rows.size, free, dtype=np.int64)
+                    )
                 else:
                     fixed = fixed_column[active_index]
-                    fixed_rows.append(rows)
-                    fixed_columns.append(np.full(rows.size, fixed, dtype=np.int64))
+                    group_fixed_rows_parts.append(rows)
+                    group_fixed_column_parts.append(
+                        np.full(rows.size, fixed, dtype=np.int64)
+                    )
             projection_seconds += perf_counter() - start
         total_origin_specific += group_entries
         total_group_bound += group_bound
-        summaries.append(
-            GroupOriginSupportSummary(
-                group=group,
-                selected_od_cells=int(active_indices.size),
-                free_od_cells=group_free,
-                positive_fixed_od_cells=group_fixed,
-                group_measurements=int(group_measurements.size),
-                group_level_candidate_entries=group_bound,
-                origin_specific_entries=group_entries,
-            )
+        summary = GroupOriginSupportSummary(
+            group=group,
+            selected_od_cells=int(active_indices.size),
+            free_od_cells=group_free,
+            positive_fixed_od_cells=group_fixed,
+            group_measurements=int(group_measurements.size),
+            group_level_candidate_entries=group_bound,
+            origin_specific_entries=group_entries,
         )
+        group_free_rows = (
+            np.concatenate(group_free_rows_parts)
+            if group_free_rows_parts
+            else np.empty(0, dtype=np.int64)
+        )
+        group_free_columns = (
+            np.concatenate(group_free_column_parts)
+            if group_free_column_parts
+            else np.empty(0, dtype=np.int64)
+        )
+        group_fixed_rows = (
+            np.concatenate(group_fixed_rows_parts)
+            if group_fixed_rows_parts
+            else np.empty(0, dtype=np.int64)
+        )
+        group_fixed_columns = (
+            np.concatenate(group_fixed_column_parts)
+            if group_fixed_column_parts
+            else np.empty(0, dtype=np.int64)
+        )
+        if checkpoint_root is not None:
+            _save_group_checkpoint(
+                directory=checkpoint_root,
+                group=group,
+                provenance_hash=str(checkpoint_provenance_hash),
+                summary=summary,
+                free_rows=group_free_rows,
+                free_columns=group_free_columns,
+                fixed_rows=group_fixed_rows,
+                fixed_columns=group_fixed_columns,
+            )
+        free_rows.append(group_free_rows)
+        free_columns.append(group_free_columns)
+        fixed_rows.append(group_fixed_rows)
+        fixed_columns.append(group_fixed_columns)
+        summaries.append(summary)
+        now = deadline.clock() if deadline is not None else perf_counter()
+        recent_group_seconds.append(max(0.0, now - group_started))
+        if reporter is not None:
+            reporter.emit(
+                phase=ConstructionPhase.SUPPORT_DISCOVERY,
+                status="running",
+                force=True,
+                completed_units=group + 1,
+                total_units=int(inputs.group_dest_node.shape[0]),
+                current_unit=f"group-{group:06d}",
+                recent_unit_seconds=recent_group_seconds[-1],
+                predicted_remaining_seconds=(
+                    recent_group_seconds[-1]
+                    * (int(inputs.group_dest_node.shape[0]) - group - 1)
+                ),
+                checkpoint_location=str(checkpoint_root),
+                cache_hits=0,
+                cache_misses=1,
+            )
     if config.materialize and total_origin_specific > config.max_materialized_entries:
         raise MemoryError(
             "origin-specific support exceeds max_materialized_entries; rerun with "

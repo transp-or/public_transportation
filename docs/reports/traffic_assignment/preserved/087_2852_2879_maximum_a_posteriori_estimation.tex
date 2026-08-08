@@ -1,0 +1,28 @@
+\subsection{Maximum a posteriori estimation}
+
+Maximum a posteriori (MAP) estimation uses the same likelihood and priors as the
+Bayesian model, but returns only the posterior mode:
+\[
+\widehat{\bm\eta}_{\mathrm{MAP}}
+=
+\arg\max_{\bm\eta}
+\left\{
+\ell(\bm\eta)+\log p(\bm\eta)
+\right\}.
+\]
+Here $p(\bm\eta)$ contains the Gaussian prior on $\widetilde{\bm z}$ and,
+when $\theta$ is estimated, the Gaussian prior on $\widetilde u$. The priors
+are evaluated on the raw variables, not on their smoothly bounded transforms.
+
+The software implements ML and MAP through the common penalized objective
+\[
+Q_w(\bm\eta)
+=
+-\ell(\bm\eta)-w\log p(\bm\eta),
+\qquad w\ge 0.
+\]
+The setting $w=0$ gives pure maximum likelihood and $w=1$ gives MAP under the
+same prior as the Bayesian model. Intermediate or larger values provide regularized
+point estimates, but do not in general correspond to the posterior of the stated
+Bayesian model.
+

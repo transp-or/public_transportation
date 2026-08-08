@@ -1,0 +1,10 @@
+\paragraph{Validity and fallback.}
+The direct operator is valid only while dispersion, routing probabilities,
+link costs, graph structure, OD ordering, and the measurement mapping remain
+fixed.  It is invalid when dispersion is estimated, costs depend on demand,
+capacity or congestion feeds back into routing, or graph, layout, or mapping
+indices change.  The normal fixed-routing loader remains the reference and
+fallback implementation and is always required when link-level outputs are
+requested.  The estimated-dispersion path never constructs or uses the direct
+operator.
+

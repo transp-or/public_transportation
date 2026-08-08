@@ -1,0 +1,51 @@
+\subsubsection{Immutable reduced-OD configuration and identity contracts}
+\label{sec:reduced-od-phase-one-contracts}
+
+The first implementation phase provides only the typed, immutable contracts
+needed by later preprocessing and inference; it does not yet construct routes,
+journeys, response operators, or estimates.  The namespace
+\path{public_transportation.preprocessing.reduced_od} contains a strict
+version-1 TOML loader and versioned artifact identities.  The namespace
+\path{public_transportation.inference.reduced_od} contains the canonical
+journey OD/time key, the exact free/frozen problem partition, and a small model
+identity.
+
+The TOML loader rejects missing and unknown keys.  It fixes the observation
+unit to timetable events, accepts only boarding and alighting in this backend,
+uses the missing-as-unobserved and duplicate-as-error policies, and requires
+external APC cleaning.  Journey origins and destinations are fixed to first
+boarding and final alighting, time-bin membership is half-open, and route
+shares are fixed within one fit.  The production mode is either
+\texttt{provided}, with an explicit input path, or
+\texttt{estimated\_basis}, initially with the
+\texttt{origin\_period} basis.  Stop mapping is declared
+\texttt{authoritative} or \texttt{reviewed\_generated}; output geography is
+scenario-stop or physical-stop level; detailed assignment is
+\texttt{explicit\_only}.  Relative input paths are resolved against the TOML
+file before the effective configuration is fingerprinted.
+
+Artifact manifests carry independent schema and implementation versions, an
+artifact kind, the complete configuration fingerprint, sorted named source
+fingerprints, and sorted dimensions.  Numerical arrays are copied into owned,
+C-contiguous, read-only NumPy storage.  Their canonical descriptors include
+name, shape, dtype, and a SHA-256 content digest.  Array order and all named
+metadata are canonical; duplicate or unsorted names are rejected rather than
+silently normalized.
+
+The inference problem contract requires unique, lexicographically sorted
+journey OD/time keys.  Strictly increasing free and frozen index arrays must be
+disjoint and must partition every key exactly once.  Fixed values are finite
+and nonnegative.  These arrays are also owned and read-only.  Frozen cells
+therefore remain absent from the parameter dimension from the first public
+contract onward.  Problem and model fingerprints use deterministic compact
+JSON plus SHA-256 and change when configuration, timetable artifact, response
+artifact, OD partition, fixed values, likelihood, production mode, or estimated
+parameter names change.
+
+Canonical identity serialization is setup work, not an optimizer operation.  A
+Phase-1 CPU microbenchmark with 100,000 OD keys produced a 2.30 MB JSON payload
+and a median combined serialization-and-hashing time of approximately
+0.072 seconds.  The measurement is machine-dependent and is not a test
+threshold; it confirms that contract identity is negligible relative to later
+preprocessing and occurs outside the repeated objective and gradient.
+

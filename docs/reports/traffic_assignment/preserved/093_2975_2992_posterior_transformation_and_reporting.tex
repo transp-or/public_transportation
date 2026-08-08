@@ -1,0 +1,18 @@
+\paragraph{Posterior transformation and reporting.}
+Posterior samples produced by the variational guide are samples of the raw variables
+$\widetilde{\bm z}$ and, when applicable, $\widetilde u$. Before reporting demand or
+$\theta$, the software applies the same smooth transformations used during likelihood
+evaluation:
+\[
+z_q^t=z_{\max}\tanh(\widetilde z_q^t/z_{\max}),
+\qquad
+f_q^t=f_q^{t,(0)}\exp(z_q^t),
+\]
+and
+\[
+u=u_{\max}\tanh(\widetilde u/u_{\max}),
+\qquad \theta=\exp(u).
+\]
+Consequently, reported posterior summaries correspond exactly to the parameter values
+used by the assignment and likelihood, rather than to untransformed raw samples.
+

@@ -1,0 +1,61 @@
+\paragraph{Stable objective compilation and reuse.}
+The fixed-operator MAP objective is defined at package scope and receives all
+numerical operator arrays, observations, baselines, and offsets as dynamic JAX
+arguments. Thus parameter values, observations, and optimizer iteration limits
+do not alter the compiled signature; shapes, dtypes, backend, JAX/JAXLIB
+versions, and compilation-relevant configuration still must agree. The public
+\texttt{prepare\_ml\_objective} and \texttt{compile\_ml\_objective} interface
+separates tracing, lowering, compilation, executable loading, and first
+execution, and \texttt{run\_ml} accepts the resulting executable without
+creating another jitted closure.
+
+An isolated investigation showed that a previously observed 29.484 s first-call
+delay was not XLA compilation. Fixed-routing preparation had launched unused
+asynchronous device work before the valid operator cache was loaded, and the
+first objective result synchronized that work. The pipeline now validates and
+loads the cached operator before preparing routing. On the TPG case, isolated
+tracing takes about 0.026 s, lowering 0.011 s, cold XLA compilation
+0.120--0.129 s, executable loading below 0.00001 s, and first execution about
+0.0014 s.
+
+The compact persistent artifact remains canonical row-major BCOO storage, with
+sorted unique indices. Three objective kernels were compared after all scenario
+preparation had completed. BCOO matvec, direct indexed scatter-add, and sorted
+segment reduction gave identical float32 objectives and gradients. Their warm
+value-and-gradient medians were respectively 0.001073 s, 0.000944 s, and
+0.000973 s; direct indexed aggregation is therefore used by the stable
+objective.
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{rrlrrrr}
+\hline
+Iter. & Cache & Compile/load & Warm V\&G & Optimizer & Process & Objective \\
+\hline
+1  & cold     & 0.1204 & 0.000975 & 0.303 & 5.800  & 55243.4375 \\
+1  & populate & 0.1285 & 0.000996 & 0.292 & 5.845  & 55243.4375 \\
+1  & hit      & 0.0070 & 0.000983 & 0.297 & 5.167  & 55243.4375 \\
+5  & cold     & 0.1231 & 0.001001 & 2.878 & 8.377  & 49635.4922 \\
+5  & populate & 0.1194 & 0.001021 & 2.604 & 8.167  & 49635.4922 \\
+5  & hit      & 0.0075 & 0.000958 & 2.539 & 7.622  & 49635.4922 \\
+20 & cold     & 0.1260 & 0.000991 & 5.805 & 11.623 & 49140.4258 \\
+20 & populate & 0.1260 & 0.000972 & 5.777 & 11.401 & 49140.4258 \\
+20 & hit      & 0.0070 & 0.000996 & 5.820 & 11.047 & 49140.4258 \\
+\hline
+\end{tabular}
+\caption{Fresh-process TPG compilation-cache and optimizer measurements. The
+compile column is cold compilation or persistent executable loading; process
+time also includes scenario and assignment preparation.}
+\label{tab:tpg-ml-compilation-cache}
+\end{table}
+
+The JAX persistent compilation cache is configured before computation through
+\path{PUBLIC_TRANSPORTATION_JAX_COMPILATION_CACHE_DIR} or the public
+package configuration function. Entry-size and compile-time thresholds default
+to zero so the objective is eligible. Fresh hit processes create no new cache
+entry and reproduce cold objectives and gradients. JAX 0.8.1 on the tested
+Apple CPU emits an AOT target-feature warning while loading entries even though
+execution succeeds and results agree exactly; this runtime warning should be
+rechecked when JAX is upgraded.
+

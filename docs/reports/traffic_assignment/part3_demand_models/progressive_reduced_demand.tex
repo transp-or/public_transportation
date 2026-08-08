@@ -1,0 +1,126 @@
+\section{Progressive Reduced-Dimensional Demand Modelling}
+
+The complete OD--time table is both computationally large and statistically
+underdetermined by aggregate boarding and alighting counts.  The software
+therefore resolves one composable model specification before JAX tracing.  A
+disabled component creates no parameter block, design matrix, objective term,
+or run-time branch.  This is a software design choice; the statistical
+components themselves are established methods or explicit transit adaptations.
+
+For origin-period group $g=(o,t)$ and cell $c=(o,d,t)$,
+\[
+ \log P_g=\log P_g^{(0)}+Z_g^{P}\theta_P,
+ \qquad
+ V_c=\log A_{dt}^{(0)}+Z_{dt}^{A}\theta_A-X_c\beta+I_c,
+ \qquad
+ q_c=P_g\frac{\exp V_c}{\sum_{k\in g}\exp V_k}.
+\]
+The fixed-routing mean remains $\boldsymbol\mu=B\boldsymbol q+\boldsymbol c$.
+Period coefficients are the first relaxation because systematic temporal
+residuals can otherwise be aliased into every spatial component.  Origin-group
+effects modify productions, whereas destination-group effects modify relative
+attractiveness; they are not interchangeable.
+
+Automatic regions are deterministic nested partitions of normalized supply,
+topology, and measurement-observability signatures.  They are model-resolution
+regions, not socioeconomic zones.  The implementation adapts the automated
+resolution and held-out-validation motivation of \cite{MenonEtAl2015} and the
+homogeneity/contiguity hierarchy of \cite{YuanEtAl2019}; applying those ideas to
+transit supply and observability is a methodological hypothesis requiring
+empirical validation.
+
+After margin heterogeneity has been assessed, a rank-$r$ interaction uses
+\[
+ I_{odt}=U_{G_O(o),:}V_{G_D(d),:}^{\mathsf T}.
+\]
+The columns of both factors are centered.  Ridge penalties stabilize their
+scale, but rotational ambiguity means individual factor columns are not given
+a behavioral interpretation.  Low rank follows the dimensional-reduction
+insight used for time-varying transit OD inference by \cite{ChenChengSun2025};
+the present JAX/MAP implementation is not a reproduction of that paper's MCMC
+method.
+
+Multiplicative gravity relationships are fitted in count scale rather than by
+log-linear least squares, following the Poisson pseudo-likelihood argument of
+\cite{SantosSilvaTenreyro2006}.  The negative-binomial parameterization has
+mean $\mu$, dispersion $r$, and variance $\mu+\mu^2/r$
+\cite{CameronTrivedi2013}.  ZIP and ZINB add a separate Bernoulli zero state
+using stable log-space mixtures \cite{Lambert1992}.  This state is not a
+timetable structural zero: network-infeasible cells have already been removed,
+whereas zero inflation concerns retained measurement records.
+
+\begin{table}[htbp]
+\centering\scriptsize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{p{2cm}p{1.7cm}p{2.6cm}p{1.4cm}p{2.1cm}p{2.4cm}}
+\hline
+Component & Added parameters & Purpose & Cost & Risk & Diagnostic trigger\\
+\hline
+Period effects & $T-1$ per block & Temporal heterogeneity & Low & Reference/centering & Residuals by period\\
+Origin groups & $G_O-1$ & Production heterogeneity & Low & Weakly observed origins & Origin-group residuals\\
+Destination groups & $G_D-1$ & Attraction heterogeneity & Low & Attraction confounding & Destination residuals\\
+Rank $r$ & $r(G_O+G_D)$ & Residual OD association & Moderate & Scale and rotation & OD pattern after margins\\
+Negative binomial & 1 & Overdispersion & Low & Large-$r$ boundary & Variance beyond Poisson\\
+ZIP/ZINB & design columns & Separate zero process & Low & Mean/zero confounding & Excess zeros after NB\\
+\hline
+\end{tabular}
+\caption{Optional components of the resolved demand family.}
+\end{table}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lll}
+\hline
+Stage & Mean structure & Observation family\\
+\hline
+M0 & Global production and impedance & Poisson\\
+M1 & Add period coefficients & Poisson\\
+M2 & M1 & Negative binomial\\
+M3 & Add origin groups & Negative binomial\\
+M4 & Add destination groups & Negative binomial\\
+M5 & Add rank one & Negative binomial\\
+M6 & Ranks 2, 4, then 8 & Negative binomial\\
+Sensitivity & Smallest adequate mean & ZIP or ZINB only if justified\\
+\hline
+\end{tabular}
+\caption{Recommended progressive ladder; advancement is diagnostic, not automatic.}
+\end{table}
+
+Warm starts copy common named blocks, expand period or hierarchy blocks under
+their declared sum-to-zero convention, and initialize new interaction columns
+with small deterministic values.  In-sample assignment residuals diagnose fit;
+held-out measurements diagnose generalization and must never enter fitting.
+Every block reports sensitivity, associated observations, gradient or
+curvature evidence, penalty contribution, held-out improvement, and whether it
+is data-supported, mixed, assumption-dominated, or unidentified.  No synthetic
+``percentage from data'' is reported.  Baselines, grouping, gravity form,
+regularization, low rank, structural-zero rules, fixed routing, zero inflation,
+and identification constraints remain explicit assumptions.
+
+The generic optimizer applies the same operational contract as the minimal
+reduced-OD fitter.  Maximum likelihood and Gaussian-prior MAP are distinct
+modes; vector or canonical named bounds act in raw parameter coordinates.
+An absolute time budget requires an atomic checkpoint.  A stopped run records
+the latest accepted iterate and resumes only when the complete model identity
+(specification, layout, features, grouping, response operator, observations,
+and software schema) matches.  Compilation time and warm value-and-gradient
+time are reported separately from optimization time.
+Each accepted iteration additionally reports its duration, a rolling mean over
+at most ten iterations, the remaining iteration allowance, estimated remaining
+seconds, and the expected UTC completion time.  The estimate excludes JAX
+compilation and is therefore meaningful only after several iterations.  With a
+configured checkpoint, progress includes its path and age; an interactive
+interrupt atomically saves the latest accepted iterate and returns an explicit
+``interrupted'' status suitable for later identity-validated resume.
+
+For migration of existing examples, a thin adapter exposes an established
+fixed-routing gravity operator directly to the generic kernel.  If the legacy
+OD rows require canonical reordering, the adapter permutes the demand vector on
+device before the operator product; it never materializes a dense response
+matrix.  Bounded end-to-end tests exercise this path on both synthetic public
+networks and on the public Geneva GTFS snapshot.  On the latter (96 free OD
+cells and 8,967 measurements, CPU, one optimization iteration), the generic M0
+kernel compiled in 0.17 seconds and its warm value-and-gradient took
+$1.1\times10^{-4}$ seconds.  These figures validate integration and kernel
+cost, not statistical convergence; model comparison still requires the full
+progressive fitting and held-out workflow described above.

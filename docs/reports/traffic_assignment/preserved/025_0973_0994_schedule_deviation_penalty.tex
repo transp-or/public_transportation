@@ -1,0 +1,22 @@
+\paragraph{Schedule-deviation penalty.}
+When the access link is included, its generalized cost is defined by a (possibly asymmetric)
+piecewise-linear penalty with a \emph{flat} (zero-penalty) region inside the interval:
+\[
+c_{\mathrm{access}}(\tau;t)
+=
+\beta_{\mathrm{early}}\;\max\!\bigl(0,\,a_t-\tau\bigr)
++
+\beta_{\mathrm{late}}\;\max\!\bigl(0,\,\tau-b_t\bigr),
+\]
+where $\beta_{\mathrm{early}}\ge 0$ and $\beta_{\mathrm{late}}\ge 0$ are user-defined coefficients.
+Therefore,
+\[
+c_{\mathrm{access}}(\tau;t)=0
+\quad\text{whenever}\quad \tau\in[a_t,b_t],
+\]
+and penalties apply only to departures strictly earlier than $a_t$ or strictly later than $b_t$.
+
+Note that the thresholds $\Delta_{\max}^{\mathrm{access}}$ and $\Delta_{\max}^{\mathrm{transfer}}$
+are fixed configuration parameters; the assignment is differentiable w.r.t.\ costs and OD flows
+given a fixed graph.
+

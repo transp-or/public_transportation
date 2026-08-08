@@ -1,0 +1,34 @@
+\subsection{Temporal Representation}
+
+The analysis period is partitioned into a set $\mathcal{T}$ of departure time intervals. Each interval represents a desired departure time window.
+
+\begin{definition}[Departure time interval]
+Each time bin $t\in\mathcal{T}$ corresponds to a half-open interval
+\[
+[a_t,b_t)\subset\mathbb{R},
+\qquad a_t<b_t,
+\]
+where $a_t$ and $b_t$ denote the start and end time (in minutes) of the
+desired departure interval. The end of the final bin may be included by an
+explicit analysis-period boundary convention. Half-open membership prevents a
+departure on a shared boundary from belonging to two adjacent bins.
+\end{definition}
+
+For each departure interval $t\in\mathcal{T}$, the desired departure window is the
+interval $[a_t,b_t)$. The admissible access window introduced below is a
+separate, closed eligibility interval and does not change this unique bin
+membership.
+
+\begin{definition}[OD demand]
+For each OD pair $q \in \mathcal{Q}$ and departure time interval $t \in \mathcal{T}$, let
+\[
+f_q^t \ge 0
+\]
+denote the number of passengers wishing to depart during interval $t$ from origin $s_o$ to destination $s_d$.
+\end{definition}
+
+The full demand vector is denoted by
+\[
+\bm{f} = \{ f_q^t : q \in \mathcal{Q},\; t \in \mathcal{T} \}.
+\]
+

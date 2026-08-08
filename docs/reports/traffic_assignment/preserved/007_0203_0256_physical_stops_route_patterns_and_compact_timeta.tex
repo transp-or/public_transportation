@@ -1,0 +1,54 @@
+\subsubsection{Physical stops, route patterns, and compact timetable index}
+\label{sec:reduced-od-phase-two-timetable}
+
+The second implementation phase compiles the domain timetable into
+deterministic host arrays without constructing a time-expanded graph.  Scenario
+stop identifiers remain the external OD and measurement geography.  A
+\emph{physical stop place} is an explicit aggregation of one or more scenario
+stops, typically platforms belonging to the same passenger interchange.  When
+no mapping is supplied, the implementation uses an identity mapping.  A
+nontrivial mapping must cover every scenario stop exactly, contain no unknown
+stop, and be labeled either \texttt{authoritative} or
+\texttt{reviewed\_generated}.  Place identifiers and member stop identifiers
+are canonical and sorted; the representative coordinates are the arithmetic
+mean of member coordinates.  The mapping policy, membership, and coordinates
+enter its fingerprint.
+
+A route pattern is defined by the tuple
+\[
+(\text{line identifier},\ \text{direction identifier},\
+  \text{complete ordered physical-stop sequence}).
+\]
+Trips are grouped only when this tuple is identical.  Consequently, opposite
+directions, express and local services, different lines, and repeated-stop
+patterns remain distinct.  Platform variants may become equivalent only
+through the explicit physical-stop mapping.  Every trip belongs to exactly one
+route pattern, and both pattern and trip ordering are deterministic.
+
+At this stage, a service-period class means a declared timetable
+\texttt{service\_id}; the software does not infer calendar semantics or create
+periods from OD departure bins.  Trips without a service identifier belong to
+one reserved default class.  Exact scheduled arrival and departure times remain
+in the timetable arrays, so after-midnight values above 24 hours are preserved.
+Later range-routing phases may select trips by clock time without changing
+these service classes.
+
+The compact index contains sorted string dictionaries for scenario stops,
+physical stops, trips, and lines.  Its numerical data consists of a trip
+stop-time CSR pointer; aligned trip, scenario-stop, physical-stop, sequence,
+arrival, and departure arrays for every stop-time record; and one line,
+direction, route-pattern, and service-period index per trip.  Integer seconds
+use 64-bit storage for timetable values, while bounded dictionary indices use
+32-bit storage.  All arrays are owned, C-contiguous, and read-only.  Input
+validation rejects duplicate or unknown identifiers, incomplete trips,
+duplicate sequences, and nonmonotone times before publishing an artifact.
+Artifact provenance independently fingerprints the source timetable, physical
+stops, route patterns, service periods, and reduced-OD configuration.
+
+The public Phase-2 CPU benchmark uses 5,000 trips with 15 stops per trip, or
+75,000 stop-time records.  The complete normalization and array build takes
+approximately 0.148 seconds, retains 2,520,008 array bytes, and increases the
+observed process peak by approximately 25.5 MiB.  These machine-dependent
+figures are not test thresholds, but confirm linear timetable storage and the
+absence of time-expanded assignment state.
+

@@ -1,0 +1,24 @@
+\paragraph{Negative binomial likelihood.}
+Conditionally on $(\bm f,\theta,\rho,r)$, the observations are assumed independent and
+\[
+Y_m \mid \bm f,\theta,\rho,r \;\sim\; \text{NegBin}\!\bigl(r,\,p_m(\bm f;\theta,\rho,r)\bigr),
+\qquad m\in\mathcal{M},
+\]
+where $r>0$ is a dispersion parameter and the success probability $p_m$ is defined so that
+$\mathbb{E}[Y_m]=\mu_m(\bm f;\theta,\rho)$:
+\[
+p_m(\bm f;\theta,\rho,r)
+=
+\frac{r}{r+\mu_m(\bm f;\theta,\rho)}
+=
+\frac{r}{r+\rho\,\lambda_m(\bm f;\theta)}.
+\]
+Hence, for $y\in\mathbb{N}_0$,
+\[
+\Pr(Y_m=y\mid \bm f,\theta,\rho,r)
+=
+\frac{\Gamma(y+r)}{\Gamma(r)\,y!}
+\left(1-p_m(\bm f;\theta,\rho,r)\right)^y
+\left(p_m(\bm f;\theta,\rho,r)\right)^r.
+\]
+

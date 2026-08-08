@@ -1,0 +1,94 @@
+% Mechanical relocation generated from the preservation ledger.
+% Existing prose is included byte-for-byte from preserved blocks.
+
+\section{Additive Operator Decomposition}
+
+The detailed and reduced models both become additive in demand once their
+routing responses are fixed. This section isolates that common mathematical
+structure. It explains why OD columns can be partitioned or compressed without
+cutting journeys through the network, and why the forward and adjoint products
+remain exact even when the full response matrix is never written explicitly.
+In particular, sharding an implicit response controls construction and working
+memory, but does not provide the same runtime benefit as constructing and
+reusing compact measurement-response columns.
+
+\subsection{Mathematical Sharding Identity}
+\label{sec:mathematical-sharding}
+
+Let the free OD-time cells be partitioned into disjoint index sets
+$\mathcal C_1,\ldots,\mathcal C_S$.  Writing $P_s$ for the injection of the
+coordinates in shard $s$ into the complete free vector gives
+\[
+  \bm f=\sum_{s=1}^{S}P_s\bm f_s,
+  \qquad
+  B\bm f=\sum_{s=1}^{S}B_s\bm f_s,
+  \qquad B_s=BP_s.
+\]
+Thus the complete expected measurement vector is
+\begin{equation}
+  \bm\mu
+  =\rho\left(\sum_{s=1}^{S}B_s\bm f_s
+              +\bm b^{\mathrm{fix}}\right).
+  \label{eq:additive-shard-forward}
+\end{equation}
+The partition is a decomposition of demand columns, not a cut of the transit
+network.  Every $B_s$ is defined using complete feasible journeys and may
+therefore contain paths through any stop, line, or geographical region.  The
+identity is exact provided that the shards are disjoint, cover every free cell
+exactly once, and use the same routing and measurement assumptions.  Frozen
+demand appears once in $\bm b^{\mathrm{fix}}$ and must not be duplicated among
+shards.
+
+The adjoint decomposes compatibly.  For any measurement-space vector $\bm v$,
+\[
+  B^{\mathsf T}\bm v
+  =\begin{bmatrix}
+      B_1^{\mathsf T}\bm v\\[-1mm]
+      \vdots\\[-1mm]
+      B_S^{\mathsf T}\bm v
+    \end{bmatrix},
+\]
+up to the declared ordering of the free coordinates.  Forward contributions
+may therefore be accumulated independently, and the derivative with respect
+to each shard uses its corresponding transpose product.
+
+This additive structure does \emph{not} generally make the statistical
+objective a sum of independent shard objectives.  For Poisson or negative-
+binomial observations, the likelihood is evaluated after the shard predictions
+have been summed in Equation~\eqref{eq:additive-shard-forward}.  Shards are
+mathematically independent only at the linear-response stage; their parameters
+remain coupled through shared measurement means and through any nonseparable
+prior or demand model.
+
+\subsection{Exact Reduced and Fixed-Routing Operators}
+
+For free demand $\bm f_{\mathcal U}$ and positive frozen demand
+$\bm f_{\mathcal F}$, the fixed-routing prediction is
+\[
+ \bm\mu=\rho\left(A_{\mathcal U}\bm f_{\mathcal U}
+                 +A_{\mathcal F}\bm f_{\mathcal F}\right)
+        =\rho\left(A_{\mathcal U}\bm f_{\mathcal U}
+                 +\bm b^{\mathrm{fix}}\right).
+\]
+Frozen-zero cells have neither columns nor offset contributions. The matrix
+$A_{\mathcal U}$ need not be materialized: an operator is mathematically
+defined by the products $\bm f\mapsto A_{\mathcal U}\bm f$ and
+$\bm v\mapsto A_{\mathcal U}^{\mathsf T}\bm v$ satisfying
+\[
+ \bm v^{\mathsf T}(A_{\mathcal U}\bm f)
+ =\bm f^{\mathsf T}(A_{\mathcal U}^{\mathsf T}\bm v).
+\]
+
+If response columns fall into exact equivalence classes $e(c)$, with one
+representative column in $\bar B$, then
+\[
+ B\bm f=\bar B\bar{\bm f},
+ \qquad
+ \bar f_e=\sum_{c:e(c)=e}f_c.
+\]
+This compression changes neither the external demand coordinates nor their
+gradients. For a linear reduced parameterization $\bm f=\Phi\bm z$, the direct
+parameter response is $H=B\Phi$, and its adjoint is
+$H^{\mathsf T}=\Phi^{\mathsf T}B^{\mathsf T}$.
+
+\input{traffic_assignment/preserved/066_1864_1890_od_blocks_without_network_cuts.tex}

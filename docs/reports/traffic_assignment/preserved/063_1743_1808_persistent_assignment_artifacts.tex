@@ -1,0 +1,66 @@
+\paragraph{Persistent assignment artifacts.}
+Assignment preparation is also demand-independent. Its immutable reusable state
+consists of the time-expanded graph arrays and labels, destination/OD grouping
+arrays, and generalized-cost components. It does not contain demand magnitudes,
+observations, priors, optimizer settings, or compiled executables. The package
+can store this state as compressed NPZ plus canonical JSON through optional
+\texttt{off}, \texttt{auto}, \texttt{refresh}, and \texttt{readonly} policies;
+ordinary uncached calls remain the default.
+
+The assignment-cache provenance includes the complete graph-relevant scenario
+contents, OD keys, assignment and cost configuration, numeric type, package and
+schema versions, sentinel conventions, and indexing rules. Loaded archives are
+checked for exact provenance, recognized fields, counts, shapes, dtypes, CSR and
+padded-mask consistency, and integer/Boolean conventions before JAX arrays are
+reconstructed. Cache writes use a unique temporary file, synchronization to
+disk, and atomic replacement. Thus concurrent writers are safe, corrupt or
+incompatible entries rebuild under \texttt{auto}, and \texttt{readonly} never
+writes. The measurement-operator cache retains its own compact-input content
+hash, so a valid assignment archive cannot validate an incompatible operator.
+
+Internal TPG profiling initially assigned 3.142 s of a 3.313 s preparation to
+destination grouping. The cause was repeated Python scalar extraction from JAX
+node arrays, which introduced thousands of small device synchronizations. One
+NumPy view is now reused for immutable node indexing and validation, and all
+destination link masks are constructed in one broadcasted operation. Uncached
+assignment construction consequently fell to 0.097 s: graph construction took
+about 0.049 s, OD indexing and grouping 0.022 s, and cost construction plus
+synchronization 0.026 s in the compilation-cache-enabled run.
+
+The TPG artifact contains 36,478 nodes, 11,259 links, 22,022 OD records, and 113
+destination groups. Its explicit arrays occupy 6,909,418 bytes and compress to
+576,227 bytes. A representative strict cache hit spent 0.00044 s opening the
+archive, 0.00460 s decompressing arrays, 0.01473 s in combined validation and
+decompression, 0.000006 s reconstructing host objects, 0.00500 s transferring
+and synchronizing JAX arrays, and 0.08787 s generating the canonical provenance.
+The complete assignment-cache call took 0.1084 s.
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{lrrrrr}
+\hline
+Policy/case & Assignment & Preparation & Warm V\&G & Optimizer & Process \\
+\hline
+Off & 0.0971 & 1.1756 & 0.000992 & 0.2908 & 2.1939 \\
+Populate & 0.3412 & 1.3532 & 0.000993 & 0.2975 & 2.4106 \\
+Valid hit & 0.1084 & 1.0775 & 0.000937 & 0.2721 & 2.0211 \\
+Corrupt/rebuild & 0.3201 & 1.3339 & 0.000965 & 0.3073 & 2.4081 \\
+Mismatch/rebuild & 0.3321 & 1.3463 & 0.001048 & 0.3166 & 2.3935 \\
+Read-only hit & 0.1128 & 1.1242 & 0.000972 & 0.2922 & 2.1872 \\
+\hline
+\end{tabular}
+\caption{Fresh-process TPG assignment-cache measurements in seconds with the
+measurement-operator and JAX compilation caches enabled.}
+\label{tab:tpg-assignment-cache}
+\end{table}
+
+After eliminating scalar synchronization, uncached reconstruction is already
+slightly faster than strict cache validation in the assignment stage itself;
+canonical fingerprinting accounts for most of the hit time. The persistent
+artifact is therefore useful primarily for strict reproducibility and validation,
+while the focused grouping simplification provides the main speedup. Relative to
+the original profile, complete one-iteration time falls from 5.389 s to roughly
+2.0--2.2 s. Cache-hit runs at 1, 5, and 20 iterations reproduce objectives
+55,243.4375, 49,635.4922, and 49,140.4258 exactly.
+

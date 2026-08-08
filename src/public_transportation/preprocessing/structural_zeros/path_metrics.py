@@ -67,12 +67,18 @@ def compute_od_path_metrics(
     profiles = tuple(profiles_list)
 
     candidates = _candidate_keys(topology, keys)
+    materialization_progress = ProgressEmitter(
+        progress,
+        phase="materialize_od_metrics",
+        total=len(candidates),
+    )
+    materialization_progress.start()
     stop_index = {stop_id: index for index, stop_id in enumerate(topology.stop_ids)}
     bin_index = {
         time_bin_id: index for index, time_bin_id in enumerate(topology.time_bin_ids)
     }
     records: list[ODPathMetricRecord] = []
-    for key in candidates:
+    for candidate_index, key in enumerate(candidates, start=1):
         origin_index = stop_index[key.origin_stop_id]
         destination_index = stop_index[key.dest_stop_id]
         time_bin_index = bin_index[key.time_bin_id]
@@ -107,6 +113,7 @@ def compute_od_path_metrics(
                 earliest_arrival_seconds=int(np.min(arrival_s)),
             )
         records.append(ODPathMetricRecord(key=key, metrics=metrics))
+        materialization_progress.update(candidate_index)
 
     return tuple(sorted(records, key=lambda record: record.key))
 

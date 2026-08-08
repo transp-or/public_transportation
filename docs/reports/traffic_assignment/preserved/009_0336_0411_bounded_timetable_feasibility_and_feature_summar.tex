@@ -1,0 +1,76 @@
+\subsubsection{Bounded timetable feasibility and feature summaries}
+\label{sec:reduced-od-raptor}
+
+RAPTOR denotes \emph{Round-Based Public Transit Routing}.  It is a
+timetable-routing method for finding feasible public-transport journeys and
+their earliest arrival times without first converting the timetable into a
+time-expanded graph.  Its state is organized by stop and round: round zero
+contains the origin and its walking reachability, and round $r$ contains labels
+reachable with at most $r$ vehicle boardings.  Routes reachable from labels
+improved in the preceding round are scanned in timetable order; newly improved
+stop labels are then propagated through transfer footpaths.  Keeping the best
+arrival label for each transfer count yields an arrival-versus-transfers Pareto
+frontier.  Unlike graph-based shortest-path algorithms, the standard method
+operates directly on route and timetable arrays and does not require a global
+priority queue over timetable events.
+
+In this project RAPTOR is a preprocessing algorithm, not an OD estimator.  Its
+role is to decide which destinations are reachable from an origin and departure
+time and to summarize the scheduled journeys used later to construct choice
+sets and measurement responses.  Passenger counts and demand parameters do not
+enter the routing calculation.
+
+The network-level preprocessing therefore begins with a deterministic
+RAPTOR-style search implemented in
+\path{public_transportation.preprocessing.reduced_od.raptor}.  It consumes the
+compact timetable arrays described above, explicit directed footpaths, a
+physical origin stop, a departure time, and a maximum number of transfers.  It
+does not construct a global time-expanded graph and does not call either
+assignment backend.
+
+A search round represents exactly one vehicle boarding.  With maximum transfer
+count $K$, the algorithm executes $K+1$ route rounds.  Each scheduled trip is
+scanned once per round in stop order.  The scan retains its best currently
+boardable label and propagates it to downstream stops, so its work is linear in
+the stop-time records scanned rather than quadratic in possible board/alight
+pairs.  Positive directed footpaths are relaxed without consuming a vehicle
+round.  Transfer depth is consequently bounded by construction.
+
+Within a round, the retained label is the deterministic earliest-arrival label,
+with waiting time, walking time, and path identity used as tie breakers.  Across
+rounds, the result retains the Pareto frontier in arrival time and number of
+boardings.  Every label reports total elapsed time, waiting, walking,
+in-vehicle time, transfers, and its scheduled transit legs.  The feature
+identity
+\[
+T_{\mathrm{elapsed}}
+=T_{\mathrm{wait}}+T_{\mathrm{walk}}+T_{\mathrm{vehicle}}
+\]
+therefore remains directly auditable.  Phase~4 does not enumerate every path
+with a distinct waiting/walking tradeoff inside one transfer round; bounded
+choice-set enumeration and pruning belong to Phase~5.  The current code is
+described as RAPTOR-style because it scans every scheduled trip in every bounded
+round and does not yet apply the standard marked-stop/marked-route pruning or a
+route-pattern search for the earliest boardable trip.  These omissions affect
+preprocessing speed, not the transfer-round semantics or the returned
+earliest-arrival labels.
+
+For every absent destination, a topology-only zero/one shortest-path pass over
+route reachability and footpaths records one fail-closed reason:
+\texttt{no\_topological\_\allowbreak path},
+\texttt{exceeds\_transfer\_\allowbreak limit}, or
+\texttt{no\_timetable\_\allowbreak feasible\_\allowbreak journey}.  The origin itself is labeled
+separately and is not presented as a destination.  This distinction prevents a
+missed scheduled connection from being misreported as a disconnected network.
+Independent range queries sort and deduplicate their departure instants and
+return one complete result per instant.
+
+The Phase-4 CPU benchmark used overlapping patterns of at most 20 stops, four
+departures per pattern, and a three-transfer bound.  For 25, 50, 100, and 200
+physical stops, mean query times were approximately 0.00065, 0.00091, 0.00124,
+and 0.00187 seconds, corresponding to about 1,535, 1,101, 803, and 534 queries
+per second.  The compact timetable arrays occupied 3,656, 7,208, 14,664, and
+29,576 bytes.  These machine-dependent measurements are diagnostic rather than
+test thresholds; full-network performance must still be measured on its actual
+pattern, trip, period, and query counts.
+

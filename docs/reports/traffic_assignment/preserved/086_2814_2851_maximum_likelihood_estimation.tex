@@ -1,0 +1,38 @@
+\subsection{Maximum likelihood estimation}
+
+The maximum likelihood estimator (MLE) is
+\[
+\widehat{\bm\eta}_{\mathrm{ML}}
+=
+\arg\max_{\bm\eta}
+\ell(\bm\eta),
+\]
+where
+\[
+\ell(\bm\eta)
+=
+\log\mathcal L\!\left(
+Y\mid \bm f(\widetilde{\bm z}),\theta(\widetilde u),\rho,r
+\right),
+\]
+with the dependence on $\widetilde u$ omitted when $\theta$ is fixed. The MLE
+uses no prior information. The baseline demand $\bm f^{(0)}$ still appears in
+the parameterization $\bm f=\bm f^{(0)}\exp(\bm z)$, but it is not a probabilistic
+prior in the ML objective.
+
+After optimization, the raw point estimate is transformed using exactly the same
+smooth mappings as in Bayesian inference:
+\[
+\widehat{z}_q^t
+=z_{\max}\tanh(\widehat{\widetilde z}_q^t/z_{\max}),
+\qquad
+\widehat f_q^t=f_q^{t,(0)}\exp(\widehat z_q^t),
+\]
+and, when estimated,
+\[
+\widehat u
+=u_{\max}\tanh(\widehat{\widetilde u}/u_{\max}),
+\qquad
+\widehat\theta=\exp(\widehat u).
+\]
+

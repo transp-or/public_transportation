@@ -1,0 +1,24 @@
+\subsubsection{Separation of routing preparation and demand loading}
+
+For a destination group $g$, let $d_g$ denote its destination, let
+$\mathcal A_g^+$ denote its enabled links after destination gating, and let
+$\bm f_g$ collect the OD/time-bin demand injected for that group. The backward
+value recursion and the resulting transition probabilities depend on
+$(\mathcal G,\bm c,d_g,\mathcal A_g^+,\theta)$, but not on $\bm f_g$. The
+assignment can therefore be written as two distinct operations:
+\[
+\mathcal R_g(\mathcal G,\bm c,d_g,\mathcal A_g^+,\theta)
+= (\bm V_g,\bm P_g),
+\]
+followed by
+\[
+\bm x_g
+=\mathcal L_g(\mathcal G,\bm P_g,\mathcal A_g^+,\bm f_g),
+\qquad
+\bm x=\sum_g \bm x_g,
+\]
+where $\mathcal R_g$ is routing preparation and $\mathcal L_g$ is the forward
+flow-loading operation. For fixed probabilities, $\mathcal L_g$ is linear in
+the injected demand. This separation is exact: it does not approximate the
+route-choice model or alter its probabilities.
+

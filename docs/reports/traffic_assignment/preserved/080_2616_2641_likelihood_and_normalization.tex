@@ -1,0 +1,26 @@
+\paragraph{Likelihood and normalization.}
+The likelihood is the product over observed measurements:
+\[
+\mathcal{L}\bigl(\{Y_m\}_{m\in\mathcal{M}}\mid \bm f,\theta,\rho,r\bigr)
+=
+\prod_{m\in\mathcal{M}}
+\Pr\!\left(Y_m=y_m^{\mathrm{obs}} \mid \bm f,\theta,\rho,r\right).
+\]
+The corresponding log-likelihood is
+\[
+\begin{aligned}
+\ell(\bm f,\theta,\rho,r)
+={}&
+\sum_{m\in\mathcal{M}}
+\Bigl[
+\log\Gamma\!\left(y_m^{\mathrm{obs}}+r\right)
+-\log\Gamma(r)
+-\log\!\left(y_m^{\mathrm{obs}}!\right) \\
+&\qquad
++r\log p_m(\bm f;\theta,\rho,r)
++y_m^{\mathrm{obs}}\log\!\left(1-p_m(\bm f;\theta,\rho,r)\right)
+\Bigr].
+\end{aligned}
+\]
+For posterior computations, terms constant with respect to $(\bm f,\theta)$ may be dropped.
+

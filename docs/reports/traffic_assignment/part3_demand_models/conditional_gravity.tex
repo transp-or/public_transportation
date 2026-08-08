@@ -1,0 +1,74 @@
+% Mechanical relocation generated from the preservation ledger.
+% Existing prose is included byte-for-byte from preserved blocks.
+
+\section{Conditional Gravity Demand}
+\subsection{Model Card: Reduced Conditional Gravity}
+
+\paragraph{Formulation and dimension.}
+Within each origin--departure-time production group, the model distributes a
+declared journey total across feasible destinations through a conditional
+logit expression based on attractiveness, scheduled travel time, transfers,
+and any explicitly introduced extensions.  Its dimension is the number of
+shared behavioral coefficients plus the dimension of a declared production
+basis, rather than the number of OD cells.
+
+\paragraph{Required information and identifying assumptions.}
+The minimal model requires feasible journey alternatives, their fixed routing
+shares and attributes, positive destination attractiveness, and either
+externally justified journey productions or a low-dimensional production
+basis.  It assumes a common parametric response to the included attributes and
+conditional independence from omitted attributes.  The normalization within
+each production group identifies only relative destination utility; an
+unconstrained common additive utility is not identified.
+
+\paragraph{Recoverable quantities and limitations.}
+The shared parameters can be identified from count patterns even when
+individual OD cells cannot, and the fitted OD table follows from the estimated
+parameters and declared productions.  However, this apparent precision is
+conditional on the gravity form, attractiveness values, feasible-set
+construction, fixed routing, and production assumptions.  Omitted spatial or
+temporal heterogeneity can create systematic residuals.  Because its parameter
+dimension remains small, this is the preferred primary demand model for the
+full-network MAP estimator, subject to adequacy and sensitivity checks.
+
+\subsection{Minimal Conditional Model}
+
+For feasible cell $c$ in production group $g$, let $a_c>0$ be attractiveness,
+$T_c$ expected scheduled travel time, and $K_c$ expected transfers. The minimal
+utility, conditional share, and demand are
+\[
+ V_c=\log a_c-\beta_T T_c/T_{\mathrm{scale}}-\beta_KK_c,
+ \qquad
+ p_c=\frac{\exp(V_c)}{\sum_{k\in g}\exp(V_k)},
+ \qquad
+ x_c=q_gp_c.
+\]
+Externally supplied $q_g$ gives the smallest model. If productions are
+estimated through a declared basis $Z$, a low-dimensional alternative is
+\[
+ q_g=q_g^{(0)}\exp((Z\bm\gamma)_g).
+\]
+Structural-zero and frozen cells do not receive free gravity-response rows.
+The count mean is obtained by applying the response operator to $\bm x$ and
+adding the frozen offset.
+
+\subsection{Information Content and Measurement Design}
+
+The gravity model can diagnose weak information about its own parameters.
+Sensitivities of predicted counts, likelihood curvature, profile behavior,
+prior sensitivity, and posterior uncertainty reveal parameter combinations
+that existing measurements distinguish poorly. Measurement-level derivatives
+also show which observed rows contribute to those combinations. This is not
+the same as residual analysis: a large residual indicates inadequate fit,
+whereas weak curvature indicates inadequate information, and either can occur
+without the other.
+
+The low parameter dimension does not imply that every reconstructed OD cell is
+locally informed by counts. A precise-looking cell estimate may follow mainly
+from the gravity form, attractiveness, production, and feasible-set assumptions.
+Choosing new counter locations is therefore a separate experimental-design
+problem. Candidate measurements must be compared by their expected increase in
+information rank or conditioning, or by the expected reduction in uncertainty
+for declared quantities of interest. The gravity response supplies the
+derivatives needed for that analysis, but it does not automatically select new
+measurement locations.

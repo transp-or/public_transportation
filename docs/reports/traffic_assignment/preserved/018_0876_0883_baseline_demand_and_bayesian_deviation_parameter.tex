@@ -1,0 +1,8 @@
+\subsection{Baseline demand and Bayesian deviation parameterization}
+
+The model assumes that the analyst can provide an \emph{a-priori} demand matrix
+$\bm f^{(0)}=\{f_{q}^{t,(0)}\}$, aligned with the OD/time-bin indexing of the scenario.
+Rather than placing a prior directly on the demand levels $\bm f$, we parameterize demand
+in terms of \emph{log-deviations} from $\bm f^{(0)}$. This improves numerical stability,
+facilitates weakly informative priors, and makes the role of prior information explicit.
+

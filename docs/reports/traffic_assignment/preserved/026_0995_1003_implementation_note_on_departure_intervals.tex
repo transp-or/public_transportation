@@ -1,0 +1,9 @@
+\paragraph{Implementation note (departure interval as OD/time-bin data).}
+Although centroid-in nodes are not time-tagged in the graph, the desired departure
+\emph{interval} $[a_t,b_t]$ remains an attribute of the OD/time-bin pair. In computations,
+the access-link penalty is evaluated by combining the interval bounds $(a_t,b_t)$ with the
+clock time $\tau$ of the \emph{departure event node} reached by that access link. This yields
+a zero penalty for departures within $[a_t,b_t]$ and an early/late penalty based on the
+nearest bound otherwise, without introducing backward-in-time links in the acyclic
+time-expanded network.
+

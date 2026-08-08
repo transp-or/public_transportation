@@ -1,0 +1,32 @@
+\paragraph{Prior on $\theta$.}
+The dispersion parameter $\theta$ is strictly positive. When it is estimated,
+the implementation introduces an unconstrained raw variable $\widetilde u\in\mathbb R$
+and defines
+\[
+u
+=
+u_{\max}\tanh\!\left(\frac{\widetilde u}{u_{\max}}\right),
+\qquad
+\theta=\exp(u),
+\qquad u_{\max}>0.
+\]
+Thus $\theta$ is positive and smoothly bounded between
+$\exp(-u_{\max})$ and $\exp(u_{\max})$. The configuration currently exposes
+$u_{\max}$ under the historical name \texttt{u\_clip}, although no hard clipping
+is performed.
+
+A Gaussian prior is placed on the raw variable,
+\[
+\widetilde u\sim\mathcal N(\mu_{\widetilde u},\sigma_u^2).
+\]
+If the requested center in effective log-dispersion space is $\mu_u$---for example,
+$\mu_u=\log(\theta^{(0)})$ for a baseline value $\theta^{(0)}$---the raw prior
+center is chosen by the inverse transformation,
+\[
+\mu_{\widetilde u}
+=
+u_{\max}\operatorname{arctanh}\!\left(\frac{\mu_u}{u_{\max}}\right).
+\]
+This guarantees that transforming the raw prior center gives exactly the requested
+effective center. It requires $|\mu_u|<u_{\max}$.
+

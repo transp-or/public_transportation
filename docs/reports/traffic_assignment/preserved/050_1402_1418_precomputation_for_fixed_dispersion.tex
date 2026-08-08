@@ -1,0 +1,17 @@
+\paragraph{Precomputation for fixed dispersion.}
+When $\theta$ is fixed during inference, and generalized costs do not depend on
+the current demand, the routing state $(\bm V_g,\bm P_g)$ is invariant across
+all likelihood evaluations. The software consequently prepares the effective
+destination masks and link probabilities once, stores them in an immutable
+JAX-compatible cache, and evaluates only $\mathcal L_g$ as the OD parameters
+change. Reverse-mode differentiation then traverses the demand-loading and
+measurement computations, but not the invariant value-function and
+route-probability calculations.
+
+This optimization is valid under the current uncongested assignment model,
+because link costs are fixed. It must not be applied when $\theta$ is estimated,
+or if a future model makes generalized costs depend on passenger flows. In
+those cases, routing is recomputed inside every assignment evaluation. The ML,
+MAP, and variational-inference pipelines select the cached path automatically
+for fixed $\theta$ and retain the dynamic path for estimated $\theta$.
+

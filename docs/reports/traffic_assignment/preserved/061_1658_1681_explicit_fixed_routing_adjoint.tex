@@ -1,0 +1,24 @@
+\paragraph{Explicit fixed-routing adjoint.}
+Generic reverse-mode differentiation through the node-loading scan retains more
+state than is necessary when link probabilities are fixed. Let $c_\ell$ be the
+cotangent of link flow and let $a_i$ be the node-flow adjoint. A reverse
+topological pass evaluates
+\[
+a_i=\sum_{\ell\in\delta^+(i)}P_\ell
+\left(c_\ell+a_{h(\ell)}\right).
+\]
+The derivative with respect to initial flow injected at node $i$ is $a_i$; the
+existing OD injection operation then gathers this adjoint at origin nodes. The
+custom vector--Jacobian product therefore retains a node vector and the supplied
+link cotangent rather than the complete forward scan tape. It deliberately
+defines no derivative with respect to routing probabilities and is exposed only
+for the fixed-routing path.
+
+On the representative 465-cell full-network destination, ordinary reverse mode
+and the explicit adjoint required respectively 12.09 and 6.69~s for a warm
+value--gradient evaluation. Their resident memory immediately after that
+evaluation was 16.21 and 13.91~GiB. Objective, prediction, and gradient
+diagnostics agreed within float32 tolerances. The explicit adjoint is retained
+as the fixed-routing differentiation path and as a reference for validating
+future sparse-operator construction.
+

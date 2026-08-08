@@ -1,0 +1,19 @@
+\section{Bayesian Inference via Variational Inference}
+
+Let $\widetilde{\bm z}_{\mathcal U}$ denote the vector of raw OD-deviation variables for free cells and let
+$\widetilde u$ denote the raw variable associated with the dispersion parameter
+of the route choice model. The effective parameters supplied to the forward model
+are deterministic transformations of these raw variables.
+The posterior distribution is proportional to
+\[
+p(\widetilde{\bm z}_{\mathcal U},\widetilde u \mid Y)
+\propto
+\mathcal{L}\!\left(Y \mid \bm f(\widetilde{\bm z}_{\mathcal U}),
+\theta(\widetilde u)\right)\,
+p(\widetilde{\bm z}_{\mathcal U})\,p(\widetilde u).
+\]
+When $\theta$ is fixed, $\widetilde u$ and its prior are omitted.
+
+Exact Bayesian inference is computationally intractable for high-dimensional OD vectors.
+The current implementation therefore uses \emph{stochastic variational inference} (SVI) as implemented in NumPyro.
+

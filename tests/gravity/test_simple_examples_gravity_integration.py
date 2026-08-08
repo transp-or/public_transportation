@@ -69,6 +69,9 @@ def test_live_simple_gravity_workflows(tmp_path):
         include_relaxation_and_holdout=True,
     )
     assert first["minimal_model"]["fixed_cell_maximum_error"] == 0
+    assert first["generic_demand_m0"]["operator_materialized"] is False
+    assert first["generic_demand_m0"]["warm_value_gradient_seconds"] > 0.0
+    assert second["generic_demand_m0"]["operator_materialized"] is False
     assert second["relaxation"]["warm_start_maximum_prediction_difference"] == 0
     assert (
         second["holdout"]["calibration_measurements"]

@@ -1,8 +1,16 @@
-"""Memory-bounded stochastic gravity objective and gradient evaluation.
+"""Memory-bounded experimental gravity objective and gradient evaluation.
 
 The sampling units are the persisted fixed-routing shards.  Selected shards are
 processed twice, one at a time, and no prepared forward batch is retained for
 the reverse pass.
+
+Full-network validation dated 2026-08-05 confirmed bounded memory but found no
+useful optimization-quality runtime--accuracy tradeoff for deterministic nested
+uniform shard sampling.  Sub-100% effort is an experimental diagnostic
+capability, not a validated drop-in replacement for exact gradients.  Callers
+must validate gradient accuracy independently.  ``quality.status`` and the
+dispersion indicators are diagnostics, not certified error bounds.  Effort
+100 delegates to the established exact backend.
 """
 
 from __future__ import annotations

@@ -19,7 +19,9 @@ def test_every_public_example_has_explicit_block_coordinate_applicability():
     discovered = {
         path.name
         for path in EXAMPLES.iterdir()
-        if path.is_dir() and not path.name.startswith(".")
+        if path.is_dir()
+        and not path.name.startswith(".")
+        and not path.name.startswith("__")
     }
     assert discovered == set(PUBLIC_EXAMPLE_APPLICABILITY)
     assert all(PUBLIC_EXAMPLE_APPLICABILITY.values())

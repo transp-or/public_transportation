@@ -1,0 +1,61 @@
+% Mechanical relocation generated from the preservation ledger.
+% Existing prose is included byte-for-byte from preserved blocks.
+
+\section{Current Limitations}
+\subsection{Large OD Layouts}
+
+An explicit dense measurement-by-OD matrix is infeasible for a full network,
+and repeated detailed graph traversals can dominate runtime even when only a
+small demand block changes. Matrix-free and sharded representations bound
+storage but do not remove the cost of an unnecessarily high-dimensional demand
+model. This motivates the reduced gravity parameterization and the separation
+between response construction, estimation, and detailed post-fit validation.
+
+\subsection{Identification and Model Dependence}
+
+Stop counts generally identify combinations of OD flows rather than every
+cell. Priors, gravity structure, production constraints, entropy, or seeds can
+select stable estimates, but they do not create observational information.
+Reported uncertainty and sensitivity must distinguish data-driven precision
+from restrictions imposed by the demand model.
+
+\subsection{Fixed Routing and Capacity}
+
+Routing probabilities are conditional on a fixed timetable, generalized costs,
+destination rules, and dispersion. Demand does not change travel time,
+capacity, denied boarding, or route utility. This is internally consistent with
+the current assignment but excludes crowding feedback and capacity-constrained
+equilibria. In heavily loaded conditions, a capacity-aware outer assignment and
+re-estimation loop would be required.
+
+\subsection{Observation and Data Limitations}
+
+The count likelihood assumes a correct mapping from operational records to
+timetable events and a suitable conditional count distribution. Missing
+records are not zeros, transfer events are not journey origins or final
+destinations, and systematic detector failures cannot be repaired by the OD
+model. Temporal aggregation and physical-stop mappings can remove or create
+apparent distinctions, so their uncertainty remains a source of model risk.
+
+\subsection{Reduced Journey Choices and External Inputs}
+
+The reduced model is conditional on feasible alternatives, fixed shares,
+travel-time and transfer summaries, attractiveness values, and journey
+productions or a production basis. Transfer limits and choice-set pruning may
+exclude behavior that occurs in practice. Gravity parameters can diagnose weak
+information within this specification, but optimal placement of new
+measurements is not yet implemented.
+
+\subsection{Inference and Computational Limits}
+
+MAP provides a mode and local curvature, not a complete uncertainty
+distribution. Variational inference provides an approximate posterior whose
+quality depends on the guide and optimization. Full cell-level estimation
+remains expensive even with a linear response because solving a large,
+ill-conditioned inverse problem is fundamentally different from merely
+executing a forward neural-network pass. The low-dimensional gravity model
+addresses this boundary through modeling as well as software efficiency.
+Section~\ref{sec:why-raptor-scales} explains why the laptop-scale reduced
+workflow depends jointly on bounded timetable search, reuse of fixed responses,
+and parameter reduction. RAPTOR by itself does not remove the cost of exhaustive
+preprocessing or an unnecessarily large response representation.

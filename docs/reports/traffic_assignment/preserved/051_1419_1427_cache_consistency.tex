@@ -1,0 +1,9 @@
+\paragraph{Cache consistency.}
+A prepared cache is associated with the exact graph instance, base link costs,
+destination-group ordering, and original destination masks from which it was
+constructed. These quantities are checked before cached loading is used. A
+change to any routing-sensitive input invalidates the cache. Empty destination
+sets and compact OD layouts are handled explicitly. The cached scan accumulates
+only total link flow and does not materialize per-destination link-flow arrays
+when they have not been requested.
+

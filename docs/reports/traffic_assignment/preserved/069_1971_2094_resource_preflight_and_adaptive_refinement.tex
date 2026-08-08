@@ -1,0 +1,124 @@
+\paragraph{Resource preflight and adaptive refinement.}
+The scalable workflow first creates a structural partition and then performs
+bounded exact-support discovery.  The old sharded planner materializes global
+origin support and retains per-column patterns and future construction tasks;
+it is therefore a compatibility path for reviewed small cases, not a
+full-network preflight.  The streaming preflight instead prepares and analyzes
+one destination group at a time.  It reduces exact reachable measurement rows
+immediately to group and block summaries, writes an atomic checkpoint, and
+releases group-local routing, reachability, pattern, and mapping state before
+continuing.  Retained state is proportional to destination and block summaries,
+not to OD--measurement support entries.
+
+Four explicit modes distinguish structural inspection, deterministic sampled
+exact support, complete streaming exact support, and an explicitly authorized
+materialized compatibility plan.  The materialized mode is rejected unless a
+prior conservative logical-support estimate fits its retained-state budget.
+Sampled selection includes small, median, 95th-percentile, and maximum
+structural groups.  Its extrapolations report observed ranges and assumptions;
+sampled completion alone cannot authorize a complete-network pilot.
+
+Elapsed time, process RSS, temporary group state, retained summaries, support
+rows, nonzeros, and operator bytes are effective limits.  Budget exhaustion or
+interruption produces a typed partial result and a valid atomic checkpoint.
+Resume validates scenario, assignment, OD layout, fixed demand, measurement
+mapping, routing, partition, configuration, and schema fingerprints.  It
+neither repeats completed groups nor skips pending groups.
+
+Checkpoint identity separates numerical semantics from invocation policy.
+The semantic fingerprint covers mode, deterministic sampling and selected
+groups, support chunking and tolerance, persisted representation, and schema;
+the authoritative data and routing fingerprints remain mandatory.  Elapsed and
+memory allowances, checkpoint cadence, and deterministic worker settings have
+a separate recorded policy fingerprint and may change compatibly on resume.
+Tightened limits are rejected before work if retained summaries or accepted
+blocks already violate them.
+
+Cumulative support time is never reset and includes discarded work from an
+incomplete group.  In contrast, the elapsed-time allowance applies only to the
+current invocation and its timer begins at zero after each resume.  Reports
+give previous, current, and cumulative time, invocation count, allowance
+overshoot, and whether stopping occurred before a group or inside a bounded
+chunk.  Thus exhausting a 120-second allowance does not cause the next
+120-second invocation to stop immediately.  An unfinished group is not
+committed and may be recomputed, while every completed group is skipped.
+
+Only after support discovery does the resource preflight select the smallest,
+median, 95th-percentile, largest, or explicitly named blocks.  Before invoking
+any builder it estimates CSR values and indices, transpose storage,
+construction temporaries, retained cache, and solver work arrays.  An unsafe
+block is rejected before allocation; no unselected operator is constructed.
+For accepted blocks it records machine memory,
+logical and physical CPUs, cache storage, operator and local-solver memory,
+construction and product times, and cache/checkpoint sizes.  The \texttt{auto},
+\texttt{laptop}, \texttt{workstation}, and \texttt{server} profiles apply
+different conservative fractions of available memory.  Worker count is bounded
+by both CPUs and safety-adjusted measured peak memory:
+\[
+n_{\mathrm{workers}}
+\leq
+\min\!\left(
+n_{\mathrm{CPU}},
+\left\lfloor\frac{M-M_0}{M_B}\right\rfloor
+\right),
+\]
+where $M$ is the selected job budget, $M_0$ is coordinator and assignment
+memory, and $M_B$ is the conservative measured worker peak.  Estimated cache
+storage is checked separately.  The structured recommendation contains hard
+variable and nonzero ceilings, worker and thread allocation, peak memory,
+cache size, first-sweep and cache-hit sweep times, and uncertainty.  Automatic
+sizing is never activated until the exact recommendation fingerprint is
+explicitly accepted.
+
+Selected fixed-routing blocks are constructed directly from their authoritative
+assignment inputs, compact free-to-active OD layout, destination-group routing,
+measurement mapping, and persisted exact support.  The production builder does
+not require a complete measurement operator.  It combines one or more base OD
+chunks into a separately configured, memory-guarded OD batch. For each batch,
+one JIT-compiled forward dynamic program computes node reach probabilities once;
+fixed-size mapped-edge gathers
+then aggregate only bounded supported-measurement chunks on the host. Numerical
+zeros are filtered before canonical COO-to-CSR assembly.  Both CSR and
+CSC storage retain only the union of supported rows, while forward products
+scatter into the complete measurement coordinate system and transpose products
+gather from it.  Consequently, the forbidden dense array of shape
+$n_{\mathcal M}\times |B|$ is never allocated: the largest dense numerical
+buffers are bounded by the effective OD batch times the node count, mapped-edge chunk,
+or supported-measurement chunk.
+
+Measurement-row lookup, enabled-link filtering, global-to-local row translation,
+and padded mapped-edge plans are invariant for the block and are prepared once,
+outside the OD-batch loop. The requested batch factor is reduced automatically
+until conservative reach, mapping, sparse-assembly, routing, solver, and retained
+storage estimates satisfy both temporary and worker ceilings. Failure of even
+one base batch is reported before numerical allocation. Because batching does
+not change the canonical per-column accumulation order, safe batch sizes share
+one logical cache identity.
+
+Exact selected support and each numerical block are persisted independently by
+atomic replacement.  Their identities include package and schema versions,
+all scenario, assignment, OD-layout, fixed-demand, measurement, routing, and
+partition fingerprints, the block and support fingerprints, fixed routing
+parameter, tolerance, dtype, and canonical accumulation contract. Pure
+performance chunk sizes are excluded from the logical cache identity. Content
+hashes, sparse dimensions, row coordinates, and dtype are validated before
+reuse; corrupt numerical caches are discarded and rebuilt, while corrupt or
+incompatible support artifacts are rejected.  A fresh process can therefore
+load a block without repeating routing or numerical construction.  In-memory
+retention is explicitly bounded and releasable.
+
+The accepted measurements also define a conservative memory/runtime cost model.
+Before estimation, any unsafe candidate block is bisected deterministically
+until every child satisfies the accepted limits.  Coverage remains exact,
+children retain a conservative measurement support, and blocks are never
+silently enlarged.  If a minimum-size block is still unsafe, a resource guard
+stops the workflow before its operator is constructed.  Refinement creates a
+new partition fingerprint, and the revised schedule is written in the initial
+checkpoint.  A checkpoint for the obsolete parent partition therefore cannot
+resume the refined run.
+
+This block-coordinate implementation is presently restricted to the
+fixed-routing linear MAP objective.  It must not be used when routing changes
+with the OD iterate or when the required conditional prior cannot be evaluated
+exactly.
+

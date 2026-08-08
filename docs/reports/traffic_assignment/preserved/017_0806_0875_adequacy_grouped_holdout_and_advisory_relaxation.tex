@@ -1,0 +1,70 @@
+\subsubsection{Adequacy, grouped holdout, and advisory relaxation}
+\label{sec:reduced-od-validation}
+
+Phase~12 separates three questions that must not be conflated.  Full-data
+\emph{adequacy} asks how well a fitted model reproduces the observations used
+to estimate it.  Grouped \emph{holdout validation} asks how well a model refitted
+without selected observations predicts those untouched observations.  An
+\emph{advisory relaxation score} identifies a possible next model but neither
+constructs nor fits that model automatically.  The implementation is divided
+between \path{validation.py}, \path{diagnostics.py}, and \path{lineage.py} in
+the reduced-OD inference package.
+
+The minimal objective now accepts an optional immutable calibration mask.  Its
+default remains all measurements, so Phases~9--11 are unchanged.  During a
+holdout fit, likelihood contributions outside the calibration mask are replaced
+by zero before summation.  Predicted means are nevertheless returned for every
+measurement row.  Consequently changing holdout counts cannot change the
+calibration objective, gradient, or estimate; a regression test changes held-out
+counts by 10,000 and obtains exactly the same fitted raw parameters.
+
+Holdout construction is deterministic from a measurement identity, seed, and
+group labels.  Supported grouping units include complete vehicle journeys,
+stop time series, lines, directions, time blocks, and explicit groups.  Every
+group lies wholly in calibration or holdout, both subsets must be nonempty, and
+their masks are complementary.  In particular, boarding and alighting rows
+from one held-out vehicle journey cannot leak individually into calibration.
+Calibration and holdout summaries report their own counts, observed and modeled
+totals, likelihood, Poisson and negative-binomial deviances, MAE, RMSE, and
+variance-weighted RMSE.  For a Poisson model the negative-binomial deviance is
+reported at its Poisson limit; a fitted negative-binomial model uses its fitted
+dispersion.
+
+Full-data adequacy reports raw and standardized residuals, threshold exceedance
+rates, and grouped summaries for available measurement type, line, direction,
+stop, period, vehicle journey, origin zone, destination zone, and transfer
+place labels.  These are calibration diagnostics and the report refuses a
+masked problem rather than presenting calibration fit as predictive evidence.
+The Hessian of the small raw-parameter objective supplies minimum and maximum
+curvature eigenvalues and a stabilized condition number.  Near-singular
+curvature, a large condition number, and too few observations per fitted
+parameter generate explicit weak-identification warnings.
+
+Residual patterns may recommend exactly one of four conventional children:
+J1, broad-period cost effects; J2, coarse destination-zone attraction; J3,
+coarse origin-zone production; or J4, selected transfer-place correction.  A
+candidate is applicable only when its declared grouping metadata contains at
+least two groups.  Its score is based on the largest grouped mean standardized
+residual and is reduced when observation support per added parameter is weak.
+The recommendation object is permanently labeled \texttt{advisory\_only}; it
+does not alter J0, add parameters to the Phase-9 objective, select a model, or
+claim predictive improvement.  Implementing and estimating these children is
+a later model-extension decision.
+
+Lineage nevertheless prepares that decision safely.  A fitted J0 root has a
+fingerprinted identity, parameter names, and estimates.  Each proposed J1--J4
+child records its parent, appends only explicitly named zero-effect parameters,
+and is accepted as a warm start only after the caller demonstrates that the
+child prediction at those zeros reproduces the parent prediction within a
+declared tolerance.  Such nodes remain marked unfitted.  Thus every proposed
+child is auditable without silently turning a diagnostic recommendation into an
+estimation run.
+
+On the public 20,000-cell, 2,000-measurement benchmark, cold adequacy including
+the first Hessian compilation took about 2.18 seconds and the warm repeated
+adequacy calculation about 0.046 seconds.  Four advisory candidates were scored
+in about 0.00018 seconds, and a vehicle-journey-grouped 20-percent holdout refit
+took about 0.153 seconds after the relevant JAX shapes had been compiled.  These
+diagnostic costs remain separate from both preprocessing and detailed-assignment
+validation.
+

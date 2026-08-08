@@ -1,0 +1,14 @@
+\paragraph{Separation of responsibilities.}
+The assignment procedure is treated as a deterministic mapping
+\[
+(\bm f,\theta)\longmapsto \bm x(\bm f;\theta)
+\]
+and remains agnostic to priors and baseline information. The construction of $\bm f$ from
+$\bm f^{(0)}$ and $\widetilde{\bm z}$ is performed in the \emph{Bayesian layer} (implemented using NumPyro and
+stochastic variational inference), which: (i) reads the baseline $\bm f^{(0)}$ provided by the user,
+(ii) draws the raw deviations $\widetilde{\bm z}$ from their prior distribution,
+(iii) applies the smooth bound to obtain $\bm z$, and (iv) computes $\bm f$ using the
+expression above before invoking the assignment. This design avoids introducing additional indexing
+conventions and keeps the assignment module independent of the inference engine.
+
+

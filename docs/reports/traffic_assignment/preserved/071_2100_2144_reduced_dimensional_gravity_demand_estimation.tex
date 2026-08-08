@@ -1,0 +1,45 @@
+\subsection{Reduced-dimensional gravity demand estimation}
+
+The public inference layer now provides a minimal dynamic gravity model on the
+canonical sparse list of feasible OD--departure-time cells.  For origin--time
+production $Q_{ot}$ and fixed positive destination attractiveness $A_{dt}$,
+\[
+ q_{odt}=Q_{ot}\frac{I_{odt}A_{dt}
+ \exp\{-\beta_{\mathrm{time}}\widetilde T_{odt}
+       -\beta_{\mathrm{transfer}}N_{odt}\}}
+ {\sum_{d'}I_{od't}A_{d't}
+ \exp\{-\beta_{\mathrm{time}}\widetilde T_{od't}
+       -\beta_{\mathrm{transfer}}N_{od't}\}}.
+\]
+Masked segmented JAX reductions preserve exact structural zeros and the
+production totals without materializing a dense origin--destination--time
+tensor.  The time and transfer coefficients, and the negative-binomial
+dispersion, are mapped from unconstrained optimizer coordinates through stable
+positive transformations.
+
+Gravity demand is passed directly through the existing dense or BCOO
+fixed-routing measurement operator, including its frozen-positive measurement
+offset.  The observation layer supports Poisson likelihood and the
+negative-binomial parameterization
+$\operatorname{Var}(Y_i)=\mu_i+\mu_i^2/r$.  For small parameter counts, a
+batched-forward derivative applies the routing operator to all demand
+directions together.  The adjoint alternative applies one routing transpose
+product and a JAX vector--Jacobian product.  Neither constructs a dense
+OD-by-parameter routing Jacobian.
+
+The minimal estimator uses an explicitly traced, lowered, and compiled JAX
+value-and-gradient kernel with L-BFGS.  Its automatic policy benchmarks first
+and warm executions of the two derivative strategies under a bounded
+preflight.  Atomic checkpoints are written at the initial state and after every
+completed iteration; their fingerprint covers gravity inputs, model and
+parameter layouts, routing and measurement provenance, observations, and
+likelihood semantics.  Resume reconstructs the full OD layout, including
+frozen-positive cells and structural zeros, while restarting non-portable
+L-BFGS history from the saved iterate.  Compilation, first execution, warm
+execution, strategy selection, persistent-cache configuration, and elapsed
+optimization time are exposed as structured diagnostics.
+
+A detailed OD table produced this way is not equivalent to estimating every OD
+cell independently: its detail is induced by the low-dimensional gravity
+structure and the fixed production and attractiveness inputs.
+

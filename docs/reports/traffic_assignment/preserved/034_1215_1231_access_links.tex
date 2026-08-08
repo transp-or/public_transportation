@@ -1,0 +1,17 @@
+\paragraph{Access links (bounded schedule deviation with a flat region).}
+Consider an access link from the centroid-in node $(s_o,t)^{\mathrm{in}}$
+to an origin \emph{departure} event node $(s_o,\tau)^{\mathrm{dep}}$.
+The link is included only if
+\[
+\tau \in \bigl[a_t-\Delta_{\max}^{\mathrm{access}},\; b_t+\Delta_{\max}^{\mathrm{access}}\bigr].
+\]
+When included, its generalized cost is
+\[
+c_\ell
+=
+\beta_{\mathrm{early}}\max(0,a_t-\tau)
++
+\beta_{\mathrm{late}}\max(0,\tau-b_t),
+\]
+with user-defined coefficients $\beta_{\mathrm{early}}\ge 0$ and $\beta_{\mathrm{late}}\ge 0$.
+

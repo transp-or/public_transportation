@@ -1,0 +1,18 @@
+\section{Maximum Likelihood and Maximum A Posteriori Estimation}
+
+The differentiable assignment and measurement models can be used for point estimation
+without constructing a full posterior approximation. Let
+\[
+\bm\eta=
+\begin{cases}
+(\widetilde{\bm z}_{\mathcal U},\widetilde u), & \text{if $\theta$ is estimated},\\
+\widetilde{\bm z}_{\mathcal U}, & \text{if $\theta$ is fixed},
+\end{cases}
+\]
+denote the vector of raw unconstrained parameters. The same smooth transformations
+defined above map $\bm\eta$ to the effective demand vector $\bm f$ and, when
+applicable, to $\theta$. Consequently, the likelihood-based ML, MAP, and Bayesian
+methods use the same forward model and negative binomial likelihood. The separate
+fixed-routing linear mode uses the weighted objective defined in
+Section~\ref{sec:fixed-routing-linear-map}.
+

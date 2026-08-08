@@ -1,0 +1,52 @@
+% Mechanical relocation generated from the preservation ledger.
+% Existing prose is included byte-for-byte from preserved blocks.
+
+\section{Adequacy and Identification}
+\subsection{Full-Data Diagnostics}
+
+Full-data adequacy asks whether fitted means reproduce the observations used in
+estimation. Residuals and count-model deviance should be reported overall and
+by measurement type, line, direction, stop, period, and vehicle journey where
+those labels exist. Systematic grouped residuals indicate misspecification,
+data problems, or an inadequate observation model; a small aggregate error can
+hide compensating local errors.
+
+Identification is a different question. It concerns sensitivity of the
+likelihood to parameter changes and is assessed through response derivatives,
+curvature eigenvalues, condition measures, profiles, prior sensitivity, and
+replicated fits. A model can fit calibration counts closely while leaving some
+parameters weakly identified. A strongly identified but misspecified model can
+also fit poorly. The two diagnoses must be reported separately.
+
+For parameter vector $\bm\eta$, local curvature of the negative log posterior
+or negative log likelihood summarizes sensitivity near the fitted point. Small
+eigenvalues identify locally weak directions; a large condition number warns
+that reported parameter precision may be unstable. These local quantities
+should be complemented by prior sensitivity, profiles, and repeated fits
+because bounded, asymmetric, or multimodal objectives are not characterized by
+one Hessian.
+
+The reduced-OD fit result operationalizes these checks without reconstructing
+the complete OD vector. It reports the symmetric Hessian eigensystem, numerical
+rank, condition estimate, and weak eigenvector loadings using production-basis
+labels where available. Negative curvature and numerical singularity produce
+warnings rather than being hidden by a covariance calculation. For MAP fits,
+the report separates likelihood and prior contributions, gives the penalty of
+each raw parameter, standardizes displacement from the prior mean, and warns
+when the prior dominates the fitted objective.
+
+Production diagnostics are calculated from the origin--period production
+vector, not by materializing all OD cells. They include fitted-to-baseline
+ratios, total production, dispersion proximity to its numerical floor, and
+extreme production multipliers. These summaries test numerical and scientific
+plausibility but do not convert operational boarding or alighting events into
+journey productions. Active bounds, extreme multipliers, poor conditioning,
+or strong prior dominance must therefore be reported alongside residual
+adequacy.
+
+When the objective is to plan additional data collection, these diagnostics
+must be evaluated for explicit candidate measurements. Expected information
+gain, improvement in conditioning, or reduction in uncertainty can support a
+counter-placement decision. Existing grouped residuals alone cannot: they
+identify where the current model fits poorly, not necessarily where an
+additional count would resolve a weak parameter direction.

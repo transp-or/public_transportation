@@ -1,0 +1,92 @@
+\paragraph{Remark.}
+The separation of centroid-in and centroid-out nodes is essential for the
+validity of the forward dynamic-programming loading algorithm. Without
+this separation, egress links could break the acyclic structure and violate the topological order implied by time.
+
+\begin{definition}[Links]
+The link set $\mathcal{A}$ contains the following link types:
+\begin{enumerate}
+\item \textbf{Access links (time-windowed):}
+      for an OD pair $q=(s_o,s_d)$ and departure interval $t$, access links connect the
+      origin centroid-in node $(s_o,t)^{\mathrm{in}}$ to \emph{selected}
+      \emph{departure} event nodes at the origin stop,
+      \[
+      (s_o,t)^{\mathrm{in}} \rightarrow (s_o,\tau)^{\mathrm{dep}},
+      \]
+only for departure times $\tau$ satisfying
+\[
+\tau \in \bigl[a_t-\Delta_{\max}^{\mathrm{access}},\; b_t+\Delta_{\max}^{\mathrm{access}}\bigr].
+\]
+
+\item \textbf{Ride links:}
+      for each trip, ride links connect a departure event at the current stop to an
+      arrival event at the next stop,
+      \[
+      (s_i,\tau_i^{\mathrm{dep}})^{\mathrm{dep}} \rightarrow (s_{i+1},\tau_{i+1}^{\mathrm{arr}})^{\mathrm{arr}}.
+      \]
+
+\item \textbf{Dwell/continue links (within-trip at a stop):}
+      for each trip and each stop event, a dwell link connects the arrival and departure
+      nodes at the same stop,
+      \[
+      (s,\tau^{\mathrm{arr}})^{\mathrm{arr}} \rightarrow (s,\tau^{\mathrm{dep}})^{\mathrm{dep}}.
+      \]
+      In the implementation, strictly positive dwell time is enforced by regularizing
+      timetable records where arrival equals departure (using a small minimum dwell time).
+
+\item \textbf{Transfer links (inter-line, time-windowed):}
+      transfer links connect an \emph{arrival} event node to a later \emph{departure} event node
+      at the same stop and represent waiting and switching \emph{between different lines}. A transfer link
+      \[
+      (s,\tau_1)^{\mathrm{arr}} \rightarrow (s,\tau_2)^{\mathrm{dep}},
+      \qquad\text{with}\qquad \tau_2>\tau_1
+      \]
+      is included only if
+      \begin{enumerate}
+      \item the two event nodes belong to \emph{different lines}, and
+      \item the waiting time satisfies $\tau_2-\tau_1 \le \Delta_{\max}^{\mathrm{transfer}}$.
+      \end{enumerate}
+      No transfer links are created between events of the same line. In particular,
+      transfer links are never created for $\tau_2=\tau_1$.
+
+\item \textbf{Egress links (global graph, destination-gated by masking):}
+      the global graph contains egress links from every arrival event node at stop $s$
+      to the centroid-out node $s^{\mathrm{out}}$:
+      \[
+      (s,\tau)^{\mathrm{arr}} \rightarrow s^{\mathrm{out}}.
+      \]
+      For a given OD pair $q=(s_o,s_d)$, only the destination centroid-out node $s_d^{\mathrm{out}}$
+      is enabled as a terminal node; all other egress options are disabled by a destination-dependent mask.
+\end{enumerate}
+\end{definition}
+
+Each link $\ell\in\mathcal{A}$ is associated with:
+\begin{itemize}
+\item a generalized cost $c_\ell$,
+\item a capacity $u_\ell$ for ride links (stored in the data structure, not yet used in costs).
+\end{itemize}
+
+\begin{assumption}[Acyclic time-expanded network]
+All links in the time-expanded network are consistent with a strict
+topological order. All \emph{event-to-event} links strictly increase
+clock time. In addition, centroid-in nodes $(s,t)^{\mathrm{in}}$ are
+placed \emph{before} all event nodes (conceptually at $-\infty$), and
+centroid-out nodes $s^{\mathrm{out}}$ are placed \emph{after} all event
+nodes (conceptually at $+\infty$). With this convention, access and
+egress links always respect the global ordering.
+
+With the event split, feasible movements follow the pattern
+\[
+(s,t)^{\mathrm{in}}
+\rightarrow (s,\tau)^{\mathrm{dep}}
+\rightarrow (s',\tau')^{\mathrm{arr}}
+\rightarrow (s',\tau'')^{\mathrm{dep}}
+\rightarrow \cdots
+\rightarrow (s_d,\bar{\tau})^{\mathrm{arr}}
+\rightarrow s_d^{\mathrm{out}}.
+\]
+Transfer links satisfy $\tau_2>\tau_1$ and dwell links are enforced to be strictly forward in time
+through a minimum dwell regularization. Therefore the directed graph is acyclic and admits
+a topological ordering, which allows value functions and flows to be computed using dynamic programming.
+\end{assumption}
+

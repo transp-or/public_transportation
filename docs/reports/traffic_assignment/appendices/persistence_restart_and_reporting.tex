@@ -1,0 +1,36 @@
+% Mechanical relocation generated from the preservation ledger.
+% Existing prose is included byte-for-byte from preserved blocks.
+
+\section{Persistence, Restart, and Reporting}
+\subsection{Persistent Artifacts and Recovery}
+
+\input{traffic_assignment/preserved/063_1743_1808_persistent_assignment_artifacts.tex}
+\input{traffic_assignment/preserved/067_1891_1959_anytime_state_and_recovery.tex}
+
+\subsection{Phase-Specific Reduced-OD Reuse}
+
+Reduced-OD preprocessing artifacts are invalidated according to their actual
+dependencies rather than one monolithic configuration fingerprint. Physical
+stops, service-day selection, and timetable construction depend only on their
+corresponding service inputs. Journey artifacts additionally depend on the
+journey-search policy. Measurement responses and response operators add the
+measurement policy and spatial output convention. Likelihood and production
+mode belong to the model identity and therefore do not invalidate timetable,
+journey, or response artifacts.
+
+Every reusable artifact still validates its schema, phase fingerprint, parent
+fingerprints, and numerical payload before acceptance. A changed likelihood
+can consequently reuse the complete prepared response chain, whereas a changed
+journey-search limit rebuilds journey choices and their descendants while
+retaining compatible physical-stop, service, and timetable artifacts. A
+changed production input republishes that input and the gravity/model stages
+without rebuilding the measurement response operator. Corrupt or incompatible
+artifacts fail closed.
+
+Potentially long journey construction accepts a progress callback that is not
+part of any numerical fingerprint. Messages contain the phase and status,
+completed and total query counts, current origin and departure, elapsed time,
+recent mean query time, predicted remaining time, and peak resident memory.
+Reporting is throttled by both a query interval and a wall-clock interval, with
+the final query always emitted. The callback therefore provides useful live
+feedback without changing reproducibility or flooding logs on fast cases.

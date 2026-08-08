@@ -1,0 +1,9 @@
+\paragraph{Recommended comparisons.}
+For validating the implementation, pure ML should be compared across optimizers
+using $w=0$, and MAP should be compared with the mode of the same posterior using
+$w=1$. Comparing an ML or MAP point estimate directly with the reported VI posterior
+mean is useful diagnostically, but disagreement should not automatically be interpreted
+as a software error. In every comparison, the effective transformed values
+$(\bm f,\theta)$ should be compared rather than the raw variables
+$(\widetilde{\bm z},\widetilde u)$.
+

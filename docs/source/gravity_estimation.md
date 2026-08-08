@@ -4,6 +4,11 @@ Progressive-fidelity objective and gradient evaluation, including deterministic
 shard sampling, quality diagnostics, control-variate anchors, and resumable
 execution, is documented in
 [`progressive_fidelity_gravity.md`](progressive_fidelity_gravity.md).
+Full-network validation found that its streaming implementation bounds memory
+successfully, but uniform persisted-shard sampling is not a validated faster
+replacement for exact optimization gradients. See the
+[2026-08-05 validation report](../reports/full_network_stochastic_gravity_validation_2026-08-05.md)
+before using sub-100% effort.
 
 ## Phase 1: demand contracts
 

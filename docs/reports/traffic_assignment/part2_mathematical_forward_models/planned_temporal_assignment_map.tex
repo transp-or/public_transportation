@@ -1,0 +1,574 @@
+\section{Planned Reusable Temporal Assignment-Map Architecture}
+\label{sec:planned-temporal-assignment-map}
+
+This section is a design specification and implementation roadmap.  It extracts
+a stable computational architecture from the forward models developed earlier
+in this part, especially the scheduled time-expanded formulation, the reduced
+journey-response formulation, the additive fixed-routing decomposition, and the
+measurement model.  It deliberately distinguishes verified public-library
+functionality from proposed work.  In particular, it does not specify an
+alternative supply model: the first target backend remains scheduled,
+time-expanded assignment.
+
+The following labels are used throughout this section.
+\begin{description}
+\item[\textbf{IMPLEMENTED}] The public library contains a concrete, tested
+  implementation of the stated behavior.
+\item[\textbf{PARTIALLY IMPLEMENTED}] Relevant tested foundations exist, but
+  the complete contract or end-to-end workflow specified here does not.
+\item[\textbf{EXPERIMENTAL}] A callable prototype exists, but its interface or
+  operational guarantees are not yet a stable general contract.
+\item[\textbf{UNIMPLEMENTED}] The component is a proposed design and is not
+  currently supplied by the public library.
+\end{description}
+When a component spans several existing modules, the label refers to the
+complete component described here, not to every useful foundation beneath it.
+
+\subsection{Layered forward decomposition}
+
+Let $\theta\in\mathbb{R}^{p}$ be a low-dimensional vector of demand-model
+parameters.  A demand generator $g$ produces the complete physical OD-time
+demand vector $x\in\mathbb{R}^{n}$ in a prescribed canonical order.  A
+preprocessed assignment map $A\in\mathbb{R}^{m\times n}$ maps that demand to
+predicted boarding and alighting measurements
+$\widehat y\in\mathbb{R}^{m}$:
+\begin{equation}
+  \theta
+  \overset{g}{\longmapsto}
+  x
+  \overset{A}{\longmapsto}
+  \widehat y,
+  \qquad
+  \widehat y=A\,g(\theta).
+  \label{eq:planned-layered-forward-map}
+\end{equation}
+Assignment, demand, observation, and estimation are independent layers.  The
+assignment layer defines how passenger demand creates expected measurement
+events.  The demand layer defines $g$.  The observation layer compares
+$\widehat y$ with recorded counts.  The estimation layer chooses an algorithm
+for varying $\theta$.  This separation makes the expensive supply-dependent
+calculation reusable across model specifications.
+
+\paragraph{Implementation status.}
+\textbf{PARTIALLY IMPLEMENTED.}  The public library already composes gravity
+demand generation, measurement operators, likelihoods, and optimizers in this
+form.  Several operator representations are interchangeable within existing
+workflows.  A single public artifact implementing the complete temporal design
+specified below does not yet exist.
+
+\subsection{Strict assignment-map contract}
+\label{sec:strict-assignment-map-contract}
+
+The external numerical responsibility of an assignment component is limited
+to the two products
+\begin{equation}
+  x\longmapsto Ax,
+  \qquad
+  r\longmapsto A^{\mathsf T}r,
+  \label{eq:assignment-forward-adjoint-contract}
+\end{equation}
+where $r\in\mathbb{R}^{m}$ is a measurement-space vector.  Neither product
+requires a dense realization of $A$.
+
+An assignment artifact may depend on network topology, the scheduled
+timetable, temporal discretization, fixed route-choice parameters, fixed
+departure-time-choice parameters, transfer, waiting, and journey-duration
+constraints, measurement definitions, and coefficient-pruning tolerances.
+These inputs determine the physical response represented by $A$.
+
+It must not depend on a gravity-model specification, gravity parameters,
+priors, the likelihood, the optimizer, or estimated OD values.  Consequently,
+changing a demand model, prior, likelihood, or optimizer must not trigger
+assignment preprocessing.  Changing the timetable, temporal intervals,
+route-choice parameters, departure-choice parameters, or feasibility
+constraints must invalidate the artifact.  Measurement-definition changes
+must likewise invalidate the corresponding measurement map.
+
+\paragraph{Implementation status.}
+\textbf{PARTIALLY IMPLEMENTED.}  Tested linear-operator and gravity-measurement
+protocols expose forward and adjoint products, shapes, fingerprints, and
+operational capabilities.  A canonical artifact identity now separates
+physical indexing, supply, timetable, temporal, choice, feasibility,
+measurement, coefficient-policy, numerical, and schema dependencies, with
+explicit mismatch diagnostics.  Existing fixed-routing operators validate
+against this identity through an adapter.  The complete dependency boundary
+is not yet embodied by one persisted scheduled assignment artifact.
+
+\subsection{Assignment-backend abstraction}
+
+Downstream code should depend on a stable abstract interface rather than on the
+internal time-expanded representation.  A minimal conceptual contract is:
+\begin{verbatim}
+class AssignmentOperator:
+    number_of_demand_cells: int
+    number_of_measurements: int
+
+    def matvec(self, demand):
+        """Calculate predicted measurements A @ demand."""
+
+    def rmatvec(self, residual):
+        """Calculate the adjoint product A.T @ residual."""
+\end{verbatim}
+Production implementations additionally need a numerical type, immutable
+identity metadata, and validated dimensions.  Those additions must not weaken
+the two-operation numerical contract in
+Equation~\eqref{eq:assignment-forward-adjoint-contract}.
+
+Other assignment backends could later implement the same canonical indexing
+and forward/adjoint contract.  Such a substitution must not require changes to
+demand models, observation models, likelihoods, or optimizers.
+
+\paragraph{Implementation status.}
+\textbf{IMPLEMENTED.}  The public library provides the runtime-checkable
+\texttt{AssignmentOperator} protocol with canonical dimensions, index and
+artifact fingerprints, and the required \texttt{matvec} and \texttt{rmatvec}
+products.  A validated adapter exposes existing explicit, matrix-free, and
+sharded fixed-routing operators through this contract without altering their
+numerical products.  The authoritative scheduled time-expanded calculation is
+also available through the same contract as a deliberately unoptimized
+reference backend.
+
+\subsection{Canonical indexing and compatibility}
+
+Three stable canonical tables define the spaces on which $A$ operates:
+\begin{enumerate}
+\item a physical OD--departure-interval cell table, with one immutable row for
+  every demand coordinate;
+\item a boarding and alighting measurement table, with one immutable row for
+  every predicted count; and
+\item a temporal-interval table giving ordered interval identifiers and exact
+  boundaries.
+\end{enumerate}
+Every demand model must return values in the assignment artifact's canonical
+OD-time order.  Display labels are not identities: canonical rows must retain
+stable physical identifiers and interval identifiers.  Compatibility checks
+must cover dimensions, schemas, and fingerprints and must fail explicitly,
+rather than silently reordering, truncating, or accepting incompatible inputs.
+
+\paragraph{Implementation status.}
+\textbf{PARTIALLY IMPLEMENTED.}  Existing reduced-OD and fixed-routing paths
+use immutable layouts, explicit dimensions, fingerprints, schemas, and
+fail-closed cache validation.  Immutable canonical interval, physical OD-time,
+and boarding/alighting measurement tables are now implemented, including
+separate physical-artifact and free/fixed-binding fingerprints.  Their builder
+adapts the existing OD parameter layout and validates fixed-routing bindings.
+These tables are not yet populated and consumed by every assignment backend
+and every demand-model workflow.
+
+\subsection{Non-uniform temporal discretization}
+
+The proposed temporal partition consists of ordered, non-overlapping intervals
+\begin{equation}
+  I_1,I_2,\ldots,I_K.
+\end{equation}
+Intervals should be finer when supply, demand, route availability, or transfer
+conditions change rapidly, and broader during stable conditions.  Selecting
+the partition is therefore a model-design problem, not merely a global choice
+of interval length.  A candidate partition should balance
+\begin{equation}
+  \text{temporal approximation loss}
+  +\lambda\,\text{assignment complexity},
+  \label{eq:temporal-partition-objective}
+\end{equation}
+where $\lambda\geq 0$ expresses the desired precision--resource compromise.
+
+Candidate diagnostics include service frequencies and headways, active lines
+and route patterns, running times, transfer opportunities, boarding and
+alighting count profiles, approximate assignment support, and projected
+nonzeros, memory, and execution time.  Rather than impose one arbitrary
+partition, preprocessing should eventually report a precision--complexity
+Pareto frontier from which a documented choice can be made.
+
+\paragraph{Implementation status.}
+\textbf{UNIMPLEMENTED.}  The library accepts temporal layouts in existing
+pipelines, but it does not generally select a data-driven non-uniform partition
+or construct the Pareto frontier described by
+Equation~\eqref{eq:temporal-partition-objective}.
+
+\subsection{Scheduled time-expanded preprocessing}
+
+The scheduled time-expanded graph described earlier in this part remains the
+authoritative routing representation during preprocessing.  For each physical
+OD pair and departure interval $s$, preprocessing should:
+\begin{enumerate}
+\item construct feasible joint departure-time and route alternatives;
+\item apply fixed exogenous departure-time-choice and route-choice parameters;
+\item calculate the alternative probabilities;
+\item project boarding and alighting contributions onto measurement interval
+  $t$; and
+\item consolidate those contributions into a sparse temporal block $A_{t,s}$.
+\end{enumerate}
+Departure-time and route choice are thus combined inside scheduled
+time-expanded preprocessing.  If $x_s$ denotes the demand coordinates in
+departure interval $s$ and $y_t$ the predicted measurements in interval $t$,
+the resulting operator satisfies
+\begin{equation}
+  y_t=\sum_s A_{t,s}x_s.
+  \label{eq:temporal-block-forward-map}
+\end{equation}
+The time-expanded graph is not traversed during estimation; repeated objective
+and gradient evaluations use only the persisted assignment response.
+
+\paragraph{Implementation status: scheduled routing foundation.}
+\textbf{IMPLEMENTED.}  The public library contains scheduled time-expanded
+network construction and assignment foundations, including journey and
+measurement-response preprocessing.  A canonical scheduled reference operator
+now evaluates the complete time-expanded forward calculation and obtains its
+exact adjoint by reverse-mode differentiation.  It validates canonical and
+supply-dependent identities and is intended for small equivalence tests rather
+than repeated production estimation.
+
+\paragraph{Implementation status: fixed-routing linear operations.}
+\textbf{IMPLEMENTED.}  Dense, sparse, matrix-free, sharded, and selected-block
+fixed-routing paths provide tested forward products; the relevant estimation
+operators also provide adjoint products and bounded operational controls.
+
+\paragraph{Implementation status: complete temporal-block conversion.}
+\textbf{PARTIALLY IMPLEMENTED.}  The library can derive an exact, independently
+addressable sparse family $\{A_{t,s}\}$ column by column from the authoritative
+scheduled reference operator, with progress, ETA, deadline handling, duplicate
+consolidation, and coefficient-mass diagnostics.  A faster constructor batches
+unit responses in one JIT-compiled fixed-shape kernel, pads the final chunk, and
+aggregates measurements on device before transferring bounded response chunks.
+It compiles once and never materializes the complete dense map.  The production
+constructor now goes further: it prepares fixed scheduled routing probabilities
+once, propagates only measurement-supported edges, emits sparse measurement
+contributions into deterministic shards, checkpoints them atomically, resumes
+after interruption, selectively rebuilds corrupt shards, and then finalizes
+canonical temporal blocks.  A general explicit joint departure-time-choice
+layer beyond the current canonical departure intervals remains unfinished.
+The resulting block operator is exposed through the established gravity
+measurement-operator protocol, including forward, adjoint, and batched products,
+so gravity objectives require no representation-specific changes.
+
+\subsection{Sparse temporal block structure}
+
+The intended block map is sparse for three distinct reasons.  First,
+\emph{causality} prevents demand from affecting earlier measurements.  Second,
+\emph{temporal banding} follows from a maximum feasible journey duration, which
+limits the active range of $t-s$.  Third, \emph{spatial sparsity} arises because
+one OD journey visits only a small subset of all measured locations and event
+types.
+
+Construction of each block should merge duplicate row--column contributions,
+remove exact zeros, and optionally prune negligible probabilities using an
+explicit, auditable tolerance.  Pruning must retain diagnostics for removed
+probability mass and its distribution.  The representation should use compact
+integer indices, persist temporal blocks independently, and support efficient
+forward and adjoint access.  Compressed sparse row (CSR) storage is natural for
+$Ax$; compressed sparse column (CSC), or equivalently a persisted transposed
+CSR representation, avoids repeated conversion for $A^{\mathsf T}r$.
+
+\paragraph{Implementation status.}
+\textbf{PARTIALLY IMPLEMENTED.}  Exact in-memory temporal blocks now merge duplicates,
+remove zeros, retain coefficient-mass diagnostics, and provide JAX-compatible
+forward and adjoint products.  A versioned manifest persists blocks
+independently and validates their content hashes before reuse.  A CPU backend
+constructs and retains CSR for forward products and CSC for adjoint products;
+its custom JAX reverse rule returns the CSC adjoint without materializing a
+dense matrix.  Direct alternative-level construction and the complete
+probability-pruning workflow remain unfinished.
+
+\subsection{Block-support complexity profiling}
+
+Before expensive construction, a bounded profiler should estimate active block
+support, projected nonzeros, persistent storage, peak construction memory, and
+forward/adjoint execution cost.  Its estimates should be reported by temporal
+block and in aggregate so that an infeasible partition can be rejected before
+full preprocessing.  The profiler is also the computational-complexity input
+to the Pareto analysis in
+Equation~\eqref{eq:temporal-partition-objective}.
+
+\paragraph{Implementation status.}
+\textbf{PARTIALLY IMPLEMENTED.}  Fixed-routing block-coordinate workflows
+provide bounded, resumable support preflight, resource limits, retained-state
+limits, progress, and checkpoint validation.  A canonical temporal profiler now
+uses causality and a maximum journey duration to report feasible blocks,
+candidate entries, excluded entries, and conservative storage.  It does not
+yet estimate spatial support, peak construction memory, or execution time from
+the scheduled graph, nor compare candidate temporal partitions.
+
+\subsection{Independent demand-model interface}
+
+The demand layer should depend only on its parameters, explanatory data, and
+the canonical demand-cell table.  A conceptual differentiable interface is:
+\begin{verbatim}
+class DemandModel:
+    parameter_names: tuple[str, ...]
+
+    def demand(self, parameters):
+        """Generate demand in canonical OD-time order."""
+
+    def transpose_jacobian_product(
+        self, parameters, demand_gradient
+    ):
+        """Calculate J_g(parameters).T @ demand_gradient."""
+\end{verbatim}
+Possible implementations include minimal global gravity, time-specific
+gravity, origin-group production, destination-group attraction, low-rank OD
+interactions, gravity plus residual corrections, directly parameterized OD
+demand, and externally supplied demand.  Switching between these models must
+reuse the same compatible assignment artifact.
+
+\paragraph{Implementation status.}
+\textbf{PARTIALLY IMPLEMENTED.}  The generic reduced-demand code supplies
+composable production, attraction, impedance, and low-rank interaction
+specifications; canonical demand generation is differentiable and several
+progressive gravity specifications are reusable with the same response
+operator.  Existing fixed, directly supplied, and reduced parameterizations
+provide additional foundations.  There is not yet one stable public
+\texttt{DemandModel} protocol covering every listed family, explicit canonical
+compatibility, and a named transpose-Jacobian product.
+
+\subsection{Independent observation model and differentiation}
+
+The observation layer receives observed counts and $Ax$, not routing
+structures.  It should select independently among Poisson, negative-binomial,
+possible zero-inflated formulations, and future count likelihoods.  With
+\begin{equation}
+  x=g(\theta),
+  \qquad
+  \widehat y=Ax,
+\end{equation}
+the chain rule gives
+\begin{equation}
+  \nabla_\theta L
+  =J_g(\theta)^{\mathsf T}
+   A^{\mathsf T}
+   \nabla_{\widehat y}L.
+  \label{eq:layered-adjoint-gradient}
+\end{equation}
+Thus neither the dense assignment matrix nor the full gravity Jacobian needs
+to be materialized.  The observation component controls the distributional
+assumption, dispersion, detection terms when modeled, zero-inflation design,
+and calibration mask, while remaining independent of assignment internals.
+
+\paragraph{Implementation status.}
+\textbf{PARTIALLY IMPLEMENTED.}  The generic reduced-demand path implements
+Poisson, negative-binomial, zero-inflated Poisson, and zero-inflated
+negative-binomial contributions independently of routing, and automatic
+differentiation composes them with operator products.  A stable general
+observation-model protocol shared by every estimation path is not yet defined.
+
+\subsection{Reusable assignment artifact}
+
+The conceptual persisted layout is:
+\begin{verbatim}
+assignment_map/
+|-- manifest.json
+|-- od_time_cells.*
+|-- measurements.*
+|-- time_intervals.json
+|-- blocks/
+|-- diagnostics/
+`-- benchmarks/
+\end{verbatim}
+The manifest should record a schema version, canonical-index fingerprints,
+network and timetable fingerprints, temporal discretization, choice-parameter
+fingerprints, feasibility constraints, coefficient precision and threshold,
+dimensions, total nonzeros, block dimensions, and construction diagnostics.
+It must not contain a gravity specification, prior, likelihood, or optimizer
+configuration.  Payloads should be published atomically and validated before
+reuse.  Incompatible or incomplete artifacts must fail closed.
+
+\paragraph{Implementation status.}
+\textbf{PARTIALLY IMPLEMENTED.}  The library now has a content-addressed,
+versioned temporal-block artifact with an atomic publication step, canonical
+tables, complete identity metadata, per-block content hashes, fixed-offset
+validation, and fail-closed fresh-process loading.  Its direct construction
+workspace contains deterministic validated shards and a checkpointed manifest;
+completed shards survive interruption and invalid shards are rebuilt
+selectively before atomic final publication.  The fuller directory above,
+including separate diagnostic and benchmark products inside the final artifact,
+remains to be implemented.
+
+Production activation is policy controlled.  Explicit 	exttt{off} leaves the
+existing loader unchanged, while explicit 	exttt{direct} constructs or resumes
+the block artifact.  In 	exttt{auto} mode, a valid persistent artifact is
+reused before preparing routing; otherwise construction occurs only when the
+expected evaluation savings strictly exceed its estimated construction cost.
+Invalid final artifacts are rejected, moved to a uniquely named quarantine
+directory for diagnosis, and rebuilt through the atomic publication path.
+
+\subsection{Validation requirements}
+
+The scheduled temporal assignment map must pass the following validation
+sequence before it can replace the authoritative preprocessing calculation in
+estimation:
+\begin{enumerate}
+\item compare scheduled sparse blocks with the authoritative time-expanded
+  assignment;
+\item test forward equivalence on several deterministic random vectors;
+\item verify the adjoint identity
+  \begin{equation}
+    \langle Ax,r\rangle
+    =\langle x,A^{\mathsf T}r\rangle;
+    \label{eq:planned-adjoint-validation}
+  \end{equation}
+\item measure nonzeros, storage, peak memory, and forward/adjoint execution
+  time;
+\item report approximation errors by time interval, transfer count, and
+  journey class;
+\item track affected observed count mass, not only matrix norms;
+\item verify artifact invalidation and canonical-index compatibility; and
+\item verify that changing only the demand model reuses the same assignment
+  artifact.
+\end{enumerate}
+Tolerance choices, random seeds, coefficient thresholds, and reference
+fingerprints belong in the validation record.  Exact equivalence tests should
+be separated from explicitly approximate pruning tests.
+
+\paragraph{Implementation status.}
+\textbf{PARTIALLY IMPLEMENTED.}  Existing operator tests cover forward
+equivalence, adjoint products, cache incompatibility, fingerprints, numerical
+agreement, frozen-demand offsets, construction progress, interruption and
+resume, finalized-artifact reuse, selective shard repair, and selected
+performance diagnostics.  Production-policy tests additionally cover explicit
+disablement, economically unjustified automatic decline without routing work,
+fresh-process reuse, gravity-protocol matrix products, and safe quarantine and
+rebuilding of an incompatible final artifact.  Stratified approximation and
+affected-count-mass reporting remain to be implemented for this representation.
+
+The executable public validation
+\texttt{docs/source/examples/direct\_scheduled\_gravity\_validation.py} applies
+this interface end to end to \texttt{simple\_example\_02}.  It constructs the
+canonical demand and observation intervals, reports shard progress, evaluates
+the same negative-binomial gravity objective and adjoint gradient through both
+the established BCOO operator and the temporal-block operator, and supports a
+mandatory fresh-process cache-reuse check.  On the development laptop, the
+first validation constructed 1,201 nonzeros in 0.31 seconds (0.48 seconds for
+complete activation) and stored 15,492 bytes.  The objective absolute difference
+was $3.05\,10^{-5}$ and the largest gradient absolute difference was
+$1.91\,10^{-6}$.  A second Python process loaded the persistent artifact in
+0.011 seconds, performed no construction, and reproduced the same numerical
+differences.  The test suite executes this two-process protocol automatically.
+
+Construction now uses a single monotonic deadline contract shared by activation,
+routing guards, support and planning guards, shard validation and construction,
+temporal assembly, and atomic persistence.  A normal bounded stop returns a
+structured terminal record rather than a partial operator or an undifferentiated
+error.  The record identifies the phase, elapsed and remaining time, completed
+work, next resumable unit, checkpoint and artifact locations, predicted next
+cost, checkpoint reusability, and any overshoot caused by an indivisible
+operation.  Versioned progress events use the same phase vocabulary and remain
+independent of presentation libraries.
+
+Shard construction stops only after atomically committing and validating the
+current shard, and a later invocation reuses it.  Fixed-shape destination-group
+routing batches,
+destination-group origin-support fragments, aggregate materialized support, the
+deterministic plan, and one temporal fragment per numerical source shard are
+also content validated and persisted.
+Thus resume bypasses the routing factory, support discovery, and planning when
+their checkpoints are compatible, and temporal assembly restarts at its first
+missing fragment.  Final persistence checks the deadline between blocks and
+removes an unpublished staging directory on termination.  Valid
+completed artifacts retain cache-first priority even under an almost-expired
+new budget. Routing is compiled once for a bounded padded batch shape; each
+batch is synchronized, transferred, content validated, and atomically persisted
+before the next dispatch. Downstream support and numerical construction load at
+most one routing batch and never concatenate the global destination-by-link
+arrays. JAX compilation and one batch execution remain indivisible internally:
+they are guarded before launch and record overshoot. Origin-support discovery checks
+the deadline between bounded origin chunks and atomically commits every
+completed destination group, so resume continues at the first missing group.
+Only the current CPU chunk or destination group may be repeated. Therefore the
+deadline hardening is sufficient for bounded public full-network probes.
+
+\subsection{Implementation roadmap}
+
+Table~\ref{tab:temporal-assignment-roadmap} records the audited status of the
+complete components, using the conservative convention at the start of this
+section.  Priorities order the remaining architectural work; a dash indicates
+an existing foundation rather than a new implementation priority.
+
+\begin{table}[htbp]
+\centering
+\footnotesize
+\caption{Roadmap for the reusable temporal assignment-map architecture.}
+\label{tab:temporal-assignment-roadmap}
+\begin{tabular}{|p{0.46\textwidth}|p{0.29\textwidth}|>{\centering\arraybackslash}p{0.09\textwidth}|}
+\hline
+\textbf{Component} & \textbf{Status} & \textbf{Priority} \\
+\hline
+Scheduled time-expanded assignment foundation & IMPLEMENTED & -- \\
+\hline
+Scheduled time-expanded reference operator & IMPLEMENTED & -- \\
+\hline
+Fixed-routing linear operations & IMPLEMENTED & -- \\
+\hline
+Stable assignment-operator abstraction & IMPLEMENTED & -- \\
+\hline
+Canonical physical OD-time index & PARTIALLY IMPLEMENTED & 1 \\
+\hline
+Data-driven non-uniform partition selection & UNIMPLEMENTED & 1 \\
+\hline
+Block-support complexity profiler & PARTIALLY IMPLEMENTED & 1 \\
+\hline
+Scheduled $A_{t,s}$ construction & PARTIALLY IMPLEMENTED & 2 \\
+\hline
+Sparse temporal-block persistence & PARTIALLY IMPLEMENTED & 2 \\
+\hline
+Optimized temporal CSR/CSC forward and adjoint & IMPLEMENTED & -- \\
+\hline
+Independent demand-model contract & PARTIALLY IMPLEMENTED & 2 \\
+\hline
+Interchangeable gravity specifications & PARTIALLY IMPLEMENTED & 3 \\
+\hline
+Independent observation models & PARTIALLY IMPLEMENTED & 3 \\
+\hline
+Assignment-backend substitution test & UNIMPLEMENTED & 4 \\
+\hline
+\end{tabular}
+\end{table}
+
+\paragraph{Implementation status.}
+\textbf{PARTIALLY IMPLEMENTED.}  The foundations identified in the table are
+available, but the remaining priorities are still a roadmap.  The temporal
+CSR/CSC backend is now implemented and tested for forward, adjoint, JIT, and
+automatic-differentiation use.  The scheduled constructor remains experimental
+until contributions are emitted directly by alternative preprocessing rather
+than by batched unit-response evaluation.
+
+\subsection{Architectural invariants}
+
+The following requirements are non-negotiable for implementation of this
+roadmap:
+\begin{enumerate}
+\item \emph{Assignment preprocessing is independent of the gravity
+  specification.}
+\item \emph{Demand models produce vectors in canonical OD-time order.}
+\item \emph{Assignment operators provide forward and adjoint operations.}
+\item \emph{Estimation never traverses the time-expanded graph.}
+\item \emph{Changing only the demand model does not rebuild the assignment
+  artifact.}
+\item \emph{Approximation and pruning are accompanied by quantitative
+  diagnostics.}
+\item \emph{Long preprocessing operations are resumable and report progress.}
+\item \emph{Downstream estimation code depends on the assignment contract, not
+  on the scheduled time-expanded implementation.}
+\end{enumerate}
+The eighth invariant is the sole future-proofing requirement for possible
+alternative assignment representations; no additional supply methodology is
+specified here.
+
+For public preprocessing, progress is a machine-readable contract rather than
+a presentation-layer convention. Physical-stop, route-pattern, service-period
+and timetable indexing, bounded RAPTOR rounds and destination scans,
+journey-choice construction, measurement-response aggregation,
+origin-support discovery, structural-zero classification, and artifact
+publication report completed and total units, elapsed time, observed
+throughput, estimated remaining time, confidence, and the current unit. Events
+occur at phase boundaries, approximately every one percent, or at the first
+unit boundary after ten seconds. The ETA is explicitly unavailable before the
+first measured unit. A library or backend call that cannot expose internal
+work remains an identified indivisible unit and is not assigned a fictitious
+completion estimate.
+
+\paragraph{Implementation status.}
+\textbf{PARTIALLY IMPLEMENTED.}  Current public workflows already embody
+forward/adjoint products, separation from several demand and likelihood
+choices, progress reporting, and resumable long-running preprocessing.  The
+invariants become collectively enforceable only after the canonical contract,
+index tables, and complete scheduled temporal artifact are implemented and
+tested together.

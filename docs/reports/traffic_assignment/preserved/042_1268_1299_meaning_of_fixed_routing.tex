@@ -1,0 +1,32 @@
+\subsubsection{Meaning of fixed routing}
+
+The software does not store one canonical physical route per OD pair. It builds one time-expanded graph for the
+complete timetable, with event nodes tied to scheduled trips and one origin centroid for every stop and departure-time
+bin. Feasible alternatives are implicit link sequences in this graph rather than an enumerated path table. Access links
+from a time-bin centroid reach only departures in its configured time window and carry the corresponding schedule-
+deviation costs. Thus, the same physical OD in two time bins can face different lines and scheduled trips; even if its
+physical stop or line sequence is unchanged, its trip sequence can differ.
+
+For each destination, the Dial recursion produces one conditional probability per enabled time-expanded link. A demand
+time bin is an aggregation interval: all demand in one OD-time cell is injected at the same time-bin centroid and shares
+its distribution over accessible departure events. The current model contains no finer within-bin departure-cohort
+index.
+
+In the ordinary assignment call these destination value functions and link probabilities are recomputed before demand
+is loaded. In \emph{fixed routing}, the effective link masks and probabilities are computed once for a fixed graph,
+timetable, generalized-cost vector, destination masks, and dispersion parameter $\theta$, then reused for every demand
+evaluation. Complete, sharded, concurrent, matrix-free, and gravity-model operators preserve this same routing contract.
+The gravity model changes how OD-time demand is generated; it does not define different routing probabilities.
+
+Consequently, ``the route set is constant throughout the day'' and ``route-choice probabilities are constant throughout
+the day'' are false in general. ``Routing probabilities are held fixed during fixed-routing estimation'' is true.
+Furthermore, routing is currently independent of demand and crowding: nominal ride-link capacities are stored as
+metadata but do not cap boarding, generate denied boarding, change passenger propagation, or enter utility. Changing
+only OD demand therefore leaves probabilities unchanged, and fixed loading agrees with a freshly recomputed assignment
+when all routing-sensitive inputs are unchanged.
+
+If crowding or capacity becomes endogenous, fixed routing would no longer be exact. A possible outer fixed-point scheme
+would alternate demand estimation, capacity-aware dynamic assignment, routing-cache reconstruction, and re-estimation
+until demand and assigned flows stabilize.
+
+

@@ -1,0 +1,42 @@
+% Mechanical relocation generated from the preservation ledger.
+% Existing prose is included byte-for-byte from preserved blocks.
+
+\section{Auxiliary Demand Baselines}
+\subsection{Route-Level Models}
+
+\subsubsection{Model Card: Route-Level IPF}
+
+\paragraph{Formulation and required information.}
+For one ordered route pattern, IPF finds a nonnegative upstream-to-downstream
+vehicle-leg table matching the observed boarding and alighting marginals that
+are explicitly marked as available.  It requires compatible marginals and a
+strictly positive seed on the feasible triangular support.
+
+\paragraph{Assumptions and limitations.}
+The seed and entropy-like proportional adjustment determine the allocation not
+fixed by the marginals.  With incomplete marginals the result is explicitly
+underdetermined; even with complete marginals, many interior tables may share
+the same margins.  Most importantly, a route boarding can be an initial
+boarding or a transfer, so the fitted cells represent vehicle legs rather than
+complete passenger journeys.  Route-level tables must not be stitched together
+and interpreted as network OD demand without additional passenger-trajectory
+information.
+
+\paragraph{Appropriate use.}
+This model is an inexpensive audit baseline, data-consistency check, and
+possible initializer.  It is not a competing full-network journey-OD estimator.
+
+For an ordered route with stops $1,\ldots,n$, let $x_{ij}\geq0$ for $i<j$ and
+$x_{ij}=0$ otherwise. IPF alternately scales feasible rows and columns toward
+the available boarding and alighting marginals,
+\[
+ \sum_{j>i}x_{ij}=b_i,
+ \qquad
+ \sum_{i<j}x_{ij}=a_j.
+\]
+Unobserved rows or columns are not constrained and remain dependent on the
+seed. Complete marginals must be compatible with the triangular support; for
+each prefix through $k$,
+\[
+ \sum_{j=1}^{k}a_j\leq\sum_{i=1}^{k-1}b_i.
+\]

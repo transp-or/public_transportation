@@ -1,0 +1,16 @@
+\paragraph{Variational approximation.}
+The posterior is approximated by a parametric distribution
+$q_\phi(\widetilde{\bm z}_{\mathcal U},\widetilde u)$ in the raw unconstrained parameter space.
+The parameters $\phi$ are chosen to maximize the \emph{Evidence Lower Bound} (ELBO):
+\[
+\mathrm{ELBO}(\phi)
+=
+\mathbb{E}_{q_\phi}
+\left[
+\log p(Y,\widetilde{\bm z}_{\mathcal U},\widetilde u)
+-
+\log q_\phi(\widetilde{\bm z}_{\mathcal U},\widetilde u)
+\right].
+\]
+Maximizing the ELBO is equivalent to minimizing $\mathrm{KL}(q_\phi \,\|\, p)$ between the variational approximation and the true posterior.
+

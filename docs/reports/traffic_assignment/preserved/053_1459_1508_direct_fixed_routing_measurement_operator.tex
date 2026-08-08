@@ -1,0 +1,50 @@
+\subsubsection{Direct fixed-routing measurement operator}
+
+Fixed routing permits a second, more aggressive optimization when inference
+needs measurement predictions but not link-level outputs.  For fixed
+transition probabilities, every forward DAG update consists only of additions
+and multiplication by constants.  It is therefore linear in the injected OD
+demand.  Measurement aggregation is also linear.  Their composition can be
+represented by a matrix $\bm A$:
+\[
+\bm\lambda = \bm A\bm f,
+\qquad
+\bm\mu = \rho\bm A\bm f.
+\]
+This identity is exact, rather than a local linearization.
+
+For a compact layout containing free cells and positive frozen cells, the
+implemented representation separates variable columns from constants:
+\[
+\bm\mu
+=\rho\left(\bm A_{\mathrm{free}}\bm f_{\mathrm{free}}
++\bm b_{\mathrm{fixed}}\right),
+\qquad
+\bm b_{\mathrm{fixed}}
+=\bm A_{\mathrm{fixed}}\bm f_{\mathrm{fixed}}.
+\]
+Frozen-zero cells have neither columns nor an offset contribution. Operator
+construction proceeds destination group by destination group, but does not
+construct unit-demand link-flow columns. Instead it combines loading and
+measurement aggregation in one reverse dynamic program. For destination group
+$g$, let $H_g(i,m)$ be the expected accumulated contribution to measurement
+$m$ of one passenger starting at node $i$. In reverse topological order,
+\[
+H_g(i,m)=
+\sum_{\ell\in\delta^+(i)} P_{g\ell}
+\left[\mathbf{1}\{\ell\in\mathcal A_m\}+H_g(h(\ell),m)\right],
+\]
+where $h(\ell)$ is the head of link $\ell$. Operator columns are obtained by
+gathering $H_g$ at the OD origin nodes. Consequently, no
+\texttt{chunk\_size}-by-$|\mathcal A|$ link-flow array is constructed or
+transferred to the host.
+
+Only measurements mapped to links enabled for a destination group are carried
+by that group's recursion. The local measurement dimension is padded to a
+single fixed maximum, and every OD output chunk is padded to the configured
+chunk size. The builder explicitly lowers and compiles this fixed-shape kernel
+once, then reuses the executable for every group and chunk, including the final
+partial chunk. For BCOO output, nonzero data and row/column indices are appended
+directly from returned local contributions; a dense operator is never allocated
+and subsequently converted.
+

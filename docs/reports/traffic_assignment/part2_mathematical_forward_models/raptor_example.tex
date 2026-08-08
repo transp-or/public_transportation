@@ -1,0 +1,255 @@
+% Mechanical relocation generated from the preservation ledger.
+% Existing prose is included byte-for-byte from preserved blocks.
+
+\subsection{A Loop-Oriented Description of a RAPTOR Query}
+\label{sec:raptor-loop-description}
+
+A RAPTOR query can be understood as an outer loop over the number of vehicle
+boardings, containing a timetable scan and a walking-relaxation loop.  Its
+state consists of labels attached to physical stops rather than paths through
+a global time-expanded graph.  A label records the earliest retained arrival
+at a stop in a given boarding round, together with the journey legs and the
+additive attributes needed later, such as waiting, walking, and in-vehicle
+time.  The query proceeds as follows.
+
+\begin{enumerate}
+  \item \emph{Initialize the access round.}  At the requested departure time,
+        the origin receives its initial label and every other stop is initially
+        unreachable.  A loop follows the admissible footpaths out of each
+        newly reached stop.  Whenever walking produces an earlier label, that
+        stop is placed back in the walking queue so that multi-link walking
+        connections are closed.  This is round zero because no vehicle has yet
+        been boarded.
+
+  \item \emph{Loop over boarding rounds.}  If at most $K$ transfers are
+        permitted, the algorithm performs $K+1$ transit rounds.  Round $r$
+        starts only from labels retained in round $r-1$ and adds exactly one
+        vehicle boarding.  This makes the transfer bound part of the search
+        state: a journey requiring another vehicle cannot leak into a round in
+        which it is not allowed.
+
+  \item \emph{Loop over scheduled trips and their stops.}  For each trip, its
+        stop times are scanned once in travel order.  Before boarding, the scan
+        compares the trip departure time at the current stop with the labels
+        from the preceding round.  If the passenger can be present in time,
+        the trip becomes boardable.  The scan then carries that boarded state
+        forward along the same trip.  At every subsequent stop it constructs
+        a candidate arrival label, records the boarding and alighting events,
+        and retains the better candidate according to the deterministic
+        arrival and feature ordering.  If a later stop offers a preferable
+        feasible boarding state for the same trip, the carried state is
+        replaced before the scan continues.
+
+  \item \emph{Loop over walking connections again.}  Once all trips have been
+        scanned for the round, the walking-closure loop starts from the stops
+        improved by transit.  Walking changes arrival and walking time but
+        consumes no additional boarding, so these labels remain in the same
+        round.  They become the possible boarding points for the next round.
+
+  \item \emph{Collect and filter the results.}  After the last permitted
+        round, the algorithm loops over each destination and compares its
+        labels across rounds.  A label is discarded if another arrives no
+        later with no more boardings.  Waiting-time and total-journey-time
+        limits are then applied.  The surviving labels form the bounded
+        timetable-feasible alternatives, and each retained state supplies its
+        vehicle legs and boarding/alighting events.  If no label
+        survives, a separate topology-only check distinguishes a disconnected
+        pair, a pair exceeding the transfer bound, and a pair for which no
+        scheduled journey is feasible at the queried time.
+\end{enumerate}
+
+Textbook RAPTOR commonly uses a further \emph{marking} optimization: in the
+next round it scans only route patterns serving stops whose labels improved in
+the preceding round.  The current implementation preserves the same bounded
+round semantics but uses the simpler deterministic variant of scanning every
+scheduled trip in every round.  This distinction affects preprocessing time,
+not the meaning of the retained journey labels.  In either variant, observed
+counts play no role in these loops.  Counts enter only after the retained
+journeys have been converted into the fixed measurement-response matrix.
+
+\subsection{A RAPTOR Example}
+\label{sec:raptor-example}
+
+RAPTOR is a round-based timetable-routing method.  A round counts vehicle
+boardings, not transfers: round zero contains access and walking labels, round
+one contains journeys using one vehicle, and round two permits two vehicles
+and hence one transfer.  The following small timetable illustrates the logic.
+
+Consider four physical stops $A,B,C,D$ and three scheduled trips:
+\begin{center}
+\begin{tabular}{llll}
+\hline
+Trip & Line & Stop sequence with times & Role \\
+\hline
+$r_1$ & Red   & $A$ 08:00, $B$ 08:10, $C$ 08:20 & first leg \\
+$b_1$ & Blue  & $B$ 08:13, $D$ 08:28            & connection \\
+$g_1$ & Green & $A$ 08:07, $D$ 08:35            & direct trip \\
+\hline
+\end{tabular}
+\end{center}
+Suppose the passenger is ready at $A$ at 07:58 and that the three-minute
+connection at $B$ satisfies the minimum-transfer rule.  Initially, round zero
+labels $A$ at 07:58.  In round one, scanning trips boardable from $A$ produces
+labels $B=08{:}10$ and $C=08{:}20$ through the Red line and $D=08{:}35$
+through the direct Green line.  In round two, the label at $B$ makes the Blue
+trip boardable at 08:13; it improves the destination label to $D=08{:}28$.
+The resulting nondominated alternatives include
+\[
+  A\xrightarrow{g_1}D
+  \quad (0\text{ transfers},\ 08{:}35),
+  \qquad
+  A\xrightarrow{r_1}B\xrightarrow{b_1}D
+  \quad (1\text{ transfer},\ 08{:}28).
+\]
+Neither alternative dominates the other in both arrival time and number of
+transfers.  A zero-transfer limit retains only the direct trip; a one-transfer
+limit also admits the faster connection.
+
+The example also shows why routing is time dependent.  A passenger becoming
+ready at 08:05 misses $r_1$ but can still board $g_1$, so the connecting
+alternative disappears even though the physical OD pair is unchanged.  A
+later query could encounter an entirely different set of trips.  RAPTOR
+therefore returns timetable-feasible journey summaries for a specified origin
+and departure time; it does not estimate OD demand and it does not impose one
+all-day route share.
+
+When this search is used to construct a reduced response, each retained
+alternative contributes boarding and alighting events for all of its vehicle
+legs.  The connecting journey above contributes boardings at $A$ and $B$ and
+alightings at $B$ and $D$, whereas the direct journey contributes only a
+boarding at $A$ and an alighting at $D$.  This distinction is what allows
+event-level counts, when sufficiently informative, to discriminate between
+journey alternatives.
+
+\subsection{Why the Reduced Approach Changes the Computational Scale}
+\label{sec:why-raptor-scales}
+
+The large difference between detailed assignment and the reduced approach does
+not arise from replacing one shortest-path routine by a universally faster
+one. The two calculations represent the network differently, are invoked at
+different stages, and expose optimization problems of very different
+dimensions.
+
+The central computational object is the assignment response, not RAPTOR
+itself. Let $A$ map OD-time demand to flows on the links or events of the
+detailed assignment, and let $M$ aggregate those flows into the modeled count
+rows. With fixed routing,
+\[
+ \bm x=A\bm f,
+ \qquad
+ \bm\mu=M\bm x=MA\bm f=B\bm f.
+\]
+Thus the measurement-response matrix is $B=MA$. It can in principle be built
+from either the time-expanded graph or RAPTOR-derived journeys. Once $B$ is
+available, estimation no longer needs to know how its columns were obtained.
+
+This also means that a redesigned time-expanded workflow could obtain the same
+computational benefit. If it enumerated or summarized a bounded journey set,
+projected those journeys directly onto measurements, stored the resulting
+compact $B$, and then removed graph traversal from the optimizer, its
+estimation stage would be conceptually the same as the reduced workflow. The
+present difference is therefore a difference in response construction and
+representation, not a mathematical capability exclusive to RAPTOR.
+
+The detailed model constructs a global time-expanded graph. Every scheduled
+arrival and departure is represented by an event node, and waiting, riding,
+transfer, access, and egress possibilities are represented by links. A forward
+assignment propagates passenger flow over this graph. Estimation additionally
+requires derivatives of measurements with respect to demand or behavioral
+parameters. A direct differentiated construction may therefore retain state
+whose scale is governed not only by the number of network events, but also by
+the number of destination groups or measurement responses. Repeating these
+graph traversals and derivative calculations at many optimization iterations
+is what creates the hours-long runtime and the prohibitive memory requirement.
+
+The earlier sharded algorithm already exploited the fact that fixed routing is
+linear, but it represented $B$ only \emph{implicitly}. For shard $s$, an
+objective evaluation computed
+\[
+ B_s\bm f_s=M A_s\bm f_s
+\]
+by loading the corresponding routing state and propagating flows through the
+complete time-expanded graph. Its adjoint similarly applied
+$A_s^{\mathsf T}M^{\mathsf T}$ by a reverse graph traversal. Routing
+probabilities could be reused, but the measurement-response columns were not
+constructed and retained. Sharding limited the amount of live state and made
+the calculation possible in memory; it did not eliminate the expensive graph
+work from each operator product. This is why reducing a run to fewer shards
+reduced memory much more clearly than elapsed time.
+
+For small cases, $B=MA$ can be constructed from the detailed graph. At full-
+network scale, however, a dense $B$ has one row per measurement and one column
+per free OD-time cell and is far too large. Constructing it column by column
+would require an enormous number of unit-demand assignments, while a reverse
+construction can require event-level derivative state for a very large
+collection of measurements. Fixed routing guarantees linearity, but it does
+not by itself make explicit matrix construction affordable.
+
+RAPTOR uses a different state representation. It scans timetable routes in a
+bounded sequence of rounds, with one additional vehicle boarding per round,
+and retains compact labels at stops rather than constructing a global graph of
+all timetable events. For one origin and departure time, its working state is
+principally determined by the stops, timetable records scanned, and permitted
+boarding rounds. It does not carry a measurement derivative for every event
+while searching for feasible journeys.
+
+More importantly, the RAPTOR journey representation constructs the relevant
+entries of $B$ directly. If journey $j$ for OD-time cell $c$ has fixed share
+$p_{j\mid c}$ and contributes $h_{jm}$ events to measurement $m$, then
+\[
+ B_{mc}=\sum_{j\in\mathcal J_c}p_{j\mid c}h_{jm}.
+\]
+Unobserved time-expanded links never appear in this construction. Each retained
+journey touches only a small number of boarding and alighting rows, so the
+response can be stored sparsely and identical columns can be compressed. This
+is the practical difference: the graph-based shards repeatedly \emph{apply} an
+implicit $B$, whereas the reduced approach builds a compact measurement-level
+$B$ once and reuses it.
+
+The two constructions produce the same matrix only when they use equivalent
+OD-time definitions, physical-stop mappings, access and transfer rules,
+feasible journey sets, generalized costs, route-choice probabilities, and
+measurement aggregation. Bounded transfer depth, journey pruning, or different
+share rules may instead give
+\[
+ B_{\mathrm{RAPTOR}}\ne B_{\mathrm{graph}}.
+\]
+The reduced matrix is exact relative to its retained journeys and fixed shares,
+but its agreement with the detailed response is an empirical validation
+question. Counts are used to estimate demand after either matrix is fixed; they
+do not choose the RAPTOR journeys.
+
+The decisive saving comes from using this search as preprocessing rather than
+inside every objective evaluation. Feasible journeys and their attributes are
+computed once, converted into fixed expected measurement responses, and then
+reused. Estimation operates on those responses. With the conditional gravity
+model, it also optimizes a small collection of shared behavioral and production
+coefficients instead of one variable per feasible OD-time cell. The resulting
+workflow is therefore
+\[
+ \begin{gathered}
+   \text{timetable search once}
+   \longrightarrow \text{compact fixed response}\\
+   \Downarrow\\[-1mm]
+   \text{many inexpensive objective evaluations}
+ \end{gathered}
+\]
+whereas repeated detailed estimation places the expensive network calculation
+inside the optimization loop.
+
+Three changes are consequently responsible for laptop-scale estimation:
+\begin{enumerate}
+  \item explicit construction and reuse of a compact measurement-response
+        matrix, rather than repeated application of an implicit graph-based
+        operator;
+  \item timetable-native, bounded-round routing that makes this compact
+        response practical to construct; and
+  \item a low-dimensional gravity parameterization instead of an unrestricted
+        OD-time parameter vector.
+\end{enumerate}
+These effects must not be attributed to RAPTOR alone. Searching every origin,
+departure instant, and destination can still require substantial preprocessing,
+and storing uncompressed journey or measurement responses can still be large.
+The approach remains practical because routing is bounded, preprocessing is
+reused, responses are sparse or compressed, and detailed assignment is reserved
+for post-fit validation.

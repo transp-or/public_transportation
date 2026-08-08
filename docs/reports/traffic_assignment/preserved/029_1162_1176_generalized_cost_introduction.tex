@@ -1,0 +1,15 @@
+\subsection{Generalized Cost}
+
+Each passenger seeks to minimize a generalized cost that includes:
+\begin{itemize}
+\item in-vehicle travel time (ride links),
+\item waiting and transfer time (transfer links) and dwell time at stops (dwell/continue links),
+\item transfer disutility through coefficient $\beta_{\mathrm{transfer}}$,
+\item early/late departure penalty relative to the desired departure \emph{interval} (access links; zero penalty within $[a_t,b_t]$).
+\end{itemize}
+
+For a path $p$, the generalized cost is
+\[
+C(p) = \sum_{\ell \in p} c_\ell.
+\]
+

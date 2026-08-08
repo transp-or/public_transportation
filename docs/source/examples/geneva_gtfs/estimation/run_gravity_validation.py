@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gc
+import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -55,6 +56,14 @@ from public_transportation.inference.gravity import (
 )
 from public_transportation.inference.od_parameter_layout import (
     build_od_parameter_layout,
+)
+from public_transportation.inference.reduced_od import (
+    DemandFitIdentity,
+    ReducedODFitConfig,
+    benchmark_demand_model,
+    build_generic_demand_problem_from_gravity,
+    estimate_demand_model,
+    progressive_model_ladder,
 )
 from public_transportation.measurement import (
     build_mapping_spec_strict,
@@ -300,6 +309,41 @@ def run_validation(
         config=estimator_config,
         execution=execution,
     )
+    stage("estimate generic M0 on the same device operator")
+    generic_problem = build_generic_demand_problem_from_gravity(
+        features=features,
+        operator=operator,
+        observations=np.asarray(mapped.y_obs),
+        specification=progressive_model_ladder()["M0"],
+    )
+    generic_identity = DemandFitIdentity(
+        generic_problem.specification.fingerprint,
+        generic_problem.parameter_layout.fingerprint,
+        generic_problem.features.fingerprint,
+        "legacy-origin-destination-groups-v1",
+        hashlib.sha256(
+            "|".join(
+                (
+                    operator.assignment_fingerprint,
+                    operator.graph_fingerprint,
+                    operator.mapping_fingerprint,
+                    str(operator.theta),
+                )
+            ).encode()
+        ).hexdigest(),
+        hashlib.sha256(np.asarray(mapped.y_obs).tobytes()).hexdigest(),
+    )
+    generic_result = estimate_demand_model(
+        problem=generic_problem,
+        initial_raw_parameters=np.zeros(generic_problem.parameter_layout.size),
+        identity=generic_identity,
+        config=ReducedODFitConfig(maximum_iterations=maximum_iterations),
+    )
+    generic_benchmark = benchmark_demand_model(
+        problem=generic_problem,
+        raw_parameters=generic_result.raw_parameters,
+        warm_evaluations=3,
+    )
     metadata = _validation_metadata()
     stage("compute full-data adequacy")
     parent_adequacy = validate_full_data_gravity_adequacy(
@@ -388,6 +432,16 @@ def run_validation(
             "objective": parent_result.objective,
             "negative_binomial_deviance": parent_adequacy.negative_binomial_deviance,
             "rmse": parent_adequacy.rmse,
+        },
+        "generic_demand_m0": {
+            "status": generic_result.status,
+            "iterations": generic_result.iterations,
+            "objective": generic_result.objective,
+            "parameter_count": generic_problem.parameter_layout.size,
+            "compile_seconds": generic_result.compile_seconds,
+            "optimization_seconds": generic_result.optimization_seconds,
+            "warm_value_gradient_seconds": generic_benchmark.warm_value_gradient_seconds,
+            "operator_materialized": False,
         },
         "recommendations": candidate_rows,
         "lineage": {

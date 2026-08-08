@@ -1,0 +1,29 @@
+\subsubsection{Explicit OD reconstruction and detailed validation}
+\label{sec:reduced-od-reconstruction}
+
+Phase~11 keeps reconstruction strictly outside estimation.  The fitted compact
+demand vector is aligned with the canonical free-cell keys and inserted into
+the full problem contract only when
+\path{public_transportation.inference.reduced_od.reconstruction} is called
+explicitly.  Frozen positive values are copied unchanged, structural-zero
+cells remain zero, and every output row records whether its value was estimated
+or fixed.  A mismatch in free-cell order, dimension, or canonical key identity
+is an error rather than an implicit reorder.
+
+The same module exposes a post-fit detailed-assignment adapter.  The caller
+supplies a function that accepts the reconstructed OD object and returns
+measurement predictions plus named transfer-audit quantities.  The adapter
+invokes that function exactly once and compares its output with the compact
+prediction using the difference vector, maximum absolute error, root mean
+square error, and relative $\ell_2$ error.  The detailed assignment configuration
+is deliberately captured by the caller: it is not part of the optimizer and
+cannot be reached from an objective evaluation.  Detailed-assignment time and
+memory must consequently be reported as validation cost, never as fitting
+cost.
+
+The public benchmark reconstructed 20,000 canonical all-free cells in about
+0.010 seconds and allocated 160,000 bytes for the demand vector.  Tests also
+cover mixed free, frozen-positive, and frozen-zero layouts, rejection of a
+noncanonical free order, a single detailed-assignment invocation, and the
+separation between the estimator and all post-fit operations.
+

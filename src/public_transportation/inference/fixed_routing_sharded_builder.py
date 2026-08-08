@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import math
+import hashlib
+import json
+import os
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+import tempfile
+import uuid
 from time import perf_counter
 from typing import Callable
 
@@ -29,6 +34,7 @@ from .fixed_routing_origin_support import (
     analyze_fixed_routing_origin_support,
 )
 from .sharded_sparse_operator import (
+    SHARDED_OPERATOR_SCHEMA_VERSION,
     ShardedOperatorManifest,
     SparseShardIdentity,
     SparseShardMetrics,
@@ -39,6 +45,78 @@ from .sharded_sparse_operator import (
     save_sparse_shard,
     shard_path,
 )
+from .construction_control import (
+    ConstructionDeadline,
+    ConstructionPhase,
+    ConstructionProgressReporter,
+    deadline_stop,
+)
+from .sharded_fixed_routing import (
+    ShardedFixedRoutingInputs,
+    fixed_routing_descriptor_for_group,
+    load_fixed_routing_shard,
+    validate_sharded_fixed_routing_compatibility,
+)
+
+FixedRoutingSource = FixedRoutingInputs | ShardedFixedRoutingInputs
+
+
+class _RoutingBatchReader:
+    """Retain at most one sharded routing batch on host and device."""
+
+    def __init__(self, routing: FixedRoutingSource) -> None:
+        self.routing = routing
+        self.descriptor = None
+        self.shard = None
+        self.device_probability = None
+        self.device_effective = None
+        self.dense_probability = (
+            None
+            if isinstance(routing, ShardedFixedRoutingInputs)
+            else np.asarray(routing.group_link_probability)
+        )
+        self.dense_effective = (
+            None
+            if isinstance(routing, ShardedFixedRoutingInputs)
+            else np.asarray(routing.effective_group_link_mask, dtype=bool)
+        )
+
+    def _ensure(self, group: int) -> int:
+        if not isinstance(self.routing, ShardedFixedRoutingInputs):
+            return group
+        descriptor = fixed_routing_descriptor_for_group(self.routing, group)
+        if self.descriptor != descriptor:
+            self.shard = load_fixed_routing_shard(
+                routing=self.routing, descriptor=descriptor
+            )
+            self.device_probability = jnp.asarray(self.shard.group_link_probability)
+            self.device_effective = jnp.asarray(
+                self.shard.effective_group_link_mask
+            )
+            self.descriptor = descriptor
+        return group - descriptor.group_start
+
+    def host(self, group: int) -> tuple[np.ndarray, np.ndarray]:
+        local = self._ensure(group)
+        if isinstance(self.routing, ShardedFixedRoutingInputs):
+            assert self.shard is not None
+            return (
+                self.shard.group_link_probability[local],
+                self.shard.effective_group_link_mask[local],
+            )
+        assert self.dense_probability is not None and self.dense_effective is not None
+        return self.dense_probability[local], self.dense_effective[local]
+
+    def device(self, group: int):
+        local = self._ensure(group)
+        if isinstance(self.routing, ShardedFixedRoutingInputs):
+            assert self.device_probability is not None
+            assert self.device_effective is not None
+            return self.device_probability[local], self.device_effective[local]
+        return (
+            self.routing.group_link_probability[local],
+            self.routing.effective_group_link_mask[local],
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +138,9 @@ class ShardedConstructionConfig:
     maximum_sparse_calls_per_product: int = 256
     manifest_checkpoint_shards: int = 16
     maximum_construction_dispatches: int = 4096
+    maximum_resident_shards: int = 2
+    progress_interval_seconds: float = 1.0
+    deadline_safety_margin_seconds: float = 5.0
 
     def __post_init__(self) -> None:
         if (
@@ -75,6 +156,15 @@ class ShardedConstructionConfig:
             raise ValueError("zero_tolerance must be finite and non-negative.")
         if self.workers <= 0:
             raise ValueError("workers must be positive.")
+        if self.maximum_resident_shards <= 0:
+            raise ValueError("maximum_resident_shards must be positive.")
+        if (
+            not math.isfinite(self.progress_interval_seconds)
+            or self.progress_interval_seconds < 0.0
+            or not math.isfinite(self.deadline_safety_margin_seconds)
+            or self.deadline_safety_margin_seconds < 0.0
+        ):
+            raise ValueError("progress interval and deadline margin must be nonnegative.")
         if not (
             0 < self.target_nonzeros_per_storage_shard
             <= self.maximum_nonzeros_per_storage_shard
@@ -265,6 +355,222 @@ class _Support:
     storage_task_keys: dict[str, tuple[str, ...]]
 
 
+SUPPORT_CHECKPOINT_SCHEMA_VERSION = 1
+
+
+def _ragged(values: tuple[np.ndarray, ...]) -> tuple[np.ndarray, np.ndarray]:
+    lengths = np.asarray([value.size for value in values], dtype=np.int64)
+    offsets = np.concatenate((np.asarray([0], dtype=np.int64), np.cumsum(lengths)))
+    flat = np.concatenate(values) if values and offsets[-1] else np.empty(0, np.int64)
+    return np.asarray(flat, dtype=np.int64), offsets
+
+
+def _unragged(flat: np.ndarray, offsets: np.ndarray) -> tuple[np.ndarray, ...]:
+    return tuple(
+        np.asarray(flat[offsets[index] : offsets[index + 1]], dtype=np.int64)
+        for index in range(offsets.size - 1)
+    )
+
+
+def _support_checkpoint_path(directory: Path) -> Path:
+    return Path(directory) / "support.npz"
+
+
+def _support_checkpoint_hash(arrays: dict[str, np.ndarray]) -> str:
+    digest = hashlib.sha256()
+    for name, value in sorted(arrays.items()):
+        array = np.ascontiguousarray(value)
+        digest.update(name.encode())
+        digest.update(str(array.dtype).encode())
+        digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+        digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
+def _derived_support(
+    *,
+    free_column: np.ndarray,
+    fixed_by_active: np.ndarray,
+    selected: np.ndarray,
+    group_od_indices: tuple[np.ndarray, ...],
+    group_measurements: tuple[np.ndarray, ...],
+    global_slots: np.ndarray,
+    global_slot_mask: np.ndarray,
+    group_level_candidate_entries: int,
+    origin_support_seconds: float,
+    patterns: tuple[SupportPattern, ...],
+    config: ShardedConstructionConfig,
+) -> _Support:
+    tasks = []
+    shard_od_indices = {}
+    shard_measurements = {}
+    identities = []
+    for pattern in patterns:
+        pattern_od = np.asarray(pattern.od_indices, dtype=np.int64)
+        pattern_measurements = np.asarray(pattern.measurements, dtype=np.int64)
+        for block, first in enumerate(
+            range(0, pattern_measurements.size, config.measurement_block_size)
+        ):
+            count = min(
+                config.measurement_block_size, pattern_measurements.size - first
+            )
+            identity = SparseShardIdentity(
+                group=pattern.group,
+                measurement_block=block,
+                first_measurement_position=first,
+                measurement_count=count,
+                support_pattern=pattern.pattern,
+            )
+            measurements = pattern_measurements[first : first + count]
+            identities.append(identity)
+            shard_od_indices[identity.key] = pattern_od
+            shard_measurements[identity.key] = measurements
+            tasks.append(
+                ConstructionTask(
+                    identity=identity,
+                    group=pattern.group,
+                    od_indices=pattern.od_indices,
+                    measurements=tuple(int(value) for value in measurements),
+                    estimated_nonzeros=int(pattern_od.size * measurements.size),
+                )
+            )
+    return _Support(
+        free_column=free_column,
+        fixed_by_active=fixed_by_active,
+        selected=selected,
+        group_od_indices=group_od_indices,
+        group_measurements=group_measurements,
+        global_slots=global_slots,
+        global_slot_mask=global_slot_mask,
+        shard_od_indices=shard_od_indices,
+        shard_measurements=shard_measurements,
+        expected_shards=tuple(identities),
+        group_level_candidate_entries=group_level_candidate_entries,
+        origin_support_seconds=origin_support_seconds,
+        support_patterns=len(patterns),
+        patterns=patterns,
+        construction_tasks=tuple(tasks),
+        storage_task_keys={},
+    )
+
+
+def _save_support_checkpoint(
+    directory: Path,
+    support: _Support,
+    *,
+    provenance_hash: str,
+) -> Path:
+    group_od, group_od_offsets = _ragged(support.group_od_indices)
+    group_rows, group_row_offsets = _ragged(support.group_measurements)
+    pattern_od, pattern_od_offsets = _ragged(
+        tuple(np.asarray(item.od_indices, dtype=np.int64) for item in support.patterns)
+    )
+    pattern_rows, pattern_row_offsets = _ragged(
+        tuple(np.asarray(item.measurements, dtype=np.int64) for item in support.patterns)
+    )
+    arrays = {
+        "free_column": np.asarray(support.free_column),
+        "fixed_by_active": np.asarray(support.fixed_by_active),
+        "selected": np.asarray(support.selected),
+        "group_od": group_od,
+        "group_od_offsets": group_od_offsets,
+        "group_rows": group_rows,
+        "group_row_offsets": group_row_offsets,
+        "global_slots": np.asarray(support.global_slots),
+        "global_slot_mask": np.asarray(support.global_slot_mask),
+        "pattern_group": np.asarray([item.group for item in support.patterns], np.int64),
+        "pattern_id": np.asarray([item.pattern for item in support.patterns], np.int64),
+        "pattern_od": pattern_od,
+        "pattern_od_offsets": pattern_od_offsets,
+        "pattern_rows": pattern_rows,
+        "pattern_row_offsets": pattern_row_offsets,
+    }
+    metadata = {
+        "schema_version": SUPPORT_CHECKPOINT_SCHEMA_VERSION,
+        "provenance_hash": provenance_hash,
+        "content_hash": _support_checkpoint_hash(arrays),
+        "group_level_candidate_entries": support.group_level_candidate_entries,
+        "origin_support_seconds": support.origin_support_seconds,
+    }
+    destination = _support_checkpoint_path(directory)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    )
+    os.close(descriptor)
+    try:
+        with open(temporary, "wb") as stream:
+            np.savez(stream, metadata=np.asarray(json.dumps(metadata)), **arrays)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _load_support_checkpoint(
+            Path(temporary), provenance_hash=provenance_hash, config=None
+        )
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return destination
+
+
+def _load_support_checkpoint(
+    path: Path,
+    *,
+    provenance_hash: str,
+    config: ShardedConstructionConfig | None,
+) -> _Support:
+    with np.load(path, allow_pickle=False) as archive:
+        metadata = json.loads(str(archive["metadata"]))
+        arrays = {
+            name: np.asarray(archive[name])
+            for name in archive.files
+            if name != "metadata"
+        }
+    if metadata.get("schema_version") != SUPPORT_CHECKPOINT_SCHEMA_VERSION:
+        raise ValueError("support checkpoint schema is incompatible.")
+    if metadata.get("provenance_hash") != provenance_hash:
+        raise ValueError("support checkpoint provenance is incompatible.")
+    if metadata.get("content_hash") != _support_checkpoint_hash(arrays):
+        raise ValueError("support checkpoint content hash is invalid.")
+    pattern_od = _unragged(arrays["pattern_od"], arrays["pattern_od_offsets"])
+    pattern_rows = _unragged(
+        arrays["pattern_rows"], arrays["pattern_row_offsets"]
+    )
+    patterns = tuple(
+        SupportPattern(
+            group=int(group),
+            pattern=int(pattern),
+            od_indices=tuple(int(value) for value in od),
+            measurements=tuple(int(value) for value in rows),
+        )
+        for group, pattern, od, rows in zip(
+            arrays["pattern_group"],
+            arrays["pattern_id"],
+            pattern_od,
+            pattern_rows,
+            strict=True,
+        )
+    )
+    effective_config = ShardedConstructionConfig() if config is None else config
+    return _derived_support(
+        free_column=arrays["free_column"],
+        fixed_by_active=arrays["fixed_by_active"],
+        selected=arrays["selected"],
+        group_od_indices=_unragged(arrays["group_od"], arrays["group_od_offsets"]),
+        group_measurements=_unragged(
+            arrays["group_rows"], arrays["group_row_offsets"]
+        ),
+        global_slots=arrays["global_slots"],
+        global_slot_mask=arrays["global_slot_mask"],
+        group_level_candidate_entries=int(
+            metadata["group_level_candidate_entries"]
+        ),
+        origin_support_seconds=float(metadata["origin_support_seconds"]),
+        patterns=patterns,
+        config=effective_config,
+    )
+
+
 def _timing_quantiles(values: list[float]) -> dict[str, float]:
     if not values:
         return {key: 0.0 for key in ("minimum", "median", "p90", "p99", "maximum")}
@@ -281,10 +587,14 @@ def _timing_quantiles(values: list[float]) -> dict[str, float]:
 def _discover_support(
     *,
     inputs: AssignmentInputs,
-    routing: FixedRoutingInputs,
+    routing: FixedRoutingSource,
     spec,
     compact_layout: CompactODAssignmentLayout,
     config: ShardedConstructionConfig,
+    checkpoint_directory: Path | None = None,
+    checkpoint_provenance_hash: str | None = None,
+    deadline: ConstructionDeadline | None = None,
+    reporter: ConstructionProgressReporter | None = None,
 ) -> _Support:
     num_active = int(inputs.od_origin_node.shape[0])
     free_column = np.full(num_active, -1, np.int64)
@@ -299,7 +609,7 @@ def _discover_support(
     )
     selected = (free_column >= 0) | (fixed_by_active != 0.0)
     global_slots, global_slot_mask = _mapping_slots(spec, inputs.graph.num_links)
-    effective = np.asarray(routing.effective_group_link_mask)
+    routing_reader = _RoutingBatchReader(routing)
     group_indices = np.asarray(inputs.group_od_index_padded)
     group_masks = np.asarray(inputs.group_od_mask)
     od_groups: list[np.ndarray] = []
@@ -314,6 +624,10 @@ def _discover_support(
             worker_memory_budget_bytes=config.worker_memory_budget_bytes,
             materialize=True,
         ),
+        checkpoint_directory=checkpoint_directory,
+        checkpoint_provenance_hash=checkpoint_provenance_hash,
+        deadline=deadline,
+        reporter=reporter,
     )
     assert analyzed.free_support is not None
     assert analyzed.positive_fixed_support is not None
@@ -335,17 +649,13 @@ def _discover_support(
                 fixed_support.indptr[column] : fixed_support.indptr[column + 1]
             ]
         )
-    identities: list[SparseShardIdentity] = []
     discovered_patterns: list[SupportPattern] = []
-    tasks: list[ConstructionTask] = []
-    shard_od_indices: dict[str, np.ndarray] = {}
-    shard_measurements: dict[str, np.ndarray] = {}
-    pattern_count = 0
     for group in range(int(inputs.group_dest_node.shape[0])):
         relevant = group_indices[group][group_masks[group]]
         relevant = relevant[selected[relevant]].astype(np.int64, copy=False)
         od_groups.append(relevant)
-        mapped = global_slot_mask & effective[group, :, None]
+        _, group_effective = routing_reader.host(group)
+        mapped = global_slot_mask & group_effective[:, None]
         measurements.append(
             np.unique(global_slots[mapped]).astype(np.int64, copy=False)
         )
@@ -355,7 +665,6 @@ def _discover_support(
             if pattern:
                 patterns.setdefault(pattern, []).append(int(active_index))
         for pattern_id, pattern in enumerate(sorted(patterns)):
-            pattern_count += 1
             pattern_measurements = np.asarray(pattern, dtype=np.int64)
             pattern_od = np.asarray(patterns[pattern], dtype=np.int64)
             discovered_patterns.append(
@@ -366,34 +675,7 @@ def _discover_support(
                     measurements=tuple(int(value) for value in pattern_measurements),
                 )
             )
-            for block, first in enumerate(
-                range(0, pattern_measurements.size, config.measurement_block_size)
-            ):
-                count = min(
-                    config.measurement_block_size,
-                    pattern_measurements.size - first,
-                )
-                identity = SparseShardIdentity(
-                    group=group,
-                    measurement_block=block,
-                    first_measurement_position=first,
-                    measurement_count=count,
-                    support_pattern=pattern_id,
-                )
-                identities.append(identity)
-                shard_od_indices[identity.key] = pattern_od
-                task_measurements = pattern_measurements[first : first + count]
-                shard_measurements[identity.key] = task_measurements
-                tasks.append(
-                    ConstructionTask(
-                        identity=identity,
-                        group=group,
-                        od_indices=tuple(int(value) for value in pattern_od),
-                        measurements=tuple(int(value) for value in task_measurements),
-                        estimated_nonzeros=int(pattern_od.size * task_measurements.size),
-                    )
-                )
-    return _Support(
+    return _derived_support(
         free_column=free_column,
         fixed_by_active=fixed_by_active,
         selected=selected,
@@ -401,17 +683,12 @@ def _discover_support(
         group_measurements=tuple(measurements),
         global_slots=global_slots,
         global_slot_mask=global_slot_mask,
-        shard_od_indices=shard_od_indices,
-        shard_measurements=shard_measurements,
-        expected_shards=tuple(identities),
         group_level_candidate_entries=(
             analyzed.metrics.group_level_candidate_entries
         ),
         origin_support_seconds=analyzed.metrics.support_discovery_seconds,
-        support_patterns=pattern_count,
         patterns=tuple(discovered_patterns),
-        construction_tasks=tuple(tasks),
-        storage_task_keys={},
+        config=config,
     )
 
 
@@ -482,22 +759,30 @@ def pack_storage_shards(
 def plan_sharded_fixed_routing_operator(
     *,
     inputs: AssignmentInputs,
-    routing: FixedRoutingInputs,
+    routing: FixedRoutingSource,
     spec,
     compact_layout: CompactODAssignmentLayout,
     config: ShardedConstructionConfig | None = None,
+    discovered_support: _Support | None = None,
 ) -> tuple[ShardedConstructionPlan, _Support]:
     """Discover structural support and reject unsafe kernels before lowering."""
     config = ShardedConstructionConfig() if config is None else config
-    validate_fixed_routing_compatibility(inputs=inputs, routing=routing)
+    if isinstance(routing, ShardedFixedRoutingInputs):
+        validate_sharded_fixed_routing_compatibility(inputs=inputs, routing=routing)
+    else:
+        validate_fixed_routing_compatibility(inputs=inputs, routing=routing)
     if compact_layout.num_active != int(inputs.od_origin_node.shape[0]):
         raise ValueError("compact layout and assignment active dimensions differ.")
-    support = _discover_support(
-        inputs=inputs,
-        routing=routing,
-        spec=spec,
-        compact_layout=compact_layout,
-        config=config,
+    support = (
+        _discover_support(
+            inputs=inputs,
+            routing=routing,
+            spec=spec,
+            compact_layout=compact_layout,
+            config=config,
+        )
+        if discovered_support is None
+        else discovered_support
     )
     task_identities = support.expected_shards
     candidates = sum(
@@ -509,20 +794,22 @@ def plan_sharded_fixed_routing_operator(
     )
     mapping_links = np.asarray(spec.link_index, dtype=np.int64)
     mapping_measurements = np.asarray(spec.measurement_index, dtype=np.int64)
-    effective = np.asarray(routing.effective_group_link_mask, dtype=bool)
-    maximum_support_edges = max(
-        (
-            int(
-                np.count_nonzero(
-                    effective[identity.group, mapping_links]
-                    & np.isin(
-                        mapping_measurements,
-                        support.shard_measurements[identity.key],
-                    )
+    routing_reader = _RoutingBatchReader(routing)
+
+    def support_edge_count(identity: SparseShardIdentity) -> int:
+        _, group_effective = routing_reader.host(identity.group)
+        return int(
+            np.count_nonzero(
+                group_effective[mapping_links]
+                & np.isin(
+                    mapping_measurements,
+                    support.shard_measurements[identity.key],
                 )
             )
-            for identity in task_identities
-        ),
+        )
+
+    maximum_support_edges = max(
+        (support_edge_count(identity) for identity in task_identities),
         default=0,
     )
     itemsize = np.dtype(inputs.base_link_cost.dtype).itemsize
@@ -569,9 +856,10 @@ def plan_sharded_fixed_routing_operator(
                 row for task in grouped_tasks for row in task.measurements
             }
             maximum_batch_rows = max(maximum_batch_rows, len(batch_measurements))
+            _, group_effective = routing_reader.host(group)
             selected_edges = int(
                 np.count_nonzero(
-                    effective[group, mapping_links]
+                    group_effective[mapping_links]
                     & np.isin(mapping_measurements, tuple(batch_measurements))
                 )
             )
@@ -693,6 +981,27 @@ def _plan_from_manifest(manifest: ShardedOperatorManifest) -> ShardedConstructio
     )
 
 
+def _restore_plan_from_manifest(
+    manifest: ShardedOperatorManifest,
+    *,
+    support: _Support,
+    config: ShardedConstructionConfig,
+    itemsize: int,
+) -> tuple[ShardedConstructionPlan, _Support]:
+    plan = _plan_from_manifest(manifest)
+    storage = pack_storage_shards(
+        support.construction_tasks, config=config, itemsize=itemsize
+    )
+    identities = tuple(item.identity for item in storage)
+    if identities != manifest.expected_shards:
+        raise ValueError("persisted plan and reconstructed support are incompatible.")
+    support = replace(
+        support,
+        storage_task_keys={item.identity.key: item.task_keys for item in storage},
+    )
+    return replace(plan, storage_shards=storage), support
+
+
 def _construction_provenance(
     *,
     inputs: AssignmentInputs,
@@ -703,6 +1012,7 @@ def _construction_provenance(
     theta: float,
     config: ShardedConstructionConfig,
     assignment_inputs_fingerprint_value: str | None = None,
+    scientific_identity: dict[str, object] | None = None,
 ) -> dict[str, object]:
     return {
         "assignment_fingerprint": str(assignment_fingerprint),
@@ -725,6 +1035,10 @@ def _construction_provenance(
         "target_nonzeros_per_storage_shard": config.target_nonzeros_per_storage_shard,
         "maximum_nonzeros_per_storage_shard": config.maximum_nonzeros_per_storage_shard,
         "maximum_patterns_per_storage_shard": config.maximum_patterns_per_storage_shard,
+        "construction_schema_version": SHARDED_OPERATOR_SCHEMA_VERSION,
+        "scientific_identity": (
+            {} if scientific_identity is None else dict(scientific_identity)
+        ),
     }
 
 
@@ -739,6 +1053,7 @@ def load_complete_sharded_fixed_routing_cache(
     theta: float,
     config: ShardedConstructionConfig | None = None,
     assignment_inputs_fingerprint_value: str | None = None,
+    scientific_identity: dict[str, object] | None = None,
 ) -> ShardedConstructionResult | None:
     """Return a compatible complete cache without routing or support planning."""
     config = ShardedConstructionConfig() if config is None else config
@@ -756,6 +1071,7 @@ def load_complete_sharded_fixed_routing_cache(
         theta=theta,
         config=config,
         assignment_inputs_fingerprint_value=assignment_inputs_fingerprint_value,
+        scientific_identity=scientific_identity,
     )
     if not manifest.complete or manifest.provenance != provenance:
         return None
@@ -785,16 +1101,26 @@ def prepare_sharded_fixed_routing_measurement_operator(
     *,
     directory: str | Path,
     inputs: AssignmentInputs,
-    routing: FixedRoutingInputs,
+    routing: FixedRoutingSource,
     spec,
     compact_layout: CompactODAssignmentLayout,
     assignment_fingerprint: str,
     od_layout_fingerprint: str,
     config: ShardedConstructionConfig | None = None,
     progress: Callable[[dict[str, object]], None] | None = None,
+    deadline: ConstructionDeadline | None = None,
+    reporter: ConstructionProgressReporter | None = None,
+    scientific_identity: dict[str, object] | None = None,
 ) -> ShardedConstructionResult:
     """Build missing/invalid shards and atomically advance a resumable manifest."""
     config = ShardedConstructionConfig() if config is None else config
+    legacy_progress = progress if deadline is None and reporter is None else None
+    control = ConstructionDeadline.unlimited() if deadline is None else deadline
+    events = (
+        ConstructionProgressReporter(control, None if legacy_progress else progress)
+        if reporter is None
+        else reporter
+    )
     if config.workers != 1:
         raise NotImplementedError(
             "parallel shard construction is not enabled yet; use workers=1"
@@ -809,15 +1135,35 @@ def prepare_sharded_fixed_routing_measurement_operator(
         od_layout_fingerprint=od_layout_fingerprint,
         theta=float(np.asarray(routing.theta)),
         config=config,
+        scientific_identity=scientific_identity,
     )
+    existing_manifest = None
     if manifest_path(directory).exists():
+        events.emit(
+            phase=ConstructionPhase.SHARD_VALIDATION,
+            status="started",
+            force=True,
+            checkpoint_location=str(directory),
+        )
         existing = load_sharded_operator_manifest(directory)
+        existing_manifest = existing
         if existing.provenance != provenance:
             raise ValueError("existing shard manifest provenance is incompatible.")
         if existing.complete and existing.plan_summary is not None:
             valid = True
             aggregate_nonzeros = 0
-            for identity in existing.expected_shards:
+            for position, identity in enumerate(existing.expected_shards):
+                if not control.may_start():
+                    raise deadline_stop(
+                        control,
+                        phase=ConstructionPhase.SHARD_VALIDATION,
+                        reason="deadline reached while validating completed shards",
+                        completed_units=position,
+                        total_units=len(existing.expected_shards),
+                        next_resumable_position=identity.key,
+                        checkpoint_location=str(directory),
+                        checkpoint_reusable=True,
+                    )
                 try:
                     loaded = load_sparse_shard(
                         shard_path(directory, identity),
@@ -851,15 +1197,102 @@ def prepare_sharded_fixed_routing_measurement_operator(
                     finalization_seconds=0.0,
                     total_seconds=perf_counter() - total_start,
                 )
-    support_start = perf_counter()
-    plan, support = plan_sharded_fixed_routing_operator(
-        inputs=inputs,
-        routing=routing,
-        spec=spec,
-        compact_layout=compact_layout,
-        config=config,
+    if not control.may_start():
+        raise deadline_stop(
+            control,
+            phase=ConstructionPhase.SUPPORT_DISCOVERY,
+            reason="deadline reached before support discovery",
+            checkpoint_location=str(directory),
+            checkpoint_reusable=manifest_path(directory).exists(),
+        )
+    events.emit(
+        phase=ConstructionPhase.SUPPORT_DISCOVERY,
+        status="started",
+        force=True,
+        checkpoint_location=str(directory),
     )
+    support_start = perf_counter()
+    provenance_hash = hashlib.sha256(
+        json.dumps(provenance, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    directory.mkdir(parents=True, exist_ok=True)
+    for abandoned in directory.glob(".support.npz.*.tmp"):
+        abandoned.unlink(missing_ok=True)
+    support_checkpoint = _support_checkpoint_path(directory)
+    support = None
+    support_reused = False
+    if support_checkpoint.exists():
+        try:
+            support = _load_support_checkpoint(
+                support_checkpoint,
+                provenance_hash=provenance_hash,
+                config=config,
+            )
+        except (KeyError, OSError, ValueError, json.JSONDecodeError):
+            quarantine = support_checkpoint.with_name(
+                f"{support_checkpoint.name}.invalid-{uuid.uuid4().hex}"
+            )
+            os.replace(support_checkpoint, quarantine)
+        else:
+            support_reused = True
+    if support is None:
+        support = _discover_support(
+            inputs=inputs,
+            routing=routing,
+            spec=spec,
+            compact_layout=compact_layout,
+            config=config,
+            checkpoint_directory=directory,
+            checkpoint_provenance_hash=provenance_hash,
+            deadline=control,
+            reporter=events,
+        )
+        _save_support_checkpoint(
+            directory, support, provenance_hash=provenance_hash
+        )
     support_seconds = perf_counter() - support_start
+    if control.expired:
+        raise deadline_stop(
+            control,
+            phase=ConstructionPhase.SUPPORT_DISCOVERY,
+            reason="deadline expired after atomically persisting support discovery",
+            completed_units=1,
+            total_units=1,
+            next_resumable_position="planning",
+            checkpoint_location=str(directory),
+            checkpoint_reusable=True,
+        )
+    events.emit(
+        phase=ConstructionPhase.SUPPORT_DISCOVERY,
+        status="completed",
+        force=True,
+        completed_units=1,
+        total_units=1,
+        recent_unit_seconds=support_seconds,
+        checkpoint_location=str(directory),
+        cache_hits=int(support_reused),
+        cache_misses=int(not support_reused),
+    )
+    planning_start = perf_counter()
+    planning_reused = False
+    if existing_manifest is not None and existing_manifest.plan_summary is not None:
+        plan, support = _restore_plan_from_manifest(
+            existing_manifest,
+            support=support,
+            config=config,
+            itemsize=np.dtype(inputs.base_link_cost.dtype).itemsize,
+        )
+        planning_reused = True
+    else:
+        plan, support = plan_sharded_fixed_routing_operator(
+            inputs=inputs,
+            routing=routing,
+            spec=spec,
+            compact_layout=compact_layout,
+            config=config,
+            discovered_support=support,
+        )
+    planning_seconds = perf_counter() - planning_start
     if not plan.safe:
         raise MemoryError(plan.reason)
     template = _manifest(
@@ -868,6 +1301,26 @@ def prepare_sharded_fixed_routing_measurement_operator(
         provenance=provenance,
         completed=set(),
         aggregate_nonzeros=0,
+    )
+    if existing_manifest is None:
+        save_sharded_operator_manifest(template, directory)
+    if control.expired:
+        raise deadline_stop(
+            control,
+            phase=ConstructionPhase.PLANNING,
+            reason="deadline expired during deterministic shard planning",
+            checkpoint_location=str(directory),
+            checkpoint_reusable=_support_checkpoint_path(directory).exists(),
+        )
+    events.emit(
+        phase=ConstructionPhase.PLANNING,
+        status="completed",
+        force=True,
+        recent_unit_seconds=planning_seconds,
+        total_units=plan.num_shards,
+        checkpoint_location=str(directory),
+        cache_hits=int(planning_reused),
+        cache_misses=int(not planning_reused),
     )
     if manifest_path(directory).exists():
         existing = load_sharded_operator_manifest(directory)
@@ -878,7 +1331,18 @@ def prepare_sharded_fixed_routing_measurement_operator(
     completed: set[str] = set()
     aggregate_nonzeros = 0
     rejected = 0
-    for identity in plan.expected_shards:
+    for validation_position, identity in enumerate(plan.expected_shards):
+        if not control.may_start():
+            raise deadline_stop(
+                control,
+                phase=ConstructionPhase.SHARD_VALIDATION,
+                reason="deadline reached during checkpoint recovery scan",
+                completed_units=validation_position,
+                total_units=plan.num_shards,
+                next_resumable_position=identity.key,
+                checkpoint_location=str(directory),
+                checkpoint_reusable=bool(completed),
+            )
         path = shard_path(directory, identity)
         if not path.exists():
             continue
@@ -940,12 +1404,14 @@ def prepare_sharded_fixed_routing_measurement_operator(
     dummy_valid = jnp.zeros(config.od_chunk_size, bool)
     dummy_links = jnp.zeros(config.support_edge_block_size, jnp.int32)
     dummy_link_mask = jnp.zeros(config.support_edge_block_size, bool)
+    routing_reader = _RoutingBatchReader(routing)
+    prototype_probability, prototype_effective = routing_reader.device(0)
     lowering_start = perf_counter()
     lowered = kernel.lower(
         dummy_origins,
         dummy_valid,
-        routing.group_link_probability[0],
-        routing.effective_group_link_mask[0],
+        prototype_probability,
+        prototype_effective,
         dummy_links,
         dummy_link_mask,
     )
@@ -955,7 +1421,6 @@ def prepare_sharded_fixed_routing_measurement_operator(
     compilation_seconds = perf_counter() - compilation_start
 
     origins = np.asarray(inputs.od_origin_node, dtype=np.int32)
-    effective = np.asarray(routing.effective_group_link_mask)
     mapping_links = np.asarray(spec.link_index, dtype=np.int32)
     mapping_measurements = np.asarray(spec.measurement_index, dtype=np.int64)
     dispatch = synchronization = transfer = filtering = persistence = 0.0
@@ -973,9 +1438,28 @@ def prepare_sharded_fixed_routing_measurement_operator(
     construction_batches = 0
     padded_buffer_allocations = 0
     routing_array_dispatch_uses = 0
+    recent_shard_seconds: list[float] = []
     for identity in plan.expected_shards:
         if identity.key in completed:
             continue
+        predicted_next = (
+            float(np.mean(recent_shard_seconds[-3:]))
+            if recent_shard_seconds
+            else None
+        )
+        if not control.may_start(predicted_next):
+            raise deadline_stop(
+                control,
+                phase=ConstructionPhase.SHARD_CONSTRUCTION,
+                reason="next shard cannot start within the safe deadline",
+                completed_units=len(completed),
+                total_units=plan.num_shards,
+                next_resumable_position=identity.key,
+                checkpoint_location=str(directory),
+                checkpoint_reusable=bool(completed),
+                predicted_next_seconds=predicted_next,
+            )
+        shard_started = control.clock()
         shard_tasks = [
             tasks_by_key[key] for key in support.storage_task_keys[identity.key]
         ]
@@ -1003,7 +1487,11 @@ def prepare_sharded_fixed_routing_measurement_operator(
             )
             batch_lookup = np.full(plan.num_measurements, -1, dtype=np.int32)
             batch_lookup[batch_measurements] = np.arange(batch_measurements.size, dtype=np.int32)
-            selected_mapping = effective[group, mapping_links] & (
+            _, group_effective_host = routing_reader.host(group)
+            group_probability_device, group_effective_device = routing_reader.device(
+                group
+            )
+            selected_mapping = group_effective_host[mapping_links] & (
                 batch_lookup[mapping_measurements] >= 0
             )
             selected_links = mapping_links[selected_mapping]
@@ -1038,8 +1526,8 @@ def prepare_sharded_fixed_routing_measurement_operator(
                     start = perf_counter()
                     device = compiled(
                         jnp.asarray(padded), jnp.asarray(valid),
-                        routing.group_link_probability[group],
-                        routing.effective_group_link_mask[group],
+                        group_probability_device,
+                        group_effective_device,
                         jnp.asarray(padded_links), jnp.asarray(edge_mask),
                     )
                     elapsed = perf_counter() - start
@@ -1123,6 +1611,7 @@ def prepare_sharded_fixed_routing_measurement_operator(
         completed.add(identity.key)
         aggregate_nonzeros += metadata.nonzero_entries
         rebuilt += 1
+        recent_shard_seconds.append(max(0.0, control.clock() - shard_started))
         should_checkpoint = (
             rebuilt % config.manifest_checkpoint_shards == 0
             or len(completed) == plan.num_shards
@@ -1143,14 +1632,50 @@ def prepare_sharded_fixed_routing_measurement_operator(
                 finalization_seconds = checkpoint_seconds
             manifest_write_count += 1
             cumulative_manifest_bytes += checkpoint_bytes
-        if progress is not None:
-            progress(
+        if legacy_progress is not None:
+            legacy_progress(
                 {
                     "completed_shards": len(completed),
                     "expected_shards": plan.num_shards,
                     "shard": identity.key,
                     "nonzero_entries": metadata.nonzero_entries,
                 }
+            )
+        events.emit(
+            phase=ConstructionPhase.SHARD_CONSTRUCTION,
+            status="running",
+            force=True,
+            completed_units=len(completed),
+            total_units=plan.num_shards,
+            current_unit=identity.key,
+            recent_unit_seconds=recent_shard_seconds[-1],
+            predicted_remaining_seconds=(
+                recent_shard_seconds[-1] * (plan.num_shards - len(completed))
+            ),
+            checkpoint_location=str(directory),
+            cache_hits=len(completed) - rebuilt,
+            cache_misses=rebuilt,
+            details={"nonzero_entries": metadata.nonzero_entries},
+        )
+        if control.expired:
+            next_position = next(
+                (
+                    item.key
+                    for item in plan.expected_shards
+                    if item.key not in completed
+                ),
+                None,
+            )
+            raise deadline_stop(
+                control,
+                phase=ConstructionPhase.SHARD_CONSTRUCTION,
+                reason="deadline expired after atomically committing a shard",
+                completed_units=len(completed),
+                total_units=plan.num_shards,
+                next_resumable_position=next_position,
+                checkpoint_location=str(directory),
+                checkpoint_reusable=True,
+                predicted_next_seconds=recent_shard_seconds[-1],
             )
     final = load_sharded_operator_manifest(directory)
     return ShardedConstructionResult(

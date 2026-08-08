@@ -1,0 +1,22 @@
+\paragraph{Event-aligned measurement resolution.}
+Boarding and alighting mappings have additional structure that avoids generic
+repeated graph searches. The strict resolver formerly scanned all links for
+every measurement to find access links entering a matched departure event or
+egress links leaving a matched arrival event. It now builds node-keyed CSR
+indices for those relations once and retains all existing stop, time,
+trip/line, event-kind, uniqueness, and nonempty-link validations. On the full
+network, synchronized strict mapping decreased from approximately 121.2~s to
+2.31~s: 0.24~s for event/link indices, 1.64~s for 426,436 record resolutions,
+and 0.42~s for result construction.
+
+All 213,218 alighting measurements map to exactly one egress link. Of 213,218
+boarding measurements, 207,805 map to one access link and 5,413 map to two
+access links because two time-bin access alternatives may enter the same
+departure event. The compact event-aligned representation therefore stores one
+primary link per measurement plus only these sparse secondary boarding pairs.
+It is exact; forcing every row to one link would not be. On the full-network
+arrays, index storage decreased from 3,454,792 to 1,749,048 bytes and warm
+aggregation decreased from 0.482 to 0.108~ms, with bit-identical predictions
+and gradients. This optimization removes mapping startup cost but does not
+materially change the six-second destination-loading bottleneck.
+

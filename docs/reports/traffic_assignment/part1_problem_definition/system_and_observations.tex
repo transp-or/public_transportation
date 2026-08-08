@@ -1,0 +1,69 @@
+% Mechanical relocation generated from the preservation ledger.
+% Existing prose is included byte-for-byte from preserved blocks.
+
+\input{traffic_assignment/preserved/002_0043_0046_modeling_elements_introduction.tex}
+\input{traffic_assignment/preserved/003_0047_0057_spatial_representation.tex}
+\input{traffic_assignment/preserved/004_0058_0091_temporal_representation.tex}
+
+\subsection{Passenger Journeys, Vehicle Legs, and Events}
+
+OD demand represents passenger journeys from a first boarding at the origin to
+a final alighting at the destination. A journey with $L$ vehicle legs contains
+$L-1$ transfers and generates one boarding and one alighting on every leg. It
+therefore contributes one initial boarding, one final alighting, $L-1$ transfer
+boardings, and $L-1$ transfer alightings. Raw boarding and alighting totals are
+not journey-origin and journey-destination marginals when transfers occur.
+
+For a conditional destination model, $Q_{ot}$ denotes journeys whose first
+boarding occurs at origin $o$ in departure period $t$. It must come from an
+external journey-entry source or a declared low-dimensional production model;
+it cannot silently be equated to all boardings at $(o,t)$. Every model must
+state which productions, attractiveness values, routing shares, detection
+factors, and dispersion parameters are fixed, normalized, estimated, or
+regularized.
+
+\subsection{Physical Stops and Timetable Identity}
+
+Scenario-stop identifiers define the external OD and measurement geography. An
+explicit mapping may aggregate platforms into physical stop places for transfer
+construction; without one, the mapping is the identity. Such a mapping must
+cover every scenario stop exactly once and is part of the model assumptions.
+A route pattern is identified by line, direction, and its complete ordered
+physical-stop sequence. Scheduled trips retain their exact event times, so
+opposite directions, express patterns, platform variants, and different service
+periods remain distinct unless an explicit mapping states otherwise.
+
+\subsection{Observation Resolution}
+
+The atomic observation is a boarding or alighting count attached to an
+unambiguous scheduled event. Stop-, route-, period-, or vehicle-level totals
+are derived aggregates with an explicit mapping. An absent record is
+unobserved, whereas a recorded zero is an observed zero. This distinction is
+preserved in the likelihood.
+
+\subsection{Free, Frozen, and Structurally Zero Demand}
+
+Let $\mathcal U$ denote the free OD-time cells and $\mathcal F$ the frozen
+cells. Only $\bm f_{\mathcal U}$ belongs to the estimation parameterization;
+fixed values $\bm f_{\mathcal F}$ are constants. Frozen-zero cells contribute
+neither a parameter nor a forward-response column. Positive frozen cells
+contribute a fixed observation offset. The complete demand vector is
+reconstructed only when a complete reported OD table is required.
+
+Structural zeros are frozen zeros justified before estimation by declared
+timetable rules. A cell is excluded when no admissible path exists or when
+every path exceeds the accepted transfer bound; optional rules may additionally
+limit initial wait, journey time, or service frequency. Classification is
+performed on OD-time candidates using the same access, transfer, and physical-
+stop assumptions as routing. A nonzero pre-existing fixed value that conflicts
+with a detected structural zero is an error rather than an implicit overwrite.
+
+Connectivity is therefore defined at the spatial resolution of the scenario
+stops used by the OD table. These identifiers may be individual platforms. A
+pair that is disconnected under the identity mapping may become connected when
+an authoritative or reviewed platform-to-physical-stop mapping supplies the
+interchange. Even at physical-stop level, connectivity remains time dependent:
+directionality, service hours, access windows, minimum transfer time, and the
+transfer bound may make a particular OD-time cell infeasible. ``No path'' and
+``a path exists but requires too many transfers'' are recorded as distinct
+structural-zero reasons.

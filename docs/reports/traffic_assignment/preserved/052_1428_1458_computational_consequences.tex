@@ -1,0 +1,31 @@
+\paragraph{Computational consequences.}
+Let $G$ be the number of active destination groups, $N$ the number of graph
+nodes, and $A$ the number of links. Routing preparation requires one backward
+pass and probability construction per group, while each subsequent cached
+evaluation requires only the forward loading passes. The principal incremental
+cache arrays scale as $O(GA)$ for probabilities and masks. Compact OD grouping
+can reduce both $G$ and this storage when frozen-zero demand removes complete
+destination groups.
+
+Table~\ref{tab:fixed-routing-benchmarks} reports illustrative CPU measurements
+from the package examples. Timings are warm medians using 32-bit arithmetic and
+are machine-dependent; numerical equivalence is tested separately and these
+values are not used as test thresholds.
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lrrrrr}
+\hline
+Example and layout & $G$ & Cache (MiB) & Forward & Value--gradient & Speedup \\
+\hline
+Simple example, compact & 7 & 0.20 & $9.44\!\to\!2.75$ ms & $12.78\!\to\!6.21$ ms & $2.06\times$ \\
+Geneva, compact & 18 & 3.43 & $0.449\!\to\!0.109$ s & $0.537\!\to\!0.180$ s & $2.98\times$ \\
+Geneva, full & 62 & 11.83 & $1.552\!\to\!0.383$ s & $1.788\!\to\!0.591$ s & $3.03\times$ \\
+\hline
+\end{tabular}
+\caption{Dynamic-to-cached fixed-routing measurements. The final column reports
+the likelihood value-and-gradient speedup; forward speedups range from
+$3.43\times$ to $4.12\times$.}
+\label{tab:fixed-routing-benchmarks}
+\end{table}
+

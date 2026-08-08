@@ -1,0 +1,12 @@
+\subsubsection{Logit routing model}
+
+Passengers are assumed to choose routes according to a logit model with dispersion parameter $\theta>0$.
+For any path $p$,
+\[
+\Pr(p) \propto \exp\!\left(-\frac{C(p)}{\theta}\right),
+\qquad
+C(p)=\sum_{\ell\in p}c_\ell.
+\]
+When $\theta$ is small, flows concentrate on lowest-cost paths.
+When $\theta$ is large, flows spread across multiple attractive alternatives.
+

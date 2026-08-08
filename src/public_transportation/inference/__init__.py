@@ -27,6 +27,19 @@ from .compact_od_assignment_layout import (  # noqa: F401
     build_compact_od_assignment_layout,
 )
 from .compact_od_groups import compact_od_groups  # noqa: F401
+from .reduced_od import (  # noqa: F401
+    REDUCED_OD_PROBLEM_SCHEMA_VERSION,
+    JourneyODTimeKey,
+    ReducedODModelContract,
+    ReducedODProblemContract,
+    RouteLevelCounts,
+    RouteLevelDataQualityReport,
+    RouteLevelIPFConfig,
+    RouteLevelIPFDiagnostics,
+    RouteLevelIPFResult,
+    RouteLevelInfeasibleError,
+    estimate_route_level_ipf,
+)
 from .assignment_adapter import FixedRoutingPreparationDiagnostics  # noqa: F401
 from .sharded_fixed_routing import (  # noqa: F401
     SHARDED_FIXED_ROUTING_IMPLEMENTATION_VERSION,
@@ -44,13 +57,18 @@ from .sharded_fixed_routing import (  # noqa: F401
     ShardedFixedRoutingPreparationResult,
     ShardedFixedRoutingInputs,
     build_sharded_fixed_routing_inputs,
+    fixed_routing_descriptor_for_group,
+    fixed_routing_shard_content_hash,
     fixed_routing_shard_path,
+    iter_fixed_routing_shards,
     load_fixed_routing_shard,
+    materialize_sharded_fixed_routing_dense,
     plan_fixed_routing_shards,
     prepare_fixed_routing_sharded,
     recommend_fixed_routing_workers,
     save_fixed_routing_shard,
     sharded_fixed_routing_identity,
+    validate_sharded_fixed_routing_compatibility,
 )
 from .gravity import (  # noqa: F401
     GravityAdequacyConfig,
@@ -204,6 +222,69 @@ from .measurement_operator_protocol import (  # noqa: F401
     GravityMeasurementOperator,
     GravityOperatorCapabilities,
     GravityOperatorMetrics,
+)
+from .assignment_contract import (  # noqa: F401
+    ASSIGNMENT_CONTRACT_SCHEMA_VERSION,
+    AssignmentArtifactIdentity,
+    AssignmentCompatibilityError,
+    AssignmentOperator,
+    CanonicalAssignmentIndex,
+    CanonicalMeasurement,
+    CanonicalODTimeCell,
+    CanonicalTimeInterval,
+    FixedRoutingAssignmentOperatorAdapter,
+    assert_assignment_artifact_compatible,
+    build_canonical_assignment_index,
+    build_fixed_routing_artifact_identity,
+    fixed_routing_route_choice_fingerprint,
+)
+from .scheduled_reference_operator import (  # noqa: F401
+    ScheduledTimeExpandedReferenceOperator,
+    build_scheduled_reference_artifact_identity,
+)
+from .temporal_assignment_blocks import (  # noqa: F401
+    TemporalBlockAssignmentOperator,
+    TemporalBlockConstructionDiagnostics,
+    TemporalBlockConstructionProgress,
+    TemporalBlockKey,
+    TemporalBlockSupportEstimate,
+    TemporalBlockSupportProfile,
+    TemporalSparseBlock,
+    TemporalSupportProfileConfig,
+    build_chunked_temporal_block_operator,
+    build_exact_temporal_block_operator,
+    profile_temporal_block_support,
+)
+from .temporal_assignment_persistence import (  # noqa: F401
+    TEMPORAL_BLOCK_ARTIFACT_SCHEMA_VERSION,
+    load_temporal_block_operator,
+    reuse_or_build_temporal_block_operator,
+    save_temporal_block_operator,
+    temporal_block_cache_path,
+)
+from .temporal_assignment_sparse_backend import (  # noqa: F401
+    CSRCSCTemporalAssignmentOperator,
+    TemporalSparseBackendMetrics,
+)
+from .direct_scheduled_temporal_builder import (  # noqa: F401
+    DirectScheduledActivationDecision,
+    DirectScheduledActivationMode,
+    DirectScheduledActivationResult,
+    DirectScheduledGravityOperator,
+    DirectScheduledTemporalConstructionResult,
+    activate_direct_scheduled_temporal_operator,
+    prepare_direct_scheduled_temporal_operator,
+)
+from .construction_control import (  # noqa: F401
+    CONSTRUCTION_EVENT_SCHEMA_VERSION,
+    ConstructionDeadline,
+    ConstructionDeadlineStop,
+    ConstructionPhase,
+    ConstructionProgressReporter,
+    ConstructionTerminalStatus,
+    ConstructionTermination,
+    deadline_stop,
+    termination_payload,
 )
 from .fixed_routing_linear_backend import (  # noqa: F401
     LinearMeasurementBackendMetrics,

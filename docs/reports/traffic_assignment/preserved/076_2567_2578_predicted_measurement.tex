@@ -1,0 +1,12 @@
+\paragraph{Predicted measurement from the assignment model.}
+The assignment model produces link flows $\bm{x}(\bm f;\theta)=\{x_\ell(\bm f;\theta):\ell\in\mathcal{A}\}$.
+A deterministic mapping associates each measurement $m$ with a subset of links $\mathcal{A}_m\subseteq\mathcal{A}$,
+so that the model-predicted quantity is the sum of the corresponding link flows:
+\[
+\lambda_m(\bm f;\theta)
+=
+\sum_{\ell\in\mathcal{A}_m} x_\ell(\bm f;\theta).
+\]
+In the current version of the software, aggregation weights are implicitly equal to one.
+
+

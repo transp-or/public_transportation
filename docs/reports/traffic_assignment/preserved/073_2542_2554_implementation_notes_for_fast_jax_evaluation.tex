@@ -1,0 +1,13 @@
+\subsection{Implementation notes for fast JAX evaluation}
+
+The time-expanded network is fixed across evaluations. All graph connectivity data are precomputed once and stored as immutable arrays:
+a topological ordering of nodes; compressed representations of outgoing adjacency; and, for each link, tail/head indices and link type.
+
+The backward recursion for the value function and forward propagation for flows are implemented using JAX primitives such as
+\texttt{logsumexp} and scan-like passes over the topological order. Variable out-degrees are handled through CSR-like adjacency
+and/or padded adjacency with masks, enabling compilation with \texttt{jit}.
+The implementation exposes routing preparation and demand loading as separate
+JAX-compatible operations. A composed operation preserves the original dynamic
+assignment behavior, while the fixed-routing inference path supplies prepared
+probabilities directly to the loading scan.
+

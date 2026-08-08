@@ -1,0 +1,31 @@
+\subsubsection{Differentiable dynamic programming formulation}
+
+Fix an OD pair $q=(s_o,s_d)$ and a departure interval $t$. The \emph{terminal} node is the destination centroid-out node
+$s_d^{\mathrm{out}}$, and the value function is initialized as
+\[
+V(s_d^{\mathrm{out}})=0.
+\]
+
+For any other node $i$, let $\mathcal{A}^+_q(i)$ denote the set of outgoing links that are enabled for the destination group.
+We define
+\[
+V(i)
+=
+-\theta\log
+\sum_{\ell=(i\to j)\in\mathcal{A}^+_q(i)}
+\exp\!\left(-\frac{c_\ell + V(j)}{\theta}\right).
+\]
+This recursion is evaluated in reverse topological order using a numerically stable \texttt{logsumexp} formulation.
+
+The probability that a passenger located at node $i$ chooses link $\ell=(i\to j)$ is
+\[
+P_\ell(i)
+=
+\frac{
+\exp\!\left(-\frac{c_\ell + V(j)}{\theta}\right)
+}{
+  \sum_{(i\to k)\in\mathcal{A}^+_q(i)}
+\exp\!\left(-\frac{c_{ik}+V(k)}{\theta}\right)
+}.
+\]
+

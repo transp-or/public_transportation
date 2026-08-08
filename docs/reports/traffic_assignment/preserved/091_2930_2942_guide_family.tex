@@ -1,0 +1,13 @@
+\paragraph{Guide family.}
+The baseline implementation uses Gaussian variational families in an unconstrained parameter space
+(e.g., diagonal or low-rank approximations), and optimization is performed using stochastic gradients (Adam).
+For a requested low-rank value $r_q$, the implemented effective rank is
+\[
+r_q^{\mathrm{eff}}=\min(r_q,d),
+\]
+where $d=|\mathcal U|+\mathbf{1}\{\theta\text{ is estimated}\}$ is the reduced
+statistical dimension. This prevents a guide configured for the original model
+from retaining unnecessary covariance factors after many OD cells are frozen.
+The effective rank, rather than the oversized requested value, is recorded in
+the inference diagnostics. When $d=0$, no guide is constructed.
+

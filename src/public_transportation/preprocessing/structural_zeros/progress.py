@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
+import math
 from time import perf_counter
 from typing import Callable, TextIO
 
@@ -25,6 +26,36 @@ class StructuralZeroProgress:
             raise ValueError("progress counts must satisfy 0 <= completed <= total.")
         if self.elapsed_seconds < 0:
             raise ValueError("elapsed_seconds must be non-negative.")
+
+    @property
+    def throughput_units_per_second(self) -> float | None:
+        """Observed throughput, once at least one unit has completed."""
+        if self.completed == 0 or self.elapsed_seconds <= 0.0:
+            return None
+        return self.completed / self.elapsed_seconds
+
+    @property
+    def estimated_remaining_seconds(self) -> float | None:
+        """Linear ETA from completed work, or ``None`` before calibration."""
+        throughput = self.throughput_units_per_second
+        if throughput is None:
+            return None
+        estimate = (self.total - self.completed) / throughput
+        return estimate if math.isfinite(estimate) else None
+
+    @property
+    def eta_confidence(self) -> str:
+        """Conservative confidence label for the linear ETA."""
+        if self.completed == self.total and self.total > 0:
+            return "complete"
+        if self.completed == 0 or self.total == 0:
+            return "unavailable"
+        fraction = self.completed / self.total
+        if self.completed < 3 or fraction < 0.01:
+            return "low"
+        if self.completed < 10 or fraction < 0.1:
+            return "medium"
+        return "high"
 
 
 StructuralZeroProgressCallback = Callable[[StructuralZeroProgress], None]

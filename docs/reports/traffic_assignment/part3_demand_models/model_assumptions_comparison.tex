@@ -1,0 +1,75 @@
+% Mechanical relocation generated from the preservation ledger.
+% Existing prose is included byte-for-byte from preserved blocks.
+
+\section{Comparison of Demand Models}
+\label{sec:demand-model-comparison}
+
+The models above answer different questions and are not interchangeable.  The
+following comparison makes their principal assumptions and failure modes
+explicit.
+
+\begin{center}
+\small
+\begin{tabular}{>{\raggedright\arraybackslash}p{2.4cm}
+                >{\raggedright\arraybackslash}p{3.1cm}
+                >{\raggedright\arraybackslash}p{4.8cm}
+                >{\raggedright\arraybackslash}p{5.0cm}}
+\hline
+Model & Unknown scale & Principal identifying information or assumption & Main limitation and role \\
+\hline
+Cell deviations
+& One parameter per free OD-time cell
+& Detailed count response, baseline matrix, and cell-level prior or penalty
+& Flexible but intrinsically weakly identified and high dimensional; use for small problems or targeted refinement. \\
+
+Conditional gravity
+& A few shared coefficients, optionally plus a small production basis
+& Feasible alternatives, journey productions, attractiveness, and common responses to travel time and transfers
+& Misspecification can propagate systematically across many cells; preferred full-network model with MAP and diagnostics. \\
+
+Route-level IPF
+& One triangular vehicle-leg table per route pattern
+& Observed route boarding and alighting marginals plus a positive seed
+& Does not identify complete journeys or distinguish transfers; audit baseline and initializer only. \\
+
+Entropic transport
+& One flow per supported OD cell, implicitly selected by entropy
+& Genuine journey marginals, generalized costs, support, and regularization or marginal penalties
+& Solution depends on supplied marginals and entropy choices; auxiliary baseline or initializer. \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{Consequences for Interpretation}
+
+Parameter count is not the same as information content.  Cell-level estimation
+has the largest parameter space but does not become more informative merely by
+being flexible.  Gravity reduces dimension by asserting that many OD cells
+share behavioral coefficients and conditional normalization.  IPF and entropy
+obtain determinate numerical tables by imposing marginal and seed or entropy
+structure; this determinacy must not be reported as identification from stop
+counts.
+
+Likewise, the models estimate different objects.  Route-level IPF estimates
+vehicle-leg movements.  The other models target passenger journeys, but
+entropy requires externally meaningful journey marginals, while conditional
+gravity requires journey productions or a declared model for them.  Raw APC
+boardings include transfer boardings and therefore cannot silently substitute
+for either journey origins or gravity productions.
+
+\subsection{Recommended Modeling Hierarchy}
+
+For a large network, the primary specification is the smallest conditional
+gravity model that is scientifically defensible, estimated by MAP.  Its low
+dimension addresses both computation and the intrinsic underdetermination of
+cell-level OD recovery.  Increasing model complexity should be evidence-led:
+first examine residual structure, curvature, grouped holdout, and sensitivity;
+then introduce a narrowly defined temporal, spatial, production, or transfer
+effect and verify that it improves adequacy without destroying identification.
+
+Cell-level deviations remain a controlled comparison and local refinement
+tool.  Route-level IPF and entropic transport supply audits or initial values,
+not alternative evidence that overrides the journey model.  Estimates from
+different rows of the table should therefore be compared at common observable
+quantities---especially predicted boarding and alighting counts---and not only
+by comparing OD matrices whose meanings and identifying assumptions differ.

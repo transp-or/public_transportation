@@ -1,0 +1,6 @@
+\subsubsection{Deterministic indexing requirement}
+Reproducibility of inference results requires that the indexing of nodes, links, and OD cells remain strictly deterministic across runs.
+Graph construction, link ordering, and OD indexing must therefore follow fixed ordering conventions (e.g., sorted iteration and deterministic
+array construction). Any change in indexing invalidates stored inference outputs, as the Bayesian layer relies on a fixed mapping between
+parameters and link indices.
+

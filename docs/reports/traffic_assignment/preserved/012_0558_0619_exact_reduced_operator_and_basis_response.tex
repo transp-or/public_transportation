@@ -1,0 +1,62 @@
+\subsubsection{Exact reduced operator and basis response}
+\label{sec:reduced-od-response-operator}
+
+Phase~7 exposes the Phase-6 response through
+\path{public_transportation.inference.reduced_od.response_operator}.  The
+operator provides NumPy and JAX forward products, transpose products, and fixed
+offset prediction without reconstructing a full OD table or an OD-to-link
+matrix.  Before accepting the Phase-6 equivalence partition, it recomputes the
+column signatures and requires exact agreement.
+
+Let $e(c)$ be the exact response class of free cell $c$, and let $\bar B$ retain
+one representative column per class.  Since all columns in a class are
+identical,
+\[
+B\bm x
+=\bar B\bar{\bm x},
+\qquad
+\bar x_e=\sum_{c:e(c)=e}x_c.
+\]
+The transpose product first computes $\bar B^{\mathsf T}\bm v$ and then assigns
+the resulting class component to every member cell.  Therefore
+\[
+\bm v^{\mathsf T}(B\bm x)
+=\bm x^{\mathsf T}(B^{\mathsf T}\bm v)
+\]
+holds without storing duplicate response columns.  The external input and
+gradient dimensions still contain every free cell; equivalence compression is
+an exact internal product optimization and does not by itself merge cells with
+different destination-choice features or denominator membership.
+
+For a declared linear basis $\bm x=\Phi\bm z$, the implementation constructs
+\[
+H=B\Phi
+=\bar B\bar\Phi,
+\qquad
+\bar\Phi_{e\cdot}
+=\sum_{c:e(c)=e}\Phi_{c\cdot},
+\]
+directly from response atoms and class-aggregated basis rows.  It never forms
+the detailed assignment operator $A$.  Both dense and SciPy sparse bases are
+accepted.  The result may be retained as dense or CSR storage, or selected
+automatically from its measured density.  Although the physical response $B$
+is nonnegative, a centered or contrast-coded basis may give signed entries in
+$H$; the generic reduced operator therefore accepts finite nonzero signed
+coefficients.
+
+JAX products use scatter-add operations over the same compressed arrays, so
+automatic differentiation returns the implemented transpose product.  Tests
+verify dense-reference equality, the adjoint identity, dense and sparse basis
+responses, storage selection, JIT products, reverse-mode gradients, fixed
+offsets, and the empty-free-cell case.
+
+The Phase-7 benchmark used 2,000 measurements, six nonzeros per original cell,
+a response-class ratio of 0.25, and a sparse 16-parameter basis.  For 1,000,
+5,000, and 20,000 free cells, compressed products averaged approximately
+0.000009, 0.000031, and 0.000125 seconds.  Operator construction took about
+0.006, 0.028, and 0.145 seconds and retained 60, 236, and 896 KB.  The direct
+basis response was built in approximately 0.011--0.026 seconds; its selected
+dense $2{,}000\times16$ representation occupied 256 KB.  These synthetic
+figures demonstrate scaling with compact response and basis sizes, not with a
+time-expanded network; full-network response density must still be measured.
+

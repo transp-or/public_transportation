@@ -1,0 +1,36 @@
+\subsubsection{Fixed-routing linear MAP estimation at scale}
+\label{sec:fixed-routing-linear-map}
+
+When $\theta$ and all generalized costs are fixed, routing probabilities are
+constant and the complete measurement prediction is affine in the free OD
+demand.  Let $\bm f_{\mathcal U}\in\mathbb R^n$ denote the free physical flows,
+let $m$ be the number of observations, and let $\bm c\in\mathbb R^m$ be the
+measurement contribution of strictly positive frozen demand.  The fixed-routing
+model is
+\[
+\widehat{\bm y}=A\bm f_{\mathcal U}+\bm c,
+\qquad A\in\mathbb R^{m\times n}.
+\]
+Frozen-zero cells have no column in $A$, while positive frozen cells contribute
+only to $\bm c$.  Thus neither kind of frozen cell increases the estimation
+dimension.
+
+The implemented linear MAP problem uses positive observation weights
+$W=\operatorname{diag}(\bm w)$, componentwise physical bounds
+$\bm\ell\leq\bm f_{\mathcal U}\leq\bm u$, and an explicitly selected ordered
+collection of linear regularization blocks $(L_k,\bm r_k,\lambda_k)$:
+\[
+\min_{\bm\ell\leq\bm f_{\mathcal U}\leq\bm u}
+\left\{
+\frac12\left\|W^{1/2}
+  (A\bm f_{\mathcal U}+\bm c-\bm y)\right\|_2^2
++\frac12\sum_k\lambda_k
+  \left\|L_k\bm f_{\mathcal U}-\bm r_k\right\|_2^2
+\right\}.
+\]
+The supported choices are no regularization, ridge toward the prior demand, and
+scaled ridge toward the prior demand.  No recommendation is applied implicitly.
+This weighted least-squares mode is distinct from the negative-binomial ML and
+MAP objectives described below: the two are comparable only when their
+observation models and priors have deliberately been made equivalent.
+

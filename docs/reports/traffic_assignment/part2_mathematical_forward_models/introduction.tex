@@ -1,0 +1,27 @@
+\section*{Purpose and Organization of the Forward Models}
+
+The estimation methods developed later require a map from OD-time demand to
+the counts that would be observed under that demand. This part constructs that
+map in stages. Once routing is fixed, the computational objective is to obtain
+and reuse the measurement-response matrix $B$, or an operator that applies it
+without reconstructing routes. The detailed assignment model is the behavioral reference: it
+represents scheduled events, access, transfers, generalized costs, route
+choice, and passenger-flow propagation on the complete time-dependent network.
+The reduced journey-response model expresses the same estimation interface in
+terms of feasible scheduled journeys and their expected measurement events.
+The RAPTOR example illustrates how those feasible journeys are found; it is an
+example of the reduced model, not a separate forward model. RAPTOR is the
+current practical construction mechanism, but it is not essential to the later
+estimator: a time-expanded preprocessing that constructed the same $B$ once
+would provide the same estimation-stage advantage.
+
+The remaining sections describe two complementary layers. The additive
+operator decomposition exploits linearity once routing is fixed, allowing the
+same response to be evaluated in complete, compressed, or sharded form without
+changing its mathematical meaning. The observation model then maps the
+predicted events to count means and supplies the statistical likelihood. Thus
+the detailed and reduced assignments are alternative representations of the
+routing response, while operator decomposition and the likelihood are
+downstream components that can be combined with either representation when
+their assumptions match. They are not competing demand models; those are
+introduced separately in Part III.

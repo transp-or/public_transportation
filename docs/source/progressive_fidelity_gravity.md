@@ -1,9 +1,20 @@
 # Progressive-fidelity gravity objective and gradient
 
+> **Full-network validation warning (2026-08-05).** The memory-bounded
+> evaluator successfully reduced peak memory, but deterministic nested uniform
+> persisted-shard sampling did **not** provide an optimization-quality
+> runtime–accuracy tradeoff. At 10% effort the full-network gradient relative
+> error was 19.2%; at 25% effort runtime exceeded the exact reference while
+> gradient error remained 17.2%. Treat sub-100% uniform shard evaluation as an
+> experimental diagnostic capability, not a faster drop-in optimization
+> backend. Independently validate gradient accuracy for every application. See
+> the [full-network validation report](../reports/full_network_stochastic_gravity_validation_2026-08-05.md).
+
 Progressive fidelity reduces the routing work used by one gravity-model
-objective and gradient evaluation. It is intended for exploratory steps of a
-future trust-region optimizer. It does not change the gravity specification or
-the final statistical objective.
+objective and gradient evaluation. It is retained for diagnostics and research
+on future noise-aware optimization strategies. It is not currently admitted
+for production optimizer steps and does not change the gravity specification
+or final statistical objective.
 
 ## Basic use
 
@@ -164,10 +175,11 @@ Cancellation or deadline expiration raises
 published as complete. Resume validates all identities and continues with the
 same subset and weights.
 
-## Initial trust-region policy
+## Experimental trust-region policy
 
-The operator reports evidence; a future optimizer must make acceptance
-decisions. A conservative initial policy is:
+The operator reports evidence; a future noise-aware optimizer would need to
+make acceptance decisions. The following historical policy motivated the
+validation experiment but is not admitted by the full-network results:
 
 - permit exploratory trial steps only when coverage is 1, quality score is at
   least 0.70, the estimated gradient relative error is at most 0.10, and the
@@ -239,6 +251,15 @@ performance step is therefore a batched or concurrent selected-shard executor;
 increasing the effort schedule alone will not solve the overhead.
 
 ## Current limitations
+
+- Full-network validation of uniform persisted-shard sampling failed its
+  intended optimization-use criterion. The evaluator is validated as
+  memory-bounded, not as a faster source of optimization-quality gradients.
+- `quality.status`, replicate dispersion, and standard-error indicators are
+  diagnostics rather than certified confidence intervals or error bounds.
+- Merely increasing uniform effort is not recommended: measured runtime was
+  nearly linear in selected shards while gradient accuracy improved only
+  marginally from 10% to 25% effort.
 
 - Progressive shard products currently execute through the public one-shard
   adapter. The existing bounded shard residency is preserved, but a dedicated
@@ -411,7 +432,23 @@ On the public benchmark with parameter displacement
 | 75% | 1.15% | 0.094% | 0.002% | 1.11 |
 
 Anchoring introduces some fixed evaluation overhead, so its speedup is smaller
-than the unanchored calculation. The accuracy gain is large enough to make
-anchored low and medium effort the preferred experimental path for nearby
-optimizer iterations. Exact evaluation remains required to create or refresh
-the anchor and to verify convergence.
+than the unanchored calculation. This public result motivated full-network
+testing of anchored low and medium effort. The full-network result below did
+not validate that approach for optimizer iterations. Exact evaluation remains
+required to create or refresh an anchor and to verify convergence.
+
+### Full-network outcome for the uniform persisted-shard evaluator
+
+The dated full-network experiment used 234 persisted shards and an exact
+control-variate anchor. At 10.256% realized effort, evaluation was 2.225 times
+faster than exact and used about 8.53 GiB internal peak RSS, but gradient
+relative error was 19.2%. At 25.214% realized effort, internal peak RSS remained
+about 8.58 GiB, confirming bounded memory, while runtime rose to 3,475.87
+seconds versus 3,176.25 seconds exact and gradient error remained 17.2%.
+
+Accordingly, the favorable public anchored microbenchmark does not validate
+the uniform persisted-shard evaluator as an optimizer backend on the full
+network. The result is retained for experimentation and future estimator
+research; it should not be enabled as a transparent substitute for exact
+gradients. Complete provenance and error measurements are in the
+[2026-08-05 validation report](../reports/full_network_stochastic_gravity_validation_2026-08-05.md).

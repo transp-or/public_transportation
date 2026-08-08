@@ -1,0 +1,10 @@
+\paragraph{Construction profiling.}
+Each chunk reports its ordinal number, fixed shape, completed columns, elapsed
+time, host peak memory, kernel dispatch, device synchronization, and NumPy
+transfer. Final metrics record the explicit compilation count and time, number
+of chunks, construction and assembly time, logical dense bytes, stored bytes,
+nonzero count, density, host peak memory, and device peak memory when the
+backend exposes it. Measurement aggregation has no separately dispatched phase
+because it is fused into the reverse loading kernel; it is therefore not
+double-counted as a separate device operation.
+

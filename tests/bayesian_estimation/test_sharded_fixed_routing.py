@@ -14,6 +14,7 @@ from public_transportation.inference.sharded_fixed_routing import (
     FixedRoutingShardDescriptor,
     build_sharded_fixed_routing_inputs,
     load_fixed_routing_shard,
+    materialize_sharded_fixed_routing_dense,
     plan_fixed_routing_shards,
     save_fixed_routing_shard,
 )
@@ -196,3 +197,38 @@ def test_shard_persistence_is_atomic_validated_and_read_only(tmp_path):
     path.write_bytes(b"not an npz")
     with pytest.raises(FixedRoutingShardCacheError, match="corrupt"):
         load_fixed_routing_shard(routing=routing, descriptor=partition[0])
+
+
+def test_dense_materialization_requires_explicit_sufficient_memory(tmp_path):
+    inputs = _inputs()
+    partition = (FixedRoutingShardDescriptor(0, 0, 3),)
+    routing = build_sharded_fixed_routing_inputs(
+        inputs=inputs,
+        theta=1.0,
+        shard_partition=partition,
+        cache_directory=tmp_path,
+    )
+    shard = FixedRoutingShard(
+        descriptor=partition[0],
+        effective_group_link_mask=np.ones((3, 2), dtype=bool),
+        group_link_probability=np.full((3, 2), 0.5, dtype=np.float32),
+    )
+    save_fixed_routing_shard(routing=routing, shard=shard)
+
+    with pytest.raises(MemoryError, match="above the explicit"):
+        materialize_sharded_fixed_routing_dense(
+            routing=routing,
+            inputs=inputs,
+            memory_limit_bytes=29,
+        )
+    dense = materialize_sharded_fixed_routing_dense(
+        routing=routing,
+        inputs=inputs,
+        memory_limit_bytes=30,
+    )
+    np.testing.assert_array_equal(
+        dense.effective_group_link_mask, shard.effective_group_link_mask
+    )
+    np.testing.assert_array_equal(
+        dense.group_link_probability, shard.group_link_probability
+    )

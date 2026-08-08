@@ -1,0 +1,17 @@
+\paragraph{Prior scale.}
+The raw unconstrained variables, rather than the bounded effective deviations, are
+assumed independent and normally distributed:
+\[
+\widetilde{z}_q^t \sim \mathcal{N}(0,\sigma_z^2).
+\]
+The parameter $\sigma_z>0$ controls the strength of regularization.
+Small values of $\sigma_z$ constrain demand to remain close to the baseline, while large values allow
+the effective deviations to approach their smooth bounds.
+In the current version of the software, $\sigma_z$ is a fixed
+hyperparameter.
+
+The distinction between $\widetilde{z}_q^t$ and $z_q^t$ is important: the
+Gaussian density is evaluated at the raw variable $\widetilde{z}_q^t$, whereas
+the assignment and all reported demand samples use the transformed value $z_q^t$.
+
+

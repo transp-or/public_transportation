@@ -1,0 +1,32 @@
+\paragraph{Modeling choice (smoothly bounded log-deviation).}
+For each OD/time-bin cell, introduce an unconstrained latent variable
+$\widetilde{z}_q^t\in\mathbb{R}$. To protect the exponentiation and the downstream
+assignment from extreme values while retaining a smooth gradient, define the effective
+log-deviation as
+\[
+z_q^t
+=
+z_{\max}\tanh\!\left(\frac{\widetilde{z}_q^t}{z_{\max}}\right),
+\qquad z_{\max}>0.
+\]
+The demand used by the assignment is then
+\[
+f_q^t
+=
+f_{q}^{t,(0)}\exp(z_q^t).
+\]
+This transformation guarantees $f_q^t\ge 0$ whenever $f_{q}^{t,(0)}\ge 0$ and preserves the baseline
+structure up to multiplicative adjustments. It also implies
+\[
+|z_q^t|\le z_{\max},
+\qquad
+\exp(-z_{\max})
+\le \frac{f_q^t}{f_q^{t,(0)}}
+\le \exp(z_{\max})
+\]
+for positive baseline cells. The default $z_{\max}=6$ therefore permits demand
+multipliers ranging approximately from $1/403$ to $403$. In the software configuration,
+this smooth bound is exposed under the historical name \texttt{z\_clip}; despite that
+name, the implementation uses a smooth hyperbolic-tangent transformation rather than
+hard clipping.
+

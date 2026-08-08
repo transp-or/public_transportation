@@ -1,0 +1,44 @@
+% Mechanical relocation generated from the preservation ledger.
+% Existing prose is included byte-for-byte from preserved blocks.
+
+\section{MAP as the Primary Estimation Method}
+\subsection{Operational Inference Hierarchy}
+
+The recommended operational estimator is MAP applied to the smallest adequate
+conditional gravity model. This combines a low-dimensional behavioral
+parameterization with explicit regularization of directions that counts do not
+identify strongly. It returns a reproducible point estimate without introducing
+one optimization variable per feasible OD-time cell.
+
+MAP is primary here for practical and inferential reasons, not because it is
+universally superior. Maximum likelihood is the essential no-prior reference:
+it reveals how strongly the data determine the parameters and whether MAP is
+sensitive to regularization. Variational Bayesian inference targets a different
+output, an approximate posterior distribution, and is appropriate when
+uncertainty propagation is central and the approximation can be validated.
+
+The fixed-routing linear MAP formulation is a separate model class. Its
+weighted least-squares observation model, physical-flow parameterization, and
+quadratic regularization need not match the negative-binomial gravity model.
+Agreement is expected only when the response, loss, parameterization,
+constraints, and prior penalty have all been made equivalent. Sharing the label
+``MAP'' does not by itself make two estimators comparable.
+
+\subsection{Reduced and Linear MAP Formulations}
+
+For raw reduced-model parameters $\bm\eta$, Gaussian prior center $\bm m$, and
+positive scales $\bm s$, gravity MAP minimizes
+\[
+ Q_{\mathrm{MAP}}(\bm\eta)
+ =-\ell(\bm\eta)
+  +\frac12\sum_j\left(\frac{\eta_j-m_j}{s_j}\right)^2.
+\]
+The prior is defined on the declared raw parameterization. Infinite prior
+scales remove the penalty and recover the corresponding ML objective exactly.
+Finite scales generally change the optimum, especially along weakly identified
+directions.
+
+\input{traffic_assignment/preserved/021_0923_0939_prior_scale.tex}
+\input{traffic_assignment/preserved/064_1809_1844_fixed_routing_linear_map_estimation_at_scale.tex}
+\input{traffic_assignment/preserved/085_2796_2813_ml_and_map_introduction.tex}
+\input{traffic_assignment/preserved/087_2852_2879_maximum_a_posteriori_estimation.tex}

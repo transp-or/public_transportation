@@ -1,0 +1,79 @@
+\subsubsection{Route-level iterative proportional fitting baseline}
+\label{sec:reduced-od-route-level-ipf}
+
+The first numerical reduced-OD baseline estimates vehicle-leg OD flows for one
+route pattern and service class.  It is intentionally simpler than the network
+journey model and is implemented in
+\path{public_transportation.inference.reduced_od.route_level}.  Consider an
+ordered route with stops $1,\ldots,n$.  Let $x_{ij}$ be the passenger flow that
+boards at stop $i$ and alights at stop $j$.  The structural support is strictly
+upper triangular:
+\[
+x_{ij}\geq 0\quad\text{for }i<j,
+\qquad
+x_{ij}=0\quad\text{for }i\geq j.
+\]
+For observed boarding marginals $b_i$ and alighting marginals $a_j$, iterative
+proportional fitting alternately scales constrained rows and columns toward
+\[
+\sum_{j>i}x_{ij}=b_i,
+\qquad
+\sum_{i<j}x_{ij}=a_j.
+\]
+A supplied seed must be finite and strictly positive on every structurally
+allowed cell and zero elsewhere.  The default seed is uniform on the allowed
+support.  Iteration stops only when the maximum observed-marginal residual,
+scaled by $\max(1,\text{target})$, meets the declared tolerance.
+
+Missing observations are represented by explicit Boolean masks.  An unobserved
+row or column is not scaled and is not interpreted as zero; its fitted value
+remains dependent on the seed and other observed constraints.  The result is
+therefore marked underdetermined whenever either set of marginals is incomplete.
+An explicit observed zero, by contrast, removes all flow from its constrained
+row or column.
+
+When all boardings and alightings are observed, their totals must agree.  The
+default policy reports unequal totals as infeasible.  The only corrective
+policy implemented at this stage is explicit:
+\texttt{average\_observed\_totals} rescales each complete marginal vector
+proportionally to the arithmetic mean of the two totals.  The original
+imbalance, reconciled totals, largest marginal adjustment, and a warning are
+retained in the data-quality report; reconciliation is never silent.  A
+positive total cannot be reconciled with a zero total.
+
+Complete marginals are checked against the triangular support before
+iteration.  In particular, boarding at the final stop and alighting at the
+first stop must be zero.  For every destination prefix through stop $k$, its
+cumulative alightings cannot exceed boardings at strictly upstream stops:
+\[
+\sum_{j=1}^{k}a_j
+\leq
+\sum_{i=1}^{k-1}b_i.
+\]
+Violations, exhausted positive support, and nonconvergence raise a dedicated
+exception carrying the data-quality report.
+
+For a positive fitted boarding marginal, the route-level alighting probability
+is
+\[
+p_{ij}=\frac{x_{ij}}{\sum_{k>i}x_{ik}}.
+\]
+Zero-flow rows receive zero probabilities.  Results expose immutable matrices,
+fitted and reconciled marginals, iterations, absolute and relative residuals,
+support size, coverage, and reconciliation diagnostics.
+
+These outputs are explicitly labeled \texttt{leg\_level}, with boarding
+semantics \texttt{leg\_boarding\_\allowbreak unclassified}, and are marked incompatible
+with journey OD.  A boarding observed on a route may be an initial boarding or
+a transfer boarding; route-level counts alone do not identify that distinction.
+The IPF result is therefore an audit baseline and initializer, not a procedure
+for stitching complete multi-line passenger journeys.
+
+The Phase-3 CPU microbenchmark generated feasible dense triangular marginals.
+Routes of 10, 25, 50, and 100 stops converged respectively in 14, 12, 12, and
+11 iterations.  Their measured wall times were approximately 0.00059,
+0.00078, 0.00131, and 0.00226 seconds, and their dense result matrices occupied
+800, 5,000, 20,000, and 80,000 bytes.  These machine-dependent values are not
+test thresholds; they show that this diagnostic baseline is negligible
+relative to later network journey preprocessing.
+

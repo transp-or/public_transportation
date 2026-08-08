@@ -1,0 +1,28 @@
+% Mechanical relocation generated from the preservation ledger.
+% Existing prose is included byte-for-byte from preserved blocks.
+
+\section{Detailed-Assignment Validation}
+\subsection{Reconstruction and Comparison}
+
+After estimation, the compact free demand is inserted into the canonical full
+OD layout, positive frozen values are copied unchanged, and frozen-zero cells
+remain zero. Reconstruction is a reporting and validation operation, not part
+of an objective evaluation.
+
+Let $\widehat{\bm y}_{\mathrm{red}}$ be the reduced prediction and
+$\widehat{\bm y}_{\mathrm{det}}$ the detailed-assignment prediction obtained
+from the reconstructed OD table under matching routing assumptions. Validation
+reports the difference vector and, at minimum,
+\[
+ \max_m|\widehat y_{\mathrm{det},m}-\widehat y_{\mathrm{red},m}|,
+ \qquad
+ \sqrt{\frac1M\sum_m
+ (\widehat y_{\mathrm{det},m}-\widehat y_{\mathrm{red},m})^2},
+ \qquad
+ \frac{\|\widehat{\bm y}_{\mathrm{det}}-
+              \widehat{\bm y}_{\mathrm{red}}\|_2}
+      {\max(\|\widehat{\bm y}_{\mathrm{det}}\|_2,\epsilon)}.
+\]
+The detailed calculation is executed only for post-fit validation. Agreement
+tests the reduced response relative to the detailed model; it does not validate
+behavioral assumptions shared by both.

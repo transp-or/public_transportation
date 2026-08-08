@@ -1,0 +1,39 @@
+% Mechanical relocation generated from the preservation ledger.
+% Existing prose is included byte-for-byte from preserved blocks.
+
+\subsection{Entropy Models}
+
+\subsubsection{Model Card: Entropic Transport}
+
+\paragraph{Formulation and required information.}
+Balanced entropic transport allocates flow over feasible OD support while
+matching supplied journey-origin and journey-destination marginals and trading
+generalized cost against entropy.  The unbalanced variant replaces exact
+marginal equality with declared divergence penalties.  Both require a feasible
+support, costs, a regularization scale, and genuine passenger-journey
+marginals---not raw boarding and alighting totals in a network with transfers.
+
+\paragraph{Assumptions and limitations.}
+The resulting table is selected by the chosen cost, entropy scale, support, and
+marginal penalties; it is not identified by APC counts alone.  Balanced
+transport is infeasible when supported marginals are incompatible.  Unbalanced
+transport can reconcile disagreement, but the reconciliation is a modeling
+choice and does not change leg-event counts into journey marginals.
+
+\paragraph{Appropriate use.}
+Entropy models are valuable when credible journey marginals exist, for
+synthetic validation, or as a smooth initializer for another demand model.
+They are auxiliary baselines rather than the primary estimator in the present
+full-network setting.
+
+For feasible support $C$, generalized cost $c_{od}$, and entropy scale
+$\varepsilon>0$, the balanced model solves
+\[
+ \min_{x\geq0}
+ \sum_{(o,d)\in C}c_{od}x_{od}
+ +\varepsilon\sum_{(o,d)\in C}x_{od}(\log x_{od}-1)
+\]
+subject to supplied journey-origin and journey-destination marginals. The
+unbalanced variant replaces exact marginal constraints with declared positive
+Kullback--Leibler penalties. It can reconcile inconsistent totals, but cannot
+turn vehicle-leg event counts into passenger-journey marginals.

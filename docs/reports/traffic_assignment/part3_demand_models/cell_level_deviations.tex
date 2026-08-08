@@ -1,0 +1,43 @@
+% Mechanical relocation generated from the preservation ledger.
+% Existing prose is included byte-for-byte from preserved blocks.
+
+\section{Cell-Level OD Deviations}
+
+\subsection{Model Card: Cell-Level Parameterization}
+
+\paragraph{Formulation and dimension.}
+Every free OD-time cell receives its own log-deviation parameter relative to a
+strictly positive baseline.  The parameter dimension is therefore the number
+of free cells (plus any separately estimated observation or route-choice
+parameters).  Frozen and structural-zero cells are absent from this dimension.
+
+\paragraph{Required information and identifying assumptions.}
+The model requires a baseline OD matrix with the exact estimation indexing.
+It assumes that multiplicative deviations around this matrix are a meaningful
+description of uncertainty and that the selected prior or penalty adequately
+regularizes directions not distinguished by counts.  A zero baseline is an
+immutable zero under this parameterization unless the analyst supplies a
+positive seed.
+
+\paragraph{Recoverable quantities and limitations.}
+The model can express independent local changes and is therefore the least
+restrictive retained demand parameterization.  Its flexibility is also its
+main limitation: count data commonly identify only aggregates or combinations
+of cells, while computation and memory grow with the number of free cells.
+Individual estimates may consequently be dominated by the baseline and prior.
+This model is appropriate for small problems, controlled validation, or local
+refinement where cell-level freedom is scientifically justified; it is not the
+preferred primary parameterization for the full network.
+
+\input{traffic_assignment/preserved/018_0876_0883_baseline_demand_and_bayesian_deviation_parameter.tex}
+
+For each free cell $c$, an unconstrained raw deviation $\widetilde z_c$ is
+mapped smoothly to a bounded log-deviation and positive demand:
+\[
+ z_c=z_{\max}\tanh(\widetilde z_c/z_{\max}),
+ \qquad
+ f_c=f_c^{(0)}\exp(z_c).
+\]
+Thus $|z_c|\leq z_{\max}$ and a positive baseline can vary only within the
+declared multiplicative range. This is a smooth saturation, not hard clipping.
+\input{traffic_assignment/preserved/020_0916_0922_zero_baseline_cells.tex}

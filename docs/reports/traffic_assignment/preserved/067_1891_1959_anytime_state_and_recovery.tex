@@ -1,0 +1,69 @@
+\paragraph{Anytime state and recovery.}
+Initialization already constitutes a complete feasible approximate solution.
+After every accepted block or conflict-free parallel batch, the estimator has a
+complete flow vector, complete prediction, current and best objective, and
+convergence diagnostics.  The durable journal records the replayable flow and
+prediction deltas using temporary-file creation, synchronization, atomic
+publication, and a separate commit marker.  Periodic compact checkpoints store
+the complete state and exact next schedule position.  Resume is rejected when
+any authoritative fingerprint changes, including scenario, assignment, OD
+layout, fixed demand, measurements, prior, routing, partition, solver semantics,
+or schema.  Returned statuses distinguish convergence, time, sweep, and update
+budgets, graceful interruption with an approximate solution, resource guards,
+and numerical failure.
+
+Progress events do not claim a generic percentage precision.  They distinguish
+exact, sampled, stale, deferred, and unavailable diagnostics and report objective
+improvements, projected-gradient measures, block and variable coverage,
+completed sweeps, elapsed time, checkpoint commitment, and estimated remaining
+sweep time.
+
+For a bounded large-network pilot, complete-operator products are governed by
+an explicit fingerprinted policy.  The initial prediction may be computed or
+supplied with validated shape, finiteness, bounds, fixed offset, and provenance.
+Initial, periodic, and final exact projected gradients can be enabled
+independently; a disabled diagnostic is recorded as deferred, never relabeled as
+an exact global quantity.  Resume prediction validation may likewise be exact
+or deferred.  Deferred operation avoids an otherwise mandatory global forward
+or transpose product, but postpones the corresponding global consistency or
+optimality claim.  A separate validation entry point can later recompute the
+prediction, objective, and projected gradient, including in a fresh process.
+
+A restricted pilot schedule is separately authorized from a complete sweep.
+Every named block must belong to a completed support group, have compatible
+persisted exact support, and satisfy support-row, nonzero, operator-storage, and
+temporary-memory ceilings.  The checkpoint records that deterministic schedule
+and its next position. Numerical semantics and the schedule remain
+fingerprinted, whereas invocation limits may extend safely, so resuming a
+five-update run with a six-update budget executes only the sixth update.
+
+The monotonic elapsed-time deadline covers initialization, global products,
+selected-block construction, solving, and checkpoint persistence.  JAX
+compilation or dispatched device work cannot generally be interrupted inside a
+process; an indivisible phase can therefore overshoot its allowance.  Such an
+overshoot is reported explicitly, and no subsequent expensive phase is started.
+Structured diagnostics expose global forward and transpose counts and times,
+block construction and solve time, checkpoint time, prediction source, and
+validation status.
+
+The selected-block numerical kernels pass graph and routing arrays as explicit
+dynamic JAX arguments rather than capturing complete assignment arrays in
+Python closures.  Tracing, lowering, compilation, synchronized device
+execution, and host transfer are timed separately.  A bounded lock-protected
+compiled-executable cache is keyed by assignment provenance, backend, numeric
+type, effective OD width, mapped-edge width, graph dimensions, and kernel schema;
+deadline and callback state are excluded.  Deadline checks remain in Python
+before and after each indivisible JAX stage.  On the public example,
+fresh-process one-variable construction took 0.093--0.194 seconds, with zero
+captured array constants and identical sparse results; compilation dominated
+the roughly 0.001-second device execution.
+
+For scheduler diagnostics, the builder can emit structured start and completion
+events immediately around each phase.  An optional append-only JSON-lines sink
+flushes every complete record and can call \texttt{fsync}; it is separate from
+operator-cache validity.  Consequently, cancellation during XLA compilation
+leaves a durable \texttt{jax\_compilation\_start} record without publishing an
+incomplete numerical operator.  The public benchmark can stop intentionally
+after tracing, lowering, compilation, or execution, allowing these indivisible
+stages to be assigned separate external wall-time limits.
+

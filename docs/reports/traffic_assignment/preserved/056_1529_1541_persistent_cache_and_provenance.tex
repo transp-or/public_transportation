@@ -1,0 +1,13 @@
+\paragraph{Persistent cache and provenance.}
+Operators can be saved as compressed NumPy archives and reused by a fresh
+process. The cache key includes the assignment identity; content digests of the
+graph and all loading arrays; the complete measurement mapping; OD-layout and
+compact-layout fingerprints, including frozen indices and values; fixed
+dispersion; representation; numeric type; package version; and cache-schema
+version. Loaded dimensions and array shapes are also validated. Cache writes
+use a temporary file followed by an atomic replacement. A missing, corrupt,
+outdated, or provenance-mismatched artifact is rejected and rebuilt safely.
+The cache directory may be supplied on the estimation request or through
+\texttt{PUBLIC\_TRANSPORTATION\_OPERATOR\_CACHE\_DIR}. Dense and JAX BCOO
+representations remain available as explicit overrides.
+

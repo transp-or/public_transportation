@@ -1,0 +1,25 @@
+% Mechanical relocation generated from the preservation ledger.
+% Existing prose is included byte-for-byte from preserved blocks.
+
+\section{Grouped Holdout Validation}
+\label{sec:grouped-holdout-validation}
+
+Holdout validation asks whether a model fitted without selected observations
+predicts those untouched observations. Measurement rows must not be split
+independently when they share a vehicle journey, stop time series, or another
+operational unit: such a split leaks closely related information between
+calibration and validation. The grouping unit must be selected before examining
+results and must correspond to the intended generalization question.
+
+For a partition $\mathcal M=\mathcal M_{\mathrm{cal}}\cup
+\mathcal M_{\mathrm{hold}}$, estimation uses likelihood contributions only
+from $\mathcal M_{\mathrm{cal}}$. Predictions are computed for both sets, but
+held-out counts must have no effect on fitted parameters. This invariance is a
+required validation check. Calibration and holdout results should report the
+same metrics and grouping definitions.
+
+Holding out complete vehicle journeys tests transfer to other journeys in the
+represented timetable; holding out stops tests spatial transfer; holding out
+time blocks tests temporal transfer. None establishes validity under a changed
+network, timetable, fare, or crowding regime. Here grouped holdout is a model-
+validity check, not a claim of forecasting performance.

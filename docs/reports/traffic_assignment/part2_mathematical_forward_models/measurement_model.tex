@@ -1,0 +1,28 @@
+% Mechanical relocation generated from the preservation ledger.
+% Existing prose is included byte-for-byte from preserved blocks.
+
+\input{traffic_assignment/preserved/075_2561_2566_measurement_model_and_likelihood_introduction.tex}
+
+Assignment produces expected passenger events; estimation requires a
+probability model for the operational records. This section completes the
+forward chain by aggregating assigned events into measurement means, accounting
+for detection when applicable, and defining the count likelihood. Its
+assumptions concern observation and noise, not route choice or demand
+generation.
+
+\subsection{Statistical Scope and Assumptions}
+\label{sec:observation-likelihood-model}
+
+The observation model is conditional on the forward response and makes three
+distinct assumptions: the mapping from assigned events to measurement rows is
+known; the detection factor is fixed unless explicitly included in the
+parameterization; and observations are conditionally distributed according to
+the selected count likelihood.  Absence of a measurement is not an observed
+zero.  Conditional independence in the likelihood is a statistical modeling
+assumption and does not imply that passenger movements or the corresponding
+expected counts are physically unrelated.
+\input{traffic_assignment/preserved/076_2567_2578_predicted_measurement.tex}
+\input{traffic_assignment/preserved/077_2579_2585_asymmetric_counting_device.tex}
+\input{traffic_assignment/preserved/078_2586_2609_negative_binomial_likelihood.tex}
+\input{traffic_assignment/preserved/079_2610_2615_fixed_measurement_parameters.tex}
+\input{traffic_assignment/preserved/080_2616_2641_likelihood_and_normalization.tex}

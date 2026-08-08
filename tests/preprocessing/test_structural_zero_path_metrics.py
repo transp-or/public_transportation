@@ -162,6 +162,12 @@ def test_destination_profile_progress_is_complete_and_monotonic() -> None:
     assert [event.completed for event in profile_events] == [0, 1, 2, 3]
     assert all(event.total == 3 for event in profile_events)
     assert all(event.elapsed_seconds >= 0 for event in profile_events)
+    materialization_events = [
+        event for event in events if event.phase == "materialize_od_metrics"
+    ]
+    assert materialization_events[0].completed == 0
+    assert materialization_events[-1].completed == materialization_events[-1].total
+    assert materialization_events[-1].estimated_remaining_seconds == pytest.approx(0.0)
 
 
 def test_destination_progress_callback_exception_propagates() -> None:
