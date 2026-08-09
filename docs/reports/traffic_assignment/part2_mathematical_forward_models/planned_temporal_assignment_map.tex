@@ -472,6 +472,15 @@ arrays. JAX compilation and one batch execution remain indivisible internally:
 they are guarded before launch and record overshoot. Origin-support discovery checks
 the deadline between bounded origin chunks and atomically commits every
 completed destination group, so resume continues at the first missing group.
+Numerical measurement-shard construction may now use an explicitly bounded
+thread pool.  All workers share the one compiled executable, but each owns its
+own routing-batch reader.  Per-worker workspace preflight and a resident-shard
+ceiling bound admission.  Workers write validated payloads only to isolated
+staging locations; the parent publishes them and advances the manifest in
+canonical plan order, even when workers finish out of order.  Worker count is
+excluded from scientific provenance, interrupted parallel and serial runs
+therefore reuse the same cache, and failures remove unpublished staging files
+without invalidating previously committed shards.
 Only the current CPU chunk or destination group may be repeated. Therefore the
 deadline hardening is sufficient for bounded public full-network probes.
 

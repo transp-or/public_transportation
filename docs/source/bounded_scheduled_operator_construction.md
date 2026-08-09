@@ -73,11 +73,24 @@ validated construction shards remain reusable.
 
 ## Laptop and cluster usage
 
-Keep `workers=1` and a conservative `worker_memory_budget_bytes` on a laptop.
+The conservative default remains `workers=1`.  Measurement-shard construction
+also supports explicit bounded thread parallelism: one compiled JAX executable
+is shared, while every worker owns an independent mutable routing-batch reader.
+`worker_memory_budget_bytes` preflights each worker's kernel, temporary batch,
+and staged-shard estimate; `maximum_resident_shards` bounds active plus buffered
+results.  Workers stage validated atomic shard files, but only the parent
+publishes them, updates the manifest, and reports completion, always in
+canonical plan order.  Consequently worker count is not scientific provenance
+and serial and parallel runs share the same cache.
+
 Select shard and OD chunk sizes explicitly, reserve a safety margin for final
 checkpointing, and resume with the same cache roots and scientific identity.
-A cluster job should derive its monotonic budget from the scheduler wall time,
-leaving enough safety margin to commit the current unit before termination.
+The parent stops admitting work when the predicted shard duration plus
+`deadline_safety_margin_seconds` no longer fits.  Already active workers finish
+their indivisible calls; their canonically publishable results are checkpointed
+before the bounded stop is returned.  Worker failures cancel pending admission,
+remove unpublished staging files, and leave the last valid manifest reusable.
+A cluster job should derive its monotonic budget from the scheduler wall time.
 Increasing concurrency is explicit; it is never inferred automatically.
 
 A conservative routing profile is explicit as well:

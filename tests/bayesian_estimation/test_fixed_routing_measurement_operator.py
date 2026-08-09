@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
@@ -10,6 +11,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+
+import public_transportation.inference.fixed_routing_sharded_builder as sharded_builder
 
 from public_transportation.assignment import AssignmentConfig
 from public_transportation.assignment.assign import prepare_assignment
@@ -50,7 +53,13 @@ from public_transportation.inference.fixed_routing_origin_support import (
 )
 from public_transportation.inference.sharded_sparse_operator import (
     ShardedSparseLinearOperator,
+    load_sharded_operator_manifest,
+    load_sparse_shard,
     shard_path,
+)
+from public_transportation.inference.construction_control import (
+    ConstructionDeadline,
+    ConstructionDeadlineStop,
 )
 from public_transportation.inference.sharded_fixed_routing import (
     FixedRoutingPreparationConfig,
@@ -690,6 +699,187 @@ def test_sharded_builder_matches_monolithic_and_resumes(all_free_operator, tmp_p
     )
 
 
+def _parallel_builder_case(all_free_operator, directory, *, workers, **kwargs):
+    inputs, routing, spec, _ = all_free_operator
+    num_od = int(inputs.od_origin_node.shape[0])
+    layout = ODParameterLayout(
+        num_od_total=num_od,
+        od_keys=tuple((f"o{i}", "d", "t") for i in range(num_od)),
+        free_od_indices=tuple(range(num_od)),
+        fixed_od_indices=(),
+        fixed_od_values=(),
+        free_baseline_values=tuple(1.0 for _ in range(num_od)),
+        fixed_zero_indices=(),
+        fixed_positive_indices=(),
+    )
+    compact = build_compact_od_assignment_layout(parameter_layout=layout)
+    config = ShardedConstructionConfig(
+        od_chunk_size=8,
+        measurement_block_size=1,
+        worker_memory_budget_bytes=100_000_000,
+        workers=workers,
+        maximum_resident_shards=2,
+        target_nonzeros_per_storage_shard=1,
+        maximum_nonzeros_per_storage_shard=1,
+        manifest_checkpoint_shards=1,
+        progress_interval_seconds=0.0,
+        deadline_safety_margin_seconds=0.0,
+    )
+    return prepare_sharded_fixed_routing_measurement_operator(
+        directory=directory,
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        compact_layout=compact,
+        assignment_fingerprint="parallel-measurement-shards",
+        od_layout_fingerprint=layout.fingerprint,
+        config=config,
+        **kwargs,
+    )
+
+
+def test_parallel_measurement_shards_match_serial_content(all_free_operator, tmp_path):
+    serial = _parallel_builder_case(
+        all_free_operator, tmp_path / "serial", workers=1
+    )
+    parallel = _parallel_builder_case(
+        all_free_operator, tmp_path / "parallel", workers=2
+    )
+    assert serial.manifest.provenance == parallel.manifest.provenance
+    assert serial.manifest.expected_shards == parallel.manifest.expected_shards
+    assert parallel.requested_workers == 2
+    assert parallel.admitted_workers == 2
+    for identity in serial.manifest.expected_shards:
+        left = load_sparse_shard(shard_path(serial.directory, identity))
+        right = load_sparse_shard(shard_path(parallel.directory, identity))
+        assert left.metadata.content_hash == right.metadata.content_hash
+        np.testing.assert_array_equal(left.row_indices, right.row_indices)
+        np.testing.assert_array_equal(left.matrix.toarray(), right.matrix.toarray())
+        np.testing.assert_array_equal(
+            left.fixed_offset_values, right.fixed_offset_values
+        )
+    demand = np.linspace(0.0, 2.0, serial.plan.num_free_od)
+    cotangent = np.linspace(-0.5, 1.0, serial.plan.num_measurements)
+    serial_operator = ShardedSparseLinearOperator(serial.directory)
+    parallel_operator = ShardedSparseLinearOperator(parallel.directory)
+    np.testing.assert_allclose(
+        serial_operator.matvec(demand), parallel_operator.matvec(demand)
+    )
+    np.testing.assert_allclose(
+        serial_operator.rmatvec(cotangent),
+        parallel_operator.rmatvec(cotangent),
+    )
+
+
+def test_parallel_publication_is_canonical_when_workers_finish_out_of_order(
+    all_free_operator, tmp_path, monkeypatch
+):
+    original = sharded_builder._construct_measurement_shard
+
+    def delayed(**kwargs):
+        position = kwargs["identity"].storage_shard
+        if position == 0:
+            time.sleep(0.05)
+        return original(**kwargs)
+
+    monkeypatch.setattr(sharded_builder, "_construct_measurement_shard", delayed)
+    published = []
+    result = _parallel_builder_case(
+        all_free_operator,
+        tmp_path,
+        workers=2,
+        progress=lambda event: (
+            published.append(event.get("current_unit") or event["shard"])
+            if (event.get("current_unit") or event.get("shard"))
+            and event.get("nonzero_entries") is not None
+            else None
+        ),
+    )
+    assert result.maximum_buffered_shards >= 1
+    assert published == [item.key for item in result.manifest.expected_shards]
+    assert tuple(result.manifest.completed_shards) == tuple(
+        item.key for item in result.manifest.expected_shards
+    )
+
+
+def test_parallel_deadline_waits_for_inflight_shards_and_resumes(
+    all_free_operator, tmp_path, monkeypatch
+):
+    original = sharded_builder._construct_measurement_shard
+    clock_state = {"now": 0.0}
+
+    def expires_inflight(**kwargs):
+        result = original(**kwargs)
+        clock_state["now"] = 100.0
+        return result
+
+    monkeypatch.setattr(
+        sharded_builder, "_construct_measurement_shard", expires_inflight
+    )
+    deadline = ConstructionDeadline(
+        started_at=0.0,
+        absolute_deadline=10.0,
+        safety_margin_seconds=0.0,
+        clock=lambda: clock_state["now"],
+    )
+    with pytest.raises(ConstructionDeadlineStop) as stopped:
+        _parallel_builder_case(
+            all_free_operator,
+            tmp_path,
+            workers=2,
+            deadline=deadline,
+        )
+    assert stopped.value.termination.completed_units == 2
+    partial = load_sharded_operator_manifest(tmp_path)
+    assert len(partial.completed_shards) == 2
+    monkeypatch.setattr(
+        sharded_builder, "_construct_measurement_shard", original
+    )
+    resumed = _parallel_builder_case(all_free_operator, tmp_path, workers=2)
+    assert resumed.manifest.complete
+    assert resumed.reused_shards == 2
+
+
+def test_parallel_failure_cleans_staging_and_checkpoint_remains_reusable(
+    all_free_operator, tmp_path, monkeypatch
+):
+    original = sharded_builder._construct_measurement_shard
+
+    def fails_second(**kwargs):
+        if kwargs["identity"].storage_shard == 1:
+            raise RuntimeError("injected worker failure")
+        return original(**kwargs)
+
+    monkeypatch.setattr(sharded_builder, "_construct_measurement_shard", fails_second)
+    with pytest.raises(RuntimeError, match="measurement-shard worker failed"):
+        _parallel_builder_case(all_free_operator, tmp_path, workers=2)
+    assert not tuple(tmp_path.glob(".measurement-shards-*"))
+    partial = load_sharded_operator_manifest(tmp_path)
+    assert set(partial.completed_shards).issubset(
+        {item.key for item in partial.expected_shards}
+    )
+    monkeypatch.setattr(
+        sharded_builder, "_construct_measurement_shard", original
+    )
+    resumed = _parallel_builder_case(all_free_operator, tmp_path, workers=2)
+    assert resumed.manifest.complete
+
+
+def test_parallel_corrupted_shard_is_repaired(all_free_operator, tmp_path):
+    built = _parallel_builder_case(all_free_operator, tmp_path, workers=2)
+    damaged_path = shard_path(tmp_path, built.plan.expected_shards[0])
+    with np.load(damaged_path, allow_pickle=False) as archive:
+        damaged = {name: archive[name] for name in archive.files}
+    metadata = json.loads(str(damaged["metadata"]))
+    metadata["content_hash"] = "0" * 64
+    damaged["metadata"] = np.asarray(json.dumps(metadata))
+    np.savez(damaged_path, **damaged)
+    repaired = _parallel_builder_case(all_free_operator, tmp_path, workers=2)
+    assert repaired.rejected_shards == 1
+    assert repaired.rebuilt_shards == 1
+    assert repaired.reused_shards == repaired.plan.num_shards - 1
+
+
 def test_sharded_positive_fixed_flow_is_offset_only(artifacts, tmp_path):
     full_inputs = build_assignment_inputs(artifacts=artifacts)
     num_od = int(full_inputs.od_origin_node.shape[0])
@@ -729,7 +919,7 @@ def test_sharded_positive_fixed_flow_is_offset_only(artifacts, tmp_path):
     )
     assert support_validation.complete
     assert origin_support.positive_fixed_support.shape[1] == 1
-    prepare_sharded_fixed_routing_measurement_operator(
+    serial = prepare_sharded_fixed_routing_measurement_operator(
         directory=tmp_path,
         inputs=inputs,
         routing=routing,
@@ -743,7 +933,32 @@ def test_sharded_positive_fixed_flow_is_offset_only(artifacts, tmp_path):
             worker_memory_budget_bytes=100_000_000,
         ),
     )
+    parallel = prepare_sharded_fixed_routing_measurement_operator(
+        directory=tmp_path / "parallel-fixed-offset",
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        compact_layout=compact,
+        assignment_fingerprint="sharded-positive-fixed",
+        od_layout_fingerprint=layout.fingerprint,
+        config=ShardedConstructionConfig(
+            od_chunk_size=8,
+            measurement_block_size=2,
+            worker_memory_budget_bytes=100_000_000,
+            workers=2,
+            maximum_resident_shards=2,
+        ),
+    )
+    for identity in serial.manifest.expected_shards:
+        serial_shard = load_sparse_shard(shard_path(serial.directory, identity))
+        parallel_shard = load_sparse_shard(
+            shard_path(parallel.directory, identity)
+        )
+        assert serial_shard.metadata.content_hash == (
+            parallel_shard.metadata.content_hash
+        )
     sharded = ShardedSparseLinearOperator(tmp_path)
+    parallel_sharded = ShardedSparseLinearOperator(parallel.directory)
     demand = np.linspace(0.0, 2.0, layout.num_free)
     np.testing.assert_allclose(
         sharded.matvec(demand) + sharded.fixed_measurement_offset,
@@ -757,6 +972,10 @@ def test_sharded_positive_fixed_flow_is_offset_only(artifacts, tmp_path):
         reference.fixed_measurement_offset,
         rtol=5e-5,
         atol=5e-5,
+    )
+    np.testing.assert_array_equal(
+        sharded.fixed_measurement_offset,
+        parallel_sharded.fixed_measurement_offset,
     )
     assert sharded.shape[1] == layout.num_free
 
