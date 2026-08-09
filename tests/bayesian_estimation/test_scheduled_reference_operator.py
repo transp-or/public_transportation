@@ -687,6 +687,7 @@ def test_direct_activation_builds_then_fresh_call_reuses_without_routing(
         **arguments,
     )
     assert isinstance(built.operator, DirectScheduledGravityOperator)
+    assert built.operator.representation == "direct_scheduled_temporal_blocks_csr_csc"
     assert len(routing_calls) == 1
     assert built.construction is not None
 

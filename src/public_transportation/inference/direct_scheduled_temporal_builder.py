@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import os
@@ -51,6 +51,7 @@ from .temporal_assignment_blocks import (
     TemporalBlockKey,
     TemporalSparseBlock,
 )
+from .temporal_assignment_sparse_backend import CSRCSCTemporalAssignmentOperator
 from .temporal_assignment_persistence import (
     load_temporal_block_operator,
     save_temporal_block_operator,
@@ -116,6 +117,9 @@ class DirectScheduledGravityOperator:
 
     operator: TemporalBlockAssignmentOperator
     theta: float
+    _execution_backend: CSRCSCTemporalAssignmentOperator = field(
+        init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         value = float(self.theta)
@@ -129,6 +133,14 @@ class DirectScheduledGravityOperator:
                 "temporal operator and fixed theta are incompatible."
             )
         object.__setattr__(self, "theta", value)
+        # The persisted temporal blocks are the provenance/source artifact.
+        # Estimation executes through one CSR/CSC forward/adjoint pair so JAX
+        # does not trace a scatter-update loop over every temporal block.
+        object.__setattr__(
+            self,
+            "_execution_backend",
+            CSRCSCTemporalAssignmentOperator(self.operator),
+        )
 
     @property
     def num_free_od(self) -> int:
@@ -148,7 +160,7 @@ class DirectScheduledGravityOperator:
 
     @property
     def representation(self) -> str:
-        return "direct_scheduled_temporal_blocks"
+        return "direct_scheduled_temporal_blocks_csr_csc"
 
     @property
     def is_matrix_free(self) -> bool:
@@ -185,10 +197,10 @@ class DirectScheduledGravityOperator:
         return GravityOperatorCapabilities(matmat=True)
 
     def jax_matvec(self, vector: jax.Array) -> jax.Array:
-        return self.operator.jax_matvec(vector)
+        return self._execution_backend.jax_matvec(vector)
 
     def jax_rmatvec(self, vector: jax.Array) -> jax.Array:
-        return self.operator.jax_rmatvec(vector)
+        return self._execution_backend.jax_rmatvec(vector)
 
     def jax_matmat(self, matrix: jax.Array) -> jax.Array:
         value = jnp.asarray(matrix, dtype=self.dtype)
