@@ -481,6 +481,11 @@ canonical plan order, even when workers finish out of order.  Worker count is
 excluded from scientific provenance, interrupted parallel and serial runs
 therefore reuse the same cache, and failures remove unpublished staging files
 without invalidating previously committed shards.
+Origin-specific support materialization has a separate positive configurable
+entry ceiling, whose default is 125 million.  This ceiling is an operational
+memory guard rather than scientific provenance, so increasing it preserves
+compatible destination-group support checkpoints.  Summary-only analysis can
+avoid materialization, but production numerical construction cannot.
 Only the current CPU chunk or destination group may be repeated. Therefore the
 deadline hardening is sufficient for bounded public full-network probes.
 

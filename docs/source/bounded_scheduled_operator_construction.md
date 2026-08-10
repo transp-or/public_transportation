@@ -83,6 +83,14 @@ publishes them, updates the manifest, and reports completion, always in
 canonical plan order.  Consequently worker count is not scientific provenance
 and serial and parallel runs share the same cache.
 
+`ShardedConstructionConfig.max_materialized_support_entries` separately bounds
+the number of origin-specific support coordinates materialized by production
+construction.  Its default is 125,000,000.  The limit is an operational memory
+guard, must be positive, and is deliberately excluded from scientific artifact
+identity: raising it preserves compatible per-group support checkpoints and
+numerical shard caches.  Summary analysis may use `materialize=False`, whereas
+the production sharded builder always requires materialized support.
+
 Select shard and OD chunk sizes explicitly, reserve a safety margin for final
 checkpointing, and resume with the same cache roots and scientific identity.
 The parent stops admitting work when the predicted shard duration plus

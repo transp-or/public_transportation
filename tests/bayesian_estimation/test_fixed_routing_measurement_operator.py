@@ -699,7 +699,14 @@ def test_sharded_builder_matches_monolithic_and_resumes(all_free_operator, tmp_p
     )
 
 
-def _parallel_builder_case(all_free_operator, directory, *, workers, **kwargs):
+def _parallel_builder_case(
+    all_free_operator,
+    directory,
+    *,
+    workers,
+    max_materialized_support_entries=125_000_000,
+    **kwargs,
+):
     inputs, routing, spec, _ = all_free_operator
     num_od = int(inputs.od_origin_node.shape[0])
     layout = ODParameterLayout(
@@ -718,6 +725,7 @@ def _parallel_builder_case(all_free_operator, directory, *, workers, **kwargs):
         measurement_block_size=1,
         worker_memory_budget_bytes=100_000_000,
         workers=workers,
+        max_materialized_support_entries=max_materialized_support_entries,
         maximum_resident_shards=2,
         target_nonzeros_per_storage_shard=1,
         maximum_nonzeros_per_storage_shard=1,
@@ -1125,10 +1133,50 @@ def test_origin_support_summary_mode_and_memory_preflight(all_free_operator):
         routing=routing,
         spec=spec,
         compact_layout=compact,
-        config=OriginSupportConfig(materialize=False),
+        config=OriginSupportConfig(
+            materialize=False, max_materialized_entries=1
+        ),
     )
     assert not summary.materialized
     assert summary.metrics.origin_specific_entries > 0
+    actual_entries = summary.metrics.origin_specific_entries
+    assert actual_entries > 1
+    with pytest.raises(
+        MemoryError,
+        match=(
+            f"origin-specific support has {actual_entries} entries, exceeding "
+            f"max_materialized_entries={actual_entries - 1}"
+        ),
+    ):
+        analyze_fixed_routing_origin_support(
+            inputs=inputs,
+            routing=routing,
+            spec=spec,
+            compact_layout=compact,
+            config=OriginSupportConfig(
+                max_materialized_entries=actual_entries - 1
+            ),
+        )
+    sufficient = analyze_fixed_routing_origin_support(
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        compact_layout=compact,
+        config=OriginSupportConfig(max_materialized_entries=actual_entries),
+    )
+    generous = analyze_fixed_routing_origin_support(
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        compact_layout=compact,
+        config=OriginSupportConfig(
+            max_materialized_entries=actual_entries + 10_000
+        ),
+    )
+    assert sufficient.fingerprint == generous.fingerprint
+    np.testing.assert_array_equal(
+        sufficient.free_support.toarray(), generous.free_support.toarray()
+    )
     with pytest.raises(MemoryError, match="memory budget"):
         analyze_fixed_routing_origin_support(
             inputs=inputs,
@@ -1137,6 +1185,67 @@ def test_origin_support_summary_mode_and_memory_preflight(all_free_operator):
             compact_layout=compact,
             config=OriginSupportConfig(worker_memory_budget_bytes=1),
         )
+
+
+def test_sharded_builder_support_cap_fails_then_reuses_group_checkpoints(
+    all_free_operator, tmp_path
+):
+    inputs, routing, spec, _ = all_free_operator
+    num_od = int(inputs.od_origin_node.shape[0])
+    layout = ODParameterLayout(
+        num_od_total=num_od,
+        od_keys=tuple((f"o{i}", "d", "t") for i in range(num_od)),
+        free_od_indices=tuple(range(num_od)),
+        fixed_od_indices=(),
+        fixed_od_values=(),
+        free_baseline_values=tuple(1.0 for _ in range(num_od)),
+        fixed_zero_indices=(),
+        fixed_positive_indices=(),
+    )
+    compact = build_compact_od_assignment_layout(parameter_layout=layout)
+    summary = analyze_fixed_routing_origin_support(
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        compact_layout=compact,
+        config=OriginSupportConfig(materialize=False),
+    )
+    actual_entries = summary.metrics.origin_specific_entries
+    with pytest.raises(MemoryError, match=f"has {actual_entries} entries"):
+        _parallel_builder_case(
+            all_free_operator,
+            tmp_path,
+            workers=1,
+            max_materialized_support_entries=actual_entries - 1,
+        )
+    checkpoints = tuple((tmp_path / "support_groups").glob("group-*.npz"))
+    assert checkpoints
+    completed = _parallel_builder_case(
+        all_free_operator,
+        tmp_path,
+        workers=1,
+        max_materialized_support_entries=actual_entries,
+    )
+    assert completed.manifest.complete
+    assert tuple((tmp_path / "support_groups").glob("group-*.npz")) == checkpoints
+    generous = _parallel_builder_case(
+        all_free_operator,
+        tmp_path / "generous",
+        workers=1,
+        max_materialized_support_entries=actual_entries + 10_000,
+    )
+    assert completed.manifest.provenance == generous.manifest.provenance
+    for identity in completed.manifest.expected_shards:
+        exact = load_sparse_shard(shard_path(completed.directory, identity))
+        roomy = load_sparse_shard(shard_path(generous.directory, identity))
+        assert exact.metadata.content_hash == roomy.metadata.content_hash
+    demand = np.linspace(0.0, 2.0, completed.plan.num_free_od)
+    np.testing.assert_allclose(
+        ShardedSparseLinearOperator(completed.directory).matvec(demand),
+        ShardedSparseLinearOperator(generous.directory).matvec(demand),
+    )
+    with pytest.raises(ValueError, match="max_materialized_support_entries"):
+        ShardedConstructionConfig(max_materialized_support_entries=0)
 
 
 def test_compact_positive_frozen_flow_becomes_offset(artifacts):

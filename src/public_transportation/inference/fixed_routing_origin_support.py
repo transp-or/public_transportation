@@ -13,7 +13,7 @@ from time import perf_counter
 
 import numpy as np
 from jax.experimental import sparse as jsparse
-from scipy import sparse
+from scipy import sparse  # type: ignore[import-untyped]
 
 from .assignment_adapter import (
     AssignmentInputs,
@@ -193,7 +193,11 @@ def _save_group_checkpoint(
     os.close(descriptor)
     try:
         with open(temporary, "wb") as stream:
-            np.savez(stream, metadata=np.asarray(json.dumps(metadata)), **arrays)
+            np.savez(
+                stream,
+                metadata=np.asarray(json.dumps(metadata)),
+                **arrays,  # type: ignore[arg-type]
+            )
             stream.flush()
             os.fsync(stream.fileno())
         _load_group_checkpoint(
@@ -574,8 +578,9 @@ def analyze_fixed_routing_origin_support(
             )
     if config.materialize and total_origin_specific > config.max_materialized_entries:
         raise MemoryError(
-            "origin-specific support exceeds max_materialized_entries; rerun with "
-            "materialize=False for summary-only analysis"
+            f"origin-specific support has {total_origin_specific} entries, exceeding "
+            "max_materialized_entries="
+            f"{config.max_materialized_entries}"
         )
     canonical_start = perf_counter()
 

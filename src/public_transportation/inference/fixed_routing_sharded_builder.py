@@ -133,6 +133,7 @@ class ShardedConstructionConfig:
     compressed_shards: bool = False
     workers: int = 1
     origin_support_chunk_size: int = 64
+    max_materialized_support_entries: int = 125_000_000
     support_edge_block_size: int = 2048
     target_nonzeros_per_storage_shard: int = 2048
     maximum_nonzeros_per_storage_shard: int = 8192
@@ -157,6 +158,8 @@ class ShardedConstructionConfig:
             raise ValueError("OD chunk and measurement block sizes must be positive.")
         if self.worker_memory_budget_bytes <= 0:
             raise ValueError("worker memory budget must be positive.")
+        if self.max_materialized_support_entries <= 0:
+            raise ValueError("max_materialized_support_entries must be positive.")
         if not math.isfinite(self.zero_tolerance) or self.zero_tolerance < 0:
             raise ValueError("zero_tolerance must be finite and non-negative.")
         if self.workers <= 0:
@@ -661,6 +664,7 @@ def _discover_support(
             origin_chunk_size=config.origin_support_chunk_size,
             worker_memory_budget_bytes=config.worker_memory_budget_bytes,
             materialize=True,
+            max_materialized_entries=config.max_materialized_support_entries,
         ),
         checkpoint_directory=checkpoint_directory,
         checkpoint_provenance_hash=checkpoint_provenance_hash,
