@@ -486,6 +486,13 @@ entry ceiling, whose default is 125 million.  This ceiling is an operational
 memory guard rather than scientific provenance, so increasing it preserves
 compatible destination-group support checkpoints.  Summary-only analysis can
 avoid materialization, but production numerical construction cannot.
+Numerical-shard preflight diagnostics likewise retain actual and permitted
+values for shard count, manifest size, filesystem work, sparse products,
+construction dispatches, and worker memory.  Unsafe plans raise a structured
+subclass of 	exttt{MemoryError}.  Shard-sizing controls remain provenance
+because they alter persisted identities; purely operational ceilings are stored
+in the plan and re-evaluated at reuse time, so an evidence-based ceiling change
+does not discard compatible support checkpoints.
 Only the current CPU chunk or destination group may be repeated. Therefore the
 deadline hardening is sufficient for bounded public full-network probes.
 

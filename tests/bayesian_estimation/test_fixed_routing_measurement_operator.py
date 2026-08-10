@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from time import perf_counter
 
@@ -42,6 +43,7 @@ from public_transportation.inference.fixed_routing_linear_backend import (
 )
 from public_transportation.inference.fixed_routing_sharded_builder import (
     ShardedConstructionConfig,
+    ShardedConstructionPreflightError,
     load_complete_sharded_fixed_routing_cache,
     plan_sharded_fixed_routing_operator,
     prepare_sharded_fixed_routing_measurement_operator,
@@ -575,6 +577,9 @@ def test_sharded_builder_matches_monolithic_and_resumes(all_free_operator, tmp_p
         config=config,
     )
     assert built.manifest.complete
+    assert (tmp_path / "manifest.json").stat().st_size <= (
+        built.plan.estimated_manifest_bytes
+    )
     assert built.rebuilt_shards == built.plan.num_shards
     assert built.plan.construction_tasks >= built.plan.num_shards
     assert built.dispatch_count <= built.plan.construction_tasks
@@ -705,6 +710,7 @@ def _parallel_builder_case(
     *,
     workers,
     max_materialized_support_entries=125_000_000,
+    maximum_storage_shards=256,
     **kwargs,
 ):
     inputs, routing, spec, _ = all_free_operator
@@ -726,6 +732,7 @@ def _parallel_builder_case(
         worker_memory_budget_bytes=100_000_000,
         workers=workers,
         max_materialized_support_entries=max_materialized_support_entries,
+        maximum_storage_shards=maximum_storage_shards,
         maximum_resident_shards=2,
         target_nonzeros_per_storage_shard=1,
         maximum_nonzeros_per_storage_shard=1,
@@ -744,6 +751,173 @@ def _parallel_builder_case(
         config=config,
         **kwargs,
     )
+
+
+@pytest.fixture(scope="module")
+def sharded_preflight_case(all_free_operator):
+    inputs, routing, spec, _ = all_free_operator
+    num_od = int(inputs.od_origin_node.shape[0])
+    layout = ODParameterLayout(
+        num_od_total=num_od,
+        od_keys=tuple((f"o{i}", "d", "t") for i in range(num_od)),
+        free_od_indices=tuple(range(num_od)),
+        fixed_od_indices=(),
+        fixed_od_values=(),
+        free_baseline_values=tuple(1.0 for _ in range(num_od)),
+        fixed_zero_indices=(),
+        fixed_positive_indices=(),
+    )
+    compact = build_compact_od_assignment_layout(parameter_layout=layout)
+    config = ShardedConstructionConfig(
+        od_chunk_size=8,
+        measurement_block_size=1,
+        worker_memory_budget_bytes=1_000_000_000,
+        target_nonzeros_per_storage_shard=1,
+        maximum_nonzeros_per_storage_shard=1,
+        maximum_patterns_per_storage_shard=256,
+        maximum_storage_shards=1_000_000,
+        maximum_manifest_bytes=1_000_000_000,
+        maximum_filesystem_operations=1_000_000_000,
+        maximum_sparse_calls_per_product=1_000_000,
+        maximum_construction_dispatches=1_000_000_000,
+    )
+    plan, support = plan_sharded_fixed_routing_operator(
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        compact_layout=compact,
+        config=config,
+    )
+    return inputs, routing, spec, compact, config, plan, support
+
+
+def test_sharded_preflight_safe_plan_is_complete_and_serializable(
+    sharded_preflight_case,
+):
+    _, _, _, _, config, plan, _ = sharded_preflight_case
+    assert plan.safe
+    diagnostics = plan.preflight_diagnostics()
+    assert all(
+        not item["exceeded"] for item in diagnostics["limits"].values()
+    )
+    assert plan.estimated_manifest_writes == (
+        2 + math.ceil(plan.num_shards / config.manifest_checkpoint_shards)
+    )
+    assert plan.estimated_filesystem_operations == (
+        plan.num_shards * 5 + plan.estimated_manifest_writes * 3
+    )
+    assert plan.estimated_sparse_calls_per_product == plan.num_shards
+    assert plan.estimated_construction_dispatches >= plan.construction_tasks
+    assert plan.estimated_worker_memory_bytes == (
+        plan.estimated_kernel_bytes
+        + plan.estimated_batch_temporary_bytes
+        + plan.estimated_maximum_staged_shard_bytes
+    )
+    assert diagnostics["storage_shard_sizing"] == {
+        "target_nonzeros": config.target_nonzeros_per_storage_shard,
+        "maximum_nonzeros": config.maximum_nonzeros_per_storage_shard,
+        "maximum_patterns": config.maximum_patterns_per_storage_shard,
+    }
+    json.dumps(diagnostics, sort_keys=True)
+    json.dumps(asdict(plan), sort_keys=True)
+    json.dumps(asdict(config), sort_keys=True)
+
+
+@pytest.mark.parametrize(
+    ("config_field", "diagnostic_name", "plan_field"),
+    [
+        ("maximum_storage_shards", "storage_shards", "num_shards"),
+        ("maximum_manifest_bytes", "manifest_bytes", "estimated_manifest_bytes"),
+        (
+            "maximum_filesystem_operations",
+            "filesystem_operations",
+            "estimated_filesystem_operations",
+        ),
+        (
+            "maximum_sparse_calls_per_product",
+            "sparse_calls_per_product",
+            "estimated_sparse_calls_per_product",
+        ),
+        (
+            "maximum_construction_dispatches",
+            "construction_dispatches",
+            "estimated_construction_dispatches",
+        ),
+    ],
+)
+def test_each_sharded_operational_limit_reports_actual_and_permitted(
+    sharded_preflight_case, config_field, diagnostic_name, plan_field
+):
+    inputs, routing, spec, compact, config, safe_plan, support = (
+        sharded_preflight_case
+    )
+    actual = getattr(safe_plan, plan_field)
+    assert actual > 1
+    permitted = actual - 1
+    rejected, _ = plan_sharded_fixed_routing_operator(
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        compact_layout=compact,
+        config=replace(config, **{config_field: permitted}),
+        discovered_support=support,
+    )
+    assert not rejected.safe
+    assert (
+        f"{diagnostic_name}: actual={actual}, permitted={permitted}"
+        in rejected.reason
+    )
+    detail = rejected.preflight_diagnostics()["limits"][diagnostic_name]
+    assert detail == {
+        "actual": actual,
+        "permitted": permitted,
+        "exceeded": True,
+    }
+
+
+def test_sharded_preflight_combines_failures_and_preserves_memoryerror(
+    sharded_preflight_case,
+):
+    inputs, routing, spec, compact, config, _, support = sharded_preflight_case
+    rejected, _ = plan_sharded_fixed_routing_operator(
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        compact_layout=compact,
+        config=replace(
+            config,
+            maximum_storage_shards=1,
+            maximum_manifest_bytes=1,
+            maximum_filesystem_operations=1,
+            maximum_sparse_calls_per_product=1,
+            maximum_construction_dispatches=1,
+            worker_memory_budget_bytes=1,
+        ),
+        discovered_support=support,
+    )
+    diagnostics = rejected.preflight_diagnostics()
+    assert not rejected.safe
+    assert all(item["exceeded"] for item in diagnostics["limits"].values())
+    error = ShardedConstructionPreflightError(rejected)
+    assert isinstance(error, MemoryError)
+    assert error.plan is rejected
+    assert error.details == diagnostics
+    assert str(error) == rejected.reason
+
+
+def test_sharded_builder_raises_structured_preflight_memoryerror(
+    all_free_operator, tmp_path
+):
+    with pytest.raises(ShardedConstructionPreflightError) as caught:
+        _parallel_builder_case(
+            all_free_operator,
+            tmp_path,
+            workers=1,
+            maximum_storage_shards=1,
+        )
+    assert isinstance(caught.value, MemoryError)
+    storage = caught.value.details["limits"]["storage_shards"]
+    assert storage["actual"] > storage["permitted"]
 
 
 def test_parallel_measurement_shards_match_serial_content(all_free_operator, tmp_path):

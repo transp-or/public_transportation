@@ -300,6 +300,7 @@ from .fixed_routing_sharded_builder import (  # noqa: F401
     ConstructionTask,
     ShardedConstructionConfig,
     ShardedConstructionPlan,
+    ShardedConstructionPreflightError,
     ShardedConstructionResult,
     StorageShardPlan,
     SupportPattern,

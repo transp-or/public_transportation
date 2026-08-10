@@ -258,6 +258,168 @@ class ShardedConstructionPlan:
     estimated_construction_batches: int = 0
     estimated_construction_dispatches: int = 0
     estimated_batch_temporary_bytes: int = 0
+    estimated_maximum_staged_shard_bytes: int = 0
+    estimated_worker_memory_bytes: int = 0
+    estimated_filesystem_operations: int = 0
+    configured_maximum_storage_shards: int = 0
+    configured_maximum_manifest_bytes: int = 0
+    configured_maximum_filesystem_operations: int = 0
+    configured_maximum_sparse_calls_per_product: int = 0
+    configured_maximum_construction_dispatches: int = 0
+    configured_target_nonzeros_per_storage_shard: int = 0
+    configured_maximum_nonzeros_per_storage_shard: int = 0
+    configured_maximum_patterns_per_storage_shard: int = 0
+    configured_manifest_checkpoint_shards: int = 0
+
+    def preflight_diagnostics(self) -> dict[str, object]:
+        """Return complete JSON-ready actual-versus-limit diagnostics."""
+        limits = {
+            "storage_shards": {
+                "actual": self.num_shards,
+                "permitted": self.configured_maximum_storage_shards,
+            },
+            "manifest_bytes": {
+                "actual": self.estimated_manifest_bytes,
+                "permitted": self.configured_maximum_manifest_bytes,
+            },
+            "filesystem_operations": {
+                "actual": self.estimated_filesystem_operations,
+                "permitted": self.configured_maximum_filesystem_operations,
+            },
+            "sparse_calls_per_product": {
+                "actual": self.estimated_sparse_calls_per_product,
+                "permitted": self.configured_maximum_sparse_calls_per_product,
+            },
+            "construction_dispatches": {
+                "actual": self.estimated_construction_dispatches,
+                "permitted": self.configured_maximum_construction_dispatches,
+            },
+            "worker_memory_bytes": {
+                "actual": self.estimated_worker_memory_bytes,
+                "permitted": self.worker_memory_budget_bytes,
+            },
+        }
+        return {
+            "safe": self.safe,
+            "reason": self.reason,
+            "limits": {
+                name: {
+                    **values,
+                    "exceeded": values["actual"] > values["permitted"],
+                }
+                for name, values in limits.items()
+            },
+            "storage_shard_sizing": {
+                "target_nonzeros": (
+                    self.configured_target_nonzeros_per_storage_shard
+                ),
+                "maximum_nonzeros": (
+                    self.configured_maximum_nonzeros_per_storage_shard
+                ),
+                "maximum_patterns": (
+                    self.configured_maximum_patterns_per_storage_shard
+                ),
+            },
+            "estimated_manifest_writes": self.estimated_manifest_writes,
+            "estimated_filesystem_file_count": (
+                self.estimated_filesystem_file_count
+            ),
+            "estimated_maximum_staged_shard_bytes": (
+                self.estimated_maximum_staged_shard_bytes
+            ),
+        }
+
+
+class ShardedConstructionPreflightError(MemoryError):
+    """Structured, backward-compatible rejection of an unsafe shard plan."""
+
+    def __init__(self, plan: ShardedConstructionPlan):
+        super().__init__(plan.reason)
+        self.plan = plan
+        self.details = plan.preflight_diagnostics()
+
+
+def _evaluate_operational_preflight(
+    plan: ShardedConstructionPlan,
+    config: ShardedConstructionConfig,
+) -> ShardedConstructionPlan:
+    """Apply current operational limits without changing scientific identity."""
+    maximum_staged_shard_bytes = max(
+        (
+            item.estimated_uncompressed_bytes
+            for item in plan.storage_shards
+        ),
+        default=plan.estimated_maximum_staged_shard_bytes,
+    )
+    worker_memory_bytes = (
+        plan.estimated_kernel_bytes
+        + plan.estimated_batch_temporary_bytes
+        + maximum_staged_shard_bytes
+    )
+    manifest_writes = 2 + math.ceil(
+        plan.num_shards / config.manifest_checkpoint_shards
+    )
+    manifest_bytes = max(
+        plan.estimated_manifest_bytes,
+        8192 + plan.num_shards * 512,
+    )
+    filesystem_operations = plan.num_shards * 5 + manifest_writes * 3
+    configured = replace(
+        plan,
+        estimated_maximum_staged_shard_bytes=maximum_staged_shard_bytes,
+        estimated_worker_memory_bytes=worker_memory_bytes,
+        estimated_manifest_writes=manifest_writes,
+        estimated_manifest_bytes=manifest_bytes,
+        estimated_cumulative_manifest_bytes=(
+            manifest_bytes * manifest_writes
+        ),
+        estimated_filesystem_file_count=plan.num_shards + 1,
+        estimated_filesystem_operations=filesystem_operations,
+        estimated_sparse_calls_per_product=plan.num_shards,
+        configured_maximum_storage_shards=config.maximum_storage_shards,
+        configured_maximum_manifest_bytes=config.maximum_manifest_bytes,
+        configured_maximum_filesystem_operations=(
+            config.maximum_filesystem_operations
+        ),
+        configured_maximum_sparse_calls_per_product=(
+            config.maximum_sparse_calls_per_product
+        ),
+        configured_maximum_construction_dispatches=(
+            config.maximum_construction_dispatches
+        ),
+        configured_target_nonzeros_per_storage_shard=(
+            config.target_nonzeros_per_storage_shard
+        ),
+        configured_maximum_nonzeros_per_storage_shard=(
+            config.maximum_nonzeros_per_storage_shard
+        ),
+        configured_maximum_patterns_per_storage_shard=(
+            config.maximum_patterns_per_storage_shard
+        ),
+        configured_manifest_checkpoint_shards=config.manifest_checkpoint_shards,
+    )
+    diagnostics = configured.preflight_diagnostics()["limits"]
+    assert isinstance(diagnostics, dict)
+    comparisons = []
+    failure_count = 0
+    for name, values in diagnostics.items():
+        assert isinstance(values, dict)
+        exceeded = bool(values["exceeded"])
+        failure_count += int(exceeded)
+        comparisons.append(
+            f"{name}: actual={values['actual']}, "
+            f"permitted={values['permitted']}, exceeded={str(exceeded).lower()}"
+        )
+    if failure_count:
+        reason = "sharded construction preflight rejected: " + "; ".join(
+            comparisons
+        )
+        return replace(configured, safe=False, reason=reason)
+    return replace(
+        configured,
+        safe=True,
+        reason="kernel memory and aggregate storage plan are operationally bounded",
+    )
 
 
 def _make_forward_support_kernel(*, graph, chunk_size: int, edge_block_size: int):
@@ -876,12 +1038,18 @@ def plan_sharded_fixed_routing_operator(
     payloads = np.asarray(
         [value.estimated_nonzeros for value in storage_shards], dtype=np.int64
     )
-    manifest_writes = 1 + math.ceil(
+    # Cold construction writes the template and recovery-scan state, then one
+    # checkpoint per publication interval (including the final checkpoint).
+    manifest_writes = 2 + math.ceil(
         len(storage_shards) / config.manifest_checkpoint_shards
     )
-    # JSON estimate is intentionally conservative and independent of private keys.
-    manifest_bytes = 2048 + len(storage_shards) * 320
-    filesystem_operations = len(storage_shards) * 2 + manifest_writes * 2
+    # The fixed allowance covers provenance plus the complete plan diagnostics;
+    # the per-shard allowance covers identity, completion key, and payload data.
+    # It is intentionally conservative and independent of private key lengths.
+    manifest_bytes = 8192 + len(storage_shards) * 512
+    # Each worker shard uses a temporary write, validation open, staging rename,
+    # and parent publication rename; manifests use temporary write and rename.
+    filesystem_operations = len(storage_shards) * 5 + manifest_writes * 3
     task_by_key = {task.identity.key: task for task in support.construction_tasks}
     estimated_batches = 0
     estimated_dispatches = 0
@@ -908,82 +1076,64 @@ def plan_sharded_fixed_routing_operator(
             estimated_dispatches += max(
                 1, math.ceil(len(batch_origins) / config.od_chunk_size)
             ) * max(1, math.ceil(selected_edges / config.support_edge_block_size))
-    operational_failures: list[str] = []
-    if len(storage_shards) > config.maximum_storage_shards:
-        operational_failures.append("storage-shard count exceeds configured maximum")
-    if manifest_bytes > config.maximum_manifest_bytes:
-        operational_failures.append("estimated manifest exceeds configured maximum")
-    if filesystem_operations > config.maximum_filesystem_operations:
-        operational_failures.append("estimated filesystem operations exceed configured maximum")
-    if len(storage_shards) > config.maximum_sparse_calls_per_product:
-        operational_failures.append("sparse calls per product exceed configured maximum")
-    if estimated_dispatches > config.maximum_construction_dispatches:
-        operational_failures.append("estimated construction dispatches exceed configured maximum")
     estimated_batch_temporary_bytes = int(
         config.od_chunk_size * maximum_batch_rows * itemsize
     )
     maximum_staged_shard_bytes = max(
         (item.estimated_uncompressed_bytes for item in storage_shards), default=0
     )
-    memory_safe = (
+    estimated_worker_memory_bytes = (
         estimated_kernel_bytes
         + estimated_batch_temporary_bytes
         + maximum_staged_shard_bytes
-        <= config.worker_memory_budget_bytes
     )
-    safe = memory_safe and not operational_failures
-    if not memory_safe:
-        reason = (
-            "kernel, batch workspace, and staged shard estimate exceeds "
-            "worker memory budget"
-        )
-    elif operational_failures:
-        reason = "; ".join(operational_failures)
-    else:
-        reason = "kernel memory and aggregate storage plan are operationally bounded"
-    return (
-        ShardedConstructionPlan(
-            num_measurements=int(spec.num_measurements),
-            num_free_od=compact_layout.num_free,
-            num_active_od=compact_layout.num_active,
-            num_groups=len(support.group_measurements),
-            num_shards=len(identities),
-            candidate_entries=candidates,
-            maximum_group_measurements=max(
-                (value.size for value in support.group_measurements), default=0
-            ),
-            maximum_shard_measurements=min(
-                config.measurement_block_size,
-                max((value.size for value in support.group_measurements), default=0),
-            ),
-            estimated_kernel_bytes=estimated_kernel_bytes,
-            worker_memory_budget_bytes=config.worker_memory_budget_bytes,
-            safe=safe,
-            reason=reason,
-            expected_shards=tuple(identities),
-            support_patterns=support.support_patterns,
-            group_level_candidate_entries=support.group_level_candidate_entries,
-            origin_support_seconds=support.origin_support_seconds,
-            maximum_support_edges=maximum_support_edges,
-            construction_tasks=len(task_identities),
-            storage_shards=storage_shards,
-            estimated_nonzeros_per_storage_shard=tuple(int(value) for value in payloads),
-            estimated_payload_min=int(payloads.min()) if payloads.size else 0,
-            estimated_payload_median=float(np.median(payloads)) if payloads.size else 0.0,
-            estimated_payload_p90=float(np.percentile(payloads, 90)) if payloads.size else 0.0,
-            estimated_payload_p99=float(np.percentile(payloads, 99)) if payloads.size else 0.0,
-            estimated_payload_max=int(payloads.max()) if payloads.size else 0,
-            estimated_filesystem_file_count=len(storage_shards) + 1,
-            estimated_manifest_bytes=manifest_bytes,
-            estimated_manifest_writes=manifest_writes,
-            estimated_cumulative_manifest_bytes=manifest_bytes * manifest_writes,
-            estimated_sparse_calls_per_product=len(storage_shards),
-            estimated_eager_cache_opens=len(storage_shards),
-            estimated_lru_cache_opens_per_product=len(storage_shards),
-            estimated_construction_batches=estimated_batches,
-            estimated_construction_dispatches=estimated_dispatches,
-            estimated_batch_temporary_bytes=estimated_batch_temporary_bytes,
+    plan = ShardedConstructionPlan(
+        num_measurements=int(spec.num_measurements),
+        num_free_od=compact_layout.num_free,
+        num_active_od=compact_layout.num_active,
+        num_groups=len(support.group_measurements),
+        num_shards=len(identities),
+        candidate_entries=candidates,
+        maximum_group_measurements=max(
+            (value.size for value in support.group_measurements), default=0
         ),
+        maximum_shard_measurements=min(
+            config.measurement_block_size,
+            max((value.size for value in support.group_measurements), default=0),
+        ),
+        estimated_kernel_bytes=estimated_kernel_bytes,
+        worker_memory_budget_bytes=config.worker_memory_budget_bytes,
+        safe=True,
+        reason="preflight diagnostics pending",
+        expected_shards=tuple(identities),
+        support_patterns=support.support_patterns,
+        group_level_candidate_entries=support.group_level_candidate_entries,
+        origin_support_seconds=support.origin_support_seconds,
+        maximum_support_edges=maximum_support_edges,
+        construction_tasks=len(task_identities),
+        storage_shards=storage_shards,
+        estimated_nonzeros_per_storage_shard=tuple(int(value) for value in payloads),
+        estimated_payload_min=int(payloads.min()) if payloads.size else 0,
+        estimated_payload_median=float(np.median(payloads)) if payloads.size else 0.0,
+        estimated_payload_p90=float(np.percentile(payloads, 90)) if payloads.size else 0.0,
+        estimated_payload_p99=float(np.percentile(payloads, 99)) if payloads.size else 0.0,
+        estimated_payload_max=int(payloads.max()) if payloads.size else 0,
+        estimated_filesystem_file_count=len(storage_shards) + 1,
+        estimated_manifest_bytes=manifest_bytes,
+        estimated_manifest_writes=manifest_writes,
+        estimated_cumulative_manifest_bytes=manifest_bytes * manifest_writes,
+        estimated_sparse_calls_per_product=len(storage_shards),
+        estimated_eager_cache_opens=len(storage_shards),
+        estimated_lru_cache_opens_per_product=len(storage_shards),
+        estimated_construction_batches=estimated_batches,
+        estimated_construction_dispatches=estimated_dispatches,
+        estimated_batch_temporary_bytes=estimated_batch_temporary_bytes,
+        estimated_maximum_staged_shard_bytes=maximum_staged_shard_bytes,
+        estimated_worker_memory_bytes=estimated_worker_memory_bytes,
+        estimated_filesystem_operations=filesystem_operations,
+    )
+    return (
+        _evaluate_operational_preflight(plan, config),
         support,
     )
 
@@ -1049,7 +1199,8 @@ def _restore_plan_from_manifest(
         support,
         storage_task_keys={item.identity.key: item.task_keys for item in storage},
     )
-    return replace(plan, storage_shards=storage), support
+    restored = replace(plan, storage_shards=storage)
+    return _evaluate_operational_preflight(restored, config), support
 
 
 def _construction_provenance(
@@ -1128,7 +1279,7 @@ def load_complete_sharded_fixed_routing_cache(
     return ShardedConstructionResult(
         directory=directory,
         manifest=manifest,
-        plan=_plan_from_manifest(manifest),
+        plan=_evaluate_operational_preflight(_plan_from_manifest(manifest), config),
         reused_shards=len(manifest.expected_shards),
         rebuilt_shards=0,
         rejected_shards=0,
@@ -1446,7 +1597,9 @@ def prepare_sharded_fixed_routing_measurement_operator(
                     break
                 aggregate_nonzeros += loaded.metadata.nonzero_entries
             if valid and aggregate_nonzeros == existing.aggregate_nonzeros:
-                plan = _plan_from_manifest(existing)
+                plan = _evaluate_operational_preflight(
+                    _plan_from_manifest(existing), config
+                )
                 return ShardedConstructionResult(
                     directory=directory,
                     manifest=existing,
@@ -1566,7 +1719,7 @@ def prepare_sharded_fixed_routing_measurement_operator(
         )
     planning_seconds = perf_counter() - planning_start
     if not plan.safe:
-        raise MemoryError(plan.reason)
+        raise ShardedConstructionPreflightError(plan)
     template = _manifest(
         plan=plan,
         config=config,

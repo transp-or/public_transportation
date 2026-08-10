@@ -91,6 +91,17 @@ identity: raising it preserves compatible per-group support checkpoints and
 numerical shard caches.  Summary analysis may use `materialize=False`, whereas
 the production sharded builder always requires materialized support.
 
+The numerical-shard preflight records both the actual estimate and configured
+ceiling for storage shards, manifest bytes, filesystem operations, sparse calls
+per product, construction dispatches, and per-worker memory.  Rejection remains
+a `MemoryError`, with a structured plan and JSON-ready diagnostics attached.
+Storage-shard sizing controls participate in scientific construction provenance
+because they change persisted shard identities.  The five operational ceilings
+do not change numerical content: they are serialized in the plan and are
+re-evaluated on every call, allowing a caller to raise an evidence-based ceiling
+and reuse compatible support checkpoints safely.  Defaults remain conservative;
+production callers must opt into larger limits explicitly.
+
 Select shard and OD chunk sizes explicitly, reserve a safety margin for final
 checkpointing, and resume with the same cache roots and scientific identity.
 The parent stops admitting work when the predicted shard duration plus

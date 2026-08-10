@@ -6,7 +6,10 @@ import math
 from dataclasses import dataclass
 from typing import Literal
 
-from .fixed_routing_sharded_builder import ShardedConstructionPlan
+from .fixed_routing_sharded_builder import (
+    ShardedConstructionPlan,
+    ShardedConstructionPreflightError,
+)
 
 ShardedCacheStatus = Literal["none", "partial", "complete"]
 
@@ -83,14 +86,18 @@ def select_sharded_fixed_routing_backend(
         else config.estimated_construction_seconds / saving
     )
     kernel_memory_safe = (
-        plan.estimated_kernel_bytes <= plan.worker_memory_budget_bytes
+        (plan.estimated_worker_memory_bytes or plan.estimated_kernel_bytes)
+        <= plan.worker_memory_budget_bytes
     )
     operational_plan_safe = plan.safe and kernel_memory_safe
     safe = operational_plan_safe and disk_safe
+    selected: Literal["matrix_free", "sharded"]
     if config.mode == "matrix_free":
         selected, reason = "matrix_free", "explicit matrix-free override"
     elif config.mode == "sharded":
-        if not safe:
+        if not operational_plan_safe:
+            raise ShardedConstructionPreflightError(plan)
+        if not disk_safe:
             raise MemoryError("sharded construction plan exceeds memory or disk budget.")
         selected, reason = "sharded", "explicit bounded sharded override"
     elif cache_status == "complete":
