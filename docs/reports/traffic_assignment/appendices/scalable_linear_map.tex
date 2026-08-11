@@ -6,3 +6,58 @@
 
 \input{traffic_assignment/preserved/065_1845_1863_operator_representations.tex}
 \input{traffic_assignment/preserved/069_1971_2094_resource_preflight_and_adaptive_refinement.tex}
+
+\subsection{Split Reachability and Measurement-Edge Gathering}
+
+The production sharded fixed-routing builder separates the expensive graph
+dynamic program from the measurement mapping.  For each padded OD chunk it
+now evaluates one fixed-shape forward-reachability kernel, retains the
+OD--node state on the device, and applies a fixed-shape edge-gather kernel to
+each mapped-edge block.  Consequently, the graph traversal is independent of
+the number of mapped-edge blocks.  Graph topology arrays are dynamic JAX
+arguments and the two compatible executables are lowered and compiled once;
+the worker pool shares those executables while each worker retains its own
+routing-shard reader.
+
+The serialized construction plan records separate estimates for
+\texttt{estimated\_reachability\allowbreak\_evaluations} and
+\texttt{estimated\_edge\allowbreak\_gather\allowbreak\_evaluations}; the construction result also
+reports both realized counts and their dispatch times, in addition to total
+JAX, synchronization, host-transfer, sparse-filtering, and persistence
+times.  Publication remains ordered and atomic, so worker completion order
+cannot change manifests or numerical artifacts.
+
+Numerical shards carry the algorithm identifier
+\texttt{reachability-edge-gather-v1} in operator provenance.  A mismatch
+invalidates old numerical shards while the support checkpoint continues to
+use the scientific/support provenance hash, allowing the expensive support
+discovery to be reused safely.  The split implementation is validated against
+the existing dense reference and serial construction: structural zeros,
+fixed offsets, forward products, and transpose products are unchanged.
+
+As a bounded smoke benchmark, the public
+\texttt{simple\_example\_02} fixture
+(eight-origin chunks and three reach/gather pairs) produced the following
+scale check on the development laptop.  The old column is the pre-refactor
+checkout; the split column is the current checkout.  Both stored 60 nonzeros
+in 9 shards, and the split path used two compiled executables.
+
+\begin{center}
+\begin{tabular}{lrr}
+\hline
+ & Old combined kernel & Split kernel \\
+\hline
+Construction (one worker, s) & 0.278 & 0.306 \\
+Peak RSS (MiB) & 445 & 444 \\
+Stored shard bytes & 5,558 & 5,558 \\
+Reachability evaluations & 3 (fused) & 3 \\
+Edge-gather evaluations & 3 (fused) & 3 \\
+\hline
+\end{tabular}
+\end{center}
+
+The fixture is intentionally too small to predict full-network wall time; the
+benchmark is a regression guard for artifact identity, execution accounting,
+and worker scaling.  Full-network deployment still requires the bounded
+representative-shard benchmark and resource extrapolation specified by the
+runbook.

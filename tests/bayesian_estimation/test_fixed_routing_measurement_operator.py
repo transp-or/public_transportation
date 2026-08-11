@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import shutil
@@ -190,10 +191,10 @@ def test_sharded_matrix_free_products_match_complete_operator(
         inputs=inputs,
         theta=1.0,
         config=FixedRoutingPreparationConfig(
-                maximum_groups_per_shard=2,
-                cache_directory=tmp_path,
-                checkpoint_directory=tmp_path / "checkpoint",
-                resident_shard_limit=1,
+            maximum_groups_per_shard=2,
+            cache_directory=tmp_path,
+            checkpoint_directory=tmp_path / "checkpoint",
+            resident_shard_limit=1,
         ),
     )
     operator = ShardedMatrixFreeFixedRoutingMeasurementOperator(
@@ -251,9 +252,7 @@ def test_sharded_matrix_free_products_match_complete_operator(
     assert progress[0].phase == "product_started"
     assert progress[-1].phase == "product_completed"
     assert progress[-1].completed_shards == progress[-1].total_shards
-    assert all(
-        event.completed_shards <= event.total_shards for event in progress
-    )
+    assert all(event.completed_shards <= event.total_shards for event in progress)
     assert operator.resident_shards <= operator.resident_shard_limit
 
     operator.absolute_deadline = 0.0
@@ -312,7 +311,9 @@ def test_sharded_matrix_free_products_match_complete_operator(
         )
         np.testing.assert_allclose(
             candidate._host_matmat(np.asarray(matrix)),
-            np.column_stack((first_result, 2.0 * first_result, np.zeros_like(first_result))),
+            np.column_stack(
+                (first_result, 2.0 * first_result, np.zeros_like(first_result))
+            ),
             rtol=4e-5,
             atol=4e-5,
         )
@@ -541,7 +542,9 @@ def test_linear_sparse_backend_cache_hit_skips_routing_rebuild(artifacts, tmp_pa
     )
     assert cached.metrics.cache_hit
     demand = np.linspace(0.0, 2.0, num_od)
-    np.testing.assert_allclose(cached.operator.matvec(demand), built.operator.matvec(demand))
+    np.testing.assert_allclose(
+        cached.operator.matvec(demand), built.operator.matvec(demand)
+    )
     np.testing.assert_allclose(
         cached.fixed_measurement_offset, built.fixed_measurement_offset
     )
@@ -797,9 +800,7 @@ def test_sharded_preflight_safe_plan_is_complete_and_serializable(
     _, _, _, _, config, plan, _ = sharded_preflight_case
     assert plan.safe
     diagnostics = plan.preflight_diagnostics()
-    assert all(
-        not item["exceeded"] for item in diagnostics["limits"].values()
-    )
+    assert all(not item["exceeded"] for item in diagnostics["limits"].values())
     assert plan.estimated_manifest_writes == (
         2 + math.ceil(plan.num_shards / config.manifest_checkpoint_shards)
     )
@@ -848,9 +849,7 @@ def test_sharded_preflight_safe_plan_is_complete_and_serializable(
 def test_each_sharded_operational_limit_reports_actual_and_permitted(
     sharded_preflight_case, config_field, diagnostic_name, plan_field
 ):
-    inputs, routing, spec, compact, config, safe_plan, support = (
-        sharded_preflight_case
-    )
+    inputs, routing, spec, compact, config, safe_plan, support = sharded_preflight_case
     actual = getattr(safe_plan, plan_field)
     assert actual > 1
     permitted = actual - 1
@@ -864,8 +863,7 @@ def test_each_sharded_operational_limit_reports_actual_and_permitted(
     )
     assert not rejected.safe
     assert (
-        f"{diagnostic_name}: actual={actual}, permitted={permitted}"
-        in rejected.reason
+        f"{diagnostic_name}: actual={actual}, permitted={permitted}" in rejected.reason
     )
     detail = rejected.preflight_diagnostics()["limits"][diagnostic_name]
     assert detail == {
@@ -921,14 +919,23 @@ def test_sharded_builder_raises_structured_preflight_memoryerror(
 
 
 def test_parallel_measurement_shards_match_serial_content(all_free_operator, tmp_path):
-    serial = _parallel_builder_case(
-        all_free_operator, tmp_path / "serial", workers=1
-    )
+    serial = _parallel_builder_case(all_free_operator, tmp_path / "serial", workers=1)
     parallel = _parallel_builder_case(
         all_free_operator, tmp_path / "parallel", workers=2
     )
     assert serial.manifest.provenance == parallel.manifest.provenance
     assert serial.manifest.expected_shards == parallel.manifest.expected_shards
+    assert serial.compilation_count == 2
+    assert parallel.compilation_count == 2
+    assert serial.reachability_evaluations == (
+        serial.plan.estimated_reachability_evaluations
+    )
+    assert serial.edge_gather_evaluations == (
+        serial.plan.estimated_edge_gather_evaluations
+    )
+    assert parallel.reachability_evaluations == serial.reachability_evaluations
+    assert parallel.edge_gather_evaluations == serial.edge_gather_evaluations
+    assert serial.edge_gather_evaluations >= serial.reachability_evaluations
     assert parallel.requested_workers == 2
     assert parallel.admitted_workers == 2
     for identity in serial.manifest.expected_shards:
@@ -950,6 +957,41 @@ def test_parallel_measurement_shards_match_serial_content(all_free_operator, tmp
     np.testing.assert_allclose(
         serial_operator.rmatvec(cotangent),
         parallel_operator.rmatvec(cotangent),
+    )
+
+
+def test_kernel_version_rebuilds_shards_but_reuses_support_checkpoint(
+    all_free_operator, tmp_path, monkeypatch
+):
+    built = _parallel_builder_case(all_free_operator, tmp_path, workers=1)
+    manifest_path = tmp_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["provenance"].pop("measurement_kernel_algorithm", None)
+    manifest["provenance_hash"] = hashlib.sha256(
+        json.dumps(
+            manifest["provenance"], sort_keys=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
+    manifest_path.write_text(json.dumps(manifest))
+    for identity in built.manifest.expected_shards:
+        path = shard_path(tmp_path, identity)
+        with np.load(path, allow_pickle=False) as archive:
+            shard = {name: archive[name] for name in archive.files}
+        metadata = json.loads(str(shard["metadata"]))
+        metadata["provenance_hash"] = manifest["provenance_hash"]
+        shard["metadata"] = np.asarray(json.dumps(metadata))
+        np.savez(path, **shard)
+
+    def support_must_be_reused(**_kwargs):
+        raise AssertionError("support discovery should have been reused")
+
+    monkeypatch.setattr(sharded_builder, "_discover_support", support_must_be_reused)
+    rebuilt = _parallel_builder_case(all_free_operator, tmp_path, workers=1)
+    assert rebuilt.rebuilt_shards == built.plan.num_shards
+    assert rebuilt.rejected_shards == built.plan.num_shards
+    assert (
+        rebuilt.manifest.provenance["measurement_kernel_algorithm"]
+        == sharded_builder.MEASUREMENT_KERNEL_ALGORITHM_VERSION
     )
 
 
@@ -1014,9 +1056,7 @@ def test_parallel_deadline_waits_for_inflight_shards_and_resumes(
     assert stopped.value.termination.completed_units == 2
     partial = load_sharded_operator_manifest(tmp_path)
     assert len(partial.completed_shards) == 2
-    monkeypatch.setattr(
-        sharded_builder, "_construct_measurement_shard", original
-    )
+    monkeypatch.setattr(sharded_builder, "_construct_measurement_shard", original)
     resumed = _parallel_builder_case(all_free_operator, tmp_path, workers=2)
     assert resumed.manifest.complete
     assert resumed.reused_shards == 2
@@ -1040,9 +1080,7 @@ def test_parallel_failure_cleans_staging_and_checkpoint_remains_reusable(
     assert set(partial.completed_shards).issubset(
         {item.key for item in partial.expected_shards}
     )
-    monkeypatch.setattr(
-        sharded_builder, "_construct_measurement_shard", original
-    )
+    monkeypatch.setattr(sharded_builder, "_construct_measurement_shard", original)
     resumed = _parallel_builder_case(all_free_operator, tmp_path, workers=2)
     assert resumed.manifest.complete
 
@@ -1133,9 +1171,7 @@ def test_sharded_positive_fixed_flow_is_offset_only(artifacts, tmp_path):
     )
     for identity in serial.manifest.expected_shards:
         serial_shard = load_sparse_shard(shard_path(serial.directory, identity))
-        parallel_shard = load_sparse_shard(
-            shard_path(parallel.directory, identity)
-        )
+        parallel_shard = load_sparse_shard(shard_path(parallel.directory, identity))
         assert serial_shard.metadata.content_hash == (
             parallel_shard.metadata.content_hash
         )
@@ -1307,9 +1343,7 @@ def test_origin_support_summary_mode_and_memory_preflight(all_free_operator):
         routing=routing,
         spec=spec,
         compact_layout=compact,
-        config=OriginSupportConfig(
-            materialize=False, max_materialized_entries=1
-        ),
+        config=OriginSupportConfig(materialize=False, max_materialized_entries=1),
     )
     assert not summary.materialized
     assert summary.metrics.origin_specific_entries > 0
@@ -1327,9 +1361,7 @@ def test_origin_support_summary_mode_and_memory_preflight(all_free_operator):
             routing=routing,
             spec=spec,
             compact_layout=compact,
-            config=OriginSupportConfig(
-                max_materialized_entries=actual_entries - 1
-            ),
+            config=OriginSupportConfig(max_materialized_entries=actual_entries - 1),
         )
     sufficient = analyze_fixed_routing_origin_support(
         inputs=inputs,
@@ -1343,9 +1375,7 @@ def test_origin_support_summary_mode_and_memory_preflight(all_free_operator):
         routing=routing,
         spec=spec,
         compact_layout=compact,
-        config=OriginSupportConfig(
-            max_materialized_entries=actual_entries + 10_000
-        ),
+        config=OriginSupportConfig(max_materialized_entries=actual_entries + 10_000),
     )
     assert sufficient.fingerprint == generous.fingerprint
     np.testing.assert_array_equal(

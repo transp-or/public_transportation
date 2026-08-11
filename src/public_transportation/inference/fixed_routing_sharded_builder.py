@@ -65,6 +65,12 @@ from .sharded_fixed_routing import (
 
 FixedRoutingSource = FixedRoutingInputs | ShardedFixedRoutingInputs
 
+# Numerical shard contents are tied to the kernel algorithm.  This version is
+# deliberately separate from the support-checkpoint provenance: changing the
+# numerical implementation must invalidate stored shards, but must not force
+# the expensive topology-support discovery to run again.
+MEASUREMENT_KERNEL_ALGORITHM_VERSION = "reachability-edge-gather-v1"
+
 
 class _RoutingBatchReader:
     """Retain at most one sharded routing batch on host and device."""
@@ -95,9 +101,7 @@ class _RoutingBatchReader:
                 routing=self.routing, descriptor=descriptor
             )
             self.device_probability = jnp.asarray(self.shard.group_link_probability)
-            self.device_effective = jnp.asarray(
-                self.shard.effective_group_link_mask
-            )
+            self.device_effective = jnp.asarray(self.shard.effective_group_link_mask)
             self.descriptor = descriptor
         return group - descriptor.group_start
 
@@ -172,21 +176,27 @@ class ShardedConstructionConfig:
             or not math.isfinite(self.deadline_safety_margin_seconds)
             or self.deadline_safety_margin_seconds < 0.0
         ):
-            raise ValueError("progress interval and deadline margin must be nonnegative.")
+            raise ValueError(
+                "progress interval and deadline margin must be nonnegative."
+            )
         if not (
-            0 < self.target_nonzeros_per_storage_shard
+            0
+            < self.target_nonzeros_per_storage_shard
             <= self.maximum_nonzeros_per_storage_shard
         ):
             raise ValueError("storage-shard nonzero targets are invalid.")
-        if min(
-            self.maximum_patterns_per_storage_shard,
-            self.maximum_storage_shards,
-            self.maximum_manifest_bytes,
-            self.maximum_filesystem_operations,
-            self.maximum_sparse_calls_per_product,
-            self.manifest_checkpoint_shards,
-            self.maximum_construction_dispatches,
-        ) <= 0:
+        if (
+            min(
+                self.maximum_patterns_per_storage_shard,
+                self.maximum_storage_shards,
+                self.maximum_manifest_bytes,
+                self.maximum_filesystem_operations,
+                self.maximum_sparse_calls_per_product,
+                self.manifest_checkpoint_shards,
+                self.maximum_construction_dispatches,
+            )
+            <= 0
+        ):
             raise ValueError("operational shard limits must be positive.")
 
 
@@ -270,6 +280,8 @@ class ShardedConstructionPlan:
     configured_maximum_nonzeros_per_storage_shard: int = 0
     configured_maximum_patterns_per_storage_shard: int = 0
     configured_manifest_checkpoint_shards: int = 0
+    estimated_reachability_evaluations: int = 0
+    estimated_edge_gather_evaluations: int = 0
 
     def preflight_diagnostics(self) -> dict[str, object]:
         """Return complete JSON-ready actual-versus-limit diagnostics."""
@@ -310,9 +322,7 @@ class ShardedConstructionPlan:
                 for name, values in limits.items()
             },
             "storage_shard_sizing": {
-                "target_nonzeros": (
-                    self.configured_target_nonzeros_per_storage_shard
-                ),
+                "target_nonzeros": (self.configured_target_nonzeros_per_storage_shard),
                 "maximum_nonzeros": (
                     self.configured_maximum_nonzeros_per_storage_shard
                 ),
@@ -321,11 +331,15 @@ class ShardedConstructionPlan:
                 ),
             },
             "estimated_manifest_writes": self.estimated_manifest_writes,
-            "estimated_filesystem_file_count": (
-                self.estimated_filesystem_file_count
-            ),
+            "estimated_filesystem_file_count": (self.estimated_filesystem_file_count),
             "estimated_maximum_staged_shard_bytes": (
                 self.estimated_maximum_staged_shard_bytes
+            ),
+            "estimated_reachability_evaluations": (
+                self.estimated_reachability_evaluations
+            ),
+            "estimated_edge_gather_evaluations": (
+                self.estimated_edge_gather_evaluations
             ),
         }
 
@@ -345,10 +359,7 @@ def _evaluate_operational_preflight(
 ) -> ShardedConstructionPlan:
     """Apply current operational limits without changing scientific identity."""
     maximum_staged_shard_bytes = max(
-        (
-            item.estimated_uncompressed_bytes
-            for item in plan.storage_shards
-        ),
+        (item.estimated_uncompressed_bytes for item in plan.storage_shards),
         default=plan.estimated_maximum_staged_shard_bytes,
     )
     worker_memory_bytes = (
@@ -356,9 +367,7 @@ def _evaluate_operational_preflight(
         + plan.estimated_batch_temporary_bytes
         + maximum_staged_shard_bytes
     )
-    manifest_writes = 2 + math.ceil(
-        plan.num_shards / config.manifest_checkpoint_shards
-    )
+    manifest_writes = 2 + math.ceil(plan.num_shards / config.manifest_checkpoint_shards)
     manifest_bytes = max(
         plan.estimated_manifest_bytes,
         8192 + plan.num_shards * 512,
@@ -370,17 +379,13 @@ def _evaluate_operational_preflight(
         estimated_worker_memory_bytes=worker_memory_bytes,
         estimated_manifest_writes=manifest_writes,
         estimated_manifest_bytes=manifest_bytes,
-        estimated_cumulative_manifest_bytes=(
-            manifest_bytes * manifest_writes
-        ),
+        estimated_cumulative_manifest_bytes=(manifest_bytes * manifest_writes),
         estimated_filesystem_file_count=plan.num_shards + 1,
         estimated_filesystem_operations=filesystem_operations,
         estimated_sparse_calls_per_product=plan.num_shards,
         configured_maximum_storage_shards=config.maximum_storage_shards,
         configured_maximum_manifest_bytes=config.maximum_manifest_bytes,
-        configured_maximum_filesystem_operations=(
-            config.maximum_filesystem_operations
-        ),
+        configured_maximum_filesystem_operations=(config.maximum_filesystem_operations),
         configured_maximum_sparse_calls_per_product=(
             config.maximum_sparse_calls_per_product
         ),
@@ -411,9 +416,7 @@ def _evaluate_operational_preflight(
             f"permitted={values['permitted']}, exceeded={str(exceeded).lower()}"
         )
     if failure_count:
-        reason = "sharded construction preflight rejected: " + "; ".join(
-            comparisons
-        )
+        reason = "sharded construction preflight rejected: " + "; ".join(comparisons)
         return replace(configured, safe=False, reason=reason)
     return replace(
         configured,
@@ -422,22 +425,23 @@ def _evaluate_operational_preflight(
     )
 
 
-def _make_forward_support_kernel(*, graph, chunk_size: int, edge_block_size: int):
-    """Compile origin reachability once, then gather only supported link values."""
-    topo = graph.topo_order
-    out_links = graph.out_links
-    out_mask = graph.out_mask
-    head = graph.head
-    tail = graph.tail
-    num_nodes = graph.num_nodes
+def _make_forward_reachability_kernel(*, chunk_size: int, num_nodes: int):
+    """Compile the complete OD-chunk reachability pass once.
+
+    The graph arrays are dynamic arguments rather than captured constants.  In
+    particular, this keeps the executable reusable across routing groups and
+    avoids embedding a second copy of the graph in every compiled worker.
+    """
 
     def kernel(
         origin_nodes,
         valid_origins,
         link_probability,
         enabled_link_mask,
-        selected_links,
-        selected_link_mask,
+        topo,
+        out_links,
+        out_mask,
+        head,
     ):
         reach = jnp.zeros((chunk_size, num_nodes), dtype=link_probability.dtype)
         reach = reach.at[jnp.arange(chunk_size), origin_nodes].set(
@@ -457,7 +461,22 @@ def _make_forward_support_kernel(*, graph, chunk_size: int, edge_block_size: int
             values = values.at[:, head[safe_links]].add(contribution)
             return values, None
 
-        reach, _ = jax.lax.scan(step, reach, topo)
+        return jax.lax.scan(step, reach, topo)[0]
+
+    return jax.jit(kernel)
+
+
+def _make_edge_gather_kernel(*, chunk_size: int, edge_block_size: int):
+    """Compile a fixed-shape gather from retained reachability state."""
+
+    def kernel(
+        reach,
+        link_probability,
+        enabled_link_mask,
+        selected_links,
+        selected_link_mask,
+        tail,
+    ):
         safe_selected = jnp.where(selected_link_mask, selected_links, 0)
         return (
             reach[:, tail[safe_selected]]
@@ -508,6 +527,15 @@ class ShardedConstructionResult:
     maximum_active_workers: int = 0
     maximum_buffered_shards: int = 0
     worker_failures: int = 0
+    compilation_count: int = 0
+    reachability_evaluations: int = 0
+    edge_gather_evaluations: int = 0
+    reachability_dispatch_seconds: float = 0.0
+    edge_gather_dispatch_seconds: float = 0.0
+    jax_execution_seconds: float = 0.0
+    reachability_time_quantiles: dict[str, float] | None = None
+    edge_gather_time_quantiles: dict[str, float] | None = None
+    synchronization_barrier_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -532,6 +560,12 @@ class _MeasurementShardWorkerResult:
     group_timing_seconds: dict[str, float]
     padded_buffer_allocations: int
     routing_array_dispatch_uses: int
+    reachability_evaluations: int
+    edge_gather_evaluations: int
+    reachability_dispatch_seconds: float
+    edge_gather_dispatch_seconds: float
+    reachability_durations: tuple[float, ...]
+    edge_gather_durations: tuple[float, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -665,7 +699,9 @@ def _save_support_checkpoint(
         tuple(np.asarray(item.od_indices, dtype=np.int64) for item in support.patterns)
     )
     pattern_rows, pattern_row_offsets = _ragged(
-        tuple(np.asarray(item.measurements, dtype=np.int64) for item in support.patterns)
+        tuple(
+            np.asarray(item.measurements, dtype=np.int64) for item in support.patterns
+        )
     )
     arrays = {
         "free_column": np.asarray(support.free_column),
@@ -677,7 +713,9 @@ def _save_support_checkpoint(
         "group_row_offsets": group_row_offsets,
         "global_slots": np.asarray(support.global_slots),
         "global_slot_mask": np.asarray(support.global_slot_mask),
-        "pattern_group": np.asarray([item.group for item in support.patterns], np.int64),
+        "pattern_group": np.asarray(
+            [item.group for item in support.patterns], np.int64
+        ),
         "pattern_id": np.asarray([item.pattern for item in support.patterns], np.int64),
         "pattern_od": pattern_od,
         "pattern_od_offsets": pattern_od_offsets,
@@ -736,9 +774,7 @@ def _load_support_checkpoint(
     if metadata.get("content_hash") != _support_checkpoint_hash(arrays):
         raise ValueError("support checkpoint content hash is invalid.")
     pattern_od = _unragged(arrays["pattern_od"], arrays["pattern_od_offsets"])
-    pattern_rows = _unragged(
-        arrays["pattern_rows"], arrays["pattern_row_offsets"]
-    )
+    pattern_rows = _unragged(arrays["pattern_rows"], arrays["pattern_row_offsets"])
     patterns = tuple(
         SupportPattern(
             group=int(group),
@@ -760,14 +796,10 @@ def _load_support_checkpoint(
         fixed_by_active=arrays["fixed_by_active"],
         selected=arrays["selected"],
         group_od_indices=_unragged(arrays["group_od"], arrays["group_od_offsets"]),
-        group_measurements=_unragged(
-            arrays["group_rows"], arrays["group_row_offsets"]
-        ),
+        group_measurements=_unragged(arrays["group_rows"], arrays["group_row_offsets"]),
         global_slots=arrays["global_slots"],
         global_slot_mask=arrays["global_slot_mask"],
-        group_level_candidate_entries=int(
-            metadata["group_level_candidate_entries"]
-        ),
+        group_level_candidate_entries=int(metadata["group_level_candidate_entries"]),
         origin_support_seconds=float(metadata["origin_support_seconds"]),
         patterns=patterns,
         config=effective_config,
@@ -804,11 +836,11 @@ def _discover_support(
     free_indices = np.asarray(compact_layout.free_compact_indices, dtype=np.int64)
     free_column[free_indices] = np.arange(free_indices.size, dtype=np.int64)
     fixed_by_active = np.zeros(num_active, dtype=np.dtype(inputs.base_link_cost.dtype))
-    fixed_by_active[np.asarray(compact_layout.fixed_compact_indices, dtype=np.int64)] = (
-        np.asarray(
-            compact_layout.fixed_compact_values,
-            dtype=np.dtype(inputs.base_link_cost.dtype),
-        )
+    fixed_by_active[
+        np.asarray(compact_layout.fixed_compact_indices, dtype=np.int64)
+    ] = np.asarray(
+        compact_layout.fixed_compact_values,
+        dtype=np.dtype(inputs.base_link_cost.dtype),
     )
     selected = (free_column >= 0) | (fixed_by_active != 0.0)
     global_slots, global_slot_mask = _mapping_slots(spec, inputs.graph.num_links)
@@ -887,9 +919,7 @@ def _discover_support(
         group_measurements=tuple(measurements),
         global_slots=global_slots,
         global_slot_mask=global_slot_mask,
-        group_level_candidate_entries=(
-            analyzed.metrics.group_level_candidate_entries
-        ),
+        group_level_candidate_entries=(analyzed.metrics.group_level_candidate_entries),
         origin_support_seconds=analyzed.metrics.support_discovery_seconds,
         patterns=tuple(discovered_patterns),
         config=config,
@@ -948,8 +978,7 @@ def pack_storage_shards(
             > config.maximum_nonzeros_per_storage_shard
         )
         reached_target = (
-            current
-            and current_estimate >= config.target_nonzeros_per_storage_shard
+            current and current_estimate >= config.target_nonzeros_per_storage_shard
         )
         too_many_patterns = len(current) >= config.maximum_patterns_per_storage_shard
         if exceeds_hard or reached_target or too_many_patterns:
@@ -1052,7 +1081,8 @@ def plan_sharded_fixed_routing_operator(
     filesystem_operations = len(storage_shards) * 5 + manifest_writes * 3
     task_by_key = {task.identity.key: task for task in support.construction_tasks}
     estimated_batches = 0
-    estimated_dispatches = 0
+    estimated_reachability_evaluations = 0
+    estimated_edge_gather_evaluations = 0
     maximum_batch_rows = 0
     for storage_shard in storage_shards:
         tasks_by_group: dict[int, list[ConstructionTask]] = {}
@@ -1061,7 +1091,9 @@ def plan_sharded_fixed_routing_operator(
             tasks_by_group.setdefault(task.group, []).append(task)
         for group, grouped_tasks in tasks_by_group.items():
             estimated_batches += 1
-            batch_origins = {index for task in grouped_tasks for index in task.od_indices}
+            batch_origins = {
+                index for task in grouped_tasks for index in task.od_indices
+            }
             batch_measurements = {
                 row for task in grouped_tasks for row in task.measurements
             }
@@ -1073,9 +1105,15 @@ def plan_sharded_fixed_routing_operator(
                     & np.isin(mapping_measurements, tuple(batch_measurements))
                 )
             )
-            estimated_dispatches += max(
-                1, math.ceil(len(batch_origins) / config.od_chunk_size)
-            ) * max(1, math.ceil(selected_edges / config.support_edge_block_size))
+            chunk_count = max(1, math.ceil(len(batch_origins) / config.od_chunk_size))
+            edge_block_count = max(
+                1, math.ceil(selected_edges / config.support_edge_block_size)
+            )
+            estimated_reachability_evaluations += chunk_count
+            estimated_edge_gather_evaluations += chunk_count * edge_block_count
+    estimated_dispatches = (
+        estimated_reachability_evaluations + estimated_edge_gather_evaluations
+    )
     estimated_batch_temporary_bytes = int(
         config.od_chunk_size * maximum_batch_rows * itemsize
     )
@@ -1115,8 +1153,12 @@ def plan_sharded_fixed_routing_operator(
         estimated_nonzeros_per_storage_shard=tuple(int(value) for value in payloads),
         estimated_payload_min=int(payloads.min()) if payloads.size else 0,
         estimated_payload_median=float(np.median(payloads)) if payloads.size else 0.0,
-        estimated_payload_p90=float(np.percentile(payloads, 90)) if payloads.size else 0.0,
-        estimated_payload_p99=float(np.percentile(payloads, 99)) if payloads.size else 0.0,
+        estimated_payload_p90=float(np.percentile(payloads, 90))
+        if payloads.size
+        else 0.0,
+        estimated_payload_p99=float(np.percentile(payloads, 99))
+        if payloads.size
+        else 0.0,
         estimated_payload_max=int(payloads.max()) if payloads.size else 0,
         estimated_filesystem_file_count=len(storage_shards) + 1,
         estimated_manifest_bytes=manifest_bytes,
@@ -1131,6 +1173,8 @@ def plan_sharded_fixed_routing_operator(
         estimated_maximum_staged_shard_bytes=maximum_staged_shard_bytes,
         estimated_worker_memory_bytes=estimated_worker_memory_bytes,
         estimated_filesystem_operations=filesystem_operations,
+        estimated_reachability_evaluations=estimated_reachability_evaluations,
+        estimated_edge_gather_evaluations=estimated_edge_gather_evaluations,
     )
     return (
         _evaluate_operational_preflight(plan, config),
@@ -1214,8 +1258,9 @@ def _construction_provenance(
     config: ShardedConstructionConfig,
     assignment_inputs_fingerprint_value: str | None = None,
     scientific_identity: dict[str, object] | None = None,
+    include_measurement_kernel_version: bool = True,
 ) -> dict[str, object]:
-    return {
+    provenance: dict[str, object] = {
         "assignment_fingerprint": str(assignment_fingerprint),
         "assignment_inputs_fingerprint": (
             assignment_inputs_fingerprint(inputs)
@@ -1241,6 +1286,20 @@ def _construction_provenance(
             {} if scientific_identity is None else dict(scientific_identity)
         ),
     }
+    if include_measurement_kernel_version:
+        provenance["measurement_kernel_algorithm"] = (
+            MEASUREMENT_KERNEL_ALGORITHM_VERSION
+        )
+    return provenance
+
+
+def _same_support_provenance(left: dict[str, object], right: dict[str, object]) -> bool:
+    """Return whether two manifests differ only in numerical-kernel version."""
+    left_support = dict(left)
+    right_support = dict(right)
+    left_support.pop("measurement_kernel_algorithm", None)
+    right_support.pop("measurement_kernel_algorithm", None)
+    return left_support == right_support
 
 
 def load_complete_sharded_fixed_routing_cache(
@@ -1312,37 +1371,40 @@ def _construct_measurement_shard(
     origins: np.ndarray,
     mapping_links: np.ndarray,
     mapping_measurements: np.ndarray,
-    compiled,
+    reach_compiled,
+    gather_compiled,
+    graph_arrays,
+    tail,
     config: ShardedConstructionConfig,
     provenance_hash: str,
 ) -> _MeasurementShardWorkerResult:
     """Construct and stage one measurement shard without shared mutable state."""
     started = perf_counter()
     routing_reader = _RoutingBatchReader(routing)
-    shard_tasks = [
-        tasks_by_key[key] for key in support.storage_task_keys[identity.key]
-    ]
+    shard_tasks = [tasks_by_key[key] for key in support.storage_task_keys[identity.key]]
     measurements = np.asarray(
         sorted({row for task in shard_tasks for row in task.measurements}),
         dtype=np.int64,
     )
-    shard_row_lookup = {
-        int(row): position for position, row in enumerate(measurements)
-    }
+    shard_row_lookup = {int(row): position for position, row in enumerate(measurements)}
     row_parts: list[np.ndarray] = []
     column_parts: list[np.ndarray] = []
     data_parts: list[np.ndarray] = []
-    offset = np.zeros(
-        measurements.size, dtype=np.dtype(inputs.base_link_cost.dtype)
-    )
+    offset = np.zeros(measurements.size, dtype=np.dtype(inputs.base_link_cost.dtype))
     dispatch = synchronization = transfer = filtering = 0.0
     dispatch_durations: list[float] = []
     synchronization_durations: list[float] = []
+    reachability_durations: list[float] = []
+    edge_gather_durations: list[float] = []
     origins_per_dispatch: list[int] = []
     supported_edges_per_dispatch: list[int] = []
     output_values_per_dispatch: list[int] = []
     group_timing: dict[str, float] = {}
     construction_batches = 0
+    reachability_evaluations = 0
+    edge_gather_evaluations = 0
+    reachability_dispatch = 0.0
+    edge_gather_dispatch = 0.0
     padded_buffer_allocations = 0
     routing_array_dispatch_uses = 0
     construction_start = perf_counter()
@@ -1387,6 +1449,30 @@ def _construct_measurement_shard(
                 dtype=np.dtype(inputs.base_link_cost.dtype),
             )
             padded_buffer_allocations += 3
+            # The graph traversal is intentionally outside the mapped-edge
+            # loop.  All gathers consume this retained device state, so the
+            # complete reachability dynamic program is evaluated once per OD
+            # chunk regardless of the number of edge blocks.
+            phase_start = perf_counter()
+            reach_device = reach_compiled(
+                jnp.asarray(padded),
+                jnp.asarray(valid),
+                group_probability_device,
+                group_effective_device,
+                *graph_arrays,
+            )
+            elapsed = perf_counter() - phase_start
+            dispatch += elapsed
+            reachability_dispatch += elapsed
+            dispatch_durations.append(elapsed)
+            reachability_durations.append(elapsed)
+            reachability_evaluations += 1
+            origins_per_dispatch.append(int(chunk.size))
+            supported_edges_per_dispatch.append(0)
+            output_values_per_dispatch.append(int(chunk.size * inputs.graph.num_nodes))
+            routing_array_dispatch_uses += 2
+            gather_devices: list[jax.Array] = []
+            gather_blocks: list[tuple[np.ndarray, np.ndarray]] = []
             for edge_first in range(
                 0, selected_links.size, config.support_edge_block_size
             ):
@@ -1396,34 +1482,44 @@ def _construct_measurement_shard(
                 edge_rows = selected_local_rows[
                     edge_first : edge_first + config.support_edge_block_size
                 ]
-                padded_links = np.zeros(
-                    config.support_edge_block_size, dtype=np.int32
-                )
+                padded_links = np.zeros(config.support_edge_block_size, dtype=np.int32)
                 edge_mask = np.zeros(config.support_edge_block_size, dtype=bool)
                 padded_links[: edge_links.size] = edge_links
                 edge_mask[: edge_links.size] = True
                 padded_buffer_allocations += 2
                 phase_start = perf_counter()
-                device = compiled(
-                    jnp.asarray(padded),
-                    jnp.asarray(valid),
-                    group_probability_device,
-                    group_effective_device,
-                    jnp.asarray(padded_links),
-                    jnp.asarray(edge_mask),
+                gather_devices.append(
+                    gather_compiled(
+                        reach_device,
+                        group_probability_device,
+                        group_effective_device,
+                        jnp.asarray(padded_links),
+                        jnp.asarray(edge_mask),
+                        tail,
+                    )
                 )
                 elapsed = perf_counter() - phase_start
                 dispatch += elapsed
+                edge_gather_dispatch += elapsed
                 dispatch_durations.append(elapsed)
+                edge_gather_durations.append(elapsed)
+                edge_gather_evaluations += 1
                 origins_per_dispatch.append(int(chunk.size))
                 supported_edges_per_dispatch.append(int(edge_links.size))
                 output_values_per_dispatch.append(int(chunk.size * edge_links.size))
                 routing_array_dispatch_uses += 2
-                phase_start = perf_counter()
-                device.block_until_ready()
-                elapsed = perf_counter() - phase_start
-                synchronization += elapsed
-                synchronization_durations.append(elapsed)
+                gather_blocks.append((edge_links, edge_rows))
+            # One explicit synchronization covers the reachability result and
+            # every dependent gather in this OD chunk.  Host transfer happens
+            # only after all device work is complete.
+            phase_start = perf_counter()
+            jax.block_until_ready(gather_devices)
+            sync_elapsed = perf_counter() - phase_start
+            synchronization += sync_elapsed
+            synchronization_durations.append(sync_elapsed)
+            for device, (edge_links, edge_rows) in zip(
+                gather_devices, gather_blocks, strict=True
+            ):
                 phase_start = perf_counter()
                 edge_values = np.asarray(device)[: chunk.size, : edge_links.size]
                 transfer += perf_counter() - phase_start
@@ -1448,9 +1544,7 @@ def _construct_measurement_shard(
                         np.abs(supported_values) > config.zero_tolerance
                     )
                     row_parts.append(batch_to_shard[allowed[nonzero]])
-                    column_parts.append(
-                        np.full(nonzero.size, column, dtype=np.int64)
-                    )
+                    column_parts.append(np.full(nonzero.size, column, dtype=np.int64))
                     data_parts.append(supported_values[nonzero])
                 else:
                     offset[batch_to_shard[allowed]] += (
@@ -1463,9 +1557,7 @@ def _construct_measurement_shard(
         )
     construction_seconds = perf_counter() - construction_start
     rows = np.concatenate(row_parts) if row_parts else np.empty(0, np.int64)
-    columns = (
-        np.concatenate(column_parts) if column_parts else np.empty(0, np.int64)
-    )
+    columns = np.concatenate(column_parts) if column_parts else np.empty(0, np.int64)
     data = (
         np.concatenate(data_parts)
         if data_parts
@@ -1516,6 +1608,12 @@ def _construct_measurement_shard(
         group_timing_seconds=group_timing,
         padded_buffer_allocations=padded_buffer_allocations,
         routing_array_dispatch_uses=routing_array_dispatch_uses,
+        reachability_evaluations=reachability_evaluations,
+        edge_gather_evaluations=edge_gather_evaluations,
+        reachability_dispatch_seconds=reachability_dispatch,
+        edge_gather_dispatch_seconds=edge_gather_dispatch,
+        reachability_durations=tuple(reachability_durations),
+        edge_gather_durations=tuple(edge_gather_durations),
     )
 
 
@@ -1571,8 +1669,19 @@ def prepare_sharded_fixed_routing_measurement_operator(
         existing = load_sharded_operator_manifest(directory)
         existing_manifest = existing
         if existing.provenance != provenance:
-            raise ValueError("existing shard manifest provenance is incompatible.")
-        if existing.complete and existing.plan_summary is not None:
+            if _same_support_provenance(existing.provenance, provenance):
+                # Numerical shards from an older kernel are deliberately not
+                # reused.  Keep the support checkpoint and let the normal
+                # recovery scan reject every old shard by its new manifest
+                # provenance hash.
+                existing_manifest = None
+            else:
+                raise ValueError("existing shard manifest provenance is incompatible.")
+        if (
+            existing_manifest is not None
+            and existing.complete
+            and existing.plan_summary is not None
+        ):
             valid = True
             aggregate_nonzeros = 0
             for position, identity in enumerate(existing.expected_shards):
@@ -1592,7 +1701,7 @@ def prepare_sharded_fixed_routing_measurement_operator(
                         shard_path(directory, identity),
                         expected_provenance_hash=existing.provenance_hash,
                     )
-                except (KeyError, OSError, ValueError):
+                except KeyError, OSError, ValueError:
                     valid = False
                     break
                 aggregate_nonzeros += loaded.metadata.nonzero_entries
@@ -1637,8 +1746,19 @@ def prepare_sharded_fixed_routing_measurement_operator(
         checkpoint_location=str(directory),
     )
     support_start = perf_counter()
-    provenance_hash = hashlib.sha256(
-        json.dumps(provenance, sort_keys=True, separators=(",", ":")).encode()
+    support_provenance = _construction_provenance(
+        inputs=inputs,
+        spec=spec,
+        compact_layout=compact_layout,
+        assignment_fingerprint=assignment_fingerprint,
+        od_layout_fingerprint=od_layout_fingerprint,
+        theta=float(np.asarray(routing.theta)),
+        config=config,
+        scientific_identity=scientific_identity,
+        include_measurement_kernel_version=False,
+    )
+    support_provenance_hash = hashlib.sha256(
+        json.dumps(support_provenance, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     directory.mkdir(parents=True, exist_ok=True)
     for abandoned in directory.glob(".support.npz.*.tmp"):
@@ -1650,10 +1770,10 @@ def prepare_sharded_fixed_routing_measurement_operator(
         try:
             support = _load_support_checkpoint(
                 support_checkpoint,
-                provenance_hash=provenance_hash,
+                provenance_hash=support_provenance_hash,
                 config=config,
             )
-        except (KeyError, OSError, ValueError, json.JSONDecodeError):
+        except KeyError, OSError, ValueError, json.JSONDecodeError:
             quarantine = support_checkpoint.with_name(
                 f"{support_checkpoint.name}.invalid-{uuid.uuid4().hex}"
             )
@@ -1668,12 +1788,12 @@ def prepare_sharded_fixed_routing_measurement_operator(
             compact_layout=compact_layout,
             config=config,
             checkpoint_directory=directory,
-            checkpoint_provenance_hash=provenance_hash,
+            checkpoint_provenance_hash=support_provenance_hash,
             deadline=control,
             reporter=events,
         )
         _save_support_checkpoint(
-            directory, support, provenance_hash=provenance_hash
+            directory, support, provenance_hash=support_provenance_hash
         )
     support_seconds = perf_counter() - support_start
     if control.expired:
@@ -1775,7 +1895,7 @@ def prepare_sharded_fixed_routing_measurement_operator(
             loaded = load_sparse_shard(
                 path, expected_provenance_hash=template.provenance_hash
             )
-        except (KeyError, OSError, ValueError):
+        except KeyError, OSError, ValueError:
             rejected += 1
             continue
         completed.add(identity.key)
@@ -1820,8 +1940,11 @@ def prepare_sharded_fixed_routing_measurement_operator(
             total_seconds=perf_counter() - total_start,
         )
 
-    kernel = _make_forward_support_kernel(
-        graph=inputs.graph,
+    reach_kernel = _make_forward_reachability_kernel(
+        chunk_size=config.od_chunk_size,
+        num_nodes=inputs.graph.num_nodes,
+    )
+    gather_kernel = _make_edge_gather_kernel(
         chunk_size=config.od_chunk_size,
         edge_block_size=config.support_edge_block_size,
     )
@@ -1829,20 +1952,38 @@ def prepare_sharded_fixed_routing_measurement_operator(
     dummy_valid = jnp.zeros(config.od_chunk_size, bool)
     dummy_links = jnp.zeros(config.support_edge_block_size, jnp.int32)
     dummy_link_mask = jnp.zeros(config.support_edge_block_size, bool)
+    graph_arrays = (
+        jnp.asarray(inputs.graph.topo_order),
+        jnp.asarray(inputs.graph.out_links),
+        jnp.asarray(inputs.graph.out_mask),
+        jnp.asarray(inputs.graph.head),
+    )
+    tail_device = jnp.asarray(inputs.graph.tail)
     routing_reader = _RoutingBatchReader(routing)
     prototype_probability, prototype_effective = routing_reader.device(0)
     lowering_start = perf_counter()
-    lowered = kernel.lower(
+    reach_lowered = reach_kernel.lower(
         dummy_origins,
         dummy_valid,
         prototype_probability,
         prototype_effective,
+        *graph_arrays,
+    )
+    gather_lowered = gather_kernel.lower(
+        jnp.zeros(
+            (config.od_chunk_size, inputs.graph.num_nodes),
+            dtype=inputs.base_link_cost.dtype,
+        ),
+        prototype_probability,
+        prototype_effective,
         dummy_links,
         dummy_link_mask,
+        tail_device,
     )
     lowering_seconds = perf_counter() - lowering_start
     compilation_start = perf_counter()
-    compiled = lowered.compile()
+    reach_compiled = reach_lowered.compile()
+    gather_compiled = gather_lowered.compile()
     compilation_seconds = perf_counter() - compilation_start
 
     origins = np.asarray(inputs.od_origin_node, dtype=np.int32)
@@ -1863,6 +2004,12 @@ def prepare_sharded_fixed_routing_measurement_operator(
     construction_batches = 0
     padded_buffer_allocations = 0
     routing_array_dispatch_uses = 0
+    reachability_durations: list[float] = []
+    edge_gather_durations: list[float] = []
+    reachability_evaluations = 0
+    edge_gather_evaluations = 0
+    reachability_dispatch = 0.0
+    edge_gather_dispatch = 0.0
     recent_shard_seconds: list[float] = []
     missing = tuple(
         identity for identity in plan.expected_shards if identity.key not in completed
@@ -1949,6 +2096,8 @@ def prepare_sharded_fixed_routing_measurement_operator(
         nonlocal aggregate_nonzeros, rebuilt, dispatch, synchronization
         nonlocal transfer, filtering, persistence, construction_batches
         nonlocal padded_buffer_allocations, routing_array_dispatch_uses
+        nonlocal reachability_evaluations, edge_gather_evaluations
+        nonlocal reachability_dispatch, edge_gather_dispatch
         destination = shard_path(directory, result.identity)
         destination.parent.mkdir(parents=True, exist_ok=True)
         os.replace(result.staged_path, destination)
@@ -1963,11 +2112,17 @@ def prepare_sharded_fixed_routing_measurement_operator(
         construction_batches += result.construction_batches
         dispatch_durations.extend(result.dispatch_durations)
         synchronization_durations.extend(result.synchronization_durations)
+        reachability_durations.extend(result.reachability_durations)
+        edge_gather_durations.extend(result.edge_gather_durations)
         origins_per_dispatch.extend(result.origins_per_dispatch)
         supported_edges_per_dispatch.extend(result.supported_edges_per_dispatch)
         output_values_per_dispatch.extend(result.output_values_per_dispatch)
         padded_buffer_allocations += result.padded_buffer_allocations
         routing_array_dispatch_uses += result.routing_array_dispatch_uses
+        reachability_evaluations += result.reachability_evaluations
+        edge_gather_evaluations += result.edge_gather_evaluations
+        reachability_dispatch += result.reachability_dispatch_seconds
+        edge_gather_dispatch += result.edge_gather_dispatch_seconds
         for group, duration in result.group_timing_seconds.items():
             group_timing[group] = group_timing.get(group, 0.0) + duration
         recent_shard_seconds.append(result.elapsed_seconds)
@@ -2027,8 +2182,7 @@ def prepare_sharded_fixed_routing_measurement_operator(
                     not stop_dispatch
                     and submitted < len(missing)
                     and len(active) < admitted_workers
-                    and len(active) + len(buffered)
-                    < config.maximum_resident_shards
+                    and len(active) + len(buffered) < config.maximum_resident_shards
                 ):
                     predicted = predicted_next_seconds()
                     if not deadline_allows_dispatch(predicted):
@@ -2051,7 +2205,10 @@ def prepare_sharded_fixed_routing_measurement_operator(
                         origins=origins,
                         mapping_links=mapping_links,
                         mapping_measurements=mapping_measurements,
-                        compiled=compiled,
+                        reach_compiled=reach_compiled,
+                        gather_compiled=gather_compiled,
+                        graph_arrays=graph_arrays,
+                        tail=tail_device,
                         config=config,
                         provenance_hash=template.provenance_hash,
                     )
@@ -2112,9 +2269,7 @@ def prepare_sharded_fixed_routing_measurement_operator(
                             details=progress_details(),
                         )
                         break
-                maximum_buffered_shards = max(
-                    maximum_buffered_shards, len(buffered)
-                )
+                maximum_buffered_shards = max(maximum_buffered_shards, len(buffered))
                 while next_publish in buffered:
                     publish(buffered.pop(next_publish))
                     next_publish += 1
@@ -2163,6 +2318,7 @@ def prepare_sharded_fixed_routing_measurement_operator(
         support_discovery_seconds=support_seconds,
         lowering_seconds=lowering_seconds,
         compilation_seconds=compilation_seconds,
+        compilation_count=2,
         dispatch_seconds=dispatch,
         synchronization_seconds=synchronization,
         transfer_seconds=transfer,
@@ -2176,18 +2332,26 @@ def prepare_sharded_fixed_routing_measurement_operator(
         total_seconds=perf_counter() - total_start,
         construction_batches=construction_batches,
         dispatch_count=len(dispatch_durations),
-        synchronization_count=len(synchronization_durations),
-        support_edge_blocks=len(supported_edges_per_dispatch),
+        # Keep the historical public counter (one entry per mapped-edge
+        # dispatch) while the timing data records the fused per-chunk barrier.
+        synchronization_count=len(dispatch_durations),
+        support_edge_blocks=edge_gather_evaluations,
         origins_per_dispatch=tuple(origins_per_dispatch),
         supported_edges_per_dispatch=tuple(supported_edges_per_dispatch),
         output_values_per_dispatch=tuple(output_values_per_dispatch),
         dispatch_time_quantiles=_timing_quantiles(dispatch_durations),
-        synchronization_time_quantiles=_timing_quantiles(
-            synchronization_durations
-        ),
+        synchronization_time_quantiles=_timing_quantiles(synchronization_durations),
         group_timing_seconds=group_timing,
         padded_buffer_allocations=padded_buffer_allocations,
         routing_array_dispatch_uses=routing_array_dispatch_uses,
+        reachability_evaluations=reachability_evaluations,
+        edge_gather_evaluations=edge_gather_evaluations,
+        reachability_dispatch_seconds=reachability_dispatch,
+        edge_gather_dispatch_seconds=edge_gather_dispatch,
+        jax_execution_seconds=dispatch + synchronization,
+        reachability_time_quantiles=_timing_quantiles(reachability_durations),
+        edge_gather_time_quantiles=_timing_quantiles(edge_gather_durations),
+        synchronization_barrier_count=len(synchronization_durations),
         requested_workers=config.workers,
         admitted_workers=admitted_workers,
         maximum_active_workers=maximum_active_workers,
