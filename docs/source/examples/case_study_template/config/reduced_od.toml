@@ -1,0 +1,45 @@
+schema_version = 2
+
+[observations]
+service_day = "2026-01-15"
+analysis_start_seconds = 28800
+analysis_end_seconds = 32400
+after_midnight_convention = "service_day_extended"
+apc_policy_identifier = "template-canonical-counts-v1"
+sensor_coverage_policy = "complete"
+sensor_outage_policy = "error"
+unit = "timetable_event"
+accepted_types = ["boarding", "alighting"]
+missing_policy = "exclude"
+duplicate_policy = "error"
+ambiguous_event_policy = "error"
+cleaning_stage = "external"
+
+[journeys]
+origin_semantics = "first_boarding"
+destination_semantics = "final_alighting"
+time_bin_membership = "half_open"
+maximum_transfers = 2
+maximum_waiting_seconds = 3600
+maximum_journey_seconds = 7200
+maximum_alternatives_per_cell = 4
+transfer_footpath_policy = "none-v1"
+route_shares = "fixed_within_fit"
+
+[productions]
+mode = "estimated_basis"
+semantics = "estimated_production_basis"
+basis = "origin_period"
+
+[stops]
+mapping_policy = "identity"
+
+[outputs]
+spatial_level = "scenario_stop"
+reconstruct_full_od = true
+
+[model]
+likelihood = "poisson"
+
+[validation]
+detailed_assignment = "explicit_only"

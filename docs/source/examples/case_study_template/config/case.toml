@@ -1,0 +1,49 @@
+schema_version = 1
+
+[case]
+name = "template_small_multiline"
+service_day = "2026-01-15"
+timezone = "Europe/Zurich"
+after_midnight_convention = "seconds_from_service_day"
+
+[paths]
+scenario_directory = "inputs/scenario"
+measurements = "inputs/measurements_boarding_alighting.csv"
+candidate_demand = "inputs/scenario/prior_demand.csv"
+results_directory = "results"
+
+[observations]
+measurement_type_column = "measurement_type"
+stop_id_column = "stop_id"
+timestamp_column = "time"
+value_column = "value"
+trip_id_column = "trip_id"
+line_id_column = "line_id"
+timestamp_semantics = "event_time"
+missing_value_policy = "error"
+ambiguous_event_policy = "error"
+
+[time_discretization]
+configuration_file = "config/time_discretization.toml"
+required_when_timestamps_exist = true
+base_resolution_minutes = 5
+min_bin_minutes = 10
+max_bin_minutes = 60
+max_bins = 24
+num_od_pairs = 2
+max_od_cells = 2
+horizon_start = "08:00:00"
+horizon_end = "09:00:00"
+candidate = "recommendation"
+
+[sampling]
+strategy = "fixed_count"
+samples_per_period = 1
+time_step_seconds = 300
+
+[structural_zeros]
+configuration_file = "config/structural_zeros.toml"
+
+[model]
+configuration_file = "config/reduced_od.toml"
+settings_file = "config/model.toml"

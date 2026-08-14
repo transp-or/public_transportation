@@ -371,6 +371,18 @@ def _resolve_measurements(
     return tuple(resolved)
 
 
+def resolve_measurements(
+    timetable: TimetableIndex, table: MeasurementTable
+) -> tuple[ResolvedMeasurement, ...]:
+    """Resolve canonical measurements to exactly one timetable event each.
+
+    This public wrapper keeps case-study adapters from depending on the
+    response-builder's private implementation while preserving its strict
+    zero/one-match contract.
+    """
+    return _resolve_measurements(timetable, table)
+
+
 def _cell_key(choice_set: JourneyChoiceSet) -> ResponseCellKey:
     return ResponseCellKey(
         choice_set.origin_physical_stop_id,

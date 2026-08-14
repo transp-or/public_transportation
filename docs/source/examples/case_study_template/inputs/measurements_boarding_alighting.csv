@@ -1,0 +1,9 @@
+method_id,measurement_type,stop_id,time,value,trip_id,line_id
+template,boarding,A,08:00:01,20.0,L1_AB_0800,
+template,alighting,B,08:10:00,20.0,L1_AB_0800,
+template,boarding,A,08:30:01,30.0,L1_AB_0830,
+template,alighting,B,08:40:00,30.0,L1_AB_0830,
+template,boarding,C,08:00:01,15.0,L2_CD_0800,
+template,alighting,D,08:12:00,15.0,L2_CD_0800,
+template,boarding,C,08:30:01,25.0,L2_CD_0830,
+template,alighting,D,08:42:00,25.0,L2_CD_0830,

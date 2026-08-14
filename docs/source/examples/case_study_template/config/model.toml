@@ -1,0 +1,7 @@
+schema_version = 1
+likelihood = "poisson"
+production_mode = "estimated_basis"
+maximum_iterations = 10
+gradient_tolerance = 1.0e-5
+function_tolerance = 1.0e-8
+prior_scale = 2.0

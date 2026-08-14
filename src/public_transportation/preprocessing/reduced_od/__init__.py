@@ -119,6 +119,7 @@ from .response_atoms import (
     ResponseCellKey,
     build_measurement_response,
     measurement_table_fingerprint,
+    resolve_measurements,
 )
 from .route_patterns import (
     RoutePattern,
@@ -232,6 +233,7 @@ __all__ = [
     "load_reduced_od_phase_artifact",
     "load_measurement_response_cache",
     "measurement_table_fingerprint",
+    "resolve_measurements",
     "prepare_reduced_od_timetable",
     "generate_uniform_midpoint_samples",
     "generate_fixed_time_step_samples",

@@ -1,0 +1,91 @@
+# Configuration-driven case-study template
+
+This directory is a public, runnable template for a canonical OD-estimation
+case. It uses the committed small multi-line synthetic dataset in
+`inputs/scenario/` and the canonical measurement table in `inputs/`;
+no private repository or generated artifact is required.
+
+For a real case, copy this directory into the case-study repository, replace
+the paths and explicit policy values in `config/case.toml`, and pin the public
+package commit in `pyproject.toml`. The generic adapter and runner remain
+unchanged for canonical inputs. A custom hook is required only when a source
+format cannot be represented by the declarative mappings.
+
+## Setup
+
+```bash
+uv lock
+uv sync --frozen
+JAX_ENABLE_X64=true uv run --frozen python run.py check
+```
+
+The template intentionally does not include a lockfile: the case owner must
+replace `<commit>` with an immutable public-repository commit and generate the
+case-specific `uv.lock`. A sibling editable checkout is not reproducible.
+
+## Independent stages
+
+Run exactly one stage per invocation:
+
+```bash
+JAX_ENABLE_X64=true uv run --frozen python run.py time-discretization
+JAX_ENABLE_X64=true uv run --frozen python run.py materialize-bins \
+  --candidate recommendation --reviewer "case owner"
+JAX_ENABLE_X64=true uv run --frozen python run.py structural-zeros
+JAX_ENABLE_X64=true uv run --frozen python run.py prepare
+JAX_ENABLE_X64=true uv run --frozen python run.py preflight
+JAX_ENABLE_X64=true uv run --frozen python run.py benchmark
+JAX_ENABLE_X64=true uv run --frozen python run.py fit --method ml --likelihood poisson
+JAX_ENABLE_X64=true uv run --frozen python run.py diagnose --fit results/fits/ml_poisson.json
+JAX_ENABLE_X64=true uv run --frozen python run.py reconstruct --fit results/fits/ml_poisson.json
+JAX_ENABLE_X64=true uv run --frozen python run.py validate-detailed --od results/validation/reconstructed_od.json
+```
+
+The first seven commands are the admission path. A failed stage stops the
+workflow; it never falls through to a later stage. Long stages emit JSON
+progress events with `--json-progress`.
+
+`config/case.toml` contains paths, source-column mappings, explicit time
+discretization limits, and references to the scientific contracts. The
+referenced configuration files remain user-owned. The runner writes only
+beneath `results/`.
+The template keeps that directory ignored; commit reports and checkpoints from
+the case repository only when the case owner explicitly decides to archive
+them.
+
+`materialize-bins` writes a reviewed candidate under
+`results/generated_inputs/`; it never overwrites the scenario's source
+`time_bins.csv`. For a real case, re-bin the demand and explicitly promote or
+repoint the reviewed file before `structural-zeros` and `prepare`. The bundled
+template already uses the same one-bin contract in its committed scenario, so
+the smoke run needs no manual promotion.
+
+## Configuration contract
+
+Canonical cases use `adapter.py` unchanged. A genuinely noncanonical case may
+provide a `GenericCaseHook` and pass it explicitly to `GenericCaseAdapter`; the
+hook receives the validated configuration and `GenericCaseData`, must return a
+new validated `GenericCaseData`, and must be recorded in the case manifest.
+
+`config/case.toml` uses `schema_version = 1`, which identifies this generic
+case-study wrapper format (the referenced reduced-OD contract has its own
+schema version). All paths are resolved relative to the case root. Unknown
+keys and missing required values are errors.
+
+| Section | Required values | Valid values and meaning |
+|---|---|---|
+| `[case]` | `name`, ISO `service_day`, IANA `timezone`, `after_midnight_convention` | `after_midnight_convention` is `seconds_from_service_day`; the service day and timezone are explicit provenance, not inferred. |
+| `[paths]` | `scenario_directory`, `measurements`, `candidate_demand`, `results_directory` | Files/directories must exist when `check` runs. `fixed_demand` is optional; all outputs stay below `results_directory`. |
+| `[observations]` | four source-column names plus `timestamp_semantics`, `missing_value_policy`, `ambiguous_event_policy` | `timestamp_semantics = "event_time"`; both policies are currently `"error"`. At least one of `trip_id_column` and `line_id_column` is required. `method_id_column` is optional when the canonical header is already `method_id`. |
+| `[time_discretization]` | explicit resolution limits, `num_od_pairs`, positive `max_od_cells`, `horizon_start`, `horizon_end`, `candidate` | `horizon_end` must exceed `horizon_start`; `max_od_cells` is an approved complexity budget, not a default. `configuration_file` points to the standalone contract. |
+| `[sampling]` | `strategy`, `samples_per_period`, `time_step_seconds` | Strategy is `uniform_midpoint`, `fixed_count`, `fixed_time_step`, or `adaptive_service_aware`; counts may be one integer or a period-keyed table. |
+| `[structural_zeros]` | `configuration_file` | Points to the strict structural-zero TOML; existing positive fixed demand conflicts are errors. |
+| `[model]` | `configuration_file`, optional `settings_file` | The reduced-OD and model settings must agree on `likelihood` (`poisson` or `negative_binomial`) and `production_mode` (`provided` or `estimated_basis`). |
+
+`time_discretization.toml` repeats the resolution, horizon, OD budget, and
+candidate fields with its own `schema_version = 1`; the loader rejects a
+contradiction between it and `[time_discretization]` in `case.toml`.
+`reduced_od.toml` and `structural_zeros.toml` retain their documented public
+schemas. `model.toml` requires `schema_version = 1`, a supported likelihood,
+and an explicit production mode; optional optimizer tolerances, iterations,
+dispersion, and MAP prior scale must be finite and positive.

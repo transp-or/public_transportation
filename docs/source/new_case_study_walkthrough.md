@@ -3,9 +3,9 @@
 This document is an operational runbook for preparing, fitting, diagnosing,
 and validating a new public-transport OD-estimation case study with
 `public_transportation`. It is intended to be handed to the person conducting
-the run. The case-specific repository owns the data adapters and results; the
-public repository owns the routing, response, estimation, persistence, and
-diagnostic algorithms.
+the run. The case-specific repository owns the data and scientific decisions;
+the public repository supplies the generic canonical-file adapter, stage
+runner, routing, response, estimation, persistence, and diagnostic algorithms.
 
 The recommended production path is the reduced-OD, fixed-routing gravity model
 fitted by maximum a posteriori (MAP) estimation. Start with the smallest model
@@ -46,13 +46,40 @@ to call inside every optimization iteration.
 
 ## 2. Case-study setup, files, and scripts
 
+For canonical inputs, do not start by writing orchestration code. Copy
+`docs/source/examples/case_study_template/` from the public repository into
+the case-study repository, then edit the TOML files for the case. The intended
+workflow is:
+
+```text
+user supplies input files and declarative configuration
+→ generic adapter validates and fingerprints the inputs
+→ generic runner executes exactly one stage per invocation
+→ custom hook only if a source format cannot be represented declaratively
+```
+
+The user supplies input paths, explicit column mappings, policy values,
+approved time-discretization settings, model settings, package commit, and
+runtime dependencies. A custom adapter hook is justified only after the
+generic adapter has shown that the source data cannot be represented by the
+canonical formats; it must be isolated, named, versioned, and included in the
+provenance manifest. `pyproject.toml`, `uv.lock`, and scientific configuration
+remain owned by the case-study repository. A missing TOML or a missing copied
+template is a case setup/documentation problem, not evidence of a package
+failure.
+
 Create the case in the private or case-specific repository. A practical layout
 is:
 
 ```text
 case_studies/<case_name>/
 ├── README.md
-├── config.toml
+├── config/
+│   ├── case.toml
+│   ├── time_discretization.toml
+│   ├── reduced_od.toml
+│   ├── structural_zeros.toml
+│   └── model.toml
 ├── inputs/
 ├── adapter.py
 ├── run.py
@@ -79,16 +106,20 @@ use subcommands or flags, but the actions must remain independent:
 
 ```bash
 python case_studies/<case_name>/run.py check
+python case_studies/<case_name>/run.py time-discretization
+python case_studies/<case_name>/run.py materialize-bins --candidate recommendation --reviewer "name"
+python case_studies/<case_name>/run.py structural-zeros
 python case_studies/<case_name>/run.py prepare
 python case_studies/<case_name>/run.py preflight
-python case_studies/<case_name>/run.py fit --model M0 --likelihood poisson
-python case_studies/<case_name>/run.py fit --model M0 --likelihood negative_binomial
+python case_studies/<case_name>/run.py benchmark
+python case_studies/<case_name>/run.py fit --method map --likelihood poisson
+python case_studies/<case_name>/run.py fit --method map --likelihood negative_binomial
 python case_studies/<case_name>/run.py diagnose --fit <fit-result>
 python case_studies/<case_name>/run.py reconstruct --fit <accepted-fit>
 python case_studies/<case_name>/run.py validate-detailed --od <reconstructed-od>
 ```
 
-If an existing adapter uses names such as `--check`, `--prepare`,
+If an existing custom hook uses names such as `--check`, `--prepare`,
 `--smoke-objective`, or `--diagnose-production`, map them to the corresponding
 stage below. Do not combine the stages just to shorten the command list.
 
@@ -99,7 +130,29 @@ The adapter should use the stable imports from
 `public_transportation.inference.reduced_od`, rather than importing private
 module internals.
 
-### 2.1 What must exist before the first command
+### 2.1 Configuration-to-stage contract
+
+Each stage has one declared source of control. This table is part of the case
+contract and should be copied into the case README:
+
+| Stage | Configuration that controls it | Output class |
+|---|---|---|
+| `check` | `case.toml` paths, observation mappings, service-day and timestamp policies | audit/provenance only |
+| `time-discretization` | `case.toml [time_discretization]` and `time_discretization.toml` | recommendation JSON only |
+| `materialize-bins` | reviewed candidate plus reviewer identity | generated input (`time_bins.csv`) |
+| `structural-zeros` | `structural_zeros.toml` and candidate demand | preprocessing artifacts/audit |
+| `prepare` | `reduced_od.toml`, sampling and input mappings | persistent reduced-OD artifacts |
+| `preflight` / `benchmark` | `model.toml` plus prepared-artifact fingerprints | read-only diagnostics |
+| `fit` | `model.toml` and explicit method/likelihood flags | fit result/checkpoint |
+| `diagnose` / `reconstruct` / `validate-detailed` | accepted fit and validation inputs | diagnostics/validation |
+
+The generic runner writes only beneath the configured `results_directory`,
+separates audit, generated-input, artifact, fit, and validation outputs, and
+records configuration and package fingerprints in each stage manifest. It
+supports `--dry-run` to print a planned stage and `--json-progress` for long
+stages.
+
+### 2.2 What must exist before the first command
 
 The following files are supplied by the case-specific repository; they are not
 generated by the public package:
@@ -109,18 +162,19 @@ generated by the public package:
 | `README.md` | case owner | yes | data provenance, assumptions, and run entry point |
 | `pyproject.toml` | case owner | yes | pinned package and runtime dependencies |
 | `uv.lock` | case owner | yes | resolved dependency graph and immutable public-package source |
-| `config.toml` | case owner | yes | reduced-OD policy and model configuration |
+| `config/*.toml` | case owner | yes | paths, mappings, time discretization, structural-zero, and model contracts |
 | `inputs/` | case owner | source-dependent | raw or canonicalized inputs, with checksums/provenance |
-| `adapter.py` | case owner | yes | case-specific CSV/domain and observation adapter |
-| `run.py` | case owner | yes | independent stage dispatcher and exit-status contract |
+| `adapter.py` | copied from public template | yes | generic canonical adapter; modify only for a documented noncanonical hook |
+| `run.py` | copied from public template | yes | generic independent stage dispatcher and exit-status contract |
 | `scripts/*.sbatch` | case owner | yes | optional Jed wrappers and dependent submission script |
 | `results/` | run | no, normally ignored | audits, artifacts, checkpoints, fits, and validation outputs |
 
-The public repository supplies algorithms and complete reference examples; it
-does not manufacture a missing case adapter. If any of `config.toml`,
-`adapter.py`, or `run.py` is absent, classify the situation as an incomplete
-case-study setup or documentation gap and stop. It is not evidence of a public
-package defect.
+The public repository supplies the generic adapter and runner as a complete
+reference template. If any of the TOML files, `adapter.py`, or `run.py` is
+absent from a copied case, classify the situation as an incomplete case-study
+setup or documentation gap and stop. It is not evidence of a public-package
+defect. A first-time user with canonical inputs should only need to edit the
+configuration and supply the files; no new orchestration code is expected.
 
 For a new case, start by copying the structure and adapting the complete
 public examples:
@@ -139,7 +193,7 @@ These examples are templates, not files to import blindly: replace their
 paths, service-day assumptions, production semantics, and measurement policy
 with decisions documented for the new case.
 
-### 2.2 Minimal case-project dependency file
+### 2.3 Minimal case-project dependency file
 
 The case project must have its own `pyproject.toml`. The following is the
 minimal public-package dependency declaration; add case-specific dependencies
@@ -164,11 +218,12 @@ selected by the case owner. Run `uv lock`, inspect the resulting `uv.lock`, and
 commit both files. A sibling editable checkout is not an acceptable substitute
 for this dependency in a reproducible run.
 
-### 2.3 Minimum adapter and dispatcher responsibilities
+### 2.4 Minimum generic-adapter and dispatcher responsibilities
 
-`adapter.py` is the only place that should know the case’s source-table
-columns, platform mapping, service calendar, and external production inputs.
-At minimum it must:
+The copied generic `adapter.py` reads the canonical scenario and measurement
+formats and is the only place that should know the case’s source-table columns,
+platform mapping, service calendar, and external production inputs. For a
+canonical case it is used unchanged. At minimum it must:
 
 1. locate the declared `inputs/` files and fail if a required file is missing;
 2. validate CSV headers, types, units, keys, duplicates, and checksums;
@@ -204,15 +259,19 @@ def load_case(case_root: Path):
 
 
 def load_configuration(case_root: Path):
-    return load_reduced_od_config(case_root / "config.toml")
+    from public_transportation.case_study import load_case_study_config
+
+    return load_case_study_config(case_root / "config/case.toml", case_root=case_root)
 ```
 
-The real adapters must add source-column mapping, event identity resolution,
-service-day checks, and audit-file writing; the snippet is not a complete
-case-study adapter. `run.py` must load the TOML, call the adapter, dispatch
-exactly one independent stage, write JSON/CSV outputs, and return a nonzero
-process status on any validation failure. It must not catch an exception and
-continue into estimation.
+The generic implementation already performs source-column mapping, event
+identity resolution, service-day checks, checksums, audit-file writing, and
+stage dispatch. A custom hook may add a genuinely noncanonical transformation
+such as platform-to-stop mapping, but it must fail explicitly when its input
+contract is not met and must be recorded in the manifest. `run.py` must load
+the TOML, call the adapter, dispatch exactly one independent stage, write
+JSON/CSV outputs, and return a nonzero process status on any validation
+failure. It must not catch an exception and continue into estimation.
 
 The public package also provides the early period validator
 `preflight_reduced_od_time_periods`. The case adapter should call it during
@@ -462,18 +521,25 @@ project. Map them explicitly:
 
 | Existing location | New case-study role |
 |---|---|
-| `data/data_medium/` | `case_studies/medium_network/inputs/raw/` or a documented external raw-data path |
-| `processed_data_for_models/medium_network/` | `case_studies/medium_network/results/legacy/` during comparison only |
-| `data_process_codes/medium_network/` | source material for `adapter.py`, `run.py`, and stage scripts |
-| new `config.toml` | `case_studies/medium_network/config.toml` |
-| new `README.md` | provenance, mappings, assumptions, and exact commands |
+| `data/data_medium/` | configured raw-input directory (`paths.scenario_directory`, `paths.measurements`, and demand paths) |
+| `processed_data_for_models/medium_network/` | legacy comparison directory only; never an implicit active artifact source |
+| `data_process_codes/medium_network/` | no longer required for canonical inputs; source material for a named custom hook only if needed |
+| copied `docs/source/examples/case_study_template/` | `case_studies/medium_network/adapter.py`, `run.py`, `config/`, and Jed wrappers |
+| `case_studies/medium_network/README.md` | provenance, mappings, assumptions, reviewer decisions, and exact commands |
 
 The preferred workflow is to create a new `case_studies/medium_network/`
-directory, adapt the existing private scripts into its adapter and independent
-stage runners, and reference or copy raw data only through documented paths
-with checksums. Existing processed artifacts may be retained under a clearly
-named legacy directory for comparison, but they must not be fed into the new
-workflow as if they were newly generated artifacts.
+directory by copying the public template, edit its declarative configuration,
+and reference raw data only through documented paths with checksums. Existing
+processed artifacts may be retained under a clearly named legacy directory for
+comparison, but they must not be fed into the new workflow as if they were
+newly generated artifacts. Existing private scripts are consulted only when a
+canonical mapping cannot express a source transformation; such a hook is a
+data-adapter limitation, not a prerequisite for ordinary cases.
+
+The public hook contract is `GenericCaseHook`: it receives the validated
+`CaseStudyConfig` and `GenericCaseData`, returns a new `GenericCaseData`, and is
+passed explicitly to `GenericCaseAdapter`/`GenericCaseRunner`. Do not hide a
+hook behind an import-time side effect.
 
 When this walkthrough requires regeneration from source data, discard the
 legacy time bins, fixed-demand files, structural-zero outputs, routing caches,
@@ -892,26 +958,27 @@ belongs in the run manifest and in the final report.
 
 | Category | Typical symptom | Evidence to collect before a fix | Stop condition |
 |---|---|---|---|
-| Incomplete or ambiguous case setup | `adapter.py`, `run.py`, `config.toml`, a mapping, or an approved budget is missing; a placeholder command has no case-specific implementation | case-study tree, exact command, current case revision/status, missing file or unresolved decision, and relevant walkthrough paragraph | Stop and ask the case owner to complete the setup or documentation. This is not a public-package defect. |
-| Public-package functionality defect | A complete, pinned case reaches a minimal reproducible call and fails consistently with a traceback or a failing public test | public-package commit, case commit, Python/dependency versions, exact command, smallest input reproducer, traceback, and relevant test output | Stop after the minimal reproducer is recorded; do not work around it by changing case assumptions. |
-| Invalid or inconsistent case data | Schema/type/key errors, duplicate or ambiguous events, unknown stops/trips, event-time gaps, positive fixed demand in a structural-zero cell, or unexplained empty response rows | offending rows and checksums, canonical schema, stop/line/trip mapping, service-day convention, units, rejection reason, and audit JSON | Stop data preparation. Correct the source or document an explicit policy, then rebuild affected fingerprints. |
-| Environment, dependency, or scheduler problem | Lock/sync failure, import/backend mismatch, JAX compilation failure, out-of-memory, wall-time limit, cancelled job, or missing Slurm output | `uv` command and lockfile, package/backend/device report, full log, job ID, `scontrol show job`, `sacct` state/exit code/MaxRSS/elapsed time, and host information | Stop the affected run and diagnose the environment or resource request separately from the scientific model. |
+| Configuration or case-setup failure | A TOML file, copied template file, mapping, approved budget, package pin, or reviewer decision is missing or contradictory | case-study tree, exact command, current case revision/status, missing file or unresolved decision, and relevant walkthrough paragraph | Stop and complete the setup or documentation. This is not a public-package defect. |
+| Public-package failure | A complete, pinned canonical case reaches a minimal reproducible public call and fails consistently with a traceback or failing public test | public-package commit, case commit, Python/dependency versions, exact command, smallest input reproducer, traceback, and relevant test output | Stop after the minimal reproducer is recorded; do not work around it by changing case assumptions. |
+| Source-data or format failure | Schema/type/key errors, duplicate or ambiguous events, unknown stops/trips, event-time gaps, positive fixed demand in a structural-zero cell, or unexplained empty response rows | offending rows and checksums, canonical schema, stop/line/trip mapping, service-day convention, units, rejection reason, and audit JSON | Stop data preparation. Correct the source or document an explicit policy, then rebuild affected fingerprints. |
+| Environment or scheduler failure | Lock/sync failure, import/backend mismatch, JAX compilation failure, out-of-memory, wall-time limit, cancelled job, or missing Slurm output | `uv` command and lockfile, package/backend/device report, full log, job ID, `scontrol show job`, `sacct` state/exit code/MaxRSS/elapsed time, and host information | Stop the affected run and diagnose the environment or resource request separately from the scientific model. |
 
 Never hide a failure by relaxing an unrelated rule, accepting an ambiguous
-event, changing a time convention, or reusing an old artifact. A corrected
+event, changing a time convention, or reusing an old artifact. Report a missing
+custom hook as a data-adapter limitation only after the generic adapter has
+validated that the source cannot be represented by the declarative contract. A corrected
 input or configuration creates a new fingerprint and requires the documented
 downstream rebuild.
 
 ## Fully worked dry-runs available in the public checkout
 
-The public repository contains two complementary, runnable smoke cases. They
-are deliberately explicit about their scope: the synthetic reduced-OD example
-is the complete artifact/preflight/benchmark path, while the Geneva example is
-the complete real-timetable count and structural-zero path. The public checkout
-does not currently contain one single generic `case_studies/<case_name>/run.py`
-adapter that wires both paths together. Therefore a new private case must not
-pretend that a missing adapter exists; create it by following Section 2 and
-record this integration work as a case-setup task.
+The public repository contains two complementary, runnable smoke cases and a
+single generic template. The synthetic reduced-OD example is the complete
+artifact/preflight/benchmark path, the Geneva example is the complete
+real-timetable count and structural-zero path, and
+`examples/case_study_template/` wires the canonical workflow end to end. A
+new case copies that template and changes only its declared inputs and policy
+files unless a documented custom hook is required.
 
 ### A. Synthetic reduced-OD J0 smoke (clean checkout, no private files)
 
@@ -1394,7 +1461,9 @@ A case is ready to report only when all applicable boxes can be checked.
 ### Reproducibility
 
 - [ ] Case-study revision and dirty state recorded.
-- [ ] The case-study adapter revision and dispatcher revision are recorded.
+- [ ] The generic adapter and runner revision are recorded.
+- [ ] Any custom adapter hook is named, versioned, and its revision is recorded;
+      otherwise the report states that no hook was used.
 - [ ] Installed public-package version, locked source/commit, and lockfile
       checksum recorded.
 - [ ] The public-package GitHub commit (or immutable PyPI release) was checked
@@ -1402,6 +1471,8 @@ A case is ready to report only when all applicable boxes can be checked.
 - [ ] Runtime versions recorded.
 - [ ] Source checksums/provenance recorded.
 - [ ] The exact source count file and checksum are recorded.
+- [ ] Configuration file checksums and the deterministic configuration
+      fingerprint are recorded.
 - [ ] Resolved TOML, every generated artifact fingerprint, and every
       parameter-layout/response fingerprint are archived.
 - [ ] The complete command transcript (including failed and diagnostic
@@ -1415,6 +1486,7 @@ A case is ready to report only when all applicable boxes can be checked.
       archived.
 - [ ] The adopted candidate and the review decision (including the reviewer)
       are stated explicitly.
+- [ ] The reviewer-selected candidate and rationale are archived.
 - [ ] The approved candidate was materialized through
       `materialize_time_bins`, and the resulting `time_bins.csv` is recorded.
 - [ ] The materialized `time_bins.csv` checksum is recorded.
@@ -1422,6 +1494,7 @@ A case is ready to report only when all applicable boxes can be checked.
       to departure-time assignment policy is documented.
 - [ ] The demand re-binning policy and any discarded or reassigned rows are
       documented.
+- [ ] All re-binning actions are listed in the manifest.
 - [ ] Structural-zero, OD-candidate, reduced-journey, and response/operator
       artifacts were rebuilt after any time-bin change.
 - [ ] Every retained observation resolves to one timetable event.
@@ -1437,6 +1510,7 @@ A case is ready to report only when all applicable boxes can be checked.
 - [ ] Objective and gradient are finite float64 values.
 - [ ] Warm benchmark shows no parameter-value recompilation.
 - [ ] Checkpoint interruption and resume were tested on a short run.
+- [ ] Every generated artifact and checkpoint fingerprint is archived.
 - [ ] Projected gradient and tolerance-resolution checks pass.
 - [ ] Active bounds, weak Hessian directions, and production totals reviewed.
 - [ ] Poisson/NB and weak/moderate-prior sensitivities reviewed.
@@ -1453,6 +1527,8 @@ A case is ready to report only when all applicable boxes can be checked.
 - [ ] Any stage stopped because the documentation, case adapter, or public
       package was incomplete is reported explicitly, with the evidence and
       follow-up action.
+- [ ] Every failed stage is recorded with one of the four failure categories
+      above and its supporting evidence.
 
 ## 17. What to deliver to a reviewer
 
@@ -1488,5 +1564,8 @@ coverage, numerical checks, and unsuccessful attempts are part of the result.
   validation, and limitations.
 - [`examples/geneva_gtfs/README.md`](examples/geneva_gtfs/README.md): a complete
   real-timetable validation example with synthetic demand and counts.
+- [`examples/case_study_template/README.md`](examples/case_study_template/README.md):
+  the generic configuration-driven adapter and independent stage runner for
+  canonical case-study inputs.
 - [`../reports/reduced_od_private_integration_handoff.md`](../reports/reduced_od_private_integration_handoff.md):
   public/private API boundary and artifact graph.
