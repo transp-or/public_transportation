@@ -81,15 +81,20 @@ case_studies/<case_name>/
 │   ├── structural_zeros.toml
 │   └── model.toml
 ├── inputs/
+│   ├── od_pairs.csv                 # optional pair-only candidate universe
+│   └── prior_demand.csv             # optional pair-level external prior
 ├── adapter.py
 ├── run.py
 ├── scripts/
 │   ├── probe.sbatch
 │   ├── 00_check.sbatch
-│   ├── 10_prepare.sbatch
-│   ├── 20_preflight.sbatch
-│   ├── 30_fit.sbatch
-│   ├── 40_diagnose.sbatch
+│   ├── 05_od_universe.sbatch
+│   ├── 10_time_discretization.sbatch
+│   ├── 15_expand_od.sbatch
+│   ├── 20_structural_zeros.sbatch
+│   ├── 30_prepare.sbatch
+│   ├── 40_preflight.sbatch
+│   ├── 50_fit.sbatch
 │   └── submit_chain.sh
 └── results/                         # generated, normally not committed
     ├── audit/
@@ -107,8 +112,10 @@ use subcommands or flags, but the actions must remain independent:
 ```bash
 cd case_studies/<case_name>
 python run.py check
+python run.py od-universe
 python run.py time-discretization
 python run.py materialize-bins --candidate recommendation --reviewer "name"
+python run.py expand-od
 python run.py structural-zeros
 python run.py prepare
 python run.py preflight
@@ -142,9 +149,11 @@ contract and should be copied into the case README:
 | Stage | Configuration that controls it | Output class |
 |---|---|---|
 | `check` | `config/case.toml` paths, observation mappings, service-day and timestamp policies | audit/provenance only |
+| `od-universe` | `config/case.toml [od_universe]` and optional `inputs/od_pairs.csv` | pair universe and exclusion audit |
 | `time-discretization` | `config/case.toml [time_discretization]` and `config/time_discretization.toml` | recommendation JSON only |
 | `materialize-bins` | reviewed candidate plus reviewer identity | generated input (`time_bins.csv`) |
-| `structural-zeros` | `config/structural_zeros.toml` and candidate demand | preprocessing artifacts/audit |
+| `expand-od` | approved bins plus the `od-universe` output | candidate OD-time cells and exclusion audit |
+| `structural-zeros` | `config/structural_zeros.toml` plus expanded OD-time cells | preprocessing artifacts/audit |
 | `prepare` | `config/reduced_od.toml`, sampling and input mappings | persistent reduced-OD artifacts |
 | `preflight` / `benchmark` | `config/model.toml` plus prepared-artifact fingerprints | read-only diagnostics |
 | `fit` | `config/model.toml` and explicit method/likelihood flags | fit result/checkpoint |
@@ -348,6 +357,88 @@ documented adaptive strategy. Finally, demand and production values are
 interpreted per named interval; the package does not rescale them merely
 because interval lengths differ. Record the intended rate-versus-interval-total
 meaning in the case configuration and audit.
+
+### 2.5 Independent OD universe, expansion, and prior contract
+
+New case studies must not use a time-binned demand table as the definition of
+the candidate universe. Choose exactly one pair-universe source:
+
+1. `inputs/od_pairs.csv`, with only
+   `origin_stop_id,destination_stop_id`; or
+2. `source = "network_ordered_pairs"` in `[od_universe]`, with its spatial
+   level, active-service rule, same-node rule, and directed-connectivity policy
+   declared explicitly.
+
+The pair file is independent of time bins and must be duplicate-free. The
+declared level must say whether identifiers are scenario stops, platforms, or
+physical stops. Same platform, same physical stop, same station, and identical
+origin/destination identifiers are not interchangeable concepts. Network
+generation distinguishes all stops, stops with departures, stops with arrivals,
+static directed reachability, and timetable-feasible cells; static graph
+reachability never implies timetable feasibility.
+
+The user must decide and record:
+
+- stop, platform, or physical-stop level;
+- whether same-node pairs are included;
+- whether inactive stops are included;
+- whether static directed connectivity is required;
+- maximum transfers, initial wait, and journey time;
+- whether feasibility is evaluated independently for every approved time bin;
+- whether the prior is neutral or externally informed;
+- whether production is provided, fixed, or estimated;
+- whether destination attractiveness is provided, fixed, or estimated;
+- correction scopes, transformations, constraints, and regularization.
+
+The stages are deliberately separate:
+
+```text
+od-universe
+→ time-discretization
+→ review recommendation
+→ materialize-bins
+→ expand-od (pair universe × approved bins)
+→ structural-zeros (timetable feasibility)
+→ prepare
+```
+
+`od-universe` writes `results/audit/od_universe.json`,
+`results/audit/od_pairs.csv`, and `results/audit/od_universe_exclusions.csv`.
+`expand-od` writes the candidate cells and
+`results/audit/od_time_expansion.json` plus its exclusion audit. A physically
+reachable pair can therefore produce a timetable structural zero in one bin
+and a retained cell in another. Every exclusion reason is preserved.
+
+An optional pair-level `inputs/prior_demand.csv` has columns
+`origin_stop_id,destination_stop_id,prior_value`. Alternatively, declare
+`[prior_demand] source = "all_ones"`, which generates one value per retained
+OD-time cell only after expansion. A prior or `all_ones` seed defines candidate
+support or a numerical baseline. It is not automatically an observed demand
+matrix, production total, destination-attractiveness measure, or passenger
+forecast.
+
+Production totals and destination attractiveness are estimated only when the
+model specification declares corresponding parameter blocks. They must never
+be inferred implicitly from the candidate OD universe or from an `all_ones`
+prior. `mode = "provided"` requires a matching input file; `mode = "fixed"`
+requires declared, fingerprinted values; and `mode = "estimated"` adds named
+correction parameters with explicit scopes, constraints, regularization, and
+identifiability diagnostics. Empty groups, destinations with no retained
+cells, unconstrained blocks, weak measurement support, and singular directions
+are validation failures or explicit warnings—not evidence that the parameters
+are estimable.
+
+The generated provenance files are:
+
+```text
+results/generated_inputs/prior_demand.csv
+results/audit/prior_generation.json
+results/audit/production_attractiveness_provenance.json
+```
+
+They record source checksums, package and configuration fingerprints, spatial
+and connectivity policies, approved-bin fingerprint, prior-generator identity,
+and production/attractiveness modes. Source inputs are never overwritten.
 
 ## 3. Before the first run
 
@@ -594,6 +685,17 @@ newly generated artifacts. Existing private scripts are consulted only when a
 canonical mapping cannot express a source transformation; such a hook is a
 data-adapter limitation, not a prerequisite for ordinary cases.
 
+For the medium network, the canonical sequence is therefore: generate or
+validate a pair-only OD universe from the network, run the count-based
+time-discretization diagnostic, obtain reviewer approval, expand the pairs over
+the approved bins, and apply timetable structural-zero rules. Use `all_ones`
+only when it is explicitly declared as the neutral prior. The historical
+coarse demand bins are not copied into newly selected bins; if they are used at
+all, the manifest must label the run
+`input_semantics = "legacy_time_dependent_demand"` and record the scientific
+re-binning rule. Production and destination-attractiveness corrections belong
+in the model component tables, never in an inferred sum of the prior.
+
 The public hook contract is `GenericCaseHook`: it receives the validated
 `CaseStudyConfig` and `GenericCaseData`, returns a new `GenericCaseData`, and is
 passed explicitly to `GenericCaseAdapter`/`GenericCaseRunner`. Do not hide a
@@ -624,10 +726,11 @@ The required workflow is:
 
 ```text
 raw count audit
-→ time-discretization diagnostic
+→ validate/generate OD universe
+→ time-discretization diagnostic (without changing the OD universe)
 → review candidate bins
 → materialize time_bins.csv
-→ re-bin demand
+→ expand OD pairs across approved bins
 → structural-zero preprocessing
 → reduced-journey and response preparation
 → estimation
@@ -641,9 +744,10 @@ budget; do not silently treat the existing bins as validated.
 Before running the diagnostic, obtain the following values from the audited
 inputs and record them in the run manifest:
 
-1. `num_od_pairs`: the number of distinct `(origin_stop_id, dest_stop_id)`
-   pairs in the declared OD candidate universe, after applying the case’s
-   explicit stop mapping and candidate-cell policy;
+1. `num_od_pairs`: the number of distinct ordered pairs in the independent
+   `od_pairs.csv` file or the network-derived universe, after applying the
+   declared spatial level and pair-level rules. Do not count time bins here;
+   this value must not change when the temporal resolution changes;
 2. `max_od_cells`: an approved upper bound on
    `num_od_pairs × number_of_time_bins`, chosen by the case owner from the
    memory and estimation budget. There is no scientifically safe package
@@ -660,28 +764,27 @@ inputs and record them in the run manifest:
 6. the candidate-bin selection rule and reviewer. The diagnostic recommends a
    candidate; it does not make the scientific decision automatically.
 
-For a candidate universe stored as `prior_demand.csv`, this command computes
-`num_od_pairs` and the number of candidate OD-time rows without guessing:
+For a pair universe stored as `od_pairs.csv`, this command computes
+`num_od_pairs` without reading any time-bin membership:
 
 ```bash
 uv run --frozen python - <<'PY'
 import csv
 from pathlib import Path
 
-path = Path("case_studies/<case_name>/inputs/prior_demand.csv")
+path = Path("case_studies/<case_name>/inputs/od_pairs.csv")
 with path.open(newline="", encoding="utf-8") as stream:
     rows = list(csv.DictReader(stream))
-pairs = {(row["origin_stop_id"], row["dest_stop_id"]) for row in rows}
+pairs = {(row["origin_stop_id"], row["destination_stop_id"]) for row in rows}
 print("num_od_pairs:", len(pairs))
-print("candidate_od_time_rows:", len(rows))
 PY
 ```
 
-If the candidate universe is not an OD table with those columns, the adapter
-must document the equivalent derivation and stop if it cannot determine the
-number unambiguously. Once the owner has selected an approved maximum number
-of bins, record `max_od_cells = num_od_pairs * approved_max_bins`; do not use a
-larger limit merely to make the diagnostic pass.
+If the universe is network-derived, `run.py od-universe` is the authoritative
+count and audit. Once the owner has selected an approved maximum number of
+bins, record `max_od_cells = num_od_pairs * approved_max_bins`; do not use a
+larger limit merely to make the diagnostic pass. Never replicate a legacy
+demand table across newly selected bins without an explicit scientific rule.
 
 For canonical timestamped measurements, this command reports the observed
 event-time range and the column-level measurement types. It does not infer the
@@ -783,16 +886,16 @@ T01,21600,22200
 ```
 
 Here `start_s` and `end_s` are seconds from midnight (the loader also accepts
-`HH:MM` or `HH:MM:SS`). Every demand record must reference one of these IDs in
-its `time_bin_id` column. If the bin edges or IDs change, the adapter must
-re-bin the demand records and rerun the structural-zero, OD-candidate,
-reduced-journey, and response/operator preparation stages. Those stages use
-the scenario's time bins to construct the OD-time universe and their
-fingerprints; old artifacts must consequently be rejected rather than mixed
-with the new discretization. Once those stages complete, the estimation and
-validation commands consume the resulting `Scenario` and prepared artifacts
-as usual. The diagnostic JSON is retained only as provenance and review
-evidence.
+`HH:MM` or `HH:MM:SS`). In the new workflow this file defines only the approved
+time intervals: the pair-only OD universe is already fixed and is not edited
+when bin edges change. `expand-od` forms pair × bin cells, fingerprints that
+expansion, and reruns timetable feasibility for each cell. Existing
+time-dependent demand files are accepted only through the explicitly labelled
+legacy compatibility path; a new case must not replicate their rows into new
+bins implicitly. Once expansion and structural-zero stages complete, the
+estimation and validation commands consume the resulting `Scenario` and
+prepared artifacts as usual. The diagnostic JSON is retained only as
+provenance and review evidence.
 
 See [`time_discretization.md`](time_discretization.md) for the report schema,
 candidate scoring details, and the limitations of interpreting event-time
@@ -804,7 +907,7 @@ value is a tunable modelling parameter.
 
 Do not skip ahead because a later file happens to exist. On a new case, run
 these stages in order. Except where a repository root is stated explicitly,
-steps 2–10 are run from the case-study root (`cd "$CASE_ROOT"`).
+steps 2–11 are run from the case-study root (`cd "$CASE_ROOT"`).
 Run step 1 from the case-study repository root, then set `CASE_ROOT` and enter
 the copied case directory before step 2.
 
@@ -813,14 +916,15 @@ the copied case directory before step 2.
 | 1 | `git rev-parse HEAD`; `uv lock --check`; package provenance check | local | no | Correct case revision and locked public package; stop on mismatch. |
 | 2 | `test -f adapter.py &&`<br>`test -f run.py &&`<br>`test -f config/case.toml &&`<br>`test -f config/time_discretization.toml &&`<br>`test -f config/reduced_od.toml &&`<br>`test -f config/structural_zeros.toml &&`<br>`test -f config/model.toml` | local, from case-study root | no | Complete case setup; a missing path is a case-setup/documentation failure and identifies the missing path. |
 | 3 | `uv run --frozen python run.py check` | local | audit JSON and rejected-row files only | All source schemas and identities valid; stop on unexplained rows. |
-| 4 | `uv run --frozen python run.py time-discretization` | local | recommendation JSON only | Candidate bins, horizon, and budget are explicit; stop if any input is unknown. |
-| 5 | `uv run --frozen python run.py materialize-bins --candidate recommendation --reviewer "<name>"` | local | reviewed `time_bins.csv` | Reviewer adopts one candidate; stop if demand cannot be re-binned. |
-| 6 | `uv run --frozen python run.py check` | local | refreshed audit JSON | New bins and demand IDs agree; stop on fingerprint or coverage changes. |
-| 7 | `uv run --frozen python run.py structural-zeros` | local first, Jed if large | structural-zero artifacts | Conflicts and reason counts reviewed; stop on positive fixed conflict. |
-| 8 | `uv run --frozen python run.py prepare` | local first, Jed if large | persistent phase artifacts | All phases complete or compatibly reused; stop on missing/invalid phase. |
-| 9 | `uv run --frozen python run.py preflight` | local or Jed | preflight JSON only | Read-only artifacts, dimensions, dtype, and fingerprints agree. |
-| 10 | `uv run --frozen python run.py benchmark` | local or Jed | benchmark JSON only | Finite warm value/gradient and no value-change recompilation. |
-| 11 | `sbatch scripts/submit_chain.sh` | Jed only | checkpoints, fits, logs | Submit estimation only after stages 1–10 pass. |
+| 4 | `uv run --frozen python run.py od-universe` | local | pair universe and exclusion audit | Pair source, spatial level, and pair-level exclusions are reviewed. |
+| 5 | `uv run --frozen python run.py time-discretization` | local | recommendation JSON only | Candidate bins, horizon, and budget are explicit; stop if any input is unknown. |
+| 6 | `uv run --frozen python run.py materialize-bins --candidate recommendation --reviewer "<name>"` | local | reviewed `time_bins.csv` | Reviewer adopts one candidate; stop if the bin contract is not approved. |
+| 7 | `uv run --frozen python run.py expand-od` | local | OD-time cells and exclusion audit | Pair universe is expanded over approved bins; every exclusion has a reason. |
+| 8 | `uv run --frozen python run.py structural-zeros` | local first, Jed if large | structural-zero artifacts | Timetable feasibility and reason counts reviewed; stop on positive fixed conflict. |
+| 9 | `uv run --frozen python run.py prepare` | local first, Jed if large | persistent phase artifacts | All phases complete or compatibly reused; stop on missing/invalid phase. |
+| 10 | `uv run --frozen python run.py preflight` | local or Jed | preflight JSON only | Read-only artifacts, dimensions, dtype, and fingerprints agree. |
+| 11 | `uv run --frozen python run.py benchmark` | local or Jed | benchmark JSON only | Finite warm value/gradient and no value-change recompilation. |
+| 12 | `sbatch scripts/submit_chain.sh` | Jed only | checkpoints, fits, logs | Submit estimation only after stages 1–11 pass. |
 
 If step 2 returns a nonzero status, identify the missing path explicitly before
 doing anything else:
@@ -837,11 +941,11 @@ do
 done
 ```
 
-Stages 1–10 are admission checks, not optional progress bars. A stage that
+Stages 1–11 are admission checks, not optional progress bars. A stage that
 fails must be diagnosed and recorded before any downstream stage is attempted.
-The first three stages should be completed locally; preparation, benchmarking,
-and estimation can move to Jed once the local smoke run fits the resource
-budget.
+The repository, setup, pair-universe, and time-discretization checks should be
+completed locally; preparation, benchmarking, and estimation can move to Jed
+once the local smoke run fits the resource budget.
 
 ## 4. Stage 1 — Input check
 
@@ -873,7 +977,50 @@ no unresolved event identities. Treat unexpected zero rows, empty periods,
 missing lines, or orders-of-magnitude changes from the source statistics as
 errors until investigated.
 
-## 5. Stage 2 — Structural zeroes and feasibility
+## 5. Stage 2 — Candidate OD universe
+
+Run this stage before choosing time bins:
+
+```bash
+cd case_studies/<case_name>
+JAX_ENABLE_X64=true uv run --frozen python run.py od-universe
+```
+
+The stage validates `inputs/od_pairs.csv` when the case declares
+`source = "file"`, or deterministically generates the declared network-derived
+universe otherwise. The pair file contains only ordered pairs—never a time-bin
+column or a numerical flow. The audit records the declared stop/platform or
+physical-stop level, same-node policy, active-service policy, directed
+connectivity policy, every excluded pair, and the pair-universe fingerprint.
+
+`od-universe` does not inspect count timestamps and does not change when the
+approved time-bin edges change. A static directed path is only a cheap
+pair-level filter; it is not evidence that a scheduled journey exists in every
+time interval.
+
+## 6. Stage 3 — Time-bin approval and OD-time expansion
+
+Run `time-discretization`, review its recommendation, and materialize the
+chosen bins. Then expand the immutable pair universe over those approved bins:
+
+```bash
+cd case_studies/<case_name>
+JAX_ENABLE_X64=true uv run --frozen python run.py time-discretization
+JAX_ENABLE_X64=true uv run --frozen python run.py materialize-bins \
+  --candidate recommendation --reviewer "<name>"
+JAX_ENABLE_X64=true uv run --frozen python run.py expand-od
+```
+
+`expand-od` applies the declared active-origin, active-destination, directed
+connectivity, initial-wait, journey-time, and maximum-transfer rules once for
+each pair/bin combination. It writes
+`results/audit/od_time_expansion.json` and
+`results/audit/od_time_exclusions.csv`; a physically reachable pair may still
+be a timetable structural zero in one bin and retained in another. The
+generated `prior_demand.csv` is created only after this expansion and contains
+one value per retained OD-time cell.
+
+## 7. Stage 4 — Structural zeroes and feasibility
 
 Structural-zero preprocessing and reduced-journey preparation solve related
 but distinct problems:
@@ -901,7 +1048,7 @@ and a frozen-zero cell has been removed from the parameter vector. A
 topologically feasible cell may still be fixed to zero for externally justified
 case-study reasons; label that decision separately from a structural zero.
 
-## 6. Stage 3 — Prepare reduced artifacts
+## 8. Stage 5 — Prepare reduced artifacts
 
 Run:
 
@@ -952,7 +1099,7 @@ vehicle-journey specific, assess departure-sampling convergence before trusting
 the response. Increase samples or use the documented adaptive integration
 method until the retained measurement response is stable enough for the case.
 
-## 7. Observations that do not correspond to a path
+## 9. Observations that do not correspond to a path
 
 Use the following decision tree. Save every affected atomic record and its
 reason to a CSV; summary counts alone are insufficient.
@@ -1132,6 +1279,13 @@ print("measurement_types:", sorted({record.measurement_type.value for record in 
 PY
 ```
 
+The committed Geneva `prior_demand.csv` is a historical, four-bin fixture for
+the worked example. It is therefore a legacy time-dependent demand input, not
+the canonical independent-universe format. A new Geneva case should first
+materialize `inputs/od_pairs.csv` (or use the documented network-derived
+policy), then run `od-universe` and `expand-od`; do not replicate these four
+coarse rows across newly selected bins without an explicit scientific rule.
+
 Run the mandatory count-based diagnostic with the audited Geneva horizon and
 budget:
 
@@ -1192,7 +1346,7 @@ read-only-preflight, and warm-benchmark part of that API is demonstrated by
 Dry-run A above. A private case that needs the complete combined flow must
 implement and commit its adapter/dispatcher before it is submitted to Jed.
 
-## 8. Stage 4 — Read-only artifact preflight
+## 10. Stage 6 — Read-only artifact preflight
 
 Run this before every new fit environment, especially on Jed:
 
@@ -1217,7 +1371,7 @@ build the intended problem. It must report:
 If incompatible, rerun preparation with `reuse_or_build`; do not copy a
 downstream artifact directory from another configuration.
 
-## 9. Stage 5 — Objective and gradient admission benchmark
+## 11. Stage 7 — Objective and gradient admission benchmark
 
 Before optimization, benchmark the exact initial problem:
 
@@ -1244,7 +1398,7 @@ Use the warm value-and-gradient time and observed accepted-iteration time for
 runtime planning. If a warm evaluation is already too slow, stop before the
 optimizer and simplify the model/response or inspect accidental dense arrays.
 
-## 10. Stage 6 — Fit the model ladder
+## 12. Stage 8 — Fit the model ladder
 
 Use one immutable response and grouped split while comparing models.
 
@@ -1286,7 +1440,7 @@ groups, or low-rank effects. Warm-start by parameter name and preserve lineage.
 Compare each child against its parent. Do not activate several new mechanisms
 at once: an improved objective would then be difficult to attribute.
 
-## 11. Checkpoints, interruption, and resume
+## 13. Checkpoints, interruption, and resume
 
 Each fit must have a unique checkpoint path. Include in its identity:
 
@@ -1308,7 +1462,7 @@ Pressing Ctrl-C should likewise save the latest accepted iterate and return an
 `interrupted` result. After any interruption, inspect the checkpoint manifest
 before resuming. Never edit checkpoint JSON by hand.
 
-## 12. Running on Jed with Slurm
+## 14. Running on Jed with Slurm
 
 ### 12.1 One-time server check
 
@@ -1395,28 +1549,37 @@ set -euo pipefail
 
 CHECK_JOB="$(sbatch --parsable \
   case_studies/<case_name>/scripts/00_check.sbatch)"
-PREPARE_JOB="$(sbatch --parsable --dependency="afterok:${CHECK_JOB}" \
-  case_studies/<case_name>/scripts/10_prepare.sbatch)"
+UNIVERSE_JOB="$(sbatch --parsable --dependency="afterok:${CHECK_JOB}" \
+  case_studies/<case_name>/scripts/05_od_universe.sbatch)"
+BINS_JOB="$(sbatch --parsable --dependency="afterok:${UNIVERSE_JOB}" \
+  case_studies/<case_name>/scripts/10_time_discretization.sbatch)"
+EXPAND_JOB="$(sbatch --parsable --dependency="afterok:${BINS_JOB}" \
+  case_studies/<case_name>/scripts/15_expand_od.sbatch)"
+ZERO_JOB="$(sbatch --parsable --dependency="afterok:${EXPAND_JOB}" \
+  case_studies/<case_name>/scripts/20_structural_zeros.sbatch)"
+PREPARE_JOB="$(sbatch --parsable --dependency="afterok:${ZERO_JOB}" \
+  case_studies/<case_name>/scripts/30_prepare.sbatch)"
 PREFLIGHT_JOB="$(sbatch --parsable --dependency="afterok:${PREPARE_JOB}" \
-  case_studies/<case_name>/scripts/20_preflight.sbatch)"
+  case_studies/<case_name>/scripts/40_preflight.sbatch)"
 FIT_1_JOB="$(sbatch --parsable --dependency="afterok:${PREFLIGHT_JOB}" \
   --export=ALL,RESUME=0 \
-  case_studies/<case_name>/scripts/30_fit.sbatch)"
+  case_studies/<case_name>/scripts/50_fit.sbatch)"
 FIT_2_JOB="$(sbatch --parsable --dependency="afterok:${FIT_1_JOB}" \
   --export=ALL,RESUME=1 \
-  case_studies/<case_name>/scripts/30_fit.sbatch)"
+  case_studies/<case_name>/scripts/50_fit.sbatch)"
 FIT_3_JOB="$(sbatch --parsable --dependency="afterok:${FIT_2_JOB}" \
   --export=ALL,RESUME=1 \
-  case_studies/<case_name>/scripts/30_fit.sbatch)"
-DIAGNOSE_JOB="$(sbatch --parsable --dependency="afterok:${FIT_3_JOB}" \
-  case_studies/<case_name>/scripts/40_diagnose.sbatch)"
+  case_studies/<case_name>/scripts/50_fit.sbatch)"
 
 echo "check=${CHECK_JOB}"
+echo "universe=${UNIVERSE_JOB}"
+echo "bins=${BINS_JOB}"
+echo "expand=${EXPAND_JOB}"
+echo "zeros=${ZERO_JOB}"
 echo "prepare=${PREPARE_JOB}"
 echo "preflight=${PREFLIGHT_JOB}"
 echo "fit_segments=${FIT_1_JOB},${FIT_2_JOB},${FIT_3_JOB}"
-echo "diagnose=${DIAGNOSE_JOB}"
-echo "squeue -j ${CHECK_JOB},${PREPARE_JOB},${PREFLIGHT_JOB},${FIT_1_JOB},${FIT_2_JOB},${FIT_3_JOB},${DIAGNOSE_JOB} -o '%.18i %.28j %.2t %.12M %.12l %R'"
+echo "squeue -j ${CHECK_JOB},${UNIVERSE_JOB},${BINS_JOB},${EXPAND_JOB},${ZERO_JOB},${PREPARE_JOB},${PREFLIGHT_JOB},${FIT_1_JOB},${FIT_2_JOB},${FIT_3_JOB} -o '%.18i %.28j %.2t %.12M %.12l %R'"
 ```
 
 The fit wrapper should translate `RESUME=0/1` into the estimator's `resume`
@@ -1464,7 +1627,7 @@ Interpret them carefully:
   search or scaling problems;
 - a scheduler timeout is not numerical convergence.
 
-## 13. Stage 7 — Interpret the fit result
+## 15. Stage 9 — Interpret the fit result
 
 Read the machine-readable result before any plot. Distinguish:
 
@@ -1480,6 +1643,7 @@ An optimizer success message alone is insufficient. Review:
 - objective resolution relative to float64 precision and configured tolerance;
 - transformed time and transfer sensitivities;
 - production coefficients and totals by origin and period;
+- fitted destination-attractiveness values and their declared correction block;
 - negative-binomial dispersion, if present;
 - active raw bounds;
 - Hessian rank, eigenvalues, condition number, and weak directions;
@@ -1495,7 +1659,7 @@ underdetermined. A good count fit means the estimate reproduces observed
 measurements under the assumed response; it does not prove that every OD cell
 is identified.
 
-## 14. Stage 8 — Grouped validation and model advice
+## 16. Stage 10 — Grouped validation and model advice
 
 Run full-data adequacy diagnostics, but label them in-sample. Then create a
 deterministic grouped holdout, preferably by `vehicle_journey`, using
@@ -1515,7 +1679,7 @@ additional data collection, but the recommendation should be expressed at the
 level supported by the response (stops, periods, routes, or OD combinations),
 not as unjustified certainty about individual cells.
 
-## 15. Stage 9 — Reconstruct and validate only an accepted fit
+## 17. Stage 11 — Reconstruct and validate only an accepted fit
 
 The optimizer works only with free cells. After accepting a fit, construct a
 `ReducedODProblemContract` and call `reconstruct_full_od` to insert frozen cells
@@ -1533,7 +1697,7 @@ reduced response. This is the place to detect disagreement caused by bounded
 journey sets, fixed shares, capacity/crowding, or response aggregation. Do not
 put the detailed assignment back inside the reduced optimizer.
 
-## Documentation consistency check
+## 18. Documentation consistency check
 
 Before committing a walkthrough or template update, run the search from the
 public-repository root:
@@ -1560,7 +1724,7 @@ with:
 git diff --check
 ```
 
-## 16. Final acceptance checklist
+## 19. Final acceptance checklist
 
 A case is ready to report only when all applicable boxes can be checked.
 
@@ -1636,7 +1800,7 @@ A case is ready to report only when all applicable boxes can be checked.
 - [ ] Every failed stage is recorded with one of the four failure categories
       above and its supporting evidence.
 
-## 17. What to deliver to a reviewer
+## 20. What to deliver to a reviewer
 
 Deliver a compact human-readable report plus the machine-readable directory.
 The report should contain:
@@ -1655,7 +1819,7 @@ The report should contain:
 Never report only the final parameter vector. The provenance, response
 coverage, numerical checks, and unsuccessful attempts are part of the result.
 
-## 18. Related documentation
+## 21. Related documentation
 
 - [`reduced_od_estimation.md`](reduced_od_estimation.md): numerical robustness,
   likelihood comparison, bounds, progress, and artifact invalidation.

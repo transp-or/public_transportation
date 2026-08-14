@@ -5,3 +5,21 @@ maximum_iterations = 10
 gradient_tolerance = 1.0e-5
 function_tolerance = 1.0e-8
 prior_scale = 2.0
+
+[production]
+mode = "estimated"
+baseline = "ones"
+correction_scope = "origin_time"
+transformation = "log"
+constraint = "sum_to_zero"
+regularization = "gaussian"
+prior_scale = 2.0
+
+[destination_attractiveness]
+mode = "estimated"
+baseline = "ones"
+correction_scope = "destination"
+transformation = "log"
+constraint = "sum_to_zero"
+regularization = "gaussian"
+prior_scale = 2.0

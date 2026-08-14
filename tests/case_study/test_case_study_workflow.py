@@ -178,3 +178,57 @@ def test_clean_template_executes_admission_path(tmp_path: Path) -> None:
     assert len(fit["raw_parameters"]) > 0
     reconstructed = run_case_stage(config_path, "reconstruct", fit_path=fit_path, **kwargs)
     assert len(reconstructed["keys"]) == len(reconstructed["demand"])
+
+
+def test_independent_od_workflow_has_pair_and_expansion_audits(tmp_path: Path) -> None:
+    case = _copy_case(tmp_path)
+    # The canonical template uses the pair-only input.  Remove the legacy
+    # fixture to prove that the new path does not need a time-dependent demand.
+    (case / "inputs/scenario/prior_demand.csv").unlink()
+    source_snapshots = {
+        path: path.read_bytes()
+        for path in (
+            case / "inputs/od_pairs.csv",
+            case / "inputs/measurements_boarding_alighting.csv",
+            case / "inputs/scenario/stops.csv",
+        )
+    }
+    config_path = case / "config/case.toml"
+    kwargs = {"case_root": case}
+    universe = run_case_stage(config_path, "od-universe", **kwargs)
+    assert universe["source"] == "file"
+    assert universe["retained_pair_count"] == 2
+    expansion = run_case_stage(config_path, "expand-od", **kwargs)
+    assert expansion["retained_cell_count"] == 2
+    assert (case / "results/audit/od_pairs.csv").is_file()
+    assert (case / "results/generated_inputs/prior_demand.csv").is_file()
+    manifest = run_case_stage(config_path, "check", **kwargs)["manifest"]
+    assert manifest["input_semantics"] == "independent_od_universe"
+    assert manifest["prior_demand"]["source"] == "all_ones"
+    data = GenericCaseAdapter(load_case_study_config(config_path, case_root=case)).data
+    assert data.prior_demand is not None
+    assert set(data.prior_demand.values()) == {1.0}
+    assert set(data.production_inputs.values()) == {1.0}
+    assert set(data.destination_attractiveness.values()) == {1.0}
+    assert data.input_semantics == "independent_od_universe"
+    assert all(path.read_bytes() == content for path, content in source_snapshots.items())
+
+
+def test_external_pair_prior_can_use_paths_fallback(tmp_path: Path) -> None:
+    case = _copy_case(tmp_path)
+    prior = case / "inputs/prior_pair_values.csv"
+    prior.write_text(
+        "origin_stop_id,destination_stop_id,prior_value\nA,B,2\nC,D,3\n",
+        encoding="utf-8",
+    )
+    text = _config_text(case).replace(
+        'results_directory = "results"',
+        'prior_demand = "inputs/prior_pair_values.csv"\nresults_directory = "results"',
+    ).replace(
+        'source = "all_ones"\nvalue = 1.0\nsemantics = "neutral_seed"',
+        'source = "external_file"\nsemantics = "external_prior"',
+    )
+    _write_config(case, text)
+    config = load_case_study_config(case / "config/case.toml", case_root=case)
+    data = GenericCaseAdapter(config).data
+    assert set(data.prior_demand.values()) == {2.0, 3.0}

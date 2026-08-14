@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import platform
@@ -47,6 +48,15 @@ from .config import CaseStudyConfig, load_case_study_config
 def _write_json(path: Path, payload: Any) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
+    return path
+
+
+def _write_csv(path: Path, header: Sequence[str], rows: Sequence[Sequence[object]]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(header)
+        writer.writerows(rows)
     return path
 
 
@@ -128,6 +138,93 @@ class GenericCaseRunner:
             raise ValueError(f"stage output escaped results directory: {path}")
         return path
 
+    def _source_checksums(self) -> dict[str, str]:
+        """Return checksums for all configured source and contract files."""
+        paths = self.config.paths
+        candidates = [
+            ("measurements", paths.measurements),
+            ("candidate_demand", paths.candidate_demand),
+            ("od_pairs", paths.od_pairs),
+            ("prior_demand", paths.prior_demand),
+            ("fixed_demand", paths.fixed_demand),
+            ("production_inputs", paths.production_inputs),
+            ("destination_attractiveness", paths.destination_attractiveness),
+            ("od_universe_pair_file", self.config.od_universe.pair_file),
+            ("prior_input_file", self.config.prior_demand.input_file),
+        ]
+        checksums = {
+            name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for name, path in candidates
+            if path is not None and path.is_file()
+        }
+        if paths.scenario_directory.is_dir():
+            for path in sorted(item for item in paths.scenario_directory.rglob("*") if item.is_file()):
+                checksums[f"scenario/{path.relative_to(paths.scenario_directory)}"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in self.config.package_config_paths:
+            if path.is_file():
+                checksums[f"configuration/{path.name}"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        return checksums
+
+    def _stage_provenance(self) -> dict[str, object]:
+        return {
+            "source_checksums": self._source_checksums(),
+            "package": self.package_info(),
+            "configuration_fingerprint": self.config.fingerprint,
+            "od_universe_policy": {
+                "source": self.config.od_universe.source,
+                "level": self.config.od_universe.level,
+                "include_same_stop": self.config.od_universe.include_same_stop,
+                "active_service_only": self.config.od_universe.active_service_only,
+                "connectivity_policy": self.config.od_universe.connectivity_policy,
+            },
+            "service_day": self.config.service_day,
+            "timezone": self.config.timezone,
+        }
+
+    def _component_provenance(self, data: Any) -> dict[str, object]:
+        """Serialize explicit production/attractiveness semantics and dimensions."""
+        expansion = data.od_time_expansion
+        origin_groups = (
+            set()
+            if expansion is None
+            else {(cell.origin_stop_id, cell.time_bin_id) for cell in expansion.cells}
+        )
+        destination_groups = (
+            set()
+            if expansion is None
+            else {(cell.destination_stop_id, cell.time_bin_id) for cell in expansion.cells}
+        )
+        result: dict[str, object] = {}
+        for name, groups in (
+            ("production", origin_groups),
+            ("destination_attractiveness", destination_groups),
+        ):
+            spec = self.config.model.get(name)
+            if not isinstance(spec, dict):
+                result[name] = {"mode": "legacy_compatibility"}
+                continue
+            mode = str(spec["mode"])
+            scope = str(spec["correction_scope"])
+            estimated_dimension = 0
+            if mode == "estimated":
+                estimated_dimension = 1 if scope == "global" else max(len(groups) - 1, 0)
+            result[name] = {
+                "mode": mode,
+                "baseline": spec.get("baseline"),
+                "correction_scope": scope,
+                "transformation": spec.get("transformation"),
+                "constraint": spec.get("constraint"),
+                "regularization": spec.get("regularization"),
+                "prior_scale": spec.get("prior_scale"),
+                "group_count": len(groups),
+                "estimated_dimension": estimated_dimension,
+                "active_parameters": estimated_dimension,
+                "inactive_parameters": 0,
+                "derived_from_prior": False,
+                "derived_from_legacy_demand": False,
+            }
+        return result
+
     def check(self) -> dict[str, object]:
         self.emit({"stage": "check", "status": "started"})
         audit = self.adapter.audit().to_dict()
@@ -142,11 +239,56 @@ class GenericCaseRunner:
             },
             "input_checksums": dict(audit["source_checksums"]),
             "package": package,
+            "input_semantics": audit.get("input_semantics", "legacy_time_dependent_demand"),
+            "od_universe_policy": {
+                "source": self.config.od_universe.source,
+                "level": self.config.od_universe.level,
+                "include_same_stop": self.config.od_universe.include_same_stop,
+                "active_service_only": self.config.od_universe.active_service_only,
+                "connectivity_policy": self.config.od_universe.connectivity_policy,
+            },
+            "prior_demand": {
+                "source": self.config.prior_demand.source,
+                "semantics": self.config.prior_demand.semantics,
+                "expansion": self.config.prior_demand.expansion,
+            },
+            "production_specification": self.config.model.get("production"),
+            "destination_attractiveness_specification": self.config.model.get("destination_attractiveness"),
         }
         payload = {"package": package, "audit": audit, "manifest": manifest}
         output = _write_json(self._stage_path("audit", "input_audit.json"), payload)
         _write_json(self._stage_path("audit", "run_manifest.json"), manifest)
         self.emit({"stage": "check", "status": "completed", "output": str(output)})
+        return payload
+
+    def od_universe(self) -> dict[str, object]:
+        """Validate/write the independent candidate pair universe."""
+        data = self.adapter.data
+        if data.candidate_od_universe is None:
+            payload = {
+                "status": "legacy_compatibility",
+                "input_semantics": "legacy_time_dependent_demand",
+                "message": "OD universe is derived from legacy demand.csv; no pair-only input was supplied.",
+            }
+            _write_json(self._stage_path("audit", "od_universe.json"), payload)
+            return payload
+        universe = data.candidate_od_universe
+        _write_csv(
+            self._stage_path("audit", "od_pairs.csv"),
+            ("origin_stop_id", "destination_stop_id"),
+            [pair.tuple for pair in universe.pairs],
+        )
+        _write_csv(
+            self._stage_path("audit", "od_universe_exclusions.csv"),
+            ("origin_stop_id", "destination_stop_id", "reason", "detail"),
+            [item.tuple for item in universe.exclusions],
+        )
+        payload = {
+            **universe.audit,
+            **self._stage_provenance(),
+        }
+        _write_json(self._stage_path("audit", "od_universe.json"), payload)
+        self.emit({"stage": "od-universe", "status": "completed", "output": str(self._stage_path("audit", "od_universe.json"))})
         return payload
 
     def time_discretization(self) -> dict[str, object]:
@@ -200,7 +342,121 @@ class GenericCaseRunner:
         self.emit({"stage": "materialize-bins", "status": "completed", "output": str(output), "reviewer": reviewer})
         return manifest
 
+    def expand_od(self) -> dict[str, object]:
+        """Expand the approved time bins across the independent OD universe."""
+        data = self.adapter.data
+        if data.od_time_expansion is None:
+            payload = {
+                "status": "legacy_compatibility",
+                "input_semantics": "legacy_time_dependent_demand",
+                "message": "OD--time cells are read from legacy demand.csv.",
+            }
+            _write_json(self._stage_path("audit", "od_time_expansion.json"), payload)
+            return payload
+        expansion = data.od_time_expansion
+        _write_csv(
+            self._stage_path("audit", "od_time_exclusions.csv"),
+            ("origin_stop_id", "destination_stop_id", "time_bin_id", "reason", "detail"),
+            [
+                (item.origin_stop_id, item.destination_stop_id, item.time_bin_id, item.reason, item.detail)
+                for item in expansion.exclusions
+            ],
+        )
+        _write_csv(
+            self._stage_path("generated_inputs", "candidate_od_time.csv"),
+            ("origin_stop_id", "destination_stop_id", "time_bin_id"),
+            [cell.tuple for cell in expansion.cells],
+        )
+        approved_bins_fingerprint = hashlib.sha256(
+            json.dumps([list(item) for item in expansion.time_bins], separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        payload = {
+            **expansion.audit,
+            "approved_time_bins_fingerprint": approved_bins_fingerprint,
+            **self._stage_provenance(),
+        }
+        _write_json(self._stage_path("audit", "od_time_expansion.json"), payload)
+        if data.prior_demand is not None:
+            _write_csv(
+                self._stage_path("generated_inputs", "prior_demand.csv"),
+                ("origin_stop_id", "destination_stop_id", "time_bin_id", "prior_value"),
+                [(*cell.tuple, value) for cell, value in sorted(data.prior_demand.items())],
+            )
+            _write_json(
+                self._stage_path("audit", "prior_generation.json"),
+                {
+                    **self._stage_provenance(),
+                    **(
+                        {}
+                        if data.prior_generation is None
+                        else data.prior_generation.audit
+                    ),
+                    "source": self.config.prior_demand.source,
+                    "semantics": self.config.prior_demand.semantics,
+                    "expansion": self.config.prior_demand.expansion,
+                    "cell_count": len(data.prior_demand),
+                    "universe_fingerprint": data.candidate_od_universe.fingerprint,
+                    "od_time_expansion_fingerprint": expansion.fingerprint,
+                    "approved_time_bins_fingerprint": approved_bins_fingerprint,
+                },
+            )
+        _write_json(
+            self._stage_path("audit", "production_attractiveness_provenance.json"),
+            {
+                **self._stage_provenance(),
+                "components": self._component_provenance(data),
+                "input_files": {
+                    "production": None if self.config.paths.production_inputs is None else str(self.config.paths.production_inputs),
+                    "destination_attractiveness": None if self.config.paths.destination_attractiveness is None else str(self.config.paths.destination_attractiveness),
+                },
+                "derived_from_prior": False,
+                "derived_from_legacy_demand": False,
+                "approved_time_bins_fingerprint": approved_bins_fingerprint,
+            },
+        )
+        self.emit({"stage": "expand-od", "status": "completed", "output": str(self._stage_path("audit", "od_time_expansion.json"))})
+        return payload
+
     def structural_zeros(self) -> dict[str, object]:
+        data = self.adapter.data
+        if data.od_time_expansion is not None:
+            fixed = {
+                (item.origin_stop_id, item.destination_stop_id, item.time_bin_id): 0.0
+                for item in data.od_time_expansion.exclusions
+            }
+            _write_csv(
+                self._stage_path("generated_inputs", "fixed_demand.csv"),
+                ("origin_stop_id", "dest_stop_id", "time_bin_id", "flow"),
+                [(*key, value) for key, value in sorted(fixed.items())],
+            )
+            _write_csv(
+                self._stage_path("audit", "structural_zero_audit.csv"),
+                ("origin_stop_id", "destination_stop_id", "time_bin_id", "reason", "detail"),
+                [
+                    (
+                        item.origin_stop_id,
+                        item.destination_stop_id,
+                        item.time_bin_id,
+                        item.reason,
+                        item.detail,
+                    )
+                    for item in data.od_time_expansion.exclusions
+                ],
+            )
+            payload = {
+                "num_cells": data.od_time_expansion.audit["expanded_od_time_count"],
+                "num_structural_zero": len(fixed),
+                "num_retained": data.od_time_expansion.cell_count,
+                "num_fixed_merged": len(fixed),
+                "num_free_after_merge": data.od_time_expansion.cell_count,
+                "primary_reason_counts": data.od_time_expansion.audit["exclusion_counts"],
+                "input_semantics": data.input_semantics,
+                "output_folder": str(self._stage_path("generated_inputs", "")),
+                "configuration_fingerprint": self.config.fingerprint,
+            }
+            output = _write_json(self._stage_path("audit", "structural_zero_summary.json"), payload)
+            self.emit({"stage": "structural-zeros", "status": "completed", "output": str(output)})
+            return payload
         configured_output = self.config.structural_zero_config.output.folder.resolve()
         if self.results.resolve() not in configured_output.parents:
             raise ValueError(
@@ -257,24 +513,84 @@ class GenericCaseRunner:
             artifact_directory=self._stage_path("artifacts", "reduced_od"),
         )
         selected_likelihood = likelihood or str(self.config.model["likelihood"])
-        production_mode = str(self.config.model["production_mode"])
-        basis = None
-        labels = None
-        columns = 0
+
+        def component_mode(name: str, legacy: str | None) -> str:
+            spec = self.config.model.get(name)
+            if isinstance(spec, dict):
+                mode = str(spec["mode"])
+                return "estimated_basis" if mode == "estimated" else "provided"
+            if name == "production" and legacy is not None:
+                return legacy
+            return "provided"
+
+        def centered_basis(
+            count: int, *, component: str, scope: str, label: str
+        ) -> tuple[np.ndarray, tuple[str, ...]]:
+            if scope == "global":
+                return np.ones((count, 1), dtype=np.float64), (f"{label}.global",)
+            if scope not in {"origin_time", "destination", "destination_time"}:
+                raise ValueError(
+                    f"{component} estimated correction scope {scope!r} is not supported by the reduced-OD runner."
+                )
+            if count < 2:
+                raise ValueError(
+                    f"{component} estimated correction requires at least two active groups."
+                )
+            # The final group is the reference implied by a sum-to-zero basis:
+            # each column is e_i - e_last, so the represented effects sum to zero.
+            basis = np.zeros((count, count - 1), dtype=np.float64)
+            basis[:-1, :] = np.eye(count - 1)
+            basis[-1, :] = -1.0
+            labels = tuple(f"{label}[{index}]" for index in range(count - 1))
+            return basis, labels
+
+        legacy_production_mode = self.config.model.get("production_mode")
+        production_mode = component_mode(
+            "production",
+            None if legacy_production_mode is None else str(legacy_production_mode),
+        )
+        production_basis = None
+        production_labels = None
+        production_columns = 0
+        production_spec = self.config.model.get("production")
         if production_mode == "estimated_basis":
-            columns = 1
-            basis = np.ones((artifacts.features.number_of_origin_time_groups, columns), dtype=np.float64)
-            labels = ("global_log_scale",)
+            scope = "global" if not isinstance(production_spec, dict) else str(production_spec["correction_scope"])
+            production_basis, production_labels = centered_basis(
+                artifacts.features.number_of_origin_time_groups,
+                component="production",
+                scope=scope,
+                label="production.deviation",
+            )
+            production_columns = production_basis.shape[1]
+
+        attraction_mode = component_mode("destination_attractiveness", None)
+        attraction_basis = None
+        attraction_labels = None
+        attraction_columns = 0
+        attraction_spec = self.config.model.get("destination_attractiveness")
+        if attraction_mode == "estimated_basis":
+            scope = "destination" if not isinstance(attraction_spec, dict) else str(attraction_spec["correction_scope"])
+            attraction_basis, attraction_labels = centered_basis(
+                len(artifacts.features.destination_ids),
+                component="destination_attractiveness",
+                scope=scope,
+                label="destination_attractiveness.deviation",
+            )
+            attraction_columns = attraction_basis.shape[1]
         specification = MinimalGravitySpecification(
             likelihood=selected_likelihood,
             production_mode=production_mode,
-            production_basis_columns=columns,
+            production_basis_columns=production_columns,
+            destination_attractiveness_mode=attraction_mode,
+            destination_attractiveness_basis_columns=attraction_columns,
         )
         built = build_minimal_gravity_problem(
             artifacts=artifacts,
             specification=specification,
-            production_basis=basis,
-            production_basis_labels=labels,
+            production_basis=production_basis,
+            production_basis_labels=production_labels,
+            destination_attractiveness_basis=attraction_basis,
+            destination_attractiveness_basis_labels=attraction_labels,
         )
         return artifacts, built
 
@@ -286,6 +602,7 @@ class GenericCaseRunner:
             artifact_directory=self._stage_path("artifacts", "reduced_od"),
             specification=built.problem.parameter_layout.specification,
             production_basis=built.problem.production_basis,
+            destination_attractiveness_basis=built.problem.destination_attractiveness_basis,
         )
         payload["configuration_fingerprint"] = self.config.fingerprint
         payload["package"] = self.package_info()
@@ -312,6 +629,9 @@ class GenericCaseRunner:
         if method == "map":
             prior = GaussianRawParameterPrior(np.zeros(initial.size), np.full(initial.size, float(self.config.model.get("prior_scale", 2.0))))
         result = estimate_minimal_gravity(problem=built.problem, initial_raw_parameters=initial, model_fingerprint=built.model_fingerprint, config=fit_config, prior=prior, progress=self.emit)
+        fitted_demand = generate_minimal_gravity_demand(
+            result.raw_parameters, problem=built.problem
+        )
         payload = {
             "method": method,
             "likelihood": likelihood,
@@ -320,6 +640,22 @@ class GenericCaseRunner:
             "message": result.message,
             "objective": result.objective,
             "raw_parameters": result.raw_parameters.tolist(),
+            "fitted_productions": [
+                [list(key), float(value)]
+                for key, value in zip(
+                    built.problem.features.origin_time_group_keys,
+                    np.asarray(fitted_demand.productions),
+                    strict=True,
+                )
+            ],
+            "fitted_destination_attractiveness": [
+                [list(key.tuple), float(value)]
+                for key, value in zip(
+                    built.problem.features.cell_keys,
+                    np.asarray(fitted_demand.destination_attractiveness),
+                    strict=True,
+                )
+            ],
             "model_fingerprint": built.model_fingerprint,
             "configuration_fingerprint": self.config.fingerprint,
         }
@@ -396,8 +732,10 @@ def run_case_stage(
     if dry_run:
         output_categories = {
             "check": "audit",
+            "od-universe": "audit",
             "time-discretization": "audit",
             "materialize-bins": "generated_inputs",
+            "expand-od": "audit",
             "structural-zeros": "audit",
             "prepare": "artifacts",
             "preflight": "preflight",
@@ -420,7 +758,9 @@ def run_case_stage(
     runner = GenericCaseRunner(config, json_progress=json_progress)
     actions = {
         "check": runner.check,
+        "od-universe": runner.od_universe,
         "time-discretization": runner.time_discretization,
+        "expand-od": runner.expand_od,
         "structural-zeros": runner.structural_zeros,
         "prepare": runner.prepare,
         "preflight": runner.preflight,
@@ -449,7 +789,7 @@ def run_case_stage(
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage", choices=("check", "time-discretization", "materialize-bins", "structural-zeros", "prepare", "preflight", "benchmark", "fit", "diagnose", "reconstruct", "validate-detailed"))
+    parser.add_argument("stage", choices=("check", "od-universe", "time-discretization", "materialize-bins", "expand-od", "structural-zeros", "prepare", "preflight", "benchmark", "fit", "diagnose", "reconstruct", "validate-detailed"))
     parser.add_argument("--config", type=Path, default=Path("config/case.toml"))
     parser.add_argument("--case-root", type=Path, default=None)
     parser.add_argument("--candidate", default=None)

@@ -2,7 +2,6 @@ version = 1
 
 [scenario]
 folder = "../inputs/scenario"
-demand_file = "../inputs/scenario/prior_demand.csv"
 
 [output]
 folder = "../results/structural_zeros"

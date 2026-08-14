@@ -82,6 +82,35 @@ def test_grouped_softmax_normalizes_and_preserves_provided_production() -> None:
     assert layout.size == 2
 
 
+def test_estimated_destination_attractiveness_has_constrained_parameter_block() -> None:
+    specification = MinimalGravitySpecification(
+        destination_attractiveness_mode="estimated_basis",
+        destination_attractiveness_basis_columns=2,
+    )
+    layout = MinimalGravityParameterLayout(specification)
+    assert layout.size == 4
+    assert layout.destination_attractiveness_slice == slice(2, 4)
+    names = layout.raw_parameter_names(
+        destination_attractiveness_basis_labels=("destination.deviation[0]", "destination.deviation[1]")
+    )
+    assert names[-2:] == ("destination.deviation[0]", "destination.deviation[1]")
+    basis = np.asarray(
+        [[1.0, 0.0], [0.0, 1.0], [-1.0, -1.0]], dtype=np.float64
+    )
+    problem = MinimalGravityProblem(
+        features=_features(),
+        parameter_layout=layout,
+        response_operator=_operator(),
+        observations=np.ones(3),
+        destination_attractiveness_basis=basis,
+    )
+    raw = default_minimal_gravity_raw_parameters(layout)
+    raw[layout.destination_attractiveness_slice] = np.asarray([0.4, -0.2])
+    generated = generate_minimal_gravity_demand(raw, problem=problem)
+    assert np.all(np.isfinite(np.asarray(generated.demand)))
+    assert not np.allclose(np.asarray(generated.probabilities), [1 / 3] * 3)
+
+
 def test_feature_builder_aligns_free_cells_and_fixed_choice_summaries() -> None:
     keys = (
         ResponseCellKey("A", "B", "P"),

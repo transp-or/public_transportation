@@ -183,6 +183,8 @@ class ReducedODPreparationInputs:
     route_pattern_initial_weights: Mapping[str, float] | None = None
     departure_time_sampling: DepartureTimeSamplingConfig | None = None
     departure_sampling_origin_period_groups: Sequence[tuple[str, str]] | None = None
+    candidate_od_pairs: Sequence[tuple[str, str]] | None = None
+    prior_demand: Mapping[object, float] | None = None
 
 
 def _sampling_support(
@@ -277,6 +279,23 @@ def _departure_sampling_identity(inputs: ReducedODPreparationInputs) -> str:
                 for key, value in sorted((inputs.fixed_demand or {}).items())
             ],
         }
+    if isinstance(payload, dict):
+        payload["candidate_od_pairs"] = (
+            None
+            if inputs.candidate_od_pairs is None
+            else sorted([list(pair) for pair in inputs.candidate_od_pairs])
+        )
+        payload["prior_demand"] = (
+            None
+            if inputs.prior_demand is None
+            else sorted(
+                [
+                    [str(key), float(value)]
+                    for key, value in inputs.prior_demand.items()
+                ],
+                key=lambda item: item[0],
+            )
+        )
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 
@@ -1659,6 +1678,8 @@ def build_minimal_gravity_problem(
     specification: MinimalGravitySpecification,
     production_basis: np.ndarray | None = None,
     production_basis_labels: tuple[str, ...] | None = None,
+    destination_attractiveness_basis: np.ndarray | None = None,
+    destination_attractiveness_basis_labels: tuple[str, ...] | None = None,
 ) -> BuiltMinimalGravityProblem:
     """Bind persisted compact artifacts into J0; no assignment/reconstruction."""
     configuration = artifacts.configuration
@@ -1678,6 +1699,8 @@ def build_minimal_gravity_problem(
         observations=artifacts.measurement_response.observed_values,
         production_basis=production_basis,
         production_basis_labels=production_basis_labels,
+        destination_attractiveness_basis=destination_attractiveness_basis,
+        destination_attractiveness_basis_labels=destination_attractiveness_basis_labels,
     )
     parameter_names = ["beta_time", "beta_transfer"]
     if specification.likelihood == "negative_binomial":
@@ -1688,6 +1711,14 @@ def build_minimal_gravity_problem(
         else tuple(
             f"production_coefficient_{index}"
             for index in range(specification.production_basis_columns)
+        )
+    )
+    parameter_names.extend(
+        destination_attractiveness_basis_labels
+        if destination_attractiveness_basis_labels is not None
+        else tuple(
+            f"destination_attractiveness_coefficient_{index}"
+            for index in range(specification.destination_attractiveness_basis_columns)
         )
     )
     model_contract = ReducedODModelContract(
@@ -1809,6 +1840,7 @@ def preflight_reduced_od_j0(
     artifact_directory: str | Path,
     specification: MinimalGravitySpecification | None = None,
     production_basis: np.ndarray | None = None,
+    destination_attractiveness_basis: np.ndarray | None = None,
 ) -> dict[str, object]:
     """Read-only JSON-ready preflight that stops at the first invalid phase."""
     directory = Path(artifact_directory).resolve()
@@ -1827,6 +1859,7 @@ def preflight_reduced_od_j0(
             artifacts=artifacts,
             specification=selected,
             production_basis=production_basis,
+            destination_attractiveness_basis=destination_attractiveness_basis,
         )
     except (ReducedODArtifactStoreError, ValueError) as error:
         text = str(error)

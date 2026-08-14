@@ -208,6 +208,7 @@ class Scenario:
         *,
         strict: bool = False,
         demand_file: str | Path | None = None,
+        allow_missing_demand: bool = False,
     ) -> "Scenario":
         """
         Load a scenario from a folder.
@@ -226,6 +227,9 @@ class Scenario:
         :param strict: If True, run Scenario.validate() after loading and raise a ValueError if any ERROR issues are found.
         :param demand_file: Optional explicit demand table. When omitted,
             ``demand.(csv|parquet|json)`` is read from ``folder``.
+        :param allow_missing_demand: If True, use an empty demand table when
+            the default or explicit demand file is absent. This is intended
+            for workflows that construct demand support independently.
         :return: Scenario.
         """
         f = Path(folder)
@@ -251,11 +255,23 @@ class Scenario:
         stops_df = _read_any(f, "stops")
         lines_df = _read_any(f, "lines")
         time_bins_df = _read_any(f, "time_bins")
-        demand_df = (
-            _read_any(f, "demand")
-            if demand_file is None
-            else read_table(Path(demand_file))
-        )
+        if demand_file is None:
+            try:
+                demand_df = _read_any(f, "demand")
+            except FileNotFoundError:
+                if not allow_missing_demand:
+                    raise
+                demand_df = pd.DataFrame(
+                    columns=["origin_stop_id", "dest_stop_id", "time_bin_id", "flow"]
+                )
+        else:
+            demand_path = Path(demand_file)
+            if not demand_path.is_file() and allow_missing_demand:
+                demand_df = pd.DataFrame(
+                    columns=["origin_stop_id", "dest_stop_id", "time_bin_id", "flow"]
+                )
+            else:
+                demand_df = read_table(demand_path)
         trips_df = _read_any(f, "trips", required=False)
         stop_times_df = _read_any(f, "stop_times", required=False)
 

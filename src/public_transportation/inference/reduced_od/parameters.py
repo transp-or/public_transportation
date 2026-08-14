@@ -30,8 +30,18 @@ class MinimalGravityParameterLayout:
         start = 3 if self.dispersion_index is not None else 2
         return slice(start, start + self.specification.production_basis_columns)
 
+    @property
+    def destination_attractiveness_slice(self) -> slice:
+        return slice(
+            self.production_slice.stop,
+            self.production_slice.stop
+            + self.specification.destination_attractiveness_basis_columns,
+        )
+
     def raw_parameter_names(
-        self, production_basis_labels: tuple[str, ...] | None = None
+        self,
+        production_basis_labels: tuple[str, ...] | None = None,
+        destination_attractiveness_basis_labels: tuple[str, ...] | None = None,
     ) -> tuple[str, ...]:
         """Return the canonical raw-coordinate ordering for this layout."""
         names = ["beta_time", "beta_transfer"]
@@ -51,6 +61,22 @@ class MinimalGravityParameterLayout:
             if len(set(production_basis_labels)) != len(production_basis_labels):
                 raise ValueError("production basis labels must be unique.")
             names.extend(production_basis_labels)
+        destination_count = self.specification.destination_attractiveness_basis_columns
+        if destination_attractiveness_basis_labels is None:
+            destination_labels = tuple(
+                f"destination_attractiveness_coefficient_{index}"
+                for index in range(destination_count)
+            )
+        else:
+            if (
+                len(destination_attractiveness_basis_labels) != destination_count
+                or len(set(destination_attractiveness_basis_labels)) != destination_count
+            ):
+                raise ValueError(
+                    "destination-attractiveness basis labels do not match the layout."
+                )
+            destination_labels = tuple(destination_attractiveness_basis_labels)
+        names.extend(destination_labels)
         if len(set(names)) != len(names):
             raise ValueError("raw parameter names must be unique.")
         return tuple(names)
@@ -62,6 +88,7 @@ class MinimalGravityParameters:
     beta_transfer: jax.Array
     dispersion: jax.Array | None
     production_coefficients: jax.Array
+    destination_attractiveness_coefficients: jax.Array
 
 
 def transform_minimal_gravity_parameters(
@@ -84,6 +111,9 @@ def transform_minimal_gravity_parameters(
         beta_transfer=positive[1],
         dispersion=dispersion,
         production_coefficients=raw[layout.production_slice],
+        destination_attractiveness_coefficients=raw[
+            layout.destination_attractiveness_slice
+        ],
     )
 
 

@@ -9,8 +9,21 @@ after_midnight_convention = "seconds_from_service_day"
 [paths]
 scenario_directory = "inputs/scenario"
 measurements = "inputs/measurements_boarding_alighting.csv"
-candidate_demand = "inputs/scenario/prior_demand.csv"
+od_pairs = "inputs/od_pairs.csv"
 results_directory = "results"
+
+[od_universe]
+source = "file"
+level = "stop"
+include_same_stop = false
+active_service_only = true
+connectivity_policy = "directed_reachable"
+
+[prior_demand]
+source = "all_ones"
+value = 1.0
+semantics = "neutral_seed"
+expansion = "one_per_retained_od_time_cell"
 
 [observations]
 measurement_type_column = "measurement_type"
@@ -30,7 +43,6 @@ base_resolution_minutes = 5
 min_bin_minutes = 10
 max_bin_minutes = 60
 max_bins = 24
-num_od_pairs = 2
 max_od_cells = 2
 horizon_start = "08:00:00"
 horizon_end = "09:00:00"

@@ -28,6 +28,7 @@ class MinimalGravityDemand(NamedTuple):
     utilities: jax.Array
     productions: jax.Array
     group_sums: jax.Array
+    destination_attractiveness: jax.Array
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +39,8 @@ class MinimalGravityProblem:
     observations: np.ndarray
     production_basis: np.ndarray | None = None
     production_basis_labels: tuple[str, ...] | None = None
+    destination_attractiveness_basis: np.ndarray | None = None
+    destination_attractiveness_basis_labels: tuple[str, ...] | None = None
     detection_rate: float = 1.0
     calibration_mask: np.ndarray | None = None
 
@@ -90,6 +93,49 @@ class MinimalGravityProblem:
                         "production_basis_labels must be unique and align with columns."
                     )
                 object.__setattr__(self, "production_basis_labels", labels)
+        if specification.destination_attractiveness_mode == "provided":
+            if self.destination_attractiveness_basis is not None:
+                raise ValueError(
+                    "provided destination attractiveness does not accept a basis."
+                )
+            if self.destination_attractiveness_basis_labels is not None:
+                raise ValueError(
+                    "provided destination attractiveness does not accept basis labels."
+                )
+        else:
+            if self.destination_attractiveness_basis is None:
+                raise ValueError(
+                    "estimated destination attractiveness requires a basis."
+                )
+            basis = np.array(
+                self.destination_attractiveness_basis, dtype=np.float64, copy=True
+            )
+            expected = (
+                len(self.features.destination_ids),
+                specification.destination_attractiveness_basis_columns,
+            )
+            if basis.shape != expected or not np.all(np.isfinite(basis)):
+                raise ValueError(
+                    "destination_attractiveness_basis has an invalid shape or values."
+                )
+            basis.setflags(write=False)
+            object.__setattr__(self, "destination_attractiveness_basis", basis)
+            if self.destination_attractiveness_basis_labels is not None:
+                labels = tuple(
+                    str(value) for value in self.destination_attractiveness_basis_labels
+                )
+                if (
+                    len(labels)
+                    != specification.destination_attractiveness_basis_columns
+                    or any(not value for value in labels)
+                    or len(set(labels)) != len(labels)
+                ):
+                    raise ValueError(
+                        "destination-attractiveness basis labels must be unique and align with columns."
+                    )
+                object.__setattr__(
+                    self, "destination_attractiveness_basis_labels", labels
+                )
         if not np.isfinite(self.detection_rate) or self.detection_rate <= 0.0:
             raise ValueError("detection_rate must be finite and positive.")
 
@@ -117,6 +163,17 @@ def generate_minimal_gravity_demand(
     time = jnp.asarray(features.journey_time_seconds, dtype=raw.dtype)
     transfers = jnp.asarray(features.transfer_count, dtype=raw.dtype)
     attraction = jnp.asarray(features.destination_attractiveness, dtype=raw.dtype)
+    if (
+        problem.parameter_layout.specification.destination_attractiveness_mode
+        == "estimated_basis"
+    ):
+        assert problem.destination_attractiveness_basis is not None
+        destination_basis = jnp.asarray(
+            problem.destination_attractiveness_basis, dtype=raw.dtype
+        )
+        destination_coefficients = parameters.destination_attractiveness_coefficients
+        destination_effect = destination_basis @ destination_coefficients
+        attraction = attraction * jnp.exp(destination_effect)
     utilities = (
         jnp.log(attraction)
         - parameters.beta_time
@@ -147,6 +204,7 @@ def generate_minimal_gravity_demand(
         utilities=utilities,
         productions=productions,
         group_sums=group_sums,
+        destination_attractiveness=attraction,
     )
 
 
