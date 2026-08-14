@@ -1,0 +1,55 @@
+{
+  "case": "template_small_multiline",
+  "configuration_files": {
+    "/Users/bierlair/MyFiles/github/public_transportation/docs/source/examples/case_study_template/config/case.toml": "ed89c51aea44ac3ffafb50d445b67b2176775ad9b85724f800be168696f30857",
+    "/Users/bierlair/MyFiles/github/public_transportation/docs/source/examples/case_study_template/config/model.toml": "e0f3a76b1c909830ac5c7e909fe65bf130959c6805dfda27993aaef724daaf61",
+    "/Users/bierlair/MyFiles/github/public_transportation/docs/source/examples/case_study_template/config/reduced_od.toml": "15777f0748128c1d57a72b3067d2494cb67d27952f679d26883bc6383f6bf2c1",
+    "/Users/bierlair/MyFiles/github/public_transportation/docs/source/examples/case_study_template/config/structural_zeros.toml": "3220b55ddc2ab9ebd4787045e785723ca04a4583f4a1c3cef19fb7300a3bbc8a",
+    "/Users/bierlair/MyFiles/github/public_transportation/docs/source/examples/case_study_template/config/time_discretization.toml": "d202f2e97f1b6727a873083870b0ac29c3d206e86d54335ea0a6de4bbfe7c7df"
+  },
+  "configuration_fingerprint": "52993d1712354642d750a5f512f235331511ed96cdaa619e575e36703b23d31c",
+  "input_checksums": {
+    "candidate_demand": "991ebf84c590fd9619f854356aa94b2e685e285768869d0eb67a6211e4b4f612",
+    "configuration/case.toml": "ed89c51aea44ac3ffafb50d445b67b2176775ad9b85724f800be168696f30857",
+    "configuration/model.toml": "e0f3a76b1c909830ac5c7e909fe65bf130959c6805dfda27993aaef724daaf61",
+    "configuration/reduced_od.toml": "15777f0748128c1d57a72b3067d2494cb67d27952f679d26883bc6383f6bf2c1",
+    "configuration/structural_zeros.toml": "3220b55ddc2ab9ebd4787045e785723ca04a4583f4a1c3cef19fb7300a3bbc8a",
+    "configuration/time_discretization.toml": "d202f2e97f1b6727a873083870b0ac29c3d206e86d54335ea0a6de4bbfe7c7df",
+    "measurements": "4acbd56e3bb3df0b57930a5608d5058a0e7c19bc24ed3ef72a65af1a104825a8",
+    "scenario/lines.csv": "b24fa8f7b472f7921789c6f0ddac26703450de8d3f723bad6e48de6759533049",
+    "scenario/metadata.json": "48e3ddbaa5452846ccd223a773a4572f006d9f9bc4d61a4163f913a192a6e1af",
+    "scenario/prior_demand.csv": "991ebf84c590fd9619f854356aa94b2e685e285768869d0eb67a6211e4b4f612",
+    "scenario/stop_times.csv": "1cf557aa740078c8e823427417ccb61d5a28b788c566525d963a7be1c1ecc8e0",
+    "scenario/stops.csv": "e598cb331c1eb5554fab7dd57ce1e57f134df37f79d82b521fcd59c3680c70e7",
+    "scenario/time_bins.csv": "e1f26496e7811bfe5695fcd0c26a15e54e90e079b16ca68a9b2ded40ca5b04bc",
+    "scenario/trips.csv": "1178f4612cb4d454c8331c3a852a46ed77d0dba376bef7932492c4518d3c9ce5"
+  },
+  "package": {
+    "command": [
+      "docs/source/examples/case_study_template/run.py",
+      "check",
+      "--config",
+      "docs/source/examples/case_study_template/config/case.toml",
+      "--case-root",
+      "docs/source/examples/case_study_template",
+      "--json-progress"
+    ],
+    "distribution_version": "0.1.0",
+    "editable_local_package_detected": true,
+    "installed_direct_url": "file:///Users/bierlair/MyFiles/github/public_transportation",
+    "jax_backend": "cpu",
+    "jax_devices": [
+      "cpu:0"
+    ],
+    "jax_version": "0.11.0",
+    "jax_x64": true,
+    "locked_revision": null,
+    "locked_source_type": "editable",
+    "package_file": "/Users/bierlair/MyFiles/github/public_transportation/src/public_transportation/__init__.py",
+    "package_source_contract": "editable-local-lock-entry",
+    "python_version": "3.14.3",
+    "uv_lock": null,
+    "uv_lock_sha256": null,
+    "working_directory": "/Users/bierlair/MyFiles/github/public_transportation"
+  }
+}
