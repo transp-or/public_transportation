@@ -26,8 +26,9 @@ from .estimator import (
     gravity_model_fingerprint,
 )
 from .objective import GravityObjectiveProblem
+from public_transportation.inference.block_coordinate._canonical import fingerprint
 
-GRAVITY_RUN_MANIFEST_SCHEMA_VERSION = 1
+GRAVITY_RUN_MANIFEST_SCHEMA_VERSION = 2
 GRAVITY_PROGRESS_SCHEMA_VERSION = 1
 
 
@@ -86,6 +87,9 @@ def build_gravity_run_manifest(
     execution: GravityExecutionPolicy,
     repository_revision: str,
     preflight: object | None = None,
+    holdout_mask: object | None = None,
+    unsupported_measurement_mask: object | None = None,
+    structural_zero_fingerprint: str | None = None,
     extra: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Build a serializable immutable-identity and execution record."""
@@ -96,18 +100,87 @@ def build_gravity_run_manifest(
         "OMP_NUM_THREADS",
         "XLA_FLAGS",
     )
+    calibration = problem.calibration_mask
+    assert calibration is not None
+    holdout = (
+        None if holdout_mask is None else jax.numpy.asarray(holdout_mask, dtype=bool)
+    )
+    unsupported = (
+        None
+        if unsupported_measurement_mask is None
+        else jax.numpy.asarray(unsupported_measurement_mask, dtype=bool)
+    )
+    for name, mask in (("holdout", holdout), ("unsupported", unsupported)):
+        if mask is not None and mask.shape != calibration.shape:
+            raise ValueError(f"{name}_measurement_mask must match observations.")
+    if unsupported is not None and bool(jax.numpy.any(unsupported & calibration)):
+        raise ValueError("unsupported measurement rows must be excluded from calibration.")
+    artifact_fingerprint = getattr(operator, "artifact_fingerprint", None) or fingerprint(
+        {
+            "schema_version": 1,
+            "assignment": operator.assignment_fingerprint,
+            "graph": operator.graph_fingerprint,
+            "mapping": operator.mapping_fingerprint,
+            "layout": operator.compact_layout_fingerprint,
+            "theta": operator.theta,
+            "representation": operator.representation,
+            "dtype": str(operator.dtype),
+        }
+    )
+    specification = problem.parameter_layout.specification
     return {
         "schema_version": GRAVITY_RUN_MANIFEST_SCHEMA_VERSION,
         "created_at_utc": _utc_now(),
         "repository_revision": str(repository_revision),
         "package_version": __version__,
         "model_fingerprint": gravity_model_fingerprint(problem, compact_layout),
+        "model_specification": specification.to_dict(),
+        "specification_fingerprint": specification.fingerprint,
+        "parameter_layout": problem.parameter_layout.to_dict(),
+        "parameter_names": list(problem.parameter_layout.names),
+        "parameter_blocks": [
+            block.to_dict() for block in problem.parameter_layout.blocks
+        ],
         "fingerprints": {
             "compact_layout": compact_layout.fingerprint,
             "assignment": operator.assignment_fingerprint,
             "graph": operator.graph_fingerprint,
             "mapping": operator.mapping_fingerprint,
+            "features": problem.features.fingerprint,
+            "direct_operator_artifact": artifact_fingerprint,
+            "structural_zeros": structural_zero_fingerprint,
         },
+        "observation_masks": {
+            "calibration": {
+                "policy": specification.likelihood.calibration_mask,
+                "included": int(calibration.sum()),
+                "excluded": int(calibration.size - calibration.sum()),
+                "total": int(calibration.size),
+            },
+            "holdout": {
+                "included": None if holdout is None else int(holdout.sum()),
+                "total": None if holdout is None else int(holdout.size),
+            },
+            "unsupported": {
+                "excluded": None
+                if unsupported is None
+                else int(unsupported.sum()),
+                "total": None if unsupported is None else int(unsupported.size),
+            },
+        },
+        "regularization": [
+            {
+                "component": block.component,
+                "type": block.regularization_type.value,
+                "strength": block.regularization_strength,
+            }
+            for block in problem.parameter_layout.blocks
+            if block.regularization_strength > 0
+        ],
+        "time_discretization": asdict(specification.time),
+        "destination_attractiveness_provenance": specification.component(
+            "destination_attractiveness"
+        ).source,
         "operator": {
             "representation": operator.representation,
             "num_free_od": operator.num_free_od,

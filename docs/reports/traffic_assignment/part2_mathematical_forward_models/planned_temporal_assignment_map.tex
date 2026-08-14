@@ -13,7 +13,9 @@ time-expanded assignment.
 The following labels are used throughout this section.
 \begin{description}
 \item[\textbf{IMPLEMENTED}] The public library contains a concrete, tested
-  implementation of the stated behavior.
+  implementation of the stated behavior for the current canonical
+  direct-scheduled workflow.  Broader generalization is stated explicitly
+  where it remains incomplete.
 \item[\textbf{PARTIALLY IMPLEMENTED}] Relevant tested foundations exist, but
   the complete contract or end-to-end workflow specified here does not.
 \item[\textbf{EXPERIMENTAL}] A callable prototype exists, but its interface or
@@ -50,11 +52,13 @@ for varying $\theta$.  This separation makes the expensive supply-dependent
 calculation reusable across model specifications.
 
 \paragraph{Implementation status.}
-\textbf{PARTIALLY IMPLEMENTED.}  The public library already composes gravity
-demand generation, measurement operators, likelihoods, and optimizers in this
-form.  Several operator representations are interchangeable within existing
-workflows.  A single public artifact implementing the complete temporal design
-specified below does not yet exist.
+\textbf{IMPLEMENTED for the current direct-scheduled full-network workflow.}
+The public library composes gravity demand generation, measurement operators,
+likelihoods, and optimizers in this form.  The content-addressed full-network
+temporal assignment artifact has been constructed, persisted, loaded in a
+fresh process, and benchmarked through the same forward/adjoint contract.
+Generalization to every possible demand, observation, and assignment backend
+remains a separate roadmap.
 
 \subsection{Strict assignment-map contract}
 \label{sec:strict-assignment-map-contract}
@@ -85,14 +89,15 @@ constraints must invalidate the artifact.  Measurement-definition changes
 must likewise invalidate the corresponding measurement map.
 
 \paragraph{Implementation status.}
-\textbf{PARTIALLY IMPLEMENTED.}  Tested linear-operator and gravity-measurement
-protocols expose forward and adjoint products, shapes, fingerprints, and
-operational capabilities.  A canonical artifact identity now separates
-physical indexing, supply, timetable, temporal, choice, feasibility,
-measurement, coefficient-policy, numerical, and schema dependencies, with
-explicit mismatch diagnostics.  Existing fixed-routing operators validate
-against this identity through an adapter.  The complete dependency boundary
-is not yet embodied by one persisted scheduled assignment artifact.
+\textbf{IMPLEMENTED for the direct-scheduled artifact path.}  Tested
+linear-operator and gravity-measurement protocols expose forward and adjoint
+products, shapes, fingerprints, and operational capabilities.  The persisted
+artifact identity separates physical indexing, supply, timetable, temporal,
+choice, feasibility, measurement, coefficient-policy, numerical, and schema
+dependencies, with explicit mismatch diagnostics.  Existing fixed-routing
+operators validate against this identity through an adapter.  The broader
+dependency boundary is not yet shared by every assignment backend and demand
+model.
 
 \subsection{Assignment-backend abstraction}
 
@@ -146,14 +151,14 @@ must cover dimensions, schemas, and fingerprints and must fail explicitly,
 rather than silently reordering, truncating, or accepting incompatible inputs.
 
 \paragraph{Implementation status.}
-\textbf{PARTIALLY IMPLEMENTED.}  Existing reduced-OD and fixed-routing paths
-use immutable layouts, explicit dimensions, fingerprints, schemas, and
-fail-closed cache validation.  Immutable canonical interval, physical OD-time,
-and boarding/alighting measurement tables are now implemented, including
-separate physical-artifact and free/fixed-binding fingerprints.  Their builder
-adapts the existing OD parameter layout and validates fixed-routing bindings.
-These tables are not yet populated and consumed by every assignment backend
-and every demand-model workflow.
+\textbf{IMPLEMENTED for the direct-scheduled artifact path.}  Existing
+reduced-OD and fixed-routing paths use immutable layouts, explicit dimensions,
+fingerprints, schemas, and fail-closed cache validation.  Immutable canonical
+interval, physical OD-time, and boarding/alighting measurement tables are now
+populated by the direct-scheduled builder and persisted in the artifact
+manifest, including separate physical-artifact and free/fixed-binding
+fingerprints.  They are not yet populated and consumed by every assignment
+backend and every demand-model workflow.
 
 \subsection{Non-uniform temporal discretization}
 
@@ -224,7 +229,8 @@ fixed-routing paths provide tested forward products; the relevant estimation
 operators also provide adjoint products and bounded operational controls.
 
 \paragraph{Implementation status: complete temporal-block conversion.}
-\textbf{PARTIALLY IMPLEMENTED.}  The library can derive an exact, independently
+\textbf{IMPLEMENTED for the current canonical direct-scheduled path.}  The
+library can derive an exact, independently
 addressable sparse family $\{A_{t,s}\}$ column by column from the authoritative
 scheduled reference operator, with progress, ETA, deadline handling, duplicate
 consolidation, and coefficient-mass diagnostics.  A faster constructor batches
@@ -260,7 +266,7 @@ $Ax$; compressed sparse column (CSC), or equivalently a persisted transposed
 CSR representation, avoids repeated conversion for $A^{\mathsf T}r$.
 
 \paragraph{Implementation status.}
-\textbf{PARTIALLY IMPLEMENTED.}  Exact in-memory temporal blocks now merge duplicates,
+\textbf{IMPLEMENTED for the persisted temporal-block path.}  Exact in-memory temporal blocks now merge duplicates,
 remove zeros, retain coefficient-mass diagnostics, and provide JAX-compatible
 forward and adjoint products.  A versioned manifest persists blocks
 independently and validates their content hashes before reuse.  A CPU backend
@@ -356,35 +362,38 @@ The conceptual persisted layout is:
 \begin{verbatim}
 assignment_map/
 |-- manifest.json
-|-- od_time_cells.*
-|-- measurements.*
-|-- time_intervals.json
-|-- blocks/
-|-- diagnostics/
-`-- benchmarks/
+|-- fixed_measurement_offset.npy
+`-- blocks/
+    `-- block-*.npz
 \end{verbatim}
-The manifest should record a schema version, canonical-index fingerprints,
-network and timetable fingerprints, temporal discretization, choice-parameter
-fingerprints, feasibility constraints, coefficient precision and threshold,
-dimensions, total nonzeros, block dimensions, and construction diagnostics.
-It must not contain a gravity specification, prior, likelihood, or optimizer
-configuration.  Payloads should be published atomically and validated before
-reuse.  Incompatible or incomplete artifacts must fail closed.
+The current artifact embeds the canonical OD-time, measurement, and temporal
+interval tables in the manifest under \texttt{canonical\_index}.  The manifest also
+records a schema version, canonical-index fingerprints, network and timetable
+fingerprints, temporal discretization, choice-parameter fingerprints,
+feasibility constraints, coefficient precision and threshold, dimensions,
+total nonzeros, block dimensions, content hashes, and construction
+diagnostics.  It does not contain a gravity specification, prior, likelihood,
+or optimizer configuration.  Run-level progress, checkpoint, and benchmark
+records are maintained alongside the artifact rather than as required payload
+subdirectories.  Payloads are published atomically and validated before reuse;
+incompatible or incomplete artifacts fail closed.
 
 \paragraph{Implementation status.}
-\textbf{PARTIALLY IMPLEMENTED.}  The library now has a content-addressed,
+\textbf{IMPLEMENTED for the current direct-scheduled artifact.}  The library
+has a content-addressed,
 versioned temporal-block artifact with an atomic publication step, canonical
 tables, complete identity metadata, per-block content hashes, fixed-offset
 validation, and fail-closed fresh-process loading.  Its direct construction
 workspace contains deterministic validated shards and a checkpointed manifest;
 completed shards survive interruption and invalid shards are rebuilt
-selectively before atomic final publication.  The fuller directory above,
-including separate diagnostic and benchmark products inside the final artifact,
-remains to be implemented.
+selectively before atomic final publication.  The full-network artifact was
+loaded in a fresh process and used for a measured forward product; diagnostic,
+progress, and benchmark records remain run-level products rather than required
+contents of the immutable assignment artifact.
 
-Production activation is policy controlled.  Explicit 	exttt{off} leaves the
-existing loader unchanged, while explicit 	exttt{direct} constructs or resumes
-the block artifact.  In 	exttt{auto} mode, a valid persistent artifact is
+Production activation is policy controlled.  Explicit \texttt{off} leaves the
+existing loader unchanged, while explicit \texttt{direct} constructs or resumes
+the block artifact.  In \texttt{auto} mode, a valid persistent artifact is
 reused before preparing routing; otherwise construction occurs only when the
 expected evaluation savings strictly exceed its estimated construction cost.
 Invalid final artifacts are rejected, moved to a uniquely named quarantine
@@ -489,7 +498,7 @@ avoid materialization, but production numerical construction cannot.
 Numerical-shard preflight diagnostics likewise retain actual and permitted
 values for shard count, manifest size, filesystem work, sparse products,
 construction dispatches, and worker memory.  Unsafe plans raise a structured
-subclass of 	exttt{MemoryError}.  Shard-sizing controls remain provenance
+subclass of \texttt{MemoryError}.  Shard-sizing controls remain provenance
 because they alter persisted identities; purely operational ceilings are stored
 in the plan and re-evaluated at reuse time, so an evidence-based ceiling change
 does not discard compatible support checkpoints.
@@ -520,21 +529,21 @@ Fixed-routing linear operations & IMPLEMENTED & -- \\
 \hline
 Stable assignment-operator abstraction & IMPLEMENTED & -- \\
 \hline
-Canonical physical OD-time index & PARTIALLY IMPLEMENTED & 1 \\
+Canonical physical OD-time index & IMPLEMENTED & -- \\
 \hline
 Data-driven non-uniform partition selection & UNIMPLEMENTED & 1 \\
 \hline
 Block-support complexity profiler & PARTIALLY IMPLEMENTED & 1 \\
 \hline
-Scheduled $A_{t,s}$ construction & PARTIALLY IMPLEMENTED & 2 \\
+Scheduled $A_{t,s}$ construction & IMPLEMENTED & -- \\
 \hline
-Sparse temporal-block persistence & PARTIALLY IMPLEMENTED & 2 \\
+Sparse temporal-block persistence & IMPLEMENTED & -- \\
 \hline
 Optimized temporal CSR/CSC forward and adjoint & IMPLEMENTED & -- \\
 \hline
 Independent demand-model contract & PARTIALLY IMPLEMENTED & 2 \\
 \hline
-Interchangeable gravity specifications & PARTIALLY IMPLEMENTED & 3 \\
+Interchangeable gravity specifications & IMPLEMENTED & -- \\
 \hline
 Independent observation models & PARTIALLY IMPLEMENTED & 3 \\
 \hline
@@ -544,12 +553,13 @@ Assignment-backend substitution test & UNIMPLEMENTED & 4 \\
 \end{table}
 
 \paragraph{Implementation status.}
-\textbf{PARTIALLY IMPLEMENTED.}  The foundations identified in the table are
-available, but the remaining priorities are still a roadmap.  The temporal
-CSR/CSC backend is now implemented and tested for forward, adjoint, JIT, and
-automatic-differentiation use.  The scheduled constructor remains experimental
-until contributions are emitted directly by alternative preprocessing rather
-than by batched unit-response evaluation.
+\textbf{IMPLEMENTED for the current canonical direct-scheduled workflow.}  The
+full-network path now includes the canonical index, fixed scheduled routing,
+temporal sparse-block construction, content-addressed persistence, atomic
+resumption, and the tested CSR/CSC forward and adjoint backend.  The remaining
+priorities are generalizations: data-driven partition selection, broader
+demand and observation protocols, backend substitution, direct alternative-level
+construction, and a more general joint departure-time-choice layer.
 
 \subsection{Architectural invariants}
 
@@ -587,9 +597,9 @@ work remains an identified indivisible unit and is not assigned a fictitious
 completion estimate.
 
 \paragraph{Implementation status.}
-\textbf{PARTIALLY IMPLEMENTED.}  Current public workflows already embody
-forward/adjoint products, separation from several demand and likelihood
-choices, progress reporting, and resumable long-running preprocessing.  The
-invariants become collectively enforceable only after the canonical contract,
-index tables, and complete scheduled temporal artifact are implemented and
-tested together.
+\textbf{IMPLEMENTED for the current direct-scheduled full-network workflow.}
+The current artifact path collectively enforces the canonical contract, index
+tables, forward/adjoint products, demand-model separation, progress reporting,
+resumability, and fail-closed artifact reuse.  Approximation-specific
+affected-count-mass reporting and substitution across independent assignment
+backends, demand protocols, and observation protocols remain future work.

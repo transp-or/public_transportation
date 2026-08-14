@@ -161,7 +161,9 @@ def run_validation(
         spec=mapped.spec,
         compact_layout=compact,
         canonical_index=canonical,
+        observations=np.asarray(mapped.y_obs),
         identity=identity,
+        measurement_info=mapped.info,
         assignment_fingerprint=str(id_manager.fingerprint),
         od_layout_fingerprint=layout.fingerprint,
         config=ShardedConstructionConfig(
@@ -188,7 +190,8 @@ def run_validation(
             "termination": termination_payload(activated.termination),
             "progress_event_count": len(progress_events),
             "construction_progress_event_count": sum(
-                event.get("phase") != "cache_validation"
+                event.get("phase")
+                not in {"cache_validation", "measurement_support_preflight"}
                 for event in progress_events
             ),
         }
@@ -239,7 +242,9 @@ def run_validation(
         ),
         "progress_event_count": len(progress_events),
         "construction_progress_event_count": sum(
-            event.get("phase") != "cache_validation" for event in progress_events
+            event.get("phase")
+            not in {"cache_validation", "measurement_support_preflight"}
+            for event in progress_events
         ),
         "objective_absolute_difference": float(
             np.abs(temporal_value.objective - reference_value.objective)

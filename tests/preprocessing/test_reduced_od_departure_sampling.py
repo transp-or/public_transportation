@@ -27,6 +27,7 @@ from public_transportation.preprocessing.reduced_od import (
     generate_uniform_midpoint_samples,
     merge_sampled_journey_choices,
     preflight_departure_sampling,
+    preflight_reduced_od_time_periods,
     recommend_departure_sampling_actions,
     canonicalize_probability_mass,
 )
@@ -131,6 +132,44 @@ def test_uniform_midpoints_are_exact_and_supply_independent() -> None:
     assert preflight.estimated_temporary_bytes == 1024
 
 
+def test_time_period_preflight_reports_unequal_durations_and_coverage() -> None:
+    periods = (
+        JourneyTimePeriod("short", 0, 300),
+        JourneyTimePeriod("long", 300, 1200),
+    )
+    report = preflight_reduced_od_time_periods(
+        periods,
+        relevant_event_seconds=(150, 900),
+        sampling_config=DepartureTimeSamplingConfig(
+            strategy="fixed_count", samples_per_period={"short": 3, "long": 9}
+        ),
+    )
+    assert report.valid
+    assert dict(report.durations_seconds) == {"short": 300, "long": 900}
+    assert report.covered_event_count == 2
+    assert report.sampling_resolution_seconds == {"short": 100.0, "long": 100.0}
+
+
+def test_time_period_preflight_blocks_overlap_gap_event_and_missing_resolution() -> None:
+    periods = (
+        JourneyTimePeriod("first", 0, 600),
+        JourneyTimePeriod("second", 500, 1200),
+        JourneyTimePeriod("third", 1500, 1800),
+    )
+    report = preflight_reduced_od_time_periods(
+        periods,
+        relevant_event_seconds=(1400,),
+        sampling_config=DepartureTimeSamplingConfig(
+            strategy="fixed_count", samples_per_period={"first": 2, "second": 2}
+        ),
+    )
+    assert not report.valid
+    assert {issue.code for issue in report.issues} >= {
+        "overlapping_periods",
+        "period_gap",
+        "event_outside_periods",
+        "sampling_configuration_missing",
+    }
 def test_sparse_origin_period_support_avoids_cartesian_queries() -> None:
     periods = (
         JourneyTimePeriod("AM", 0, 10),

@@ -29,7 +29,7 @@ from .objective import (
 )
 
 GRAVITY_CHECKPOINT_SCHEMA_VERSION = 1
-GRAVITY_RESULT_SCHEMA_VERSION = 1
+GRAVITY_RESULT_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +117,17 @@ class GravityEstimationResult:
     resumed: bool
     checkpoint_path: Path | None
     deadline_phase: str | None = None
+    specification_fingerprint: str = ""
+    model_specification: dict[str, object] | None = None
+    parameter_names: tuple[str, ...] = ()
+    parameter_blocks: tuple[dict[str, object], ...] = ()
+    feature_cache_fingerprint: str = ""
+    direct_operator_artifact_fingerprint: str = ""
+    regularization_contribution: float = 0.0
+    calibration_measurements: int = 0
+    excluded_measurements: int = 0
+    time_discretization: dict[str, object] | None = None
+    destination_attractiveness_provenance: str | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != GRAVITY_RESULT_SCHEMA_VERSION:
@@ -133,6 +144,8 @@ class GravityEstimationResult:
             value = np.array(getattr(self, name), copy=True)
             value.setflags(write=False)
             object.__setattr__(self, name, value)
+        if self.parameter_names and len(self.parameter_names) != self.raw_parameters.size:
+            raise ValueError("gravity result parameter names do not match the estimates.")
 
 
 def gravity_model_fingerprint(
@@ -544,6 +557,20 @@ def estimate_gravity_model(
     full[np.asarray(compact_layout.active_full_indices, dtype=np.int64)] = active
     physical = np.asarray(problem.parameter_layout.physical_vector(latest_raw))
     elapsed = resumed_elapsed + clock() - started
+    artifact_fingerprint = getattr(problem.operator, "artifact_fingerprint", None)
+    if artifact_fingerprint is None:
+        artifact_fingerprint = fingerprint(
+            {
+                "schema_version": 1,
+                "assignment": problem.operator.assignment_fingerprint,
+                "graph": problem.operator.graph_fingerprint,
+                "mapping": problem.operator.mapping_fingerprint,
+                "layout": problem.operator.compact_layout_fingerprint,
+                "theta": problem.operator.theta,
+                "representation": problem.operator.representation,
+                "dtype": str(problem.operator.dtype),
+            }
+        )
     return GravityEstimationResult(
         GRAVITY_RESULT_SCHEMA_VERSION,
         status,
@@ -565,4 +592,24 @@ def estimate_gravity_model(
         resumed,
         checkpoint,
         deadline_phase,
+        problem.parameter_layout.specification.fingerprint,
+        problem.parameter_layout.specification.to_dict(),
+        problem.parameter_layout.names,
+        tuple(block.to_dict() for block in problem.parameter_layout.blocks),
+        problem.features.fingerprint,
+        str(artifact_fingerprint),
+        float(latest_evaluation.regularization),
+        int(latest_evaluation.calibration_measurements),
+        int(latest_evaluation.excluded_measurements),
+        {
+            "units": problem.parameter_layout.specification.time.units,
+            "interpretation": problem.parameter_layout.specification.time.interpretation,
+            "bin_labels": list(
+                problem.parameter_layout.specification.time.bin_labels
+            ),
+            "smooth_basis_name": problem.parameter_layout.specification.time.smooth_basis_name,
+        },
+        problem.parameter_layout.specification.component(
+            "destination_attractiveness"
+        ).source,
     )

@@ -52,6 +52,88 @@ Structural-zero and frozen cells do not receive free gravity-response rows.
 The count mean is obtained by applying the response operator to $\bm x$ and
 adding the frozen offset.
 
+\subsection{Declarative Gravity Specifications}
+
+The implementation no longer assumes that the first three parameters exhaust
+the model. A versioned \texttt{GravityModelSpecification} declares the scope,
+parameterization, normalization, feature mapping, and regularization of every
+component. The conservative template is
+\path{configs/gravity/gravity_model_spec.yaml}. It can be loaded and validated
+without editing estimation code; unknown fields and unsupported combinations
+are errors rather than ignored options.
+
+The supported categorical scopes are global, origin, destination, time period,
+origin--time, destination--time, origin zone, destination zone, zone pair, and
+a named custom group. The scopes \texttt{none} and \texttt{fixed} introduce no
+estimated parameter. A smooth temporal basis is also supported when its
+cell-by-basis matrix is present in the feature cache and is named in the time
+specification. These scopes can be applied, subject to component-specific
+validation, to production corrections, destination-attractiveness corrections,
+journey-time, transfer, and waiting-time coefficients, and departure-time
+effects. Negative-binomial dispersion is global or fixed. Estimated residual
+demand is deliberately rejected because no supported observation model yet
+identifies it separately.
+
+For a general declared model, cell utility and production are
+\[
+\begin{aligned}
+ V_c & = \log a_c + \alpha_c + \tau_c
+       -\beta_{T,c}T_c/T_{\mathrm{scale}}
+       -\beta_{K,c}K_c-\beta_{W,c}W_c,\\
+ q_g & =q_g^{(0)}\exp(\delta_g),
+ & x_c & =q_{g(c)}p_c.
+\end{aligned}
+\]
+Positive behavioral coefficients use a softplus transformation with a small
+strictly positive floor. Production corrections are log multipliers;
+attractiveness and temporal corrections are additive utilities. Categorical
+deviations use either an explicit reference category or an exact sum-to-zero
+expansion. A grouped positive coefficient consists of one positive base and
+normalized log deviations. Origin--time and custom production corrections
+must carry ridge regularization because their dimension can otherwise approach
+the number of production groups.
+
+The parameter layout is derived deterministically from the specification. It
+records one named slice per block, raw-to-physical and physical-to-raw
+transformations, constraints, regularization, and a stable fingerprint.
+Legacy names \texttt{beta\_time}, \texttt{beta\_transfer},
+\texttt{dispersion}, and \texttt{production\_scale} are retained, so the
+original three-parameter model and the optional global production scale remain
+backward compatible. Nested specifications are warm-started by matching these
+stable parameter names; new normalized deviations start at zero and reproduce
+the parent prediction exactly.
+
+\subsection{Feature and Identifiability Contracts}
+
+\texttt{GravityFeatures} is an immutable sparse cell table, not a dense
+origin--destination--time tensor. In addition to the canonical origin,
+destination, departure-time, and origin--time indices, it may contain time
+period, origin-zone, destination-zone, destination--time, zone-pair, named
+custom-group, waiting-time, and smooth-time-basis arrays. Required mappings
+are inferred from the specification and checked before estimation for length,
+integer type, contiguous labels, declared group count, and constancy within a
+production group where required. All optional mappings participate in the
+feature-cache fingerprint.
+
+Invalid specifications are rejected, including a global production scale with
+an estimated detection-rate scale, an unnormalized categorical effect, and an
+unregularized high-dimensional production correction. Technically valid but
+weakly identified choices produce visible warnings. Examples are a global
+additive attractiveness correction, which cancels in each conditional softmax,
+and simultaneous grouped production and attraction corrections, which may be
+strongly correlated even after normalization. Model selection must therefore
+use grouped holdout performance, gradient and curvature diagnostics,
+regularization sensitivity, and count-mass audits rather than calibration
+likelihood alone.
+
+The generalized generator preserves structural zeros exactly and applies only
+sparse per-cell vectors and grouped segment reductions. Its JAX implementation
+and independent NumPy reference agree at the established floating-point
+tolerances. The same demand function is exercised through negative-binomial
+objectives, calibration masks, fixed-positive measurement offsets, batched
+forward gradients, and matrix-free adjoint gradients. Unsupported measurement
+rows must be excluded by an explicit calibration mask.
+
 \subsection{Information Content and Measurement Design}
 
 The gravity model can diagnose weak information about its own parameters.

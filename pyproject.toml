@@ -19,6 +19,7 @@ dependencies = [
     "matplotlib",
     "scipy",
     "threadpoolctl",
+    "pyyaml",
 ]
 
 

@@ -231,3 +231,32 @@ def test_parameter_layout_sign_transform_and_round_trip():
         layout.fingerprint
         == GravityParameterLayout(GravityModelSpecification()).fingerprint
     )
+
+
+def test_global_production_correction_scales_demand():
+    specification = replace(
+        GravityModelSpecification(),
+        estimate_global_production_correction=True,
+    )
+    layout = GravityParameterLayout(specification)
+    assert layout.names == (
+        "beta_time",
+        "beta_transfer",
+        "dispersion",
+        "production_scale",
+    )
+    physical = np.asarray((0.25, 1.5, 20.0, 2.0))
+    raw = layout.raw_from_physical(physical)
+    np.testing.assert_allclose(layout.physical_vector(raw), physical, rtol=1e-6, atol=1e-6)
+
+    item = features()
+    baseline_layout = GravityParameterLayout(GravityModelSpecification())
+    baseline_raw = baseline_layout.raw_from_physical(physical[:3])
+    baseline = generate_gravity_demand(
+        baseline_raw,
+        features=item,
+        parameter_layout=baseline_layout,
+    )
+    corrected = generate_gravity_demand(raw, features=item, parameter_layout=layout)
+    np.testing.assert_allclose(np.asarray(corrected.demand), 2.0 * np.asarray(baseline.demand))
+    np.testing.assert_allclose(np.asarray(corrected.origin_time_sums), 2.0 * item.origin_time_totals)

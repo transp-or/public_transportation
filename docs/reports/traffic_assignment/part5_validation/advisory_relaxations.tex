@@ -23,3 +23,18 @@ improves calibration fit but produces unstable parameters, worsens held-out
 performance, or merely absorbs a data defect should not be adopted. Automated
 scores can rank candidates for review; they cannot replace the scientific
 decision.
+
+Relaxations can now be expressed as complete serialized specifications rather
+than Python edits. In addition to the three original atomic helpers, the
+declarative interface supports origin, destination, time-period, origin--time,
+destination--time, zone-pair, and custom-group effects, plus an optional smooth
+time basis. The validation summary lists the generated parameter blocks,
+required feature mappings, calibration and excluded rows, regularization,
+feature-cache and structural-zero fingerprints, and all identifiability
+warnings before optimization begins.
+
+Completed model results record parameter count, convergence state, gradient
+norm, regularization contribution, supported count mass, and, when supplied,
+held-out likelihood and predictive error. Comparison utilities refuse to rank
+models that lack held-out metrics; ranking is based on held-out evidence,
+predictive error, and then parsimony, never on in-sample objective alone.

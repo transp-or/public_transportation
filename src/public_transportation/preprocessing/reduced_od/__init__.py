@@ -58,6 +58,11 @@ from .departure_sampling import (
     validate_sample_weights,
     canonicalize_probability_mass,
 )
+from .period_preflight import (
+    ReducedODTimePeriodPreflight,
+    TimePeriodPreflightIssue,
+    preflight_reduced_od_time_periods,
+)
 from .adaptive_departure_quadrature import (
     QUADRATURE_SCHEMA_VERSION,
     DepartureQuadratureDiagnostics,
@@ -149,6 +154,8 @@ __all__ = [
     "DepartureSamplingPreflight",
     "DepartureSamplingRecommendation",
     "DepartureTimeSamplingConfig",
+    "ReducedODTimePeriodPreflight",
+    "TimePeriodPreflightIssue",
     "ProbabilityMassCanonicalization",
     "DepartureQuadratureDiagnostics",
     "DepartureQuadratureResult",
@@ -232,6 +239,7 @@ __all__ = [
     "integrate_adaptive_departure_responses",
     "merge_sampled_journey_choices",
     "preflight_departure_sampling",
+    "preflight_reduced_od_time_periods",
     "recommend_departure_sampling_actions",
     "run_raptor_query",
     "run_raptor_range_query",

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import shutil
 import tempfile
@@ -75,6 +74,21 @@ def main() -> None:
         "link_flow_correlation": float(np.corrcoef(true_link_flow, estimated_link_flow)[0, 1]),
     }
     RESULTS.mkdir(parents=True, exist_ok=True)
+    keys = [
+        (record.origin_stop_id, record.dest_stop_id, record.time_bin_id)
+        for record in scenario.demand.records
+    ]
+    summary["od_comparison"] = [
+        {
+            "origin_stop_id": keys[index][0],
+            "dest_stop_id": keys[index][1],
+            "time_bin_id": keys[index][2],
+            "true_flow": float(f_true[index]),
+            "estimated_flow": float(f_hat[index]),
+            "error": float(od_error[index]),
+        }
+        for index in active
+    ]
     (RESULTS / f"{args.method}_comparison.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -85,15 +99,6 @@ def main() -> None:
         true_link_flow=true_link_flow,
     )
 
-    keys = [
-        (record.origin_stop_id, record.dest_stop_id, record.time_bin_id)
-        for record in scenario.demand.records
-    ]
-    with (RESULTS / f"{args.method}_od_comparison.csv").open("w", encoding="utf-8", newline="") as stream:
-        writer = csv.writer(stream, lineterminator="\n")
-        writer.writerow(("origin_stop_id", "dest_stop_id", "time_bin_id", "true_flow", "estimated_flow", "error"))
-        for index in active:
-            writer.writerow((*keys[index], f_true[index], f_hat[index], od_error[index]))
     print(json.dumps(summary, indent=2, sort_keys=True))
 
 

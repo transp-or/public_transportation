@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, cast
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Any, Mapping, cast
 
 import numpy as np
 
@@ -17,6 +18,14 @@ def _immutable_vector(value: object, *, name: str, dtype: np.dtype) -> np.ndarra
     array = np.array(value, dtype=dtype, copy=True)
     if array.ndim != 1:
         raise ValueError(f"{name} must be one-dimensional, got {array.shape}.")
+    array.setflags(write=False)
+    return array
+
+
+def _immutable_matrix(value: object, *, name: str, dtype: np.dtype) -> np.ndarray:
+    array = np.array(value, dtype=dtype, copy=True)
+    if array.ndim != 2:
+        raise ValueError(f"{name} must be two-dimensional, got {array.shape}.")
     array.setflags(write=False)
     return array
 
@@ -44,6 +53,10 @@ class GravityFeatures:
     origin_zone_index: np.ndarray | None = None
     destination_zone_index: np.ndarray | None = None
     time_period_index: np.ndarray | None = None
+    destination_time_group_index: np.ndarray | None = None
+    zone_pair_index: np.ndarray | None = None
+    custom_group_indices: Mapping[str, np.ndarray] = field(default_factory=dict)
+    smooth_time_basis: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         integer_fields = (
@@ -104,6 +117,8 @@ class GravityFeatures:
             "origin_zone_index",
             "destination_zone_index",
             "time_period_index",
+            "destination_time_group_index",
+            "zone_pair_index",
         ):
             value = getattr(self, name)
             if value is None:
@@ -128,6 +143,35 @@ class GravityFeatures:
             if prepared.size != cell_count:
                 raise ValueError(f"{name} must contain {cell_count} cells.")
             object.__setattr__(self, name, prepared)
+        custom: dict[str, np.ndarray] = {}
+        for name, value in self.custom_group_indices.items():
+            if not name or name in self.available_mapping_names:
+                raise ValueError(
+                    f"custom group name {name!r} is empty or collides with a built-in mapping."
+                )
+            source = np.asarray(value)
+            if source.dtype.kind not in "iu":
+                raise TypeError(f"custom group {name!r} must contain integers.")
+            prepared = _immutable_vector(
+                source, name=f"custom_group_indices[{name!r}]", dtype=np.dtype(np.int64)
+            )
+            if prepared.size != cell_count or np.any(prepared < 0):
+                raise ValueError(
+                    f"custom group {name!r} must contain {cell_count} non-negative cells."
+                )
+            custom[name] = prepared
+        object.__setattr__(self, "custom_group_indices", MappingProxyType(custom))
+        if self.smooth_time_basis is not None:
+            basis = _immutable_matrix(
+                self.smooth_time_basis, name="smooth_time_basis", dtype=dtype
+            )
+            if basis.shape[0] != cell_count or basis.shape[1] == 0:
+                raise ValueError(
+                    "smooth_time_basis must contain one row per cell and at least one column."
+                )
+            if not np.all(np.isfinite(basis)):
+                raise ValueError("smooth_time_basis must be finite.")
+            object.__setattr__(self, "smooth_time_basis", basis)
         for name in ("num_origins", "num_destinations", "num_departure_times"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive.")
@@ -222,9 +266,73 @@ class GravityFeatures:
         return self.journey_time.dtype
 
     @property
+    def available_mapping_names(self) -> tuple[str, ...]:
+        return (
+            "origin_index",
+            "destination_index",
+            "departure_time_index",
+            "time_period_index",
+            "origin_time_group_index",
+            "origin_zone_index",
+            "destination_zone_index",
+            "destination_time_group_index",
+            "zone_pair_index",
+            "smooth_time_basis",
+        )
+
+    def mapping(self, name: str) -> np.ndarray | None:
+        """Return a built-in or named custom cell mapping."""
+        if name in self.available_mapping_names:
+            return getattr(self, name)
+        return self.custom_group_indices.get(name)
+
+    def validate_mapping(
+        self,
+        name: str,
+        *,
+        group_count: int,
+        constant_within_origin_time: bool = False,
+        smooth_basis: bool = False,
+    ) -> np.ndarray:
+        """Validate one mapping exactly as declared by a model component."""
+        values = self.mapping(name)
+        if values is None:
+            raise ValueError(f"feature mapping {name!r} is required by the model.")
+        array = np.asarray(values)
+        if smooth_basis:
+            if array.ndim != 2 or array.shape != (self.num_cells, group_count):
+                raise ValueError(
+                    f"smooth basis {name!r} must have shape "
+                    f"({self.num_cells}, {group_count})."
+                )
+            return array
+        if array.ndim != 1 or array.shape != (self.num_cells,):
+            raise ValueError(f"feature mapping {name!r} must contain {self.num_cells} cells.")
+        if array.dtype.kind not in "iu":
+            raise TypeError(f"feature mapping {name!r} must contain integers.")
+        if not np.array_equal(np.unique(array), np.arange(group_count)):
+            raise ValueError(
+                f"feature mapping {name!r} must use every contiguous index from "
+                f"zero to {group_count - 1}."
+            )
+        for group in range(group_count):
+            if not np.any((array == group) & self.structural_feasible):
+                raise ValueError(
+                    f"feature mapping {name!r} group {group} has no structurally "
+                    "feasible cell."
+                )
+        if constant_within_origin_time:
+            for group in range(self.num_origin_time_groups):
+                if np.unique(array[self.origin_time_group_index == group]).size != 1:
+                    raise ValueError(
+                        f"feature mapping {name!r} must be constant within each "
+                        "origin-time group."
+                    )
+        return array
+
+    @property
     def fingerprint(self) -> str:
-        return fingerprint(
-            {
+        payload = {
                 "schema_version": 1,
                 "origin_index": self.origin_index,
                 "canonical_od_index": self.canonical_od_index,
@@ -246,12 +354,27 @@ class GravityFeatures:
                 "origin_zone_index": self.origin_zone_index,
                 "destination_zone_index": self.destination_zone_index,
                 "time_period_index": self.time_period_index,
-            }
-        )
+        }
+        if (
+            self.destination_time_group_index is not None
+            or self.zone_pair_index is not None
+            or self.custom_group_indices
+            or self.smooth_time_basis is not None
+        ):
+            payload.update(
+                {
+                "schema_version": 2,
+                "destination_time_group_index": self.destination_time_group_index,
+                "zone_pair_index": self.zone_pair_index,
+                "custom_group_indices": dict(self.custom_group_indices),
+                "smooth_time_basis": self.smooth_time_basis,
+                }
+            )
+        return fingerprint(payload)
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "canonical_od_index": self.canonical_od_index.tolist(),
             "origin_index": self.origin_index.tolist(),
             "destination_index": self.destination_index.tolist(),
@@ -288,11 +411,28 @@ class GravityFeatures:
                 if self.time_period_index is None
                 else self.time_period_index.tolist()
             ),
+            "destination_time_group_index": (
+                None
+                if self.destination_time_group_index is None
+                else self.destination_time_group_index.tolist()
+            ),
+            "zone_pair_index": (
+                None if self.zone_pair_index is None else self.zone_pair_index.tolist()
+            ),
+            "custom_group_indices": {
+                name: values.tolist()
+                for name, values in self.custom_group_indices.items()
+            },
+            "smooth_time_basis": (
+                None
+                if self.smooth_time_basis is None
+                else self.smooth_time_basis.tolist()
+            ),
         }
 
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> GravityFeatures:
-        if payload.get("schema_version") != 1:
+        if payload.get("schema_version") not in (1, 2):
             raise ValueError("unsupported gravity feature schema version.")
         dtype = np.dtype(str(payload["dtype"]))
         return cls(
@@ -332,6 +472,27 @@ class GravityFeatures:
                 None
                 if payload.get("time_period_index") is None
                 else np.asarray(payload["time_period_index"])
+            ),
+            destination_time_group_index=(
+                None
+                if payload.get("destination_time_group_index") is None
+                else np.asarray(payload["destination_time_group_index"])
+            ),
+            zone_pair_index=(
+                None
+                if payload.get("zone_pair_index") is None
+                else np.asarray(payload["zone_pair_index"])
+            ),
+            custom_group_indices={
+                str(name): np.asarray(values)
+                for name, values in cast(
+                    Mapping[str, object], payload.get("custom_group_indices", {})
+                ).items()
+            },
+            smooth_time_basis=(
+                None
+                if payload.get("smooth_time_basis") is None
+                else np.asarray(payload["smooth_time_basis"], dtype=dtype)
             ),
         )
 

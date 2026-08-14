@@ -9,12 +9,14 @@ import os
 from pathlib import Path
 import tempfile
 from time import perf_counter
-from typing import Callable, Literal
+from typing import Callable, Literal, Mapping
 import uuid
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+from public_transportation.measurement.mapping import MappingInfo
 
 from .assignment_adapter import (
     AssignmentInputs,
@@ -58,6 +60,12 @@ from .temporal_assignment_persistence import (
     temporal_block_cache_path,
 )
 from .measurement_operator_protocol import GravityOperatorCapabilities
+from .measurement_support_preflight import (
+    PositiveBoardingPreflightContext,
+    audit_positive_boarding_support,
+    boarding_access_supported_measurement_rows,
+    enforce_positive_boarding_support,
+)
 from .construction_control import (
     ConstructionDeadline,
     ConstructionDeadlineStop,
@@ -490,6 +498,117 @@ def _validate_identity_inputs(
         )
 
 
+def _positive_boarding_context(
+    *,
+    checkpoint_root: str | Path,
+    inputs: AssignmentInputs,
+    spec,
+    canonical_index: CanonicalAssignmentIndex,
+    identity: AssignmentArtifactIdentity,
+    observations: object,
+    mapping_info: MappingInfo | None,
+    fixed_zero_reasons_by_full_index: Mapping[int, str] | None,
+) -> PositiveBoardingPreflightContext:
+    return PositiveBoardingPreflightContext(
+        canonical_index=canonical_index,
+        observations=observations,
+        report_path=(
+            Path(checkpoint_root)
+            / identity.fingerprint
+            / "positive_boarding_support_preflight.json"
+        ),
+        mapping_info=mapping_info,
+        fixed_zero_reasons_by_full_index=fixed_zero_reasons_by_full_index,
+        canonical_supported_measurement_rows=boarding_access_supported_measurement_rows(
+            active_origin_nodes=inputs.od_origin_node,
+            graph_link_tails=inputs.graph.tail,
+            measurement_index=spec.measurement_index,
+            link_index=spec.link_index,
+        ),
+    )
+
+
+def _run_origin_positive_boarding_preflight(
+    *,
+    context: PositiveBoardingPreflightContext,
+    reporter: ConstructionProgressReporter,
+) -> None:
+    reporter.emit(
+        phase=ConstructionPhase.MEASUREMENT_SUPPORT_PREFLIGHT,
+        status="started",
+        force=True,
+        completed_units=0,
+        total_units=2,
+        checkpoint_location=(
+            None if context.report_path is None else str(context.report_path)
+        ),
+        details={"preflight_stage": "canonical_origin_support"},
+    )
+    report = audit_positive_boarding_support(
+        canonical_index=context.canonical_index,
+        observations=context.observations,
+        supported_measurement_rows=context.canonical_supported_measurement_rows,
+        mapping_info=context.mapping_info,
+        fixed_zero_reasons_by_full_index=context.fixed_zero_reasons_by_full_index,
+    )
+    enforce_positive_boarding_support(report, report_path=context.report_path)
+    reporter.emit(
+        phase=ConstructionPhase.MEASUREMENT_SUPPORT_PREFLIGHT,
+        status="running",
+        force=True,
+        completed_units=1,
+        total_units=2,
+        checkpoint_location=(
+            None if context.report_path is None else str(context.report_path)
+        ),
+        details={
+            "preflight_stage": "canonical_origin_support",
+            "positive_boarding_rows": report.positive_boarding_rows,
+            "unsupported_positive_boarding_rows": 0,
+        },
+    )
+
+
+def _validate_cached_positive_boarding_support(
+    *,
+    operator: TemporalBlockAssignmentOperator,
+    context: PositiveBoardingPreflightContext,
+    reporter: ConstructionProgressReporter,
+) -> None:
+    supported = {
+        int(row)
+        for block in operator.blocks
+        for row in np.unique(block.row_indices)
+    }
+    supported.update(
+        int(row) for row in np.flatnonzero(operator.fixed_measurement_offset != 0.0)
+    )
+    report = audit_positive_boarding_support(
+        canonical_index=context.canonical_index,
+        observations=context.observations,
+        supported_measurement_rows=np.asarray(sorted(supported), dtype=np.int64),
+        stage="realized_operator_support",
+        mapping_info=context.mapping_info,
+        fixed_zero_reasons_by_full_index=context.fixed_zero_reasons_by_full_index,
+    )
+    enforce_positive_boarding_support(report, report_path=context.report_path)
+    reporter.emit(
+        phase=ConstructionPhase.MEASUREMENT_SUPPORT_PREFLIGHT,
+        status="completed",
+        force=True,
+        completed_units=2,
+        total_units=2,
+        checkpoint_location=(
+            None if context.report_path is None else str(context.report_path)
+        ),
+        details={
+            "preflight_stage": "realized_operator_support",
+            "positive_boarding_rows": report.positive_boarding_rows,
+            "unsupported_positive_boarding_rows": 0,
+        },
+    )
+
+
 def _finalize_temporal_blocks(
     *,
     construction: ShardedConstructionResult,
@@ -693,6 +812,7 @@ def prepare_direct_scheduled_temporal_operator(
     spec,
     compact_layout: CompactODAssignmentLayout,
     canonical_index: CanonicalAssignmentIndex,
+    observations: object,
     identity: AssignmentArtifactIdentity,
     assignment_fingerprint: str,
     od_layout_fingerprint: str,
@@ -700,6 +820,8 @@ def prepare_direct_scheduled_temporal_operator(
     progress: DirectTemporalProgressCallback | None = None,
     deadline: ConstructionDeadline | None = None,
     reporter: ConstructionProgressReporter | None = None,
+    measurement_info: MappingInfo | None = None,
+    fixed_zero_reasons_by_full_index: Mapping[int, str] | None = None,
 ) -> DirectScheduledTemporalConstructionResult:
     """Build or resume direct measurement shards, then publish temporal blocks."""
     legacy_progress = progress if deadline is None and reporter is None else None
@@ -716,6 +838,17 @@ def prepare_direct_scheduled_temporal_operator(
         canonical_index=canonical_index,
         identity=identity,
     )
+    preflight = _positive_boarding_context(
+        checkpoint_root=checkpoint_root,
+        inputs=inputs,
+        spec=spec,
+        canonical_index=canonical_index,
+        identity=identity,
+        observations=observations,
+        mapping_info=measurement_info,
+        fixed_zero_reasons_by_full_index=fixed_zero_reasons_by_full_index,
+    )
+    _run_origin_positive_boarding_preflight(context=preflight, reporter=events)
     checkpoint_directory = Path(checkpoint_root) / identity.fingerprint
     artifact_directory = (
         None
@@ -735,6 +868,9 @@ def prepare_direct_scheduled_temporal_operator(
             )
             os.replace(artifact_directory, quarantine)
         else:
+            _validate_cached_positive_boarding_support(
+                operator=operator, context=preflight, reporter=events
+            )
             return DirectScheduledTemporalConstructionResult(
                 operator=operator,
                 checkpoint_directory=checkpoint_directory,
@@ -780,6 +916,7 @@ def prepare_direct_scheduled_temporal_operator(
             "numeric_dtype": identity.numeric_dtype,
             "assignment_contract_schema_version": identity.schema_version,
         },
+        positive_boarding_preflight=preflight,
     )
     predicted_finalization = (
         source.total_seconds / max(1, source.plan.num_shards)
@@ -883,6 +1020,7 @@ def activate_direct_scheduled_temporal_operator(
     spec,
     compact_layout: CompactODAssignmentLayout,
     canonical_index: CanonicalAssignmentIndex,
+    observations: object,
     identity: AssignmentArtifactIdentity,
     assignment_fingerprint: str,
     od_layout_fingerprint: str,
@@ -898,6 +1036,8 @@ def activate_direct_scheduled_temporal_operator(
     ]
     | None = None,
     routing_preparation_config: FixedRoutingPreparationConfig | None = None,
+    measurement_info: MappingInfo | None = None,
+    fixed_zero_reasons_by_full_index: Mapping[int, str] | None = None,
 ) -> DirectScheduledActivationResult:
     """Reuse a valid artifact or build only when the requested policy permits it.
 
@@ -956,6 +1096,18 @@ def activate_direct_scheduled_temporal_operator(
         )
         return DirectScheduledActivationResult(None, decision, None)
 
+    preflight = _positive_boarding_context(
+        checkpoint_root=checkpoint_root,
+        inputs=inputs,
+        spec=spec,
+        canonical_index=canonical_index,
+        identity=identity,
+        observations=observations,
+        mapping_info=measurement_info,
+        fixed_zero_reasons_by_full_index=fixed_zero_reasons_by_full_index,
+    )
+    _run_origin_positive_boarding_preflight(context=preflight, reporter=reporter)
+
     artifact_directory = temporal_block_cache_path(artifact_root, identity)
     reporter.emit(
         phase=ConstructionPhase.CACHE_VALIDATION,
@@ -973,6 +1125,9 @@ def activate_direct_scheduled_temporal_operator(
         except (AssignmentCompatibilityError, ValueError, KeyError, OSError):
             cached = None
         if cached is not None:
+            _validate_cached_positive_boarding_support(
+                operator=cached, context=preflight, reporter=reporter
+            )
             reporter.emit(
                 phase=ConstructionPhase.CACHE_VALIDATION,
                 status="completed",
@@ -1238,6 +1393,7 @@ def activate_direct_scheduled_temporal_operator(
             spec=spec,
             compact_layout=compact_layout,
             canonical_index=canonical_index,
+            observations=observations,
             identity=identity,
             assignment_fingerprint=assignment_fingerprint,
             od_layout_fingerprint=od_layout_fingerprint,
@@ -1245,6 +1401,8 @@ def activate_direct_scheduled_temporal_operator(
             progress=progress,
             deadline=control,
             reporter=reporter,
+            measurement_info=measurement_info,
+            fixed_zero_reasons_by_full_index=fixed_zero_reasons_by_full_index,
         )
     except ConstructionDeadlineStop as error:
         reporter.terminal(error.termination)

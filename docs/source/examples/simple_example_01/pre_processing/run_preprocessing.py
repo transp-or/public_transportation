@@ -18,7 +18,7 @@ Outputs:
     results/demand.csv
     results/measurements_boarding_alighting.csv
     results/time_expanded_report_true.html
-    results/synthetic_measurement_link_mapping.md
+    results/synthetic_measurement_link_mapping.json
     results/true_assignment.npz
 """
 
@@ -246,60 +246,60 @@ def main() -> None:
         measurements_path = RESULTS / "measurements_boarding_alighting.csv"
         write_measurements_csv(measurement_table, measurements_path)
 
-        mapping_path = RESULTS / "synthetic_measurement_link_mapping.md"
-        with mapping_path.open("w", encoding="utf-8") as file:
-            file.write("# Synthetic measurement → contributing links\n\n")
-            file.write(
-                "This report explains how each synthetic boarding/alighting "
-                "measurement was generated from the assigned link flows under "
-                "the true demand.\n\n"
+        mapping_path = RESULTS / "synthetic_measurement_link_mapping.json"
+        mapping_records = []
+        for (measurement_type, stop_id, trip_id, time_hms), value in sorted(agg.items()):
+            if trip_id is None:
+                continue
+            parts = sorted(
+                contrib.get((measurement_type, stop_id, trip_id, time_hms), []),
+                key=lambda item: int(item["link_id"]),
             )
-            file.write(
-                "Link indices refer to the time-expanded network links shown in "
-                "`time_expanded_report_true.html`.\n\n"
+            links = []
+            for part in parts:
+                link_id = int(part["link_id"])
+                tail_node = int(tail[link_id])
+                head_node = int(head[link_id])
+                links.append(
+                    {
+                        "link_id": link_id,
+                        "contribution": float(part["value"]),
+                        "link_type": int(link_type[link_id]),
+                        "tail_node": tail_node,
+                        "tail_stop": stop_id_from_node(tail_node),
+                        "tail_time": node_hms(tail_node),
+                        "head_node": head_node,
+                        "head_stop": stop_id_from_node(head_node),
+                        "head_time": node_hms(head_node),
+                    }
+                )
+            mapping_records.append(
+                {
+                    "measurement_type": measurement_type,
+                    "stop_id": stop_id,
+                    "trip_id": trip_id,
+                    "time": time_hms,
+                    "value": float(value),
+                    "contributing_links": links,
+                }
             )
-
-            for (measurement_type, stop_id, trip_id, time_hms), value in sorted(agg.items()):
-                if trip_id is None:
-                    continue
-
-                file.write(
-                    f"## {measurement_type} — stop={stop_id}, "
-                    f"trip={trip_id}, time={time_hms}\n\n"
-                )
-                file.write(f"Aggregated value: **{float(value):.6g}**\n\n")
-
-                parts = sorted(
-                    contrib.get((measurement_type, stop_id, trip_id, time_hms), []),
-                    key=lambda item: int(item["link_id"]),
-                )
-
-                if not parts:
-                    file.write("No contributing links found.\n\n")
-                    continue
-
-                file.write(
-                    "| link_id | contribution | link_type | tail_node | tail_stop | "
-                    "tail_time | head_node | head_stop | head_time |\n"
-                )
-                file.write(
-                    "|---:|---:|---:|---:|:---|:---|---:|:---|:---|\n"
-                )
-
-                for part in parts:
-                    link_id = int(part["link_id"])
-                    value = float(part["value"])
-                    tail_node = int(tail[link_id])
-                    head_node = int(head[link_id])
-
-                    file.write(
-                        "| "
-                        f"{link_id} | {value:.6g} | {int(link_type[link_id])} | "
-                        f"{tail_node} | {stop_id_from_node(tail_node)} | {node_hms(tail_node)} | "
-                        f"{head_node} | {stop_id_from_node(head_node)} | {node_hms(head_node)} |\n"
-                    )
-
-                file.write("\n")
+        mapping_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "description": (
+                        "Synthetic boarding/alighting measurements and their "
+                        "contributing assigned links."
+                    ),
+                    "assignment_report": report_path.name,
+                    "measurements": mapping_records,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
         true_assignment_path = RESULTS / "true_assignment.npz"
         np.savez_compressed(
@@ -319,7 +319,7 @@ def main() -> None:
             "generated_demand_file": str(generated_demand_path),
             "measurements_file": str(measurements_path),
             "time_expanded_report": str(report_path),
-            "measurement_mapping_report": str(mapping_path),
+            "measurement_mapping_json": str(mapping_path),
             "true_assignment_file": str(true_assignment_path),
             "num_od_records": len(scenario.demand.records),
             "total_true_demand": float(np.asarray(od_values).sum()),

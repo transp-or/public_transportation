@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 import public_transportation.inference.fixed_routing_sharded_builder as sharded_builder
+import public_transportation.inference.fixed_routing_origin_support as origin_support
 
 from public_transportation.assignment import AssignmentConfig
 from public_transportation.assignment.assign import prepare_assignment
@@ -26,6 +27,11 @@ from public_transportation.inference.assignment_adapter import (
 )
 from public_transportation.inference.compact_od_assignment_layout import (
     build_compact_od_assignment_layout,
+)
+from public_transportation.inference.assignment_contract import (
+    CanonicalMeasurement,
+    CanonicalTimeInterval,
+    build_canonical_assignment_index,
 )
 from public_transportation.inference.fixed_routing_measurement_operator import (
     choose_fixed_measurement_operator,
@@ -74,6 +80,10 @@ from public_transportation.inference.sharded_matrix_free_operator import (
 )
 from public_transportation.inference.measurement_operator_protocol import (
     GravityMeasurementOperator,
+)
+from public_transportation.inference.measurement_support_preflight import (
+    PositiveBoardingPreflightContext,
+    UnsupportedPositiveBoardingError,
 )
 from public_transportation.inference.od_parameter_layout import ODParameterLayout
 from public_transportation.inference.maximum_likelihood_pipeline import (
@@ -707,11 +717,133 @@ def test_sharded_builder_matches_monolithic_and_resumes(all_free_operator, tmp_p
     )
 
 
+def test_compact_support_matches_reference_builder_on_small_example(
+    all_free_operator, tmp_path
+):
+    reference = _parallel_builder_case(
+        all_free_operator,
+        tmp_path / "reference",
+        workers=1,
+        support_discovery_mode="reference",
+    )
+    compact = _parallel_builder_case(
+        all_free_operator,
+        tmp_path / "compact",
+        workers=1,
+        support_discovery_mode="compact",
+    )
+    assert reference.manifest.expected_shards == compact.manifest.expected_shards
+    assert reference.manifest.provenance["support_discovery_mode"] == "reference"
+    assert compact.manifest.provenance["support_discovery_mode"] == "compact"
+    assert reference.plan.candidate_entries == compact.plan.candidate_entries
+    assert reference.plan.support_patterns == compact.plan.support_patterns
+    assert reference.plan.group_level_candidate_entries == (
+        compact.plan.group_level_candidate_entries
+    )
+    with np.load(tmp_path / "reference" / "support.npz", allow_pickle=False) as left:
+        with np.load(tmp_path / "compact" / "support.npz", allow_pickle=False) as right:
+            assert set(left.files) == set(right.files)
+            for name in left.files:
+                if name == "metadata":
+                    left_metadata = json.loads(str(left[name]))
+                    right_metadata = json.loads(str(right[name]))
+                    assert left_metadata["content_hash"] == right_metadata["content_hash"]
+                    assert left_metadata["group_level_candidate_entries"] == (
+                        right_metadata["group_level_candidate_entries"]
+                    )
+                    continue
+                np.testing.assert_array_equal(left[name], right[name])
+    for identity in reference.manifest.expected_shards:
+        left = load_sparse_shard(shard_path(reference.directory, identity))
+        right = load_sparse_shard(shard_path(compact.directory, identity))
+        assert left.metadata.content_hash == right.metadata.content_hash
+        np.testing.assert_array_equal(left.row_indices, right.row_indices)
+        np.testing.assert_array_equal(left.matrix.toarray(), right.matrix.toarray())
+        np.testing.assert_array_equal(left.fixed_offset_values, right.fixed_offset_values)
+    demand = np.linspace(0.0, 2.0, reference.plan.num_free_od)
+    cotangent = np.linspace(-0.5, 1.0, reference.plan.num_measurements)
+    reference_operator = ShardedSparseLinearOperator(reference.directory)
+    compact_operator = ShardedSparseLinearOperator(compact.directory)
+    np.testing.assert_allclose(
+        reference_operator.matvec(demand), compact_operator.matvec(demand)
+    )
+    np.testing.assert_allclose(
+        reference_operator.rmatvec(cotangent), compact_operator.rmatvec(cotangent)
+    )
+
+def test_exact_positive_boarding_preflight_stops_before_numerical_kernel(
+    all_free_operator, tmp_path, monkeypatch
+):
+    inputs, routing, original_spec, _ = all_free_operator
+    num_od = int(inputs.od_origin_node.shape[0])
+    layout = ODParameterLayout(
+        num_od_total=num_od,
+        od_keys=tuple((f"o{i}", "d", "t") for i in range(num_od)),
+        free_od_indices=tuple(range(num_od)),
+        fixed_od_indices=(),
+        fixed_od_values=(),
+        free_baseline_values=tuple(1.0 for _ in range(num_od)),
+        fixed_zero_indices=(),
+        fixed_positive_indices=(),
+    )
+    compact = build_compact_od_assignment_layout(parameter_layout=layout)
+    spec = AggregationSpec(
+        num_measurements=4,
+        measurement_index=np.asarray(original_spec.measurement_index),
+        link_index=np.asarray(original_spec.link_index),
+    )
+    canonical = build_canonical_assignment_index(
+        parameter_layout=layout,
+        time_intervals=(CanonicalTimeInterval("t", 0, 3600),),
+        measurements=tuple(
+            CanonicalMeasurement(row, f"m{row}", "boarding", "o0", "t")
+            for row in range(4)
+        ),
+    )
+    report_path = tmp_path / "positive-boarding-preflight.json"
+    context = PositiveBoardingPreflightContext(
+        canonical_index=canonical,
+        observations=np.asarray([0.0, 0.0, 0.0, 7.0]),
+        report_path=report_path,
+        # Row 3 passes the cheap access-side admission deliberately; because it
+        # has no mapping contribution, exact support must reject it next.
+        canonical_supported_measurement_rows=np.asarray([3]),
+    )
+
+    monkeypatch.setattr(
+        sharded_builder,
+        "_make_forward_reachability_kernel",
+        lambda **_: pytest.fail("numerical kernel compiled before support preflight"),
+    )
+    with pytest.raises(UnsupportedPositiveBoardingError) as caught:
+        prepare_sharded_fixed_routing_measurement_operator(
+            directory=tmp_path / "operator",
+            inputs=inputs,
+            routing=routing,
+            spec=spec,
+            compact_layout=compact,
+            assignment_fingerprint="positive-boarding-exact-preflight",
+            od_layout_fingerprint=layout.fingerprint,
+            config=ShardedConstructionConfig(
+                od_chunk_size=8,
+                measurement_block_size=2,
+                worker_memory_budget_bytes=100_000_000,
+            ),
+            positive_boarding_preflight=context,
+        )
+
+    assert caught.value.report.stage == "routing_support"
+    assert caught.value.report.issues[0].row_index == 3
+    assert report_path.exists()
+    assert not (tmp_path / "operator" / "manifest.json").exists()
+
+
 def _parallel_builder_case(
     all_free_operator,
     directory,
     *,
     workers,
+    support_discovery_mode="compact",
     max_materialized_support_entries=125_000_000,
     maximum_storage_shards=256,
     **kwargs,
@@ -734,6 +866,7 @@ def _parallel_builder_case(
         measurement_block_size=1,
         worker_memory_budget_bytes=100_000_000,
         workers=workers,
+        support_discovery_mode=support_discovery_mode,
         max_materialized_support_entries=max_materialized_support_entries,
         maximum_storage_shards=maximum_storage_shards,
         maximum_resident_shards=2,
@@ -1322,6 +1455,111 @@ def test_origin_support_is_deterministic_across_chunk_sizes(all_free_operator):
     np.testing.assert_array_equal(
         first.free_support.toarray(), second.free_support.toarray()
     )
+
+
+def test_parallel_origin_support_matches_serial_and_resumes(
+    all_free_operator, tmp_path
+):
+    inputs, routing, spec, _ = all_free_operator
+    num_od = int(inputs.od_origin_node.shape[0])
+    layout = ODParameterLayout(
+        num_od_total=num_od,
+        od_keys=tuple((f"o{i}", "d", "t") for i in range(num_od)),
+        free_od_indices=tuple(range(num_od)),
+        fixed_od_indices=(),
+        fixed_od_values=(),
+        free_baseline_values=tuple(1.0 for _ in range(num_od)),
+        fixed_zero_indices=(),
+        fixed_positive_indices=(),
+    )
+    compact = build_compact_od_assignment_layout(parameter_layout=layout)
+
+    def analyze(directory, workers):
+        return analyze_fixed_routing_origin_support(
+            inputs=inputs,
+            routing=routing,
+            spec=spec,
+            compact_layout=compact,
+            config=OriginSupportConfig(
+                origin_chunk_size=3,
+                workers=workers,
+                worker_memory_budget_bytes=100_000_000,
+            ),
+            checkpoint_directory=directory,
+            checkpoint_provenance_hash="parallel-support-test",
+        )
+
+    serial = analyze(tmp_path / "serial", workers=1)
+    parallel = analyze(tmp_path / "parallel", workers=2)
+    resumed = analyze(tmp_path / "parallel", workers=2)
+    assert serial.fingerprint == parallel.fingerprint == resumed.fingerprint
+    np.testing.assert_array_equal(
+        serial.free_support.toarray(), parallel.free_support.toarray()
+    )
+    np.testing.assert_array_equal(
+        serial.positive_fixed_support.toarray(),
+        parallel.positive_fixed_support.toarray(),
+    )
+    assert len(tuple((tmp_path / "parallel" / "support_groups").glob("group-*.npz"))) == len(
+        parallel.summaries
+    )
+    summary_only = analyze_fixed_routing_origin_support(
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        compact_layout=compact,
+        config=OriginSupportConfig(
+            origin_chunk_size=3,
+            workers=2,
+            materialize=False,
+            max_materialized_entries=1,
+            worker_memory_budget_bytes=100_000_000,
+        ),
+    )
+    assert not summary_only.materialized
+
+
+def test_parallel_origin_support_failure_preserves_published_checkpoints(
+    all_free_operator, tmp_path, monkeypatch
+):
+    inputs, routing, spec, _ = all_free_operator
+    num_od = int(inputs.od_origin_node.shape[0])
+    layout = ODParameterLayout(
+        num_od_total=num_od,
+        od_keys=tuple((f"o{i}", "d", "t") for i in range(num_od)),
+        free_od_indices=tuple(range(num_od)),
+        fixed_od_indices=(),
+        fixed_od_values=(),
+        free_baseline_values=tuple(1.0 for _ in range(num_od)),
+        fixed_zero_indices=(),
+        fixed_positive_indices=(),
+    )
+    compact = build_compact_od_assignment_layout(parameter_layout=layout)
+    original = origin_support._compute_group_support_result
+
+    def fail_group_one(**kwargs):
+        if kwargs["group"] == 1:
+            raise RuntimeError("injected support worker failure")
+        return original(**kwargs)
+
+    monkeypatch.setattr(origin_support, "_compute_group_support_result", fail_group_one)
+    with pytest.raises(RuntimeError, match="support worker failed for group-000001"):
+        analyze_fixed_routing_origin_support(
+            inputs=inputs,
+            routing=routing,
+            spec=spec,
+            compact_layout=compact,
+            config=OriginSupportConfig(
+                origin_chunk_size=3,
+                workers=2,
+                worker_memory_budget_bytes=100_000_000,
+            ),
+            checkpoint_directory=tmp_path,
+            checkpoint_provenance_hash="parallel-support-failure-test",
+        )
+    checkpoints = tuple(tmp_path.glob("support_groups/group-*.npz"))
+    assert checkpoints
+    assert not tuple(tmp_path.glob("support_groups/.*.tmp"))
 
 
 def test_origin_support_summary_mode_and_memory_preflight(all_free_operator):

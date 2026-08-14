@@ -9,6 +9,17 @@ from .demand import (
     gravity_demand_kernel,
     gravity_demand_numpy_reference,
 )
+from .configuration import (
+    GravitySpecificationValidation,
+    gravity_model_specification_from_mapping,
+    load_gravity_model_specification,
+    validate_gravity_model_specification,
+)
+from .comparison import (
+    GravityModelFitSummary,
+    rank_gravity_model_summaries,
+    summarize_gravity_model_fit,
+)
 from .diagnostics import (
     GravityRecommendationConfig,
     GravityRelaxationRecommendation,
@@ -74,6 +85,7 @@ from .estimator import (
     gravity_model_fingerprint,
 )
 from .parameters import (
+    GravityParameterBlock,
     GravityParameterLayout,
     MinimalGravityParameters,
     validate_gravity_relaxation_features,
@@ -104,7 +116,17 @@ from .preflight import (
     GravityPreflightResult,
     run_gravity_preflight,
 )
-from .specification import GravityEffectScope, GravityModelSpecification
+from .specification import (
+    GravityComponentSpecification,
+    GravityConstraint,
+    GravityEffectScope,
+    GravityLikelihoodSpecification,
+    GravityModelSpecification,
+    GravityParameterization,
+    GravityRegularization,
+    GravityRegularizationType,
+    GravityTimeSpecification,
+)
 from .relaxations import (
     GravityRelaxationInfo,
     add_gravity_relaxation,

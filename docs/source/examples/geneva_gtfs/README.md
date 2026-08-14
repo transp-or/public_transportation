@@ -123,12 +123,13 @@ reassignment for `ml`, `map`, and `vi`, then generate the common report:
 python docs/source/examples/geneva_gtfs/post_processing/compare_methods.py
 ```
 
-The generated [method comparison](post_processing/results/method_comparison.md)
+The generated [method comparison](post_processing/results/method_comparison.json)
 records runtime, OD error, reassigned link-flow error, optimizer termination,
-and the empirical coverage and width of VI's 90% intervals. The committed
-benchmark deliberately uses the inaccurate stress-test prior. It therefore
-demonstrates the cost of prior misspecification; it is not evidence that
-regularization is intrinsically inferior to unregularized ML.
+and the empirical coverage and width of VI's 90% intervals. Execution produces
+JSON only; a human-readable rendering can be generated separately when needed.
+The committed benchmark deliberately uses the inaccurate stress-test prior. It
+therefore demonstrates the cost of prior misspecification; it is not evidence
+that regularization is intrinsically inferior to unregularized ML.
 
 To reproduce the committed input tables after obtaining the source archive:
 

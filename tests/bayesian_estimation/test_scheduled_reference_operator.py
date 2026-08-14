@@ -44,6 +44,9 @@ from public_transportation.inference.fixed_routing_sharded_builder import (
     ShardedConstructionConfig,
 )
 from public_transportation.inference.od_parameter_layout import ODParameterLayout
+from public_transportation.inference.measurement_support_preflight import (
+    UnsupportedPositiveBoardingError,
+)
 from public_transportation.inference.scheduled_reference_operator import (
     ScheduledTimeExpandedReferenceOperator,
     build_scheduled_reference_artifact_identity,
@@ -489,6 +492,7 @@ def test_direct_resumable_builder_matches_reference_and_reuses_artifact(
         spec=spec,
         compact_layout=compact,
         canonical_index=index,
+        observations=np.zeros(index.number_of_measurements),
         identity=reference.identity,
         assignment_fingerprint="direct-scheduled-public-example",
         od_layout_fingerprint=layout.fingerprint,
@@ -502,6 +506,7 @@ def test_direct_resumable_builder_matches_reference_and_reuses_artifact(
         spec=spec,
         compact_layout=compact,
         canonical_index=index,
+        observations=np.zeros(index.number_of_measurements),
         identity=reference.identity,
         assignment_fingerprint="direct-scheduled-public-example",
         od_layout_fingerprint=layout.fingerprint,
@@ -555,6 +560,7 @@ def test_direct_builder_resumes_after_interruption(artifacts, tmp_path):
             spec=spec,
             compact_layout=compact,
             canonical_index=index,
+            observations=np.zeros(index.number_of_measurements),
             identity=reference.identity,
             assignment_fingerprint="direct-resume",
             od_layout_fingerprint=layout.fingerprint,
@@ -569,6 +575,7 @@ def test_direct_builder_resumes_after_interruption(artifacts, tmp_path):
         spec=spec,
         compact_layout=compact,
         canonical_index=index,
+        observations=np.zeros(index.number_of_measurements),
         identity=reference.identity,
         assignment_fingerprint="direct-resume",
         od_layout_fingerprint=layout.fingerprint,
@@ -596,6 +603,7 @@ def test_direct_builder_selectively_rebuilds_corrupt_shard(artifacts, tmp_path):
         spec=spec,
         compact_layout=compact,
         canonical_index=index,
+        observations=np.zeros(index.number_of_measurements),
         identity=reference.identity,
         assignment_fingerprint="direct-repair",
         od_layout_fingerprint=layout.fingerprint,
@@ -614,6 +622,7 @@ def test_direct_builder_selectively_rebuilds_corrupt_shard(artifacts, tmp_path):
         spec=spec,
         compact_layout=compact,
         canonical_index=index,
+        observations=np.zeros(index.number_of_measurements),
         identity=reference.identity,
         assignment_fingerprint="direct-repair",
         od_layout_fingerprint=layout.fingerprint,
@@ -647,6 +656,7 @@ def _activation_arguments(artifacts, tmp_path):
         spec=spec,
         compact_layout=compact,
         canonical_index=index,
+        observations=np.zeros(index.number_of_measurements),
         identity=reference.identity,
         assignment_fingerprint="direct-activation",
         od_layout_fingerprint=layout.fingerprint,
@@ -672,6 +682,45 @@ def test_direct_activation_declines_unjustified_build_without_routing(
     assert "does not exceed" in result.decision.reason
     assert result.decision.break_even_evaluations == pytest.approx(20.0 / 1.5)
     assert routing_calls == []
+
+
+def test_direct_activation_rejects_unsupported_positive_boarding_before_routing(
+    artifacts, tmp_path
+):
+    arguments, routing_calls = _activation_arguments(artifacts, tmp_path)
+    inputs = arguments["inputs"]
+    active_origins = np.asarray(inputs.od_origin_node)
+    tails = np.asarray(inputs.graph.tail)
+    ineligible = np.flatnonzero(~np.isin(tails, active_origins))
+    assert ineligible.size
+    spec = AggregationSpec(
+        num_measurements=3,
+        measurement_index=np.arange(3, dtype=np.int32),
+        link_index=np.full(3, ineligible[0], dtype=np.int32),
+    )
+    arguments["spec"] = spec
+    arguments["identity"] = _scheduled_operator(
+        inputs=inputs,
+        spec=spec,
+        index=arguments["canonical_index"],
+    ).identity
+    arguments["observations"] = np.asarray([5.0, 0.0, 0.0])
+
+    with pytest.raises(UnsupportedPositiveBoardingError) as caught:
+        activate_direct_scheduled_temporal_operator(
+            mode="direct",
+            expected_evaluations=1,
+            construction_seconds=None,
+            reference_evaluation_seconds=2.0,
+            operator_evaluation_seconds=0.5,
+            **arguments,
+        )
+
+    assert routing_calls == []
+    assert caught.value.report.stage == "canonical_origin_support"
+    assert caught.value.report.issues[0].row_index == 0
+    assert caught.value.report_path is not None
+    assert caught.value.report_path.exists()
 
 
 def test_direct_activation_builds_then_fresh_call_reuses_without_routing(
@@ -1023,6 +1072,7 @@ def test_activation_stops_and_resumes_persistent_sharded_routing(
         spec=arguments["spec"],
         compact_layout=arguments["compact_layout"],
         canonical_index=arguments["canonical_index"],
+        observations=arguments["observations"],
         identity=arguments["identity"],
         assignment_fingerprint=arguments["assignment_fingerprint"],
         od_layout_fingerprint=arguments["od_layout_fingerprint"],

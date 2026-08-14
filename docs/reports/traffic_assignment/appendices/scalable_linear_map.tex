@@ -7,6 +7,63 @@
 \input{traffic_assignment/preserved/065_1845_1863_operator_representations.tex}
 \input{traffic_assignment/preserved/069_1971_2094_resource_preflight_and_adaptive_refinement.tex}
 
+\subsection{Fail-Fast Positive-Boarding Support Admission}
+
+Observed support is now an admission condition for direct scheduled
+construction, rather than a diagnostic deferred until after the linear map
+has been generated.  The activation and construction interfaces require the
+observation vector.  Let $\mathcal O_{+}$ be the active assignment-origin
+nodes (free OD cells together with positive fixed cells), let
+$\mathcal L_m$ be the assignment links mapped to boarding row $m$, and let
+$y_m>0$.  Before routing preparation, the implementation checks the cheap
+necessary condition
+\[
+  \{\operatorname{tail}(\ell):\ell\in\mathcal L_m\}
+  \cap \mathcal O_{+}\ne\varnothing.
+\]
+Because the strict boarding mapper uses access links entering the scheduled
+departure event, failure of this condition proves that no modeled demand can
+produce the observed boarding.  This graph-level check distinguishes
+departure-interval centroid nodes even when they share a physical stop label.
+The canonical OD table is used to explain whether the location--interval is
+absent altogether, all of its cells are fixed at zero, or active cells exist
+but none starts at a mapped access-link tail.  Callers may supply the
+structural-zero reason for every fixed-zero full OD index; these reasons are
+then counted in the row report instead of being guessed.  The report also
+states explicitly that transfer boardings are outside an access-link-only
+first-boarding measurement contract.
+
+The cheap condition is necessary but not sufficient.  Immediately after
+origin-specific routing support has been discovered---and before planning,
+JAX kernel lowering, compilation, or numerical shard construction---the
+builder performs a second exact row-support audit.  A positive boarding row
+must occur in the union of free-column support and positive-fixed support.  If
+it does not, the reported cause is that no retained route under the current
+timing and feasibility rules reaches the mapped boarding event.  A valid
+cached operator is audited in the same way from its realized nonzero rows and
+fixed offset before it is returned.
+
+Any failure raises
+\texttt{UnsupportedPositiveBoardingError} and stops the expensive path.  The
+exception carries the complete structured report; an atomic JSON copy named
+\texttt{positive\_boarding\_support\_preflight.json} is written under the
+identity-specific checkpoint directory.  Every affected row records its
+canonical row and measurement identifiers, observed value, location and
+interval, available OD-role counts, optional fixed-zero cause counts, mapping
+method, time, trip and line when supplied, a cause code, explanation, and
+remediation.  The exception text contains aggregate row and mass counts plus
+a short preview, so tens of thousands of offending rows remain available in
+the JSON artifact without flooding the terminal.
+
+This check addresses the failure mode observed in the completed full-network
+case: positive boarding rows were found only after construction even though
+their corresponding origin/period cells contained no free or positive-fixed
+demand.  Under the current contract those rows are rejected before routing or
+linear-map generation.  Regression tests cover absent origins, all-zero
+origins with upstream reason provenance, fixed-positive support, exact
+routing-support rejection before kernel compilation, cache auditing, and
+atomic row-report persistence.
+
 \subsection{Split Reachability and Measurement-Edge Gathering}
 
 The production sharded fixed-routing builder separates the expensive graph
@@ -58,6 +115,57 @@ Edge-gather evaluations & 3 (fused) & 3 \\
 
 The fixture is intentionally too small to predict full-network wall time; the
 benchmark is a regression guard for artifact identity, execution accounting,
-and worker scaling.  Full-network deployment still requires the bounded
-representative-shard benchmark and resource extrapolation specified by the
-runbook.
+and worker scaling.  A completed full-network artifact was subsequently
+validated and timed separately.
+
+\subsection{Completed Full-Network Linear-Map Benchmark}
+
+The full-network direct-scheduled artifact has fingerprint
+\begin{quote}
+\texttt{2b4285c26c5721c2dad749af459767ab}\\
+\texttt{51c47734878bfd51d94d1c0916ed6b7a}
+\end{quote}
+It contains 5,674 persisted temporal blocks and exposes the fixed-routing
+affine response
+\[
+  \widehat{\bm y}=A\bm f_{\mathcal U}+\bm c,
+  \qquad
+  A\in\mathbb R^{426{,}436\times627{,}123},
+\]
+with 100,257,824 stored nonzero coefficients.  The corresponding dense
+matrix would contain 267,427,823,628 logical entries; the persisted operator
+has density approximately 0.0375\%.  The artifact occupies approximately
+1.6~GB on disk.
+
+The cache was loaded on a development laptop using the production CSR/CSC
+execution backend.  The benchmark used an all-ones float32 free-OD vector;
+the particular OD values were deliberately irrelevant because the experiment
+measured the operator path rather than a substantive demand specification.
+The reported assignment response included the fixed positive-flow offset
+\(\bm c\).  The measurements were:
+
+\begin{center}
+\begin{tabular}{lr}
+\hline
+Phase & Time (s) \\
+\hline
+Contract preparation & 45.352 \\
+Artifact validation and CSR/CSC activation & 421.190 \\
+Warm-up assignment & 0.211 \\
+Timed assignment & 0.180 \\
+Complete benchmark process & 467.099 \\
+\hline
+\end{tabular}
+\end{center}
+
+Thus the expensive operation is one-time artifact loading and materialization
+of the in-memory forward-CSR and adjoint-CSC representations.  Once loaded,
+one full assignment is a sparse matrix--vector product over approximately
+100~million nonzeros and took 0.18~s in this CPU run, corresponding to about
+5.6 forward products per second under the measured conditions.  No routing
+construction or timetable traversal occurred during the benchmark.  These
+results establish that repeated fixed-routing operator products are
+computationally practical on the laptop; they do not, by themselves, certify
+the wall time or convergence of a complete objective-gradient optimization.
+The next validation is one full objective-gradient smoke evaluation using the
+actual feature cache and observations.

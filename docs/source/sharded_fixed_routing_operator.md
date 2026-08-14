@@ -7,6 +7,26 @@ construction path: its reverse dynamic-programming kernel returns
 zero. For a large destination group this static output and the corresponding
 node state are excessive even when the realized operator is very sparse.
 
+## Positive-boarding support is checked first
+
+Direct scheduled activation requires the observation vector. Before routing,
+the preflight verifies that every positive boarding row has a mapped access
+link whose tail is an active free or fixed-positive assignment origin. It
+reports rows whose origin/time domain is absent, whose corresponding OD cells
+are all fixed at zero, or whose mapped access links have no active origin.
+
+After origin-specific routing support is available, a second exact check runs
+before planning, lowering, compilation, or numerical shard generation. It
+rejects any remaining positive boarding row that no retained free or
+fixed-positive route can reach. Valid cached operators are checked from their
+realized nonzero rows and fixed offset before reuse.
+
+Failures raise `UnsupportedPositiveBoardingError`. The full row-level report is
+written atomically to
+`positive_boarding_support_preflight.json` in the identity-specific checkpoint
+directory. Optional fixed-zero reason provenance lets callers report the exact
+preprocessing rules responsible for excluded origin cells.
+
 The sharded builder instead partitions each destination group's structurally
 eligible measurements into fixed-width blocks. Its largest construction state
 is proportional to
@@ -43,6 +63,27 @@ four explicit layers:
 2. `ConstructionTask` describes bounded pattern/measurement computation.
 3. `StorageShardPlan` deterministically packs many tasks to a payload target.
 4. `SparseShardIdentity` identifies the aggregate NPZ and solver matrix.
+
+The sharded builder defaults to `ShardedConstructionConfig.support_discovery_mode="compact"`.
+It consumes each destination-group support result as soon as its checkpoint is
+written, forms deterministic support patterns, and releases the group arrays
+before the next group. It therefore avoids constructing the global
+origin-by-measurement CSR matrices used by the `"reference"` mode. The
+reference mode remains available for small-fixture validation; the two modes
+have separate provenance and cannot silently reuse one another's checkpoints
+or numerical shards.
+
+When `ShardedConstructionConfig.workers` is greater than one, exact support
+groups are computed in a bounded thread pool. Each worker owns its routing
+shard reader; only the parent writes group checkpoints, emits progress, and
+publishes groups in canonical order. Worker count is deliberately absent from
+scientific provenance, so serial and parallel runs share compatible support
+checkpoints and produce the same patterns.
+
+The optimized worker path uses a fixed-shape JAX boolean reachability scan,
+compiled once before dispatch. It retains the NumPy implementation for the
+serial/reference path and validates the two paths against the same support
+matrices and sparse operator products on the public small example.
 
 Packing is stable under construction completion order. Contributions are
 canonicalized after aggregation, so duplicate row/column contributions and
@@ -155,18 +196,19 @@ status, selected policy and whether the KKT requirement was satisfied.
 
 ## Current boundary
 
-The implemented builder is deterministic and resumable with one construction
-worker. Multi-process shard construction is intentionally rejected for now:
-safe JAX process initialization, memory-aware scheduling and single-writer
-manifest coordination require a dedicated benchmark before enabling it.
+The implemented builder is deterministic and resumable. Measurement-shard
+construction can use the bounded shared-executable worker pool; the parent
+publishes completed shards in canonical order and owns the manifest. The
+default remains one worker until full-network memory and throughput benchmarks
+justify a larger value.
 `analyze_fixed_routing_origin_support` provides the origin-specific boolean
 reachability pass used by construction. For every selected OD cell it propagates
 boolean reachability through positive-probability links in the fixed-routing
 DAG and projects reachable mapped links into canonical measurement rows. Work
 is bounded by configurable origin chunks. Summary-only mode reports counts and
-reductions without materializing a potentially large support matrix; validated
-public examples may materialize canonical CSR support for a no-false-negative
-comparison with the existing operator.
+reductions without materializing a potentially large global support matrix;
+validated public examples may materialize canonical CSR support for a
+no-false-negative comparison with the existing operator.
 
 On the public Geneva benchmark, origin-specific analysis reduced 411,720
 group-level candidates to exactly 4,788 supported entries, equal to the

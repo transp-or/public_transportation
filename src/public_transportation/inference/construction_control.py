@@ -15,6 +15,7 @@ CONSTRUCTION_EVENT_SCHEMA_VERSION = 1
 
 
 class ConstructionPhase(str, Enum):
+    MEASUREMENT_SUPPORT_PREFLIGHT = "measurement_support_preflight"
     CACHE_VALIDATION = "cache_validation"
     ROUTING_PREPARATION = "routing_preparation"
     SUPPORT_DISCOVERY = "support_discovery"

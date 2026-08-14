@@ -33,6 +33,9 @@ from public_transportation.preprocessing.reduced_od.departure_sampling import (
     merge_sampled_journey_choices,
     validate_sample_weights,
 )
+from public_transportation.preprocessing.reduced_od.period_preflight import (
+    preflight_reduced_od_time_periods,
+)
 from public_transportation.preprocessing.reduced_od.adaptive_departure_quadrature import (
     DepartureQuadratureDiagnostics,
     generate_fixed_time_step_samples,
@@ -484,6 +487,16 @@ def prepare_reduced_od_artifacts(
         raise ValueError("journey_progress_interval_queries must be positive.")
     if journey_progress_interval_seconds <= 0.0:
         raise ValueError("journey_progress_interval_seconds must be positive.")
+    period_preflight = preflight_reduced_od_time_periods(
+        inputs.time_periods,
+        sampling_config=inputs.departure_time_sampling,
+    )
+    blocking_period_issues = tuple(
+        issue for issue in period_preflight.issues if issue.severity == "error"
+    )
+    if blocking_period_issues:
+        details = "; ".join(issue.message for issue in blocking_period_issues)
+        raise ValueError(f"reduced-OD time-period preflight failed: {details}")
     directory = Path(output_directory).resolve()
     reusable_timetable: TimetableIndex | None = None
     reusable_early_fingerprints: dict[str, str] = {}

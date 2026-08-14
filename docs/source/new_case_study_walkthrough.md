@@ -1,0 +1,1019 @@
+# Walkthrough for a new OD-estimation case study
+
+This document is an operational runbook for preparing, fitting, diagnosing,
+and validating a new public-transport OD-estimation case study with
+`public_transportation`. It is intended to be handed to the person conducting
+the run. The case-specific repository owns the data adapters and results; the
+public repository owns the routing, response, estimation, persistence, and
+diagnostic algorithms.
+
+The recommended production path is the reduced-OD, fixed-routing gravity model
+fitted by maximum a posteriori (MAP) estimation. Start with the smallest model
+and a Poisson diagnostic fit. Introduce the negative-binomial observation model
+and richer demand blocks only after the basic response has passed its checks.
+The detailed time-expanded assignment is a validation backend, not something
+to call inside every optimization iteration.
+
+## 1. Non-negotiable rules
+
+1. Never run a long fit before input audit, artifact preflight, and one warm
+   objective-and-gradient benchmark have passed.
+2. Missing observations are unobserved; they are not zeroes. Numerical zeroes
+   present in the observation table are observed zeroes.
+3. Every boarding or alighting record must resolve to exactly one timetable
+   event. Never resolve an ambiguous record by arbitrary row order.
+4. A positive count with no modeled response is an admission failure. Do not
+   silently discard it and do not invent a path.
+5. Structural-zero and otherwise frozen OD cells are not estimation
+   parameters. A nonzero pre-existing fixed value that conflicts with a newly
+   detected structural zero is an error.
+6. Never reuse an artifact or checkpoint merely because its filename matches.
+   Reuse is allowed only after fingerprint validation.
+7. Keep preparation, estimation, OD reconstruction, and detailed-assignment
+   validation as separate commands and separate result stages.
+8. Use JAX float64 for real count data:
+
+   ```bash
+   export JAX_ENABLE_X64=true
+   ```
+
+## 2. Case-study directory and scripts
+
+Create the case in the private or case-specific repository. A practical layout
+is:
+
+```text
+case_studies/<case_name>/
+├── README.md
+├── config.toml
+├── inputs/
+├── adapter.py
+├── run.py
+├── scripts/
+│   ├── probe.sbatch
+│   ├── 00_check.sbatch
+│   ├── 10_prepare.sbatch
+│   ├── 20_preflight.sbatch
+│   ├── 30_fit.sbatch
+│   ├── 40_diagnose.sbatch
+│   └── submit_chain.sh
+└── results/                         # generated, normally not committed
+    ├── audit/
+    ├── artifacts/
+    ├── preflight/
+    ├── checkpoints/
+    ├── fits/
+    ├── diagnostics/
+    └── validation/
+```
+
+The case-specific `run.py` should expose the following stable actions. It may
+use subcommands or flags, but the actions must remain independent:
+
+```bash
+python case_studies/<case_name>/run.py check
+python case_studies/<case_name>/run.py prepare
+python case_studies/<case_name>/run.py preflight
+python case_studies/<case_name>/run.py fit --model M0 --likelihood poisson
+python case_studies/<case_name>/run.py fit --model M0 --likelihood negative_binomial
+python case_studies/<case_name>/run.py diagnose --fit <fit-result>
+python case_studies/<case_name>/run.py reconstruct --fit <accepted-fit>
+python case_studies/<case_name>/run.py validate-detailed --od <reconstructed-od>
+```
+
+If an existing adapter uses names such as `--check`, `--prepare`,
+`--smoke-objective`, or `--diagnose-production`, map them to the corresponding
+stage below. Do not combine the stages just to shorten the command list.
+
+The complete public API sequence is illustrated in
+[`examples/reduced_od_j0_integration.py`](examples/reduced_od_j0_integration.py).
+The adapter should use the stable imports from
+`public_transportation.preprocessing.reduced_od` and
+`public_transportation.inference.reduced_od`, rather than importing private
+module internals.
+
+The public package also provides the early period validator
+`preflight_reduced_od_time_periods`. The case adapter should call it during
+`check`, before constructing a timetable index or running RAPTOR:
+
+```python
+import json
+
+from public_transportation.preprocessing.reduced_od import (
+    DepartureTimeSamplingConfig,
+    preflight_reduced_od_time_periods,
+)
+
+period_report = preflight_reduced_od_time_periods(
+    time_periods,
+    relevant_event_seconds=relevant_journey_event_seconds,
+    sampling_config=DepartureTimeSamplingConfig(
+        strategy="fixed_count",
+        samples_per_period={"morning": 12, "peak": 24},
+    ),
+)
+(results_directory / "audit/time_period_preflight.json").write_text(
+    json.dumps(period_report.to_dict(), indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+if not period_report.valid:
+    raise RuntimeError("time-period preflight failed")
+```
+
+`relevant_journey_event_seconds` must be supplied by the case adapter from
+the event universe that the reduced response is expected to represent. The
+validator is deliberately agnostic about whether production inputs are rates
+or interval totals; the adapter must record and review that scientific
+exposure convention separately.
+
+## 3. Before the first run
+
+### 3.1 Install and pin the public package
+
+Treat `public_transportation` like any other Python dependency. A sibling
+checkout is not required. Until a suitable release is available from PyPI, pin
+an immutable GitHub commit or release tag in the case-study project:
+
+```bash
+uv add "public_transportation @ git+https://github.com/transp-or/public_transportation.git@<commit-or-tag>"
+uv lock
+uv sync --frozen
+```
+
+Once the package is published on PyPI, pin the selected release instead:
+
+```bash
+uv add "public_transportation==<version>"
+uv lock
+uv sync --frozen
+```
+
+Commit `pyproject.toml` and `uv.lock` in the case-study repository. The lockfile
+is the deployment contract: it records the resolved source and, for a VCS
+dependency, the exact commit. An editable local checkout is useful during joint
+library development, but it is an explicit development mode and must not be
+the default assumed by this runbook.
+
+### 3.2 Freeze provenance
+
+Record the following in `results/audit/run_manifest.json`:
+
+- case name and creation timestamp;
+- private/case-study repository revision and `git status --short`;
+- installed `public_transportation` distribution version;
+- resolved package source: PyPI release or GitHub URL and commit, as recorded in
+  `uv.lock`;
+- checksum of `uv.lock`;
+- Python, NumPy, SciPy, JAX, and JAXlib versions;
+- JAX backend, devices, and x64 status;
+- host name, logical CPU count, and available memory;
+- checksums or immutable source identifiers for timetable, observations,
+  fixed demand, stop mapping, and external covariates;
+- service day, analysis interval, and after-midnight convention.
+
+Run this import check in the same environment that will run the case:
+
+```bash
+uv run --frozen python - <<'PY'
+from importlib.metadata import distribution
+
+import jax
+import public_transportation
+
+installed = distribution("public_transportation")
+print("distribution:", installed.metadata["Name"])
+print("distribution_version:", installed.version)
+print("package_version:", public_transportation.__version__)
+print("backend:", jax.default_backend())
+print("devices:", jax.devices())
+print("x64:", jax.config.x64_enabled)
+PY
+```
+
+Stop if the installed version differs from the version resolved in `uv.lock`,
+or if the lockfile does not identify the intended release/commit. Inspecting
+`public_transportation.__file__` can be useful when troubleshooting an
+accidental editable install, but its absolute installation path is not part of
+the scientific identity and need not be recorded.
+
+### 3.3 Validate the TOML configuration
+
+The TOML file is the case-study configuration file, conventionally named
+`config.toml`. Its first top-level entry must be:
+
+```toml
+schema_version = 2
+```
+
+Here, `schema` means the documented structure of the configuration file: the
+section names, parameter names, data types, required fields, and allowed
+values. Despite its TOML syntax, `schema_version` is not a user-selectable
+parameter or a modeling option. It is a mandatory configuration-format marker.
+The user copies the supported value into the file and does not tune it or
+increment it for a new case or run.
+
+The number `2` tells the installed package which configuration format it is
+reading. It is not the version of the case study, the routing algorithm, the
+gravity model, or the input data. The package developers change this number
+only when the configuration format changes incompatibly.
+
+For the currently implemented reduced-OD configuration format, write exactly
+`schema_version = 2`; it is presently the only accepted value. The marker is
+still useful because configuration files and case studies may outlive the
+current package release. If a later package introduces format 3, an archived
+file marked as format 2 can be interpreted by version-2 rules, migrated
+explicitly, or rejected with a clear compatibility error. Without the marker,
+the parser would have to guess which meanings apply. For the same reason, a
+file declaring an unsupported version is rejected rather than silently
+reinterpreted.
+
+The rest of the file is divided into named TOML sections. For example:
+
+```toml
+schema_version = 2
+
+[observations]
+service_day = "2026-01-15"
+# ...the remaining observation settings...
+
+[journeys]
+maximum_transfers = 2
+# ...the remaining journey settings...
+
+[model]
+likelihood = "negative_binomial"
+```
+
+This abbreviated fragment only illustrates the syntax; it is not a complete
+configuration. The complete TOML must explicitly state:
+
+- service day, analysis start/end seconds, and extended-service-day policy;
+- accepted observation types and missing/duplicate/ambiguity policies;
+- APC cleaning, coverage, and outage policy identifiers;
+- journey origin and destination semantics;
+- half-open OD-time bins;
+- maximum transfers, waiting time, journey time, and alternatives per cell;
+- footpath and physical-stop mapping policies;
+- route-share policy (`fixed_within_fit` for fixed routing);
+- production mode and its scientific meaning;
+- likelihood and output spatial level;
+- detailed assignment as `explicit_only`.
+
+Unknown or missing keys must fail. Do not weaken the parser to accept an
+incomplete file. Use the complete synthetic configuration in
+[`examples/reduced_od_j0_integration.py`](examples/reduced_od_j0_integration.py)
+as a template, then replace every synthetic policy identifier with the actual
+case policy. Validate the completed file by loading it before any expensive
+work:
+
+```bash
+uv run --frozen python - <<'PY'
+from public_transportation.preprocessing.reduced_od import load_reduced_od_config
+
+configuration = load_reduced_od_config("case_studies/<case_name>/config.toml")
+print("schema_version:", configuration.schema_version)
+print("configuration_fingerprint:", configuration.fingerprint)
+PY
+```
+
+Successful loading proves that the file follows schema version 2. It does not
+prove that the chosen assumptions are scientifically appropriate; those still
+require the reviews described below.
+
+### 3.4 Prepare, but do not silently clean, the source tables
+
+The adapter must produce immutable in-memory `Scenario` and
+`MeasurementTable` objects. Perform cleaning before constructing the immutable
+measurement table and report every exclusion by reason.
+
+Check at least:
+
+- unique stop, line, trip, time-bin, and stop-time keys;
+- strictly ordered stop sequences and valid arrival/departure times;
+- active service on the selected service day;
+- correct handling of times greater than 24 hours;
+- complete platform-to-physical-stop mapping;
+- explicit and plausible transfer footpaths;
+- finite nonnegative measurement values;
+- uniqueness of the atomic measurement identity;
+- explicit distinction between an absent record and a record with value zero;
+- sensor coverage and outage exclusions made before likelihood construction;
+- units (passenger counts, not rates or cumulative counters);
+- consistency between count timestamps and timetable event timestamps;
+- complete OD candidate universe and unique fixed-demand keys.
+
+The audit output should include totals and histograms by observation type,
+line, stop, period, and vehicle journey; the number of zero observations; the
+number excluded by each documented rule; timetable and demand dimensions; and
+the selected production semantics.
+
+### 3.5 Choose a data-driven time discretization (diagnostic only)
+
+If the source measurements retain an event timestamp (rather than already
+being aggregated into the current demand intervals), run the standalone time
+discretization diagnostic after the source-table audit and before structural
+zero or reduced-journey preparation. It uses the observed boarding/alighting
+counts to identify concentrated periods, compares several candidate binning
+schemes, and reports their complexity. It does not alter the case inputs or
+write `time_bins.csv`.
+
+Run it with a small base resolution and explicit complexity limits. Adapt the
+measurement path and horizon to the case; the horizon is especially important
+when the source file contains only a subset of the service day:
+
+```bash
+uv run --frozen python -m public_transportation.preprocessing.time_discretization \
+  --measurements case_studies/<case_name>/results/audit/measurements_boarding_alighting.csv \
+  --base-resolution-minutes 5 \
+  --min-bin-minutes 10 \
+  --max-bin-minutes 60 \
+  --max-bins 24 \
+  --num-od-pairs <audited_od_pair_count> \
+  --max-od-cells <approved_od_cell_budget> \
+  --horizon-start 05:00 \
+  --horizon-end 25:00 \
+  --output-json case_studies/<case_name>/results/audit/time_discretization_recommendation.json
+```
+
+The command writes JSON only. Review the JSON before choosing a production
+discretization, in particular:
+
+- `profile` and `peak_intervals`, to confirm that the detected peaks are
+  plausible and are not caused by an outage, duplicated records, or a partial
+  observation window;
+- every entry in `candidates`, including `within_bin_deviance`, bin count,
+  estimated OD-cell count, validity, and warnings;
+- `recommendation.time_bins`, its `estimated_od_cells`, and the warnings
+  attached to the recommended candidate.
+
+The OD-cell limit is an operational guard, not part of the scientific identity
+of the data. If it rejects all candidates, increase the limit only after
+checking the available memory and routing budget; do not hide the warning by
+dropping observations. If the measurements have no raw event timestamp, this
+diagnostic cannot recover finer peaks and the existing timetable/time-bin
+definition must be reviewed manually instead. When the source contains several
+days, compare recommendations across representative or held-out days before
+fixing a common production horizon.
+
+Adopt a recommendation deliberately: check that the returned bins are
+half-open, cover the intended horizon, have strictly increasing edges, and do
+not create empty or unsupported periods unless that is an explicit modelling
+choice. Materialize the reviewed candidate explicitly; the materializer
+validates the report schema, candidate validity, unique IDs, contiguous
+half-open edges, and writes the CSV atomically:
+
+```bash
+uv run --frozen python -m public_transportation.preprocessing.materialize_time_bins \
+  --recommendation-json case_studies/<case_name>/results/audit/time_discretization_recommendation.json \
+  --output case_studies/<case_name>/inputs/time_bins.csv
+```
+
+This is the only step that turns the diagnostic JSON into a model input. The
+resulting CSV is what the case adapter and scenario loader consume; the JSON
+remains a review and provenance artifact.
+
+Use `--candidate peak_adaptive` (or another candidate name in the report) when
+you have deliberately selected a candidate other than the report's default
+recommendation. An existing `time_bins.csv` is never replaced unless
+`--overwrite` is supplied explicitly after review. Record the JSON report path
+and its fingerprint in the run manifest, then re-run Stage 1 after this
+change. Do not feed the diagnostic JSON directly to estimation and do not let
+the preparation script overwrite an existing `time_bins.csv` automatically.
+
+The handoff to the rest of the pipeline is therefore an ordinary scenario
+input, not a second report format. The adopted file must contain the columns
+expected by the scenario loader:
+
+```text
+bin_id,start_s,end_s
+T00,18000,21600
+T01,21600,22200
+```
+
+Here `start_s` and `end_s` are seconds from midnight (the loader also accepts
+`HH:MM` or `HH:MM:SS`). Every demand record must reference one of these IDs in
+its `time_bin_id` column. If the bin edges or IDs change, the adapter must
+re-bin the demand records and rerun the structural-zero, OD-candidate,
+reduced-journey, and response/operator preparation stages. Those stages use
+the scenario's time bins to construct the OD-time universe and their
+fingerprints; old artifacts must consequently be rejected rather than mixed
+with the new discretization. Once those stages complete, the estimation and
+validation commands consume the resulting `Scenario` and prepared artifacts
+as usual. The diagnostic JSON is retained only as provenance and review
+evidence.
+
+See [`time_discretization.md`](time_discretization.md) for the report schema,
+candidate scoring details, and the limitations of interpreting event-time
+peaks as departure-time demand bins.
+
+## 4. Stage 1 — Input check
+
+Run locally first:
+
+```bash
+JAX_ENABLE_X64=true uv run --frozen python \
+  case_studies/<case_name>/run.py check
+```
+
+This stage must not construct expensive routing artifacts. It should:
+
+1. verify the environment, case revision, and locked dependency identity;
+2. load and validate the TOML;
+3. stream or load all source tables;
+4. audit service-day and time conventions;
+5. verify stop mapping and observation identities;
+6. report candidate OD-time, fixed, structural-zero candidate, measurement,
+   trip, stop-time, and physical-stop counts;
+7. run `preflight_reduced_od_time_periods` and write its JSON report;
+8. estimate memory/disk needs where possible;
+9. write machine-readable audit JSON and any rejected-record CSV.
+
+Accept the stage only if all counts are explainable, every rejection has a
+documented policy reason, the package identity and case revision are correct,
+and there are
+no unresolved event identities. Treat unexpected zero rows, empty periods,
+missing lines, or orders-of-magnitude changes from the source statistics as
+errors until investigated.
+
+## 5. Stage 2 — Structural zeroes and feasibility
+
+Structural-zero preprocessing and reduced-journey preparation solve related
+but distinct problems:
+
+- structural-zero preprocessing decides which OD-time cells must not be
+  parameters;
+- reduced-journey preparation constructs timetable-feasible journey
+  alternatives and their count responses for the retained cells.
+
+For the separate TOML-driven structural-zero tool, follow
+[`structural_zero_preprocessing.md`](structural_zero_preprocessing.md). Enable
+the same-stop, no-feasible-path, and maximum-transfer rules at minimum. The
+assignment feasibility settings must agree with the later routing assumptions.
+
+Review these generated files before estimation:
+
+- `fixed_demand.csv`;
+- `structural_zero_audit.csv`;
+- `structural_zero_summary.json`;
+- `resolved_config.toml`;
+- `fingerprints.json`.
+
+Verify that reason counts add up, all fixed values are finite and nonnegative,
+and a frozen-zero cell has been removed from the parameter vector. A
+topologically feasible cell may still be fixed to zero for externally justified
+case-study reasons; label that decision separately from a structural zero.
+
+## 6. Stage 3 — Prepare reduced artifacts
+
+Run:
+
+```bash
+JAX_ENABLE_X64=true uv run --frozen python \
+  case_studies/<case_name>/run.py prepare
+```
+
+The adapter should call `prepare_reduced_od_artifacts` with an explicit
+`ReducedODPreparationInputs` and a persistent output directory. The first run
+uses `cache_policy="reuse_or_build"`. Use `"read_only"` in estimation jobs.
+Use `"rebuild"` only after a deliberate input or policy change.
+
+The artifact dependency chain is:
+
+```text
+configuration
+  -> physical_stops
+  -> service_periods_route_patterns
+  -> timetable_index
+  -> journey_choices
+       -> measurement_response -> response_equivalence
+       -> production_inputs
+       -> destination_attractiveness
+  -> conditional_gravity_features
+  -> reduced_response_operator
+  -> problem_manifest
+```
+
+Every phase directory contains a `manifest.json` and, where needed, immutable
+NumPy arrays. Inspect the preparation report and verify:
+
+- every phase is `built` or compatibly `reused`;
+- all upstream, configuration, and content fingerprints are present;
+- dimensions, dtypes, and array checksums pass loading;
+- the number of free cells excludes all frozen cells;
+- all configured origins, periods, and departure samples appear;
+- route searches completed and no unexplained origin/period has zero journeys;
+- journey alternatives obey transfer, waiting, duration, footpath, and service
+  constraints;
+- measurement rows and response rows use the same immutable identity;
+- the response operator is finite and has the expected shape;
+- production and attraction inputs have the declared semantics.
+
+Do not infer that one departure sample represents a broad period. If counts are
+vehicle-journey specific, assess departure-sampling convergence before trusting
+the response. Increase samples or use the documented adaptive integration
+method until the retained measurement response is stable enough for the case.
+
+## 7. Observations that do not correspond to a path
+
+Use the following decision tree. Save every affected atomic record and its
+reason to a CSV; summary counts alone are insufficient.
+
+### 7.1 The observation does not match a timetable event
+
+Examples are an unknown trip, platform, or stop; an inactive service-day trip;
+the wrong after-midnight convention; a boarding recorded at an arrival rather
+than departure time; or a line-only identity matching several trips.
+
+This is an input-resolution error. Check, in order:
+
+1. service day and calendar exceptions;
+2. timezone and seconds-from-service-day conversion;
+3. times after midnight (`25:10`, for example);
+4. trip and line identifier translation;
+5. platform-to-physical-stop mapping;
+6. arrival-versus-departure event semantics;
+7. allowed, explicitly documented timestamp tolerance;
+8. duplicate or ambiguous timetable records.
+
+Correct the adapter or source policy and rebuild affected artifacts. Do not
+attach the count to the nearest event merely because it is nearby. Exclusion is
+allowed only when an independent sensor-quality, coverage, or outage policy
+justifies it; record that exclusion before model construction.
+
+### 7.2 The event exists, but no retained journey contributes to it
+
+The observation identity is valid, but its measurement-response row is empty.
+For a positive count, the model then predicts zero for every parameter value,
+so estimation cannot repair the problem.
+
+Investigate:
+
+1. whether the event lies inside the analysis and OD departure windows;
+2. whether all relevant origins and destinations are in the candidate universe;
+3. departure sampling within each period;
+4. maximum initial wait and journey duration;
+5. maximum transfers;
+6. missing or incorrect transfer footpaths;
+7. physical-stop aggregation;
+8. maximum alternatives and journey-pruning rules;
+9. whether fixed route shares assigned zero mass to every contributing journey;
+10. whether the count is actually a load or another unsupported observation
+    type mislabeled as a boarding/alighting.
+
+Change one justified assumption at a time, create a new configuration
+fingerprint, rebuild the affected phases, and compare response coverage. Never
+inject an artificial journey. A present zero count with an empty response does
+not contradict the model, but it is also uninformative; report it separately
+rather than claiming it validates routing.
+
+### 7.3 An OD-time pair has no feasible journey
+
+This is an OD support decision, not an observation-resolution decision. The
+RAPTOR result distinguishes:
+
+- no topological path;
+- minimum boardings exceeding the transfer limit;
+- a topological path but no timetable-feasible journey at the query time.
+
+If the classification is correct, freeze the cell to zero and remove it from
+the parameter layout. If external fixed demand is positive for that cell, stop:
+the only supported conflict policy is `error`. Investigate stop mapping,
+footpaths, time conventions, and the external value; do not overwrite it.
+
+### 7.4 A path exists but the fit is systematically poor
+
+This is neither an unmatched record nor a structural zero. Examine residuals
+by line, stop, period, direction, and vehicle journey. Likely causes include
+fixed route shares, inadequate departure sampling, crowding/capacity effects
+not present in the reduced model, incomplete production structure, inconsistent
+count coverage, or overdispersion. Address these through model diagnostics and
+explicit child models, not by deleting inconvenient observations.
+
+## 8. Stage 4 — Read-only artifact preflight
+
+Run this before every new fit environment, especially on Jed:
+
+```bash
+JAX_ENABLE_X64=true uv run --frozen python \
+  case_studies/<case_name>/run.py preflight
+```
+
+The stage should call `preflight_reduced_od_j0` (for the minimal model) or the
+corresponding generic-demand admission code, then load artifacts read-only and
+build the intended problem. It must report:
+
+- compatibility and the first missing/incompatible phase, if any;
+- artifact, model, data, specification, and parameter-layout fingerprints;
+- likelihood, production mode, model blocks, parameter names, and dimension;
+- measurement, free-cell, fixed-cell, origin-period, and response dimensions;
+- input, objective, and gradient dtypes;
+- bounds and prior fingerprints;
+- process RSS before and after problem construction.
+
+If incompatible, rerun preparation with `reuse_or_build`; do not copy a
+downstream artifact directory from another configuration.
+
+## 9. Stage 5 — Objective and gradient admission benchmark
+
+Before optimization, benchmark the exact initial problem:
+
+```python
+timing = benchmark_minimal_gravity_objective(
+    problem=built.problem,
+    raw_parameters=initial_raw,
+    warm_evaluations=5,
+)
+```
+
+Require:
+
+- finite objective and gradient;
+- successful trace, lowering, compilation, first execution, and warm runs;
+- no recompilation when only parameter values change;
+- float64 objective and gradient;
+- stable warm evaluation times after compilation;
+- memory comfortably below the allocation;
+- a projected full-fit runtime compatible with the checkpoint plan.
+
+Compilation time and first execution are not representative iteration times.
+Use the warm value-and-gradient time and observed accepted-iteration time for
+runtime planning. If a warm evaluation is already too slow, stop before the
+optimizer and simplify the model/response or inspect accidental dense arrays.
+
+## 10. Stage 6 — Fit the model ladder
+
+Use one immutable response and grouped split while comparing models.
+
+### 10.1 M0 Poisson diagnostic
+
+Fit the smallest production and impedance model first. Poisson has no free
+dispersion and is useful for localizing whether an unstable negative-binomial
+fit is driven by dispersion. It is not automatically the final scientific
+model.
+
+Verify finite values, projected-gradient convergence, sensible production
+totals, non-pathological time/transfer coefficients, inactive accidental
+bounds, and residual structure.
+
+### 10.2 M0 negative binomial
+
+Fit the same response and demand structure with the negative-binomial
+observation model. Compare objective, deviance, residuals, parameter stability,
+and fitted dispersion. Dispersion at its numerical floor or an extremely broad
+variance is a warning, not evidence of a successful model.
+
+### 10.3 MAP and prior sensitivity
+
+MAP is the recommended primary estimator for a large underdetermined case.
+Specify the Gaussian prior explicitly; the library deliberately supplies no
+undocumented informative prior. Run at least a broad/weak and a moderate prior
+scenario. Report likelihood and prior contributions and whether the result is
+prior dominated.
+
+An infinite-scale Gaussian prior is exactly flat and should reproduce ML to
+deterministic optimizer tolerance. Use that as a software check, not as the
+final regularization strategy.
+
+### 10.4 Add richer demand blocks only when motivated
+
+If M0 has structured residuals or inadequate production variation, add the
+next predeclared model block—for example period effects, origin/destination
+groups, or low-rank effects. Warm-start by parameter name and preserve lineage.
+Compare each child against its parent. Do not activate several new mechanisms
+at once: an improved objective would then be difficult to attribute.
+
+## 11. Checkpoints, interruption, and resume
+
+Each fit must have a unique checkpoint path. Include in its identity:
+
+- artifact and model fingerprints;
+- likelihood and full model specification;
+- parameter layout and dimension;
+- bounds;
+- prior;
+- data identity;
+- software/schema version.
+
+Set an application deadline 10–15 minutes before the Slurm wall-time. The
+estimator should save the latest accepted iterate atomically and return a
+structured `deadline` result with exit status zero. A subsequent identical run
+uses `resume=True`. A changed fingerprint, dimension, model, prior, or bound
+must reject the checkpoint.
+
+Pressing Ctrl-C should likewise save the latest accepted iterate and return an
+`interrupted` result. After any interruption, inspect the checkpoint manifest
+before resuming. Never edit checkpoint JSON by hand.
+
+## 12. Running on Jed with Slurm
+
+### 12.1 One-time server check
+
+From the case-study repository on Jed:
+
+```bash
+mkdir -p case_studies/<case_name>/results
+git rev-parse HEAD
+git status --short
+uv sync --frozen
+uv run --frozen python -c \
+  'import public_transportation; print(public_transportation.__version__)'
+sbatch case_studies/<case_name>/scripts/probe.sbatch
+```
+
+Inspect the probe output for CPU topology, memory, temporary storage, Python,
+JAX backend, and devices. Confirm the account, partition, QoS, time, CPU, and
+memory limits with the current Jed policy; do not assume the example values
+below are universally available. Always submit from the case-study repository
+root so that `SLURM_SUBMIT_DIR` is unambiguous. The Slurm output directory must
+exist before submission because Slurm opens the log before the job script runs.
+
+### 12.2 Common Slurm wrapper
+
+Each `.sbatch` file should use one process and explicitly control numerical
+threads. Adapt `<ACCOUNT>`, `<PARTITION>`, resources, and paths:
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=od-<stage>
+#SBATCH --account=<ACCOUNT>
+#SBATCH --partition=<PARTITION>
+#SBATCH --qos=serial
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=04:00:00
+#SBATCH --output=case_studies/<case_name>/results/slurm-%x-%j.out
+
+set -euo pipefail
+
+PRIVATE_ROOT="${PRIVATE_ROOT:-$SLURM_SUBMIT_DIR}"
+UV_EXECUTABLE="${UV_EXECUTABLE:-$HOME/.local/bin/uv}"
+
+cd "$PRIVATE_ROOT"
+test -f case_studies/<case_name>/run.py
+unset VIRTUAL_ENV
+
+export JAX_ENABLE_X64=true
+export JAX_PLATFORM_NAME=cpu
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export OMP_NUM_THREADS="$SLURM_CPUS_PER_TASK"
+export OPENBLAS_NUM_THREADS="$SLURM_CPUS_PER_TASK"
+export MKL_NUM_THREADS="$SLURM_CPUS_PER_TASK"
+export MPLCONFIGDIR="${TMPDIR:-/tmp}/matplotlib"
+export XDG_CACHE_HOME="${TMPDIR:-/tmp}/xdg-cache"
+export UV_CACHE_DIR="${TMPDIR:-/tmp}/uv-cache"
+mkdir -p "$MPLCONFIGDIR" "$XDG_CACHE_HOME" "$UV_CACHE_DIR"
+
+/usr/bin/time -v "$UV_EXECUTABLE" run --frozen python \
+  case_studies/<case_name>/run.py <stage-and-options>
+
+sstat --jobs="${SLURM_JOB_ID}.batch" \
+  --format=JobID,AveCPU,MaxRSS,MaxVMSize 2>/dev/null || true
+```
+
+Store reusable artifacts and checkpoints on persistent project storage, not
+`$TMPDIR`. Use `$TMPDIR` only for disposable caches. Every wrapper should print
+the case-study revision, installed package version and locked source, resolved
+config fingerprint, job ID, host, allocation, and output directory before
+substantive work starts. A suitable hardware-probe template is available in
+the public repository as `jedtests/jed_probe.run`; copy it into the case-study
+repository and adapt its account and partition when creating `probe.sbatch`.
+
+### 12.3 Submit a dependent chain
+
+Use `afterok` so that an invalid prerequisite blocks downstream work. A
+submission script can be:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+CHECK_JOB="$(sbatch --parsable \
+  case_studies/<case_name>/scripts/00_check.sbatch)"
+PREPARE_JOB="$(sbatch --parsable --dependency="afterok:${CHECK_JOB}" \
+  case_studies/<case_name>/scripts/10_prepare.sbatch)"
+PREFLIGHT_JOB="$(sbatch --parsable --dependency="afterok:${PREPARE_JOB}" \
+  case_studies/<case_name>/scripts/20_preflight.sbatch)"
+FIT_1_JOB="$(sbatch --parsable --dependency="afterok:${PREFLIGHT_JOB}" \
+  --export=ALL,RESUME=0 \
+  case_studies/<case_name>/scripts/30_fit.sbatch)"
+FIT_2_JOB="$(sbatch --parsable --dependency="afterok:${FIT_1_JOB}" \
+  --export=ALL,RESUME=1 \
+  case_studies/<case_name>/scripts/30_fit.sbatch)"
+FIT_3_JOB="$(sbatch --parsable --dependency="afterok:${FIT_2_JOB}" \
+  --export=ALL,RESUME=1 \
+  case_studies/<case_name>/scripts/30_fit.sbatch)"
+DIAGNOSE_JOB="$(sbatch --parsable --dependency="afterok:${FIT_3_JOB}" \
+  case_studies/<case_name>/scripts/40_diagnose.sbatch)"
+
+echo "check=${CHECK_JOB}"
+echo "prepare=${PREPARE_JOB}"
+echo "preflight=${PREFLIGHT_JOB}"
+echo "fit_segments=${FIT_1_JOB},${FIT_2_JOB},${FIT_3_JOB}"
+echo "diagnose=${DIAGNOSE_JOB}"
+echo "squeue -j ${CHECK_JOB},${PREPARE_JOB},${PREFLIGHT_JOB},${FIT_1_JOB},${FIT_2_JOB},${FIT_3_JOB},${DIAGNOSE_JOB} -o '%.18i %.28j %.2t %.12M %.12l %R'"
+```
+
+The fit wrapper should translate `RESUME=0/1` into the estimator's `resume`
+setting. All segments use the same checkpoint and result identity. If the fit
+is already complete, a later resume segment should validate the completion
+manifest and exit successfully without optimizing again. This makes it safe to
+schedule enough segments in advance for a very long run.
+
+Prefer this sequence to a single request for a very long wall time. It gives
+regular atomic checkpoints, makes queue placement easier, and limits work lost
+to an unexpected node failure. Do not use `afterany` in the normal chain: an
+actual validation or model failure must not automatically launch estimation.
+If Slurm kills a segment before its application deadline, inspect the log and
+checkpoint manually, then submit a resume job explicitly.
+
+The example chain is for several wall-time segments of one immutable fit. Run
+the scientific model ladder separately: review the completed Poisson diagnostic
+before submitting the negative-binomial fit, and review M0 before activating a
+richer child model. Independent sensitivity fits may run concurrently only
+after their common parent and artifact identities have been accepted, and they
+must use different checkpoint and result paths.
+
+### 12.4 Monitoring and resource interpretation
+
+Useful commands are:
+
+```bash
+squeue -u "$USER" -o '%.18i %.28j %.2t %.12M %.12l %.6D %R'
+scontrol show job <job-id>
+sacct -j <job-id> --format=JobID,State,Elapsed,AllocCPUS,MaxRSS,ExitCode
+tail -f case_studies/<case_name>/results/slurm-<job>-<id>.out
+```
+
+Interpret them carefully:
+
+- high allocation with low CPU use can mean a single-threaded bottleneck,
+  compilation, I/O, or excessive Python preprocessing;
+- `MaxRSS` near the allocation means the next run needs either more memory or a
+  representation change, not merely more CPUs;
+- JAX compilation can use CPU without optimizer progress; progress events must
+  distinguish compilation from iterations;
+- a stale checkpoint age while iterations continue indicates checkpoint wiring
+  is not functioning;
+- rapidly changing objective with no accepted iterations may indicate line
+  search or scaling problems;
+- a scheduler timeout is not numerical convergence.
+
+## 13. Stage 7 — Interpret the fit result
+
+Read the machine-readable result before any plot. Distinguish:
+
+1. `optimizer_success`: what SciPy reported;
+2. numerical convergence: finite/resolvable objective and sufficiently small
+   projected gradient;
+3. scientific admissibility: a separate case-study decision.
+
+An optimizer success message alone is insufficient. Review:
+
+- final objective and gradient norm;
+- termination status and accepted iterations;
+- objective resolution relative to float64 precision and configured tolerance;
+- transformed time and transfer sensitivities;
+- production coefficients and totals by origin and period;
+- negative-binomial dispersion, if present;
+- active raw bounds;
+- Hessian rank, eigenvalues, condition number, and weak directions;
+- likelihood and prior contributions;
+- predicted and observed totals;
+- MAE, RMSE, deviance, and variance-weighted RMSE;
+- residuals by line, stop, period, direction, and vehicle journey;
+- response coverage and positive zero-response observations;
+- sensitivity to initialization, likelihood, bounds, and prior.
+
+Large OD error cannot be diagnosed from count fit alone when the system is
+underdetermined. A good count fit means the estimate reproduces observed
+measurements under the assumed response; it does not prove that every OD cell
+is identified.
+
+## 14. Stage 8 — Grouped validation and model advice
+
+Run full-data adequacy diagnostics, but label them in-sample. Then create a
+deterministic grouped holdout, preferably by `vehicle_journey`, using
+`build_reduced_od_holdout_split`, and refit on calibration rows before calling
+`validate_reduced_od_holdout`. Never split individual boarding/alighting rows
+from the same vehicle journey independently.
+
+Compare calibration and holdout totals, log likelihood, Poisson or NB deviance,
+MAE, RMSE, and variance-weighted RMSE. Examine grouped residuals, not only a
+global score. Pass adequacy and metadata to
+`recommend_reduced_od_relaxations`; its proposed child models are advisory and
+must be scientifically reviewed.
+
+Use the gravity model's weak directions and measurement-response structure to
+identify poorly informed demand combinations. These are candidates for
+additional data collection, but the recommendation should be expressed at the
+level supported by the response (stops, periods, routes, or OD combinations),
+not as unjustified certainty about individual cells.
+
+## 15. Stage 9 — Reconstruct and validate only an accepted fit
+
+The optimizer works only with free cells. After accepting a fit, construct a
+`ReducedODProblemContract` and call `reconstruct_full_od` to insert frozen cells
+and restore canonical OD-time ordering. Verify:
+
+- every canonical cell appears exactly once;
+- frozen values are byte-for-byte or numerically unchanged;
+- structural zeroes remain exactly zero;
+- reconstructed free values match the compact fit;
+- totals by origin, destination, and period are consistent with the fit report.
+
+Next, perform one explicit detailed assignment of the reconstructed estimate.
+Compare its boarding, alighting, and link flows with observations and with the
+reduced response. This is the place to detect disagreement caused by bounded
+journey sets, fixed shares, capacity/crowding, or response aggregation. Do not
+put the detailed assignment back inside the reduced optimizer.
+
+## 16. Final acceptance checklist
+
+A case is ready to report only when all applicable boxes can be checked.
+
+### Reproducibility
+
+- [ ] Case-study revision and dirty state recorded.
+- [ ] Installed public-package version, locked source/commit, and lockfile
+      checksum recorded.
+- [ ] Runtime versions recorded.
+- [ ] Source checksums/provenance recorded.
+- [ ] Resolved TOML and all fingerprints archived.
+- [ ] Commands, Slurm scripts, job IDs, logs, and resource use archived.
+
+### Data and routing
+
+- [ ] Observation missing/zero semantics verified.
+- [ ] If used, the time-discretization JSON recommendation and its review are
+      archived.
+- [ ] The approved candidate was materialized through
+      `materialize_time_bins`, and the resulting `time_bins.csv` is recorded.
+- [ ] Demand `time_bin_id` values match the adopted bin IDs and the event-time
+      to departure-time assignment policy is documented.
+- [ ] Structural-zero, OD-candidate, reduced-journey, and response/operator
+      artifacts were rebuilt after any time-bin change.
+- [ ] Every retained observation resolves to one timetable event.
+- [ ] All unmatched, ambiguous, excluded, and zero-response rows audited.
+- [ ] No unexplained positive observation has an empty response.
+- [ ] Physical-stop mapping and footpaths reviewed.
+- [ ] Structural-zero conflicts resolved without overwriting positive demand.
+- [ ] Departure sampling and journey limits are adequate for the periods.
+
+### Numerical estimation
+
+- [ ] Artifacts load read-only with compatible fingerprints.
+- [ ] Objective and gradient are finite float64 values.
+- [ ] Warm benchmark shows no parameter-value recompilation.
+- [ ] Checkpoint interruption and resume were tested on a short run.
+- [ ] Projected gradient and tolerance-resolution checks pass.
+- [ ] Active bounds, weak Hessian directions, and production totals reviewed.
+- [ ] Poisson/NB and weak/moderate-prior sensitivities reviewed.
+
+### Scientific validation
+
+- [ ] Production semantics are defensible and clearly labeled.
+- [ ] Full-data diagnostics are labeled in-sample.
+- [ ] Grouped holdout refits and metrics are available.
+- [ ] Residuals have been reviewed by operational group.
+- [ ] Full OD was reconstructed only after fit acceptance.
+- [ ] At least one detailed-assignment comparison was performed.
+- [ ] Limitations and rejected model attempts are reported.
+
+## 17. What to deliver to a reviewer
+
+Deliver a compact human-readable report plus the machine-readable directory.
+The report should contain:
+
+1. the scientific question and analysis period;
+2. input provenance and observation coverage;
+3. stop mapping, feasibility, departure sampling, and route-share assumptions;
+4. dimensions before and after structural-zero removal;
+5. response coverage and all unmatched/unsupported observation decisions;
+6. model ladder, priors, bounds, and likelihoods tried;
+7. runtime, peak memory, checkpoint history, and Jed job IDs;
+8. numerical convergence and identification diagnostics;
+9. grouped validation and detailed-assignment comparisons;
+10. the accepted model, rejected attempts, limitations, and next action.
+
+Never report only the final parameter vector. The provenance, response
+coverage, numerical checks, and unsuccessful attempts are part of the result.
+
+## 18. Related documentation
+
+- [`reduced_od_estimation.md`](reduced_od_estimation.md): numerical robustness,
+  likelihood comparison, bounds, progress, and artifact invalidation.
+- [`reduced_od_generic_demand.md`](reduced_od_generic_demand.md): composable
+  demand models, parameter blocks, warm starts, and restart behavior.
+- [`structural_zero_preprocessing.md`](structural_zero_preprocessing.md): TOML
+  schema, feasibility rules, conflicts, and generated artifacts.
+- [`../reports/reduced_od_observation_contract.md`](../reports/reduced_od_observation_contract.md):
+  observation and passenger-journey semantics.
+- [`../reports/traffic_assignment.pdf`](../reports/traffic_assignment.pdf):
+  mathematical assumptions, RAPTOR response construction, MAP estimation,
+  validation, and limitations.
+- [`examples/geneva_gtfs/README.md`](examples/geneva_gtfs/README.md): a complete
+  real-timetable validation example with synthetic demand and counts.
+- [`../reports/reduced_od_private_integration_handoff.md`](../reports/reduced_od_private_integration_handoff.md):
+  public/private API boundary and artifact graph.

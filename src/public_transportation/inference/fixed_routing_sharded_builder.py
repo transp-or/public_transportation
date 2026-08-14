@@ -13,7 +13,7 @@ from pathlib import Path
 import tempfile
 import uuid
 from time import perf_counter
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import jax
 import jax.numpy as jnp
@@ -34,6 +34,11 @@ from .fixed_routing_measurement_operator import (
 from .fixed_routing_origin_support import (
     OriginSupportConfig,
     analyze_fixed_routing_origin_support,
+)
+from .measurement_support_preflight import (
+    PositiveBoardingPreflightContext,
+    audit_positive_boarding_support,
+    enforce_positive_boarding_support,
 )
 from .sharded_sparse_operator import (
     SHARDED_OPERATOR_SCHEMA_VERSION,
@@ -138,6 +143,7 @@ class ShardedConstructionConfig:
     workers: int = 1
     origin_support_chunk_size: int = 64
     max_materialized_support_entries: int = 125_000_000
+    support_discovery_mode: Literal["compact", "reference"] = "compact"
     support_edge_block_size: int = 2048
     target_nonzeros_per_storage_shard: int = 2048
     maximum_nonzeros_per_storage_shard: int = 8192
@@ -164,6 +170,10 @@ class ShardedConstructionConfig:
             raise ValueError("worker memory budget must be positive.")
         if self.max_materialized_support_entries <= 0:
             raise ValueError("max_materialized_support_entries must be positive.")
+        if self.support_discovery_mode not in ("compact", "reference"):
+            raise ValueError(
+                "support_discovery_mode must be 'compact' or 'reference'."
+            )
         if not math.isfinite(self.zero_tolerance) or self.zero_tolerance < 0:
             raise ValueError("zero_tolerance must be finite and non-negative.")
         if self.workers <= 0:
@@ -819,6 +829,49 @@ def _timing_quantiles(values: list[float]) -> dict[str, float]:
     }
 
 
+def _compact_group_patterns(
+    *,
+    active_indices: np.ndarray,
+    free_rows: np.ndarray,
+    free_columns: np.ndarray,
+    fixed_rows: np.ndarray,
+    fixed_columns: np.ndarray,
+    free_indices: np.ndarray,
+    positive_fixed_indices: np.ndarray,
+) -> dict[tuple[int, ...], list[int]]:
+    """Group one destination result by identical measurement support.
+
+    The arrays are limited to one destination group.  Sorting by compact
+    column lets us recover each active OD's rows without retaining a global
+    sparse support matrix or a global per-OD Python dictionary.
+    """
+    support_by_active: dict[int, tuple[int, ...]] = {}
+
+    def collect(
+        rows: np.ndarray, columns: np.ndarray, active_lookup: np.ndarray
+    ) -> None:
+        if rows.size == 0:
+            return
+        order = np.argsort(columns, kind="stable")
+        sorted_columns = columns[order]
+        sorted_rows = rows[order]
+        unique_columns, starts = np.unique(sorted_columns, return_index=True)
+        stops = np.concatenate((starts[1:], np.asarray([rows.size])))
+        for column, first, stop in zip(unique_columns, starts, stops, strict=True):
+            support_by_active[int(active_lookup[column])] = tuple(
+                int(value) for value in np.unique(sorted_rows[first:stop])
+            )
+
+    collect(free_rows, free_columns, free_indices)
+    collect(fixed_rows, fixed_columns, positive_fixed_indices)
+    patterns: dict[tuple[int, ...], list[int]] = {}
+    for active_index in active_indices:
+        pattern = support_by_active.get(int(active_index), ())
+        if pattern:
+            patterns.setdefault(pattern, []).append(int(active_index))
+    return patterns
+
+
 def _discover_support(
     *,
     inputs: AssignmentInputs,
@@ -847,8 +900,41 @@ def _discover_support(
     routing_reader = _RoutingBatchReader(routing)
     group_indices = np.asarray(inputs.group_od_index_padded)
     group_masks = np.asarray(inputs.group_od_mask)
-    od_groups: list[np.ndarray] = []
-    measurements: list[np.ndarray] = []
+    num_groups = int(inputs.group_dest_node.shape[0])
+    od_groups_by_group: list[np.ndarray | None] = [None] * num_groups
+    measurements_by_group: list[np.ndarray | None] = [None] * num_groups
+    patterns_by_group: list[dict[tuple[int, ...], list[int]] | None] = [
+        None
+    ] * num_groups
+    positive_fixed = np.asarray(
+        compact_layout.fixed_compact_indices, dtype=np.int64
+    )[
+        np.asarray(compact_layout.fixed_compact_values) > 0.0
+    ]
+    def consume_compact_group(
+        group: int,
+        active_indices: np.ndarray,
+        group_measurements: np.ndarray,
+        summary,
+        group_free_rows: np.ndarray,
+        group_free_columns: np.ndarray,
+        group_fixed_rows: np.ndarray,
+        group_fixed_columns: np.ndarray,
+    ) -> None:
+        od_groups_by_group[group] = np.asarray(active_indices, dtype=np.int64)
+        measurements_by_group[group] = np.asarray(
+            group_measurements, dtype=np.int64
+        )
+        patterns_by_group[group] = _compact_group_patterns(
+            active_indices=active_indices,
+            free_rows=group_free_rows,
+            free_columns=group_free_columns,
+            fixed_rows=group_fixed_rows,
+            fixed_columns=group_fixed_columns,
+            free_indices=free_indices,
+            positive_fixed_indices=positive_fixed,
+        )
+
     analyzed = analyze_fixed_routing_origin_support(
         inputs=inputs,
         routing=routing,
@@ -857,66 +943,91 @@ def _discover_support(
         config=OriginSupportConfig(
             origin_chunk_size=config.origin_support_chunk_size,
             worker_memory_budget_bytes=config.worker_memory_budget_bytes,
-            materialize=True,
+            materialize=config.support_discovery_mode == "reference",
             max_materialized_entries=config.max_materialized_support_entries,
+            workers=config.workers,
         ),
         checkpoint_directory=checkpoint_directory,
         checkpoint_provenance_hash=checkpoint_provenance_hash,
         deadline=deadline,
         reporter=reporter,
+        group_callback=(
+            None
+            if config.support_discovery_mode == "reference"
+            else consume_compact_group
+        ),
     )
-    assert analyzed.free_support is not None
-    assert analyzed.positive_fixed_support is not None
-    free_support = analyzed.free_support.tocsc()
-    fixed_support = analyzed.positive_fixed_support.tocsc()
-    support_by_active: dict[int, tuple[int, ...]] = {}
-    for column, active_index in enumerate(free_indices):
-        support_by_active[int(active_index)] = tuple(
-            int(value)
-            for value in free_support.indices[
-                free_support.indptr[column] : free_support.indptr[column + 1]
-            ]
+    if (
+        config.support_discovery_mode == "compact"
+        and analyzed.metrics.origin_specific_entries
+        > config.max_materialized_support_entries
+    ):
+        raise MemoryError(
+            f"origin-specific support has {analyzed.metrics.origin_specific_entries} "
+            "entries, exceeding max_materialized_entries="
+            f"{config.max_materialized_support_entries}"
         )
-    positive_fixed = np.asarray(analyzed.positive_fixed_active_indices, dtype=np.int64)
-    for column, active_index in enumerate(positive_fixed):
-        support_by_active[int(active_index)] = tuple(
-            int(value)
-            for value in fixed_support.indices[
-                fixed_support.indptr[column] : fixed_support.indptr[column + 1]
-            ]
-        )
+    if config.support_discovery_mode == "reference":
+        assert analyzed.free_support is not None
+        assert analyzed.positive_fixed_support is not None
+        free_support = analyzed.free_support.tocsc()
+        fixed_support = analyzed.positive_fixed_support.tocsc()
+        support_by_active: dict[int, tuple[int, ...]] = {}
+        for column, active_index in enumerate(free_indices):
+            support_by_active[int(active_index)] = tuple(
+                int(value)
+                for value in free_support.indices[
+                    free_support.indptr[column] : free_support.indptr[column + 1]
+                ]
+            )
+        for column, active_index in enumerate(positive_fixed):
+            support_by_active[int(active_index)] = tuple(
+                int(value)
+                for value in fixed_support.indices[
+                    fixed_support.indptr[column] : fixed_support.indptr[column + 1]
+                ]
+            )
+        for group in range(num_groups):
+            relevant = group_indices[group][group_masks[group]]
+            relevant = relevant[selected[relevant]].astype(np.int64, copy=False)
+            od_groups_by_group[group] = relevant
+            _, group_effective = routing_reader.host(group)
+            mapped = global_slot_mask & group_effective[:, None]
+            measurements_by_group[group] = np.unique(global_slots[mapped]).astype(
+                np.int64, copy=False
+            )
+            patterns: dict[tuple[int, ...], list[int]] = {}
+            for active_index in relevant:
+                pattern = support_by_active[int(active_index)]
+                if pattern:
+                    patterns.setdefault(pattern, []).append(int(active_index))
+            patterns_by_group[group] = patterns
+    od_groups = tuple(
+        value if value is not None else np.empty(0, dtype=np.int64)
+        for value in od_groups_by_group
+    )
+    measurements = tuple(
+        value if value is not None else np.empty(0, dtype=np.int64)
+        for value in measurements_by_group
+    )
     discovered_patterns: list[SupportPattern] = []
-    for group in range(int(inputs.group_dest_node.shape[0])):
-        relevant = group_indices[group][group_masks[group]]
-        relevant = relevant[selected[relevant]].astype(np.int64, copy=False)
-        od_groups.append(relevant)
-        _, group_effective = routing_reader.host(group)
-        mapped = global_slot_mask & group_effective[:, None]
-        measurements.append(
-            np.unique(global_slots[mapped]).astype(np.int64, copy=False)
-        )
-        patterns: dict[tuple[int, ...], list[int]] = {}
-        for active_index in relevant:
-            pattern = support_by_active[int(active_index)]
-            if pattern:
-                patterns.setdefault(pattern, []).append(int(active_index))
+    for group, patterns in enumerate(patterns_by_group):
+        assert patterns is not None
         for pattern_id, pattern in enumerate(sorted(patterns)):
-            pattern_measurements = np.asarray(pattern, dtype=np.int64)
-            pattern_od = np.asarray(patterns[pattern], dtype=np.int64)
             discovered_patterns.append(
                 SupportPattern(
                     group=group,
                     pattern=pattern_id,
-                    od_indices=tuple(int(value) for value in pattern_od),
-                    measurements=tuple(int(value) for value in pattern_measurements),
+                    od_indices=tuple(int(value) for value in patterns[pattern]),
+                    measurements=tuple(int(value) for value in pattern),
                 )
             )
     return _derived_support(
         free_column=free_column,
         fixed_by_active=fixed_by_active,
         selected=selected,
-        group_od_indices=tuple(od_groups),
-        group_measurements=tuple(measurements),
+        group_od_indices=od_groups,
+        group_measurements=measurements,
         global_slots=global_slots,
         global_slot_mask=global_slot_mask,
         group_level_candidate_entries=(analyzed.metrics.group_level_candidate_entries),
@@ -1277,6 +1388,7 @@ def _construction_provenance(
         "od_chunk_size": config.od_chunk_size,
         "origin_support_chunk_size": config.origin_support_chunk_size,
         "support_strategy": "positive_probability_group_batched_reachability_v2",
+        "support_discovery_mode": config.support_discovery_mode,
         "support_edge_block_size": config.support_edge_block_size,
         "target_nonzeros_per_storage_shard": config.target_nonzeros_per_storage_shard,
         "maximum_nonzeros_per_storage_shard": config.maximum_nonzeros_per_storage_shard,
@@ -1631,6 +1743,7 @@ def prepare_sharded_fixed_routing_measurement_operator(
     deadline: ConstructionDeadline | None = None,
     reporter: ConstructionProgressReporter | None = None,
     scientific_identity: dict[str, object] | None = None,
+    positive_boarding_preflight: PositiveBoardingPreflightContext | None = None,
 ) -> ShardedConstructionResult:
     """Build missing/invalid shards and atomically advance a resumable manifest."""
     config = ShardedConstructionConfig() if config is None else config
@@ -1648,6 +1761,51 @@ def prepare_sharded_fixed_routing_measurement_operator(
     )
     directory = Path(directory)
     total_start = perf_counter()
+    if positive_boarding_preflight is not None:
+        events.emit(
+            phase=ConstructionPhase.MEASUREMENT_SUPPORT_PREFLIGHT,
+            status="started",
+            force=True,
+            completed_units=0,
+            total_units=2,
+            checkpoint_location=(
+                None
+                if positive_boarding_preflight.report_path is None
+                else str(positive_boarding_preflight.report_path)
+            ),
+            details={"preflight_stage": "canonical_origin_support"},
+        )
+        origin_report = audit_positive_boarding_support(
+            canonical_index=positive_boarding_preflight.canonical_index,
+            observations=positive_boarding_preflight.observations,
+            supported_measurement_rows=(
+                positive_boarding_preflight.canonical_supported_measurement_rows
+            ),
+            mapping_info=positive_boarding_preflight.mapping_info,
+            fixed_zero_reasons_by_full_index=(
+                positive_boarding_preflight.fixed_zero_reasons_by_full_index
+            ),
+        )
+        enforce_positive_boarding_support(
+            origin_report, report_path=positive_boarding_preflight.report_path
+        )
+        events.emit(
+            phase=ConstructionPhase.MEASUREMENT_SUPPORT_PREFLIGHT,
+            status="running",
+            force=True,
+            completed_units=1,
+            total_units=2,
+            checkpoint_location=(
+                None
+                if positive_boarding_preflight.report_path is None
+                else str(positive_boarding_preflight.report_path)
+            ),
+            details={
+                "preflight_stage": "canonical_origin_support",
+                "positive_boarding_rows": origin_report.positive_boarding_rows,
+                "unsupported_positive_boarding_rows": 0,
+            },
+        )
     provenance = _construction_provenance(
         inputs=inputs,
         spec=spec,
@@ -1684,6 +1842,7 @@ def prepare_sharded_fixed_routing_measurement_operator(
         ):
             valid = True
             aggregate_nonzeros = 0
+            realized_supported_rows: set[int] = set()
             for position, identity in enumerate(existing.expected_shards):
                 if not control.may_start():
                     raise deadline_stop(
@@ -1705,7 +1864,53 @@ def prepare_sharded_fixed_routing_measurement_operator(
                     valid = False
                     break
                 aggregate_nonzeros += loaded.metadata.nonzero_entries
+                local_nonzero_rows = np.flatnonzero(
+                    np.diff(loaded.matrix.indptr) > 0
+                )
+                realized_supported_rows.update(
+                    int(row) for row in loaded.row_indices[local_nonzero_rows]
+                )
+                realized_supported_rows.update(
+                    int(row)
+                    for row in loaded.row_indices[loaded.fixed_offset_indices]
+                )
             if valid and aggregate_nonzeros == existing.aggregate_nonzeros:
+                if positive_boarding_preflight is not None:
+                    realized_report = audit_positive_boarding_support(
+                        canonical_index=positive_boarding_preflight.canonical_index,
+                        observations=positive_boarding_preflight.observations,
+                        supported_measurement_rows=np.asarray(
+                            sorted(realized_supported_rows), dtype=np.int64
+                        ),
+                        stage="realized_operator_support",
+                        mapping_info=positive_boarding_preflight.mapping_info,
+                        fixed_zero_reasons_by_full_index=(
+                            positive_boarding_preflight.fixed_zero_reasons_by_full_index
+                        ),
+                    )
+                    enforce_positive_boarding_support(
+                        realized_report,
+                        report_path=positive_boarding_preflight.report_path,
+                    )
+                    events.emit(
+                        phase=ConstructionPhase.MEASUREMENT_SUPPORT_PREFLIGHT,
+                        status="completed",
+                        force=True,
+                        completed_units=2,
+                        total_units=2,
+                        checkpoint_location=(
+                            None
+                            if positive_boarding_preflight.report_path is None
+                            else str(positive_boarding_preflight.report_path)
+                        ),
+                        details={
+                            "preflight_stage": "realized_operator_support",
+                            "positive_boarding_rows": (
+                                realized_report.positive_boarding_rows
+                            ),
+                            "unsupported_positive_boarding_rows": 0,
+                        },
+                    )
                 plan = _evaluate_operational_preflight(
                     _plan_from_manifest(existing), config
                 )
@@ -1818,6 +2023,47 @@ def prepare_sharded_fixed_routing_measurement_operator(
         cache_hits=int(support_reused),
         cache_misses=int(not support_reused),
     )
+    if positive_boarding_preflight is not None:
+        supported_rows = np.asarray(
+            sorted(
+                {
+                    row
+                    for pattern in support.patterns
+                    for row in pattern.measurements
+                }
+            ),
+            dtype=np.int64,
+        )
+        routing_report = audit_positive_boarding_support(
+            canonical_index=positive_boarding_preflight.canonical_index,
+            observations=positive_boarding_preflight.observations,
+            supported_measurement_rows=supported_rows,
+            stage="routing_support",
+            mapping_info=positive_boarding_preflight.mapping_info,
+            fixed_zero_reasons_by_full_index=(
+                positive_boarding_preflight.fixed_zero_reasons_by_full_index
+            ),
+        )
+        enforce_positive_boarding_support(
+            routing_report, report_path=positive_boarding_preflight.report_path
+        )
+        events.emit(
+            phase=ConstructionPhase.MEASUREMENT_SUPPORT_PREFLIGHT,
+            status="completed",
+            force=True,
+            completed_units=2,
+            total_units=2,
+            checkpoint_location=(
+                None
+                if positive_boarding_preflight.report_path is None
+                else str(positive_boarding_preflight.report_path)
+            ),
+            details={
+                "preflight_stage": "routing_support",
+                "positive_boarding_rows": routing_report.positive_boarding_rows,
+                "unsupported_positive_boarding_rows": 0,
+            },
+        )
     planning_start = perf_counter()
     planning_reused = False
     if existing_manifest is not None and existing_manifest.plan_summary is not None:

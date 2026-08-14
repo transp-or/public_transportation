@@ -212,50 +212,33 @@ def benchmark(*, repeats: int, chunk_size: int) -> dict[str, object]:
         shutil.rmtree(directory)
 
 
-def _markdown(report: dict[str, object]) -> str:
-    reference = report["reference"]
-    lines = [
-        "# Fixed-routing measurement operator benchmark",
-        "",
-        f"Example: `{report['example']}`",
-        "",
-        f"- Active OD cells: {report['num_active_od']}",
-        f"- Measurements: {report['num_measurements']}",
-        f"- Links: {report['num_links']}",
-        f"- Reference warm value-and-gradient: {reference['warm_value_and_gradient_seconds']:.6f} s",
-        "",
-        "| Representation | Construction (s) | Warm forward (s) | Warm value+grad (s) | Stored (MiB) | Density | Break-even evals |",
-        "|---|---:|---:|---:|---:|---:|---:|",
-    ]
-    for name, metrics in report["representations"].items():
-        break_even = metrics["break_even_evaluations"]
-        break_even_text = "n/a" if break_even is None else f"{break_even:.1f}"
-        lines.append(
-            f"| {name} | {metrics['construction_seconds']:.6f} | "
-            f"{metrics['warm_forward_seconds']:.6f} | "
-            f"{metrics['warm_value_and_gradient_seconds']:.6f} | "
-            f"{metrics['stored_bytes'] / 2**20:.3f} | "
-            f"{metrics['density']:.4f} | {break_even_text} |"
-        )
-    lines.extend(("", str(report["recommendation"]), ""))
-    return "\n".join(lines)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--chunk-size", type=int, default=128)
     parser.add_argument(
+        "--output-json",
         "--output-prefix",
+        dest="output_json",
         type=Path,
-        default=ROOT / "benchmarks/fixed_routing_measurement_operator",
+        default=None,
+        help=(
+            "Optional JSON output path; stdout is used when omitted. "
+            "The legacy --output-prefix spelling is retained as a JSON-only alias."
+        ),
     )
     args = parser.parse_args()
     report = benchmark(repeats=args.repeats, chunk_size=args.chunk_size)
-    args.output_prefix.with_suffix(".json").write_text(
-        json.dumps(report, indent=2) + "\n"
-    )
-    args.output_prefix.with_suffix(".md").write_text(_markdown(report))
+    encoded = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    if args.output_json is not None:
+        output_path = args.output_json
+        if output_path.suffix.lower() == ".md":
+            raise ValueError("benchmark output must be JSON, not Markdown")
+        if output_path.suffix.lower() != ".json":
+            output_path = output_path.with_suffix(".json")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(encoded, encoding="utf-8")
+    print(encoded, end="")
 
 
 if __name__ == "__main__":

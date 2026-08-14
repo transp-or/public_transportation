@@ -19,6 +19,7 @@ from .demand import generate_gravity_demand
 from .features import GravityFeatures
 from .operator import GravityMeasurementOperator
 from .parameters import GravityParameterLayout, validate_gravity_relaxation_features
+from .specification import GravityEffectScope
 
 
 class GravityLikelihood(str, Enum):
@@ -46,6 +47,31 @@ class GravityObjectiveProblem:
         validate_gravity_relaxation_features(
             self.features, self.parameter_layout.specification
         )
+        specification = self.parameter_layout.specification
+        if specification.components and specification.likelihood.family != self.likelihood.value:
+            raise ValueError(
+                "objective likelihood does not match the declarative model specification."
+            )
+        if specification.components:
+            mask_policy = specification.likelihood.calibration_mask
+            if mask_policy == "explicit" and self.calibration_mask is None:
+                raise ValueError(
+                    "calibration-mask policy 'explicit' requires calibration_mask."
+                )
+            if mask_policy == "all_measurements" and self.calibration_mask is not None:
+                supplied = np.asarray(self.calibration_mask, dtype=bool)
+                if not np.all(supplied):
+                    raise ValueError(
+                        "calibration-mask policy 'all_measurements' cannot exclude rows."
+                    )
+        waiting = specification.component("waiting_time")
+        if waiting.scope not in (
+            GravityEffectScope.NONE,
+            GravityEffectScope.FIXED,
+        ) and self.features.initial_waiting_time is None:
+            raise ValueError(
+                "initial_waiting_time is required by the active waiting-time component."
+            )
         if self.features.num_cells != self.operator.num_free_od:
             raise ValueError(
                 "gravity cell count must equal the operator free-OD dimension."

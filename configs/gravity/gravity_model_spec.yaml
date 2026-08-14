@@ -1,0 +1,90 @@
+# General gravity-model specification (schema 1).
+# Every estimated degree of freedom is declared below and appears by name in
+# validation output and run manifests. Scopes: none/fixed add no parameter;
+# global adds one; categorical scopes add K-1 normalized parameters; smooth_basis
+# adds one parameter per supplied basis column.
+#
+# IMPLEMENTED SCOPE REFERENCE
+#   none: no effect and no parameter.
+#   fixed: a declared fixed_value (or the fixed feature-cache baseline).
+#   global: one parameter; global additive utility shifts are warned because
+#     they cancel within a conditional softmax.
+#   origin / destination: origin_index / destination_index; K-1 deviations,
+#     or K parameters for a positive coefficient (positive base plus K-1).
+#   time_period: time_period_index with the same K-1/K rule.
+#   origin_time: origin_time_group_index; K-1; production requires ridge.
+#   destination_time: destination_time_group_index; K-1/K.
+#   origin_zone / destination_zone: the corresponding *_zone_index; K-1/K.
+#   zone_pair: zone_pair_index; K-1/K and regularization is recommended.
+#   custom_group: grouping names an integer feature mapping; K-1/K; production
+#     requires ridge and every group must contain structurally feasible cells.
+#   smooth_basis: smooth_time_basis; one additive coefficient per basis column.
+# Every categorical block must set sum_zero or an explicit reference category.
+schema_version: 1
+model_name: global_production
+
+likelihood:
+  family: negative_binomial
+  calibration_mask: supported_measurements  # unsupported rows must be excluded
+  # calibration_mask: all_measurements       # only if all rows are supported
+  detection_rate_estimated: false            # cannot coexist with global production
+
+time:
+  units: minutes
+  interpretation: categorical departure-time bins
+  # bin_labels: [morning_peak, interpeak, evening_peak]
+  # smooth_basis_name: smooth_time_basis
+
+production:
+  baseline: origin_time_totals
+  correction:
+    scope: global                 # one log scale; conservative active alternative
+    parameterization: log_multiplier
+    # scope: none                 # zero parameters
+    # scope: origin               # origin_index, K-1 centered parameters
+    # scope: time_period          # time_period_index, K-1 centered parameters
+    # scope: origin_time          # origin_time_group_index; ridge is required
+    # scope: origin_zone          # origin_zone_index, K-1 centered parameters
+    # scope: custom_group         # set grouping and group_count/infer from features
+    # grouping: my_production_group
+    # constraint: sum_zero        # or reference with reference_category
+    # regularization:             # strongly recommended; required at high dimension
+    #   type: ridge
+    #   strength: 1.0
+
+destination_attractiveness:
+  source: feature_cache           # fixed positive baseline, recorded as provenance
+  correction:
+    scope: fixed                  # no estimated correction
+    # scope: global               # implemented but cancels in group softmax; warned
+    # scope: destination          # destination_index, K-1 centered parameters
+    # scope: time_period          # time_period_index, K-1 centered parameters
+    # scope: destination_time     # destination_time_group_index, K-1 parameters
+    # scope: destination_zone     # destination_zone_index, K-1 parameters
+    # constraint: sum_zero
+
+utility:
+  journey_time:
+    scope: global                 # one positive coefficient
+    # scope: origin               # positive base plus K-1 log deviations
+    # scope: destination
+    # scope: time_period
+  transfers:
+    scope: global                 # one positive coefficient
+    # scope: origin
+    # scope: destination
+    # scope: time_period
+  waiting_time:
+    scope: none                   # requires initial_waiting_time when estimated
+    # scope: global
+    # scope: time_period
+  departure_time:
+    scope: none
+    # scope: categorical          # additive K-1 effects; warned if constant in each softmax
+    # scope: smooth_basis         # requires smooth_time_basis; basis must vary within groups
+
+dispersion:
+  scope: global                   # one positive negative-binomial dispersion
+
+residual_demand:
+  scope: none                     # estimated residual demand is not implemented

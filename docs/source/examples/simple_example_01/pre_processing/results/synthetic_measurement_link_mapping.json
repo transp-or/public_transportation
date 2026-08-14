@@ -1,0 +1,335 @@
+{
+  "assignment_report": "time_expanded_report_true.html",
+  "description": "Synthetic boarding/alighting measurements and their contributing assigned links.",
+  "measurements": [
+    {
+      "contributing_links": [
+        {
+          "contribution": 8.037698745727539,
+          "head_node": 203,
+          "head_stop": "B",
+          "head_time": "00:00:00",
+          "link_id": 170,
+          "link_type": 3,
+          "tail_node": 45,
+          "tail_stop": "B",
+          "tail_time": "08:30:00"
+        }
+      ],
+      "measurement_type": "alighting",
+      "stop_id": "B",
+      "time": "08:30:00",
+      "trip_id": "L1_AB_0800",
+      "value": 8.037698745727539
+    },
+    {
+      "contributing_links": [
+        {
+          "contribution": 26.285470962524414,
+          "head_node": 203,
+          "head_stop": "B",
+          "head_time": "00:00:00",
+          "link_id": 172,
+          "link_type": 3,
+          "tail_node": 59,
+          "tail_stop": "B",
+          "tail_time": "08:45:00"
+        }
+      ],
+      "measurement_type": "alighting",
+      "stop_id": "B",
+      "time": "08:45:00",
+      "trip_id": "L1_AB_0815",
+      "value": 26.285470962524414
+    },
+    {
+      "contributing_links": [
+        {
+          "contribution": 35.67682647705078,
+          "head_node": 203,
+          "head_stop": "B",
+          "head_time": "00:00:00",
+          "link_id": 173,
+          "link_type": 3,
+          "tail_node": 73,
+          "tail_stop": "B",
+          "tail_time": "09:00:00"
+        }
+      ],
+      "measurement_type": "alighting",
+      "stop_id": "B",
+      "time": "09:00:00",
+      "trip_id": "L1_AB_0830",
+      "value": 35.67682647705078
+    },
+    {
+      "contributing_links": [
+        {
+          "contribution": 9.639036178588867,
+          "head_node": 208,
+          "head_stop": "D",
+          "head_time": "00:00:00",
+          "link_id": 206,
+          "link_type": 3,
+          "tail_node": 129,
+          "tail_stop": "D",
+          "tail_time": "08:30:00"
+        }
+      ],
+      "measurement_type": "alighting",
+      "stop_id": "D",
+      "time": "08:30:00",
+      "trip_id": "L2_CD_0800",
+      "value": 9.639036178588867
+    },
+    {
+      "contributing_links": [
+        {
+          "contribution": 10.711763381958008,
+          "head_node": 208,
+          "head_stop": "D",
+          "head_time": "00:00:00",
+          "link_id": 208,
+          "link_type": 3,
+          "tail_node": 143,
+          "tail_stop": "D",
+          "tail_time": "08:50:00"
+        }
+      ],
+      "measurement_type": "alighting",
+      "stop_id": "D",
+      "time": "08:50:00",
+      "trip_id": "L2_CD_0820",
+      "value": 10.711763381958008
+    },
+    {
+      "contributing_links": [
+        {
+          "contribution": 49.649208068847656,
+          "head_node": 208,
+          "head_stop": "D",
+          "head_time": "00:00:00",
+          "link_id": 209,
+          "link_type": 3,
+          "tail_node": 157,
+          "tail_stop": "D",
+          "tail_time": "09:10:00"
+        }
+      ],
+      "measurement_type": "alighting",
+      "stop_id": "D",
+      "time": "09:10:00",
+      "trip_id": "L2_CD_0840",
+      "value": 49.649208068847656
+    },
+    {
+      "contributing_links": [
+        {
+          "contribution": 7.935998439788818,
+          "head_node": 34,
+          "head_stop": "A",
+          "head_time": "08:00:01",
+          "link_id": 0,
+          "link_type": 2,
+          "tail_node": 0,
+          "tail_stop": "A",
+          "tail_time": "00:00:00"
+        },
+        {
+          "contribution": 0.24516361951828003,
+          "head_node": 34,
+          "head_stop": "A",
+          "head_time": "08:00:01",
+          "link_id": 2,
+          "link_type": 2,
+          "tail_node": 1,
+          "tail_stop": "A",
+          "tail_time": "00:00:00"
+        }
+      ],
+      "measurement_type": "boarding",
+      "stop_id": "A",
+      "time": "08:00:01",
+      "trip_id": "L1_AB_0800",
+      "value": 8.181162059307098
+    },
+    {
+      "contributing_links": [
+        {
+          "contribution": 2.0640034675598145,
+          "head_node": 48,
+          "head_stop": "A",
+          "head_time": "08:15:01",
+          "link_id": 1,
+          "link_type": 2,
+          "tail_node": 0,
+          "tail_stop": "A",
+          "tail_time": "00:00:00"
+        },
+        {
+          "contribution": 25.723596572875977,
+          "head_node": 48,
+          "head_stop": "A",
+          "head_time": "08:15:01",
+          "link_id": 3,
+          "link_type": 2,
+          "tail_node": 1,
+          "tail_stop": "A",
+          "tail_time": "00:00:00"
+        },
+        {
+          "contribution": 0.02646295353770256,
+          "head_node": 48,
+          "head_stop": "A",
+          "head_time": "08:15:01",
+          "link_id": 6,
+          "link_type": 2,
+          "tail_node": 2,
+          "tail_stop": "A",
+          "tail_time": "00:00:00"
+        }
+      ],
+      "measurement_type": "boarding",
+      "stop_id": "A",
+      "time": "08:15:01",
+      "trip_id": "L1_AB_0815",
+      "value": 27.814062993973494
+    },
+    {
+      "contributing_links": [
+        {
+          "contribution": 24.031227111816406,
+          "head_node": 62,
+          "head_stop": "A",
+          "head_time": "08:30:01",
+          "link_id": 4,
+          "link_type": 2,
+          "tail_node": 1,
+          "tail_stop": "A",
+          "tail_time": "00:00:00"
+        },
+        {
+          "contribution": 9.97353744506836,
+          "head_node": 62,
+          "head_stop": "A",
+          "head_time": "08:30:01",
+          "link_id": 7,
+          "link_type": 2,
+          "tail_node": 2,
+          "tail_stop": "A",
+          "tail_time": "00:00:00"
+        }
+      ],
+      "measurement_type": "boarding",
+      "stop_id": "A",
+      "time": "08:30:01",
+      "trip_id": "L1_AB_0830",
+      "value": 34.004764556884766
+    },
+    {
+      "contributing_links": [
+        {
+          "contribution": 9.66579818725586,
+          "head_node": 118,
+          "head_stop": "C",
+          "head_time": "08:00:01",
+          "link_id": 46,
+          "link_type": 2,
+          "tail_node": 12,
+          "tail_stop": "C",
+          "tail_time": "00:00:00"
+        },
+        {
+          "contribution": 0.09445258229970932,
+          "head_node": 118,
+          "head_stop": "C",
+          "head_time": "08:00:01",
+          "link_id": 48,
+          "link_type": 2,
+          "tail_node": 13,
+          "tail_stop": "C",
+          "tail_time": "00:00:00"
+        }
+      ],
+      "measurement_type": "boarding",
+      "stop_id": "C",
+      "time": "08:00:01",
+      "trip_id": "L2_CD_0800",
+      "value": 9.760250769555569
+    },
+    {
+      "contributing_links": [
+        {
+          "contribution": 0.3342011570930481,
+          "head_node": 132,
+          "head_stop": "C",
+          "head_time": "08:20:01",
+          "link_id": 47,
+          "link_type": 2,
+          "tail_node": 12,
+          "tail_stop": "C",
+          "tail_time": "00:00:00"
+        },
+        {
+          "contribution": 9.73509407043457,
+          "head_node": 132,
+          "head_stop": "C",
+          "head_time": "08:20:01",
+          "link_id": 49,
+          "link_type": 2,
+          "tail_node": 13,
+          "tail_stop": "C",
+          "tail_time": "00:00:00"
+        },
+        {
+          "contribution": 0.9399417638778687,
+          "head_node": 132,
+          "head_stop": "C",
+          "head_time": "08:20:01",
+          "link_id": 52,
+          "link_type": 2,
+          "tail_node": 14,
+          "tail_stop": "C",
+          "tail_time": "00:00:00"
+        }
+      ],
+      "measurement_type": "boarding",
+      "stop_id": "C",
+      "time": "08:20:01",
+      "trip_id": "L2_CD_0820",
+      "value": 11.009236991405487
+    },
+    {
+      "contributing_links": [
+        {
+          "contribution": 0.17045558989048004,
+          "head_node": 146,
+          "head_stop": "C",
+          "head_time": "08:40:01",
+          "link_id": 51,
+          "link_type": 2,
+          "tail_node": 13,
+          "tail_stop": "C",
+          "tail_time": "00:00:00"
+        },
+        {
+          "contribution": 49.06006622314453,
+          "head_node": 146,
+          "head_stop": "C",
+          "head_time": "08:40:01",
+          "link_id": 54,
+          "link_type": 2,
+          "tail_node": 14,
+          "tail_stop": "C",
+          "tail_time": "00:00:00"
+        }
+      ],
+      "measurement_type": "boarding",
+      "stop_id": "C",
+      "time": "08:40:01",
+      "trip_id": "L2_CD_0840",
+      "value": 49.23052181303501
+    }
+  ],
+  "schema_version": 1
+}

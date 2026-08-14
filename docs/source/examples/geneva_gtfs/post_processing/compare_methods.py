@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import csv
 import json
 from pathlib import Path
 
@@ -59,26 +58,6 @@ def main() -> None:
     for row in rows:
         row["runtime_relative_to_fastest"] = float(row["runtime_seconds"]) / fastest
 
-    fields = (
-        "method",
-        "runtime_seconds",
-        "runtime_relative_to_fastest",
-        "success",
-        "termination",
-        "od_mae_active",
-        "od_rmse_active",
-        "link_flow_mae",
-        "link_flow_rmse",
-        "link_flow_correlation",
-        "estimated_total_demand",
-        "coverage_90_active",
-        "mean_interval_width_90_active",
-    )
-    with (RESULTS / "method_comparison.csv").open("w", encoding="utf-8", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore", lineterminator="\n")
-        writer.writeheader()
-        writer.writerows(rows)
-
     payload = {
         "experiment": {
             "fixed_theta": 5.0,
@@ -93,36 +72,7 @@ def main() -> None:
     (RESULTS / "method_comparison.json").write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-
-    lines = [
-        "# Geneva estimation-method comparison",
-        "",
-        "All methods use the same timetable, observations, fixed theta, OD support, and frozen-cell layout.",
-        "",
-        "| Method | Runtime (s) | Relative runtime | OD RMSE | Link RMSE | Link correlation | 90% coverage | Mean 90% width |",
-        "|:--|--:|--:|--:|--:|--:|--:|--:|",
-    ]
-    for row in rows:
-        coverage = row["coverage_90_active"]
-        width = row["mean_interval_width_90_active"]
-        lines.append(
-            f"| {row['method']} | {float(row['runtime_seconds']):.1f} | "
-            f"{float(row['runtime_relative_to_fastest']):.1f}x | "
-            f"{float(row['od_rmse_active']):.3f} | {float(row['link_flow_rmse']):.3f} | "
-            f"{float(row['link_flow_correlation']):.6f} | "
-            f"{('—' if coverage == '' else f'{float(coverage):.1%}')} | "
-            f"{('—' if width == '' else f'{float(width):.3f}')} |"
-        )
-    lines.extend(
-        (
-            "",
-            "ML reached its configured iteration cap; MAP satisfied the optimizer termination criterion; VI completed its fixed 1,000-step schedule.",
-            "The prior is intentionally inaccurate, so this benchmark is a stress test of regularization rather than a favorable MAP/VI setup.",
-            "",
-        )
-    )
-    (RESULTS / "method_comparison.md").write_text("\n".join(lines), encoding="utf-8")
-    print("\n".join(lines))
+    print(json.dumps(payload, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

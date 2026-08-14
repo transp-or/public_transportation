@@ -27,6 +27,16 @@ changed production input republishes that input and the gravity/model stages
 without rebuilding the measurement response operator. Corrupt or incompatible
 artifacts fail closed.
 
+Observed-data support reports are diagnostic artifacts, not scientific
+operator identities.  Before a potentially long direct scheduled build, the
+complete positive-boarding admission report is atomically written as
+\texttt{positive\_boarding\_support\_preflight.json} in the identity-specific
+checkpoint directory.  The report is refreshed at canonical-origin,
+routing-support, and realized-cache stages.  Changing observations therefore
+does not invalidate compatible routing or operator shards, but every new
+activation rechecks the supplied positive boarding rows before reusing or
+constructing an operator.
+
 Potentially long journey construction accepts a progress callback that is not
 part of any numerical fingerprint. Messages contain the phase and status,
 completed and total query counts, current origin and departure, elapsed time,
@@ -34,3 +44,13 @@ recent mean query time, predicted remaining time, and peak resident memory.
 Reporting is throttled by both a query interval and a wall-clock interval, with
 the final query always emitted. The callback therefore provides useful live
 feedback without changing reproducibility or flooding logs on fast cases.
+
+Gravity run manifests use a separate model-level identity. They now contain
+the complete serialized gravity specification and fingerprint, named parameter
+blocks and transformations, feature-cache and direct-operator artifact
+fingerprints, calibration, holdout, and unsupported-row summaries,
+regularization settings, time-bin definitions, and destination-attractiveness
+provenance. Checkpoint fingerprints include the specification and parameter
+layout, so a changed scope, mapping, constraint, or ridge setting cannot resume
+an incompatible optimizer state. Conversely, such a model change does not
+invalidate a scientifically compatible fixed-routing assignment artifact.
