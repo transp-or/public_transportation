@@ -1093,6 +1093,44 @@ truncating when the estimate exceeds the configured budget. This is the first
 stage that may construct the reusable timetable-feasibility index and perform
 the schedule search.
 
+For a large independent universe, `expand-od` is deliberately observable and
+interruptible. Pair chunks (512 pairs by default, configurable in
+`[expansion]`) are written as immutable JSONL files below
+`results/checkpoints/od_time_expansion/<expansion_fingerprint>/`. The atomic
+`manifest.json` records the package, case, source, OD-universe, approved-bin,
+feasibility, and algorithm fingerprints, plus chunk checksums and completed
+counters. `progress.json` is updated after each chunk and contains elapsed time,
+recent rates, an ETA after enough observations, memory usage, and `next_chunk`.
+Only the active chunk is held in memory. Canonical candidate/prior/exclusion
+files are published only after every chunk has completed, so an interrupted
+run cannot be consumed accidentally.
+
+If the process receives `SIGINT`/`SIGTERM`, the active chunk is discarded, the
+completed chunks remain reusable, and the command exits with status 130. From
+the case-study root, resume explicitly with:
+
+```bash
+uv run --frozen python run.py expand-od --resume --json-progress
+```
+
+An existing checkpoint without `--resume` is an explicit stop condition. To
+start over, archive it intentionally with `--fresh`:
+
+```bash
+uv run --frozen python run.py expand-od --fresh --json-progress
+```
+
+`--resume` rejects changed configuration, source checksums, timetable/bin
+contracts, package revision, feasibility settings, chunk size, or corrupted
+chunks. `structural-zeros` and `prepare` require a completed, checksum-valid
+checkpoint and stream its exclusion rows; they reject `running` or
+`interrupted` manifests and never consume partial canonical files.
+
+The `prepare` summary repeats the expansion status, checkpoint path and reuse
+flag, completed/total chunk counts, retained-cell count, and structural-zero
+cell count. Review these fields alongside the reduced-OD phase diagnostics so
+that the prepared problem can always be traced back to one completed expansion.
+
 ## 7. Stage 4 — Structural zeroes and feasibility
 
 Structural-zero preprocessing and reduced-journey preparation solve related
@@ -1211,6 +1249,24 @@ mismatch).
 `expand-od` completed for the current configuration and that their fingerprints
 match. Re-run the missing preceding stage; never let the downstream stage
 silently rebuild or overwrite the artifact.
+
+### An expansion was interrupted or a checkpoint is present
+
+**Symptom:** `expand-od` exits with status 130, reports `status =
+"interrupted"`, or refuses to start because a checkpoint already exists.
+
+**Action:** inspect `results/checkpoints/od_time_expansion/<fingerprint>/manifest.json`
+and `progress.json`. Confirm the case, package, source, OD-universe, approved
+bins, and feasibility fingerprints are the ones intended for this run. Resume
+only that matching checkpoint with `run.py expand-od --resume --json-progress`.
+Do not copy or edit JSONL chunks. If the scientific inputs or settings changed,
+use `--fresh` to archive the old checkpoint and start a new expansion. A
+checkpoint is never selected implicitly, and downstream stages must wait for a
+completed manifest.
+
+**Classification:** an interrupted run is an expected operational stop; a
+checksum or fingerprint mismatch is a stale/corrupt-artifact failure requiring
+review before rerunning.
 
 ### A generated time-bin artifact is stale
 

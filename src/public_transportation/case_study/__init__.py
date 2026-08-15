@@ -11,6 +11,7 @@ from .config import (
     CASE_CONFIG_SCHEMA_VERSION,
     CaseStudyConfig,
     CaseStudyConfigError,
+    ExpansionSettings,
     load_case_study_config,
 )
 from .adapter import (
@@ -27,6 +28,7 @@ __all__ = [
     "CASE_CONFIG_SCHEMA_VERSION",
     "CaseStudyConfig",
     "CaseStudyConfigError",
+    "ExpansionSettings",
     "GenericCaseAdapter",
     "GenericCaseAudit",
     "GenericCaseData",

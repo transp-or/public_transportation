@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 from collections.abc import Callable, Mapping
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Iterator
 
 from public_transportation.domain import Scenario, TimeOfDay, read_fixed_demand_csv
 from public_transportation.measurement import (
@@ -777,6 +777,26 @@ class GenericCaseAdapter:
         if not audit_path.is_file() or not cell_path.is_file() or not exclusion_path.is_file():
             raise FileNotFoundError("run expand-od before structural-zeros")
         payload = json.loads(audit_path.read_text(encoding="utf-8"))
+        if payload.get("status") != "completed":
+            raise ValueError("OD-time expansion is incomplete; complete expand-od before downstream stages")
+        checkpoint_value = payload.get("checkpoint_directory")
+        if checkpoint_value:
+            checkpoint = Path(str(checkpoint_value)).expanduser().resolve()
+            manifest_path = checkpoint / "manifest.json"
+            if not manifest_path.is_file():
+                raise ValueError("OD-time expansion checkpoint manifest is missing")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if manifest.get("status") != "completed":
+                raise ValueError("OD-time expansion checkpoint is incomplete")
+            if manifest.get("expansion_fingerprint") != payload.get("expansion_fingerprint"):
+                raise ValueError("OD-time expansion checkpoint fingerprint does not match its audit")
+            checksums = manifest.get("chunk_checksums", {})
+            for item in manifest.get("completed_chunks", []):
+                chunk = checkpoint / f"chunk-{int(item):06d}.jsonl"
+                if not chunk.is_file():
+                    raise ValueError(f"OD-time expansion checkpoint chunk is missing: {chunk}")
+                if str(checksums.get(str(int(item)), "")) != _sha256(chunk):
+                    raise ValueError(f"OD-time expansion checkpoint chunk checksum mismatch: {chunk}")
         if payload.get("configuration_fingerprint") != self.config.fingerprint:
             raise ValueError("OD-time expansion artifact configuration fingerprint does not match current configuration.")
         universe = self.load_persisted_universe()
@@ -820,6 +840,66 @@ class GenericCaseAdapter:
         self._universe = universe
         self._expansion = expansion
         return expansion
+
+    def iter_persisted_expansion_records(self) -> Iterator[dict[str, object]]:
+        """Stream validated checkpoint rows without materializing the expansion."""
+        audit_path = self.config.paths.results_directory / "audit/od_time_expansion.json"
+        if not audit_path.is_file():
+            raise FileNotFoundError("run expand-od before structural-zeros")
+        payload = json.loads(audit_path.read_text(encoding="utf-8"))
+        if payload.get("status") != "completed":
+            raise ValueError("OD-time expansion is incomplete; complete expand-od before structural-zero stages")
+        universe = self.load_persisted_universe()
+        if payload.get("universe_fingerprint") != universe.fingerprint:
+            raise ValueError("OD-universe artifact fingerprint does not match the persisted expansion")
+        periods = self._approved_time_periods(require_materialized=True)
+        if payload.get("approved_time_bins_fingerprint") != self._time_bins_fingerprint(periods):
+            raise ValueError("time-bin fingerprint does not match the persisted expansion")
+        checkpoint = Path(str(payload.get("checkpoint_directory", ""))).expanduser().resolve()
+        manifest_path = checkpoint / "manifest.json"
+        if not manifest_path.is_file():
+            raise ValueError("OD-time expansion checkpoint manifest is missing")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("status") != "completed":
+            raise ValueError("OD-time expansion checkpoint is incomplete")
+        if manifest.get("expansion_fingerprint") != payload.get("expansion_fingerprint"):
+            raise ValueError("OD-time expansion checkpoint fingerprint does not match its audit")
+        digest = hashlib.sha256()
+        completed = sorted(int(item) for item in manifest.get("completed_chunks", []))
+        expected_checksums = manifest.get("chunk_checksums", {})
+        seen = 0
+        for index in completed:
+            chunk = checkpoint / f"chunk-{index:06d}.jsonl"
+            if not chunk.is_file():
+                raise ValueError(f"OD-time expansion checkpoint chunk is missing: {chunk}")
+            if str(expected_checksums.get(str(index), "")) != _sha256(chunk):
+                raise ValueError(f"OD-time expansion checkpoint chunk checksum mismatch: {chunk}")
+            with chunk.open("r", encoding="utf-8") as stream:
+                for line in stream:
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    if row.get("status") not in {"retained", "excluded"}:
+                        raise ValueError(f"invalid expansion row status in {chunk}")
+                    digest.update(
+                        json.dumps(
+                            [
+                                str(row["origin_stop_id"]),
+                                str(row["destination_stop_id"]),
+                                str(row["time_bin_id"]),
+                                str(row["status"]),
+                                str(row.get("reason", "")),
+                            ],
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    )
+                    digest.update(b"\n")
+                    seen += 1
+                    yield row
+        if int(manifest.get("completed_cells", -1)) != seen:
+            raise ValueError("OD-time expansion checkpoint row count does not match its manifest")
+        if payload.get("semantic_checksum") and digest.hexdigest() != payload.get("semantic_checksum"):
+            raise ValueError("OD-time expansion semantic checksum does not match its checkpoint rows")
 
     def _load_persisted_prior(
         self, expansion: ODTimeExpansion

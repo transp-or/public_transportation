@@ -48,6 +48,15 @@ horizon_start = "08:00:00"
 horizon_end = "09:00:00"
 candidate = "recommendation"
 
+[expansion]
+# Checkpointed OD–time expansion settings.  These defaults are safe for a
+# large case; review chunk size and the temporary-byte ceiling for your host.
+chunk_size_pairs = 512
+progress_interval_seconds = 5.0
+checkpoint_enabled = true
+resume_requires_explicit_flag = true
+maximum_temporary_bytes = 8589934592
+
 [sampling]
 strategy = "fixed_count"
 samples_per_period = 1

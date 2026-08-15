@@ -79,6 +79,29 @@ is the first expensive stage. It persists the approved pair-by-bin expansion,
 priors, and provenance; `structural-zeros` and `prepare` consume those files
 and fail on missing or incompatible fingerprints instead of recomputing them.
 Review the reported complexity estimate before allowing `expand-od` to run.
+The expansion is chunked and checkpointed under
+`results/checkpoints/od_time_expansion/<expansion_fingerprint>/`. It emits one
+JSON progress event at startup and after each completed chunk when
+`--json-progress` is supplied. If a long run is interrupted, completed chunks
+remain valid and canonical CSV files are not published. Resume only the
+matching checkpoint explicitly:
+
+```bash
+JAX_ENABLE_X64=true uv run --frozen python run.py expand-od --resume --json-progress
+```
+
+To discard the matching checkpoint deliberately, archive it and start over:
+
+```bash
+JAX_ENABLE_X64=true uv run --frozen python run.py expand-od --fresh --json-progress
+```
+
+An existing checkpoint is never reused implicitly. `manifest.json` records the
+package/configuration/OD/bin fingerprints, chunk checksums, completed counts,
+and semantic checksum; `progress.json` records the latest rate, ETA (once
+enough samples exist), memory estimate, and next chunk. `structural-zeros` and
+`prepare` reject a running, interrupted, corrupt, or fingerprint-mismatched
+expansion and consume only a completed checkpoint.
 For an independent case, `time-discretization` requires the current
 `results/audit/od_universe.json` and uses its `retained_pair_count`; it never
 uses legacy demand rows or a stale audit. If no candidate fits
@@ -169,6 +192,7 @@ expects a root-level configuration file; all contracts are under `config/`.
 | `[prior_demand]` | `source`, `semantics`, `expansion`; `value` for `all_ones` | `source` is `all_ones`, `external_file`, or legacy; pair-level external files are independent of time bins. |
 | `[observations]` | four source-column names plus `timestamp_semantics`, `missing_value_policy`, `ambiguous_event_policy` | `timestamp_semantics = "event_time"`; both policies are currently `"error"`. At least one of `trip_id_column` and `line_id_column` is required. `method_id_column` is optional when the canonical header is already `method_id`. |
 | `[time_discretization]` | explicit resolution limits, positive `max_od_cells`, `horizon_start`, `horizon_end`, `candidate` | `num_od_pairs` is optional legacy metadata; for new cases it is audited from `od-universe`. `max_od_cells` is an approved complexity budget, not a default. |
+| `[expansion]` | `chunk_size_pairs`, `progress_interval_seconds`, `checkpoint_enabled`, `resume_requires_explicit_flag`, `maximum_temporary_bytes` | positive integer chunk size; positive seconds; booleans; positive temporary-byte ceiling. Defaults are `512`, `5.0`, `true`, `true`, and `8589934592`. Settings are part of the expansion fingerprint. |
 | `[sampling]` | `strategy`, `samples_per_period`, `time_step_seconds` | Strategy is `uniform_midpoint`, `fixed_count`, `fixed_time_step`, or `adaptive_service_aware`; counts may be one integer or a period-keyed table. |
 | `[structural_zeros]` | `configuration_file` | Points to the strict structural-zero TOML; existing positive fixed demand conflicts are errors. |
 | `[model]` | `configuration_file`, optional `settings_file` | The model settings declare likelihood and explicit production/destination-attractiveness component blocks. Legacy `production_mode` remains accepted for compatibility. |

@@ -16,13 +16,19 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 import math
+import os
+import platform
+import signal
+import tempfile
+import time
 from bisect import bisect_left
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Callable, Literal, Mapping, Sequence
+from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
 
 from public_transportation.domain import Scenario
 
@@ -33,6 +39,7 @@ ODUniverseSource = Literal["file", "network_ordered_pairs"]
 ODUniverseLevel = Literal["stop", "physical_stop"]
 ConnectivityPolicy = Literal["none", "directed_reachable"]
 TimetablePolicy = Literal["required", "defer", "none"]
+EXPANSION_ALGORITHM_VERSION = 1
 
 
 def _text(value: Any, name: str) -> str:
@@ -207,6 +214,496 @@ class ODTimeExpansion:
             "universe_fingerprint": self.universe_fingerprint,
             "fingerprint": self.fingerprint,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class ODTimeExpansionRunResult:
+    """Summary of a checkpointed OD--time expansion.
+
+    Rows are deliberately not retained here.  The durable JSONL chunks are
+    the source of truth and can be streamed by downstream stages.
+    """
+
+    checkpoint_directory: Path
+    expansion_fingerprint: str
+    semantic_checksum: str
+    status: str
+    total_chunks: int
+    completed_chunks: int
+    total_cells: int
+    retained_cells: int
+    excluded_cells: int
+    next_chunk: int
+    checkpoint_reused: bool = False
+
+
+class ODTimeExpansionInterrupted(RuntimeError):
+    """Raised when checkpointed expansion is interrupted safely."""
+
+    exit_code = 130
+
+    def __init__(self, checkpoint_directory: Path, message: str = "OD-time expansion interrupted") -> None:
+        super().__init__(message)
+        self.checkpoint_directory = checkpoint_directory
+
+
+def _atomic_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
+    _atomic_text(path, json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n")
+
+
+def _atomic_jsonl(path: Path, rows: Iterable[Mapping[str, object]], *, maximum_bytes: int) -> None:
+    """Atomically write one bounded chunk without a second serialized copy."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    written = 0
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+            for row in rows:
+                line = json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+                written += len(line.encode("utf-8"))
+                if written > maximum_bytes:
+                    raise MemoryError("one expansion chunk exceeds expansion.maximum_temporary_bytes")
+                stream.write(line)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _memory_bytes() -> int | None:
+    try:
+        import resource
+
+        value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        return value if platform.system() == "Darwin" else value * 1024
+    except (ImportError, OSError, ValueError):
+        return None
+
+
+def _semantic_checksum(rows: Iterable[Mapping[str, object]]) -> str:
+    digest = hashlib.sha256()
+    for row in rows:
+        digest.update(
+            canonical_json(
+                [
+                    str(row["origin_stop_id"]),
+                    str(row["destination_stop_id"]),
+                    str(row["time_bin_id"]),
+                    str(row["status"]),
+                    str(row.get("reason", "")),
+                ]
+            ).encode("utf-8")
+        )
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def expansion_contract_fingerprint(
+    universe: CandidateODUniverse,
+    time_periods: Sequence[object],
+    configuration: Mapping[str, object] | None = None,
+) -> str:
+    """Return the deterministic contract fingerprint for checkpoint reuse."""
+    bins = tuple(_period_tuple(period) for period in time_periods)
+    payload = {
+        "algorithm_version": EXPANSION_ALGORITHM_VERSION,
+        "universe_fingerprint": universe.fingerprint,
+        "time_bins": [list(item) for item in bins],
+        "configuration": dict(configuration or {}),
+    }
+    return _sha256_payload(payload)
+
+
+def _expansion_rows_for_pair(
+    pair: CandidateODPair,
+    bins: tuple[tuple[str, int, int], ...],
+    universe: CandidateODUniverse,
+    *,
+    scenario: Scenario | None,
+    departures: set[str],
+    arrivals: set[str],
+    reachable: Mapping[str, set[str]],
+    maximum_transfers: int,
+    maximum_initial_wait_seconds: int,
+    maximum_journey_seconds: int,
+    maximum_waiting_seconds: int,
+    timetable_policy: TimetablePolicy,
+    timetable_feasibility: Callable[[CandidateODPair, tuple[str, int, int]], bool] | None,
+    feasibility_index: TimetableFeasibilityIndex | None,
+) -> list[dict[str, object]]:
+    pair_reason: str | None = None
+    if pair.origin_stop_id == pair.destination_stop_id and not universe.include_same_stop:
+        pair_reason = "same_node"
+    elif universe.active_service_only and scenario is not None and pair.origin_stop_id not in departures:
+        pair_reason = "inactive_origin"
+    elif universe.active_service_only and scenario is not None and pair.destination_stop_id not in arrivals:
+        pair_reason = "inactive_destination"
+    elif (
+        universe.connectivity_policy == "directed_reachable"
+        and scenario is not None
+        and pair.destination_stop_id not in reachable.get(pair.origin_stop_id, set())
+    ):
+        pair_reason = "static_unreachable"
+    rows: list[dict[str, object]] = []
+    for period in bins:
+        row: dict[str, object] = {
+            "origin_stop_id": pair.origin_stop_id,
+            "destination_stop_id": pair.destination_stop_id,
+            "time_bin_id": period[0],
+            "status": "excluded",
+            "reason": pair_reason or "",
+            "detail": "",
+        }
+        if pair_reason is None:
+            if timetable_feasibility is not None:
+                feasible: bool | None = bool(timetable_feasibility(pair, period))
+            elif timetable_policy == "none":
+                feasible = True
+            elif timetable_policy == "defer":
+                feasible = None
+            elif scenario is None or scenario.timetable is None:
+                feasible = False
+            elif feasibility_index is not None:
+                feasible = feasibility_index.is_feasible(
+                    pair,
+                    period,
+                    maximum_transfers=maximum_transfers,
+                    maximum_initial_wait_seconds=maximum_initial_wait_seconds,
+                    maximum_waiting_seconds=maximum_waiting_seconds,
+                    maximum_journey_seconds=maximum_journey_seconds,
+                )
+            else:
+                feasible = _timetable_feasible(
+                    scenario,
+                    pair,
+                    period,
+                    mapping=universe.physical_stop_mapping,
+                    maximum_transfers=maximum_transfers,
+                    maximum_initial_wait_seconds=maximum_initial_wait_seconds,
+                    maximum_journey_seconds=maximum_journey_seconds,
+                    maximum_waiting_seconds=maximum_waiting_seconds,
+                )
+            if feasible is True or feasible is None:
+                row["status"] = "retained"
+                row["reason"] = ""
+            else:
+                row["reason"] = "timetable_infeasible"
+        rows.append(row)
+    return rows
+
+
+def run_candidate_od_time_expansion(
+    universe: CandidateODUniverse,
+    time_periods: Sequence[object],
+    scenario: Scenario | None = None,
+    feasibility_index: TimetableFeasibilityIndex | None = None,
+    configuration: Mapping[str, object] | None = None,
+    checkpoint_directory: str | Path | None = None,
+    resume: bool = False,
+    progress: Callable[[Mapping[str, object]], None] | None = None,
+    timetable_feasibility: Callable[[CandidateODPair, tuple[str, int, int]], bool] | None = None,
+) -> ODTimeExpansionRunResult:
+    """Expand candidate cells in deterministic, resumable pair chunks.
+
+    Only one chunk is materialized in memory.  Completed chunks are immutable
+    JSONL files, each accompanied by a checksum in the atomic manifest.
+    """
+    if configuration is None:
+        config: dict[str, object] = {}
+    elif isinstance(configuration, Mapping):
+        config = dict(configuration)
+    elif is_dataclass(configuration):
+        config = dict(asdict(configuration))
+    else:
+        config = dict(vars(configuration))
+    bins = tuple(_period_tuple(period) for period in time_periods)
+    if not bins:
+        raise ValueError("at least one approved time period is required")
+    if bins != tuple(sorted(bins, key=lambda item: (item[1], item[2], item[0]))):
+        raise ValueError("approved time periods must be sorted by start/end/id")
+    if any(left[2] > right[1] for left, right in zip(bins, bins[1:], strict=False)):
+        raise ValueError("approved time periods must not overlap")
+    chunk_size = int(config.get("chunk_size_pairs", 512))
+    interval = float(config.get("progress_interval_seconds", 5.0))
+    maximum_temporary_bytes = int(config.get("maximum_temporary_bytes", 8 * 1024**3))
+    if chunk_size <= 0 or interval <= 0 or maximum_temporary_bytes <= 0:
+        raise ValueError("expansion chunk and resource settings must be positive")
+    if checkpoint_directory is None:
+        raise ValueError("checkpoint_directory is required")
+    checkpoint = Path(checkpoint_directory).expanduser().resolve()
+    checkpoint.mkdir(parents=True, exist_ok=True)
+    expansion_fingerprint = expansion_contract_fingerprint(universe, bins, config)
+    manifest_path = checkpoint / "manifest.json"
+    progress_path = checkpoint / "progress.json"
+    if manifest_path.exists() and not resume:
+        raise FileExistsError(
+            f"checkpoint already exists at {checkpoint}; pass --resume or explicitly archive it before a fresh run"
+        )
+    if not manifest_path.exists() and not resume and any(checkpoint.iterdir()):
+        raise FileExistsError(
+            f"checkpoint directory contains existing files at {checkpoint}; pass --resume only for a valid manifest"
+        )
+    if resume and not manifest_path.exists():
+        raise FileNotFoundError(f"cannot resume without checkpoint manifest: {manifest_path}")
+    total_chunks = (len(universe.pairs) + chunk_size - 1) // chunk_size
+    total_rows = len(universe.pairs) * len(bins)
+    departures, arrivals = (set(), set()) if scenario is None else _service_activity(scenario, universe.physical_stop_mapping)
+    reachable = {} if scenario is None else _directed_reachability(scenario, universe.physical_stop_mapping)
+    if (
+        timetable_feasibility is None
+        and feasibility_index is None
+        and config.get("timetable_policy", "required") == "required"
+        and scenario is not None
+        and scenario.timetable is not None
+    ):
+        feasibility_index = TimetableFeasibilityIndex.from_scenario(
+            scenario, physical_stop_mapping=universe.physical_stop_mapping
+        )
+    policy = str(config.get("timetable_policy", "required"))
+    if policy not in {"required", "defer", "none"}:
+        raise ValueError("unsupported timetable_policy")
+    limits = {
+        "maximum_transfers": int(config.get("maximum_transfers", 2)),
+        "maximum_initial_wait_seconds": int(config.get("maximum_initial_wait_seconds", 3600)),
+        "maximum_journey_seconds": int(config.get("maximum_journey_seconds", 7200)),
+        "maximum_waiting_seconds": int(config.get("maximum_waiting_seconds", 3600)),
+    }
+    if any(value < 0 for value in limits.values()) or limits["maximum_journey_seconds"] <= 0:
+        raise ValueError("feasibility limits must be non-negative (journey time positive)")
+    contract = {
+        "status": "running",
+        "algorithm_version": EXPANSION_ALGORITHM_VERSION,
+        "expansion_fingerprint": expansion_fingerprint,
+        "configuration": config,
+        "configuration_fingerprint": config.get("configuration_fingerprint"),
+        "package_revision": config.get("package_revision"),
+        "scenario_checksums": config.get("scenario_checksums", config.get("source_checksums", {})),
+        "od_universe_fingerprint": universe.fingerprint,
+        "reduced_od_fingerprint": config.get("reduced_od_fingerprint"),
+        "approved_time_bins_fingerprint": config.get("approved_time_bins_fingerprint"),
+        "approved_time_bins": [list(item) for item in bins],
+        "chunk_size_pairs": chunk_size,
+        "total_pairs": len(universe.pairs),
+        "total_time_bins": len(bins),
+        "total_rows": total_rows,
+        "total_chunks": total_chunks,
+        "completed_chunks": [],
+        "completed_cells": 0,
+        "retained_cells": 0,
+        "excluded_cells": 0,
+        "next_chunk": 0,
+        "semantic_checksum": None,
+    }
+    reused = bool(resume)
+    completed: set[int] = set()
+    chunk_checksums: dict[str, str] = {}
+    if resume:
+        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if existing.get("expansion_fingerprint") != expansion_fingerprint:
+            raise ValueError("checkpoint fingerprint does not match the current expansion contract")
+        if existing.get("status") == "completed":
+            # A completed checkpoint is reusable, but still verify every chunk.
+            pass
+        for item in existing.get("completed_chunks", []):
+            index = int(item)
+            chunk_path = checkpoint / f"chunk-{index:06d}.jsonl"
+            if not chunk_path.is_file():
+                raise ValueError(f"checkpoint chunk is missing: {chunk_path}")
+            expected_checksum = str(existing.get("chunk_checksums", {}).get(str(index), ""))
+            if not expected_checksum or _file_sha256(chunk_path) != expected_checksum:
+                raise ValueError(f"checkpoint chunk checksum mismatch: {chunk_path}")
+            completed.add(index)
+            chunk_checksums[str(index)] = expected_checksum
+        contract.update(
+            {
+                "completed_chunks": sorted(completed),
+                "completed_cells": int(existing.get("completed_cells", 0)),
+                "retained_cells": int(existing.get("retained_cells", 0)),
+                "excluded_cells": int(existing.get("excluded_cells", 0)),
+                "next_chunk": int(existing.get("next_chunk", max(completed, default=-1) + 1)),
+                "chunk_checksums": chunk_checksums,
+            }
+        )
+    else:
+        contract["chunk_checksums"] = {}
+        _atomic_json(manifest_path, contract)
+
+    start = time.monotonic()
+    rates: list[float] = []
+    lock_path = checkpoint / ".lock"
+    try:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(lock_fd)
+    except FileExistsError as error:
+        raise RuntimeError(f"another expand-od process is using checkpoint {checkpoint}") from error
+
+    def report(status: str, *, chunk: int | None = None, final: bool = False) -> None:
+        completed_cells = int(contract["completed_cells"])
+        elapsed = max(time.monotonic() - start, 1e-9)
+        rate = completed_cells / elapsed if completed_cells else 0.0
+        if rate > 0.0:
+            rates.append(rate)
+        eta = None
+        if len(rates) >= 3 and rates[-3:]:
+            eta = max(total_rows - completed_cells, 0) / (sum(rates[-3:]) / len(rates[-3:]))
+        event: dict[str, object] = {
+            "status": status,
+            "chunk": chunk,
+            "completed_chunks": len(completed),
+            "total_chunks": total_chunks,
+            "completed_cells": completed_cells,
+            "total_cells": total_rows,
+            "retained_cells": int(contract["retained_cells"]),
+            "excluded_cells": int(contract["excluded_cells"]),
+            "elapsed_seconds": elapsed,
+            "rolling_rate_cells_per_second": rates[-3:] if rates else [],
+            "eta_seconds": eta,
+            "memory_bytes": _memory_bytes(),
+            "next_chunk": int(contract["next_chunk"]),
+            "checkpoint_directory": str(checkpoint),
+            "expansion_fingerprint": expansion_fingerprint,
+        }
+        if final:
+            event["checkpoint_reusable"] = False
+        _atomic_json(progress_path, event)
+        if progress is not None:
+            progress(event)
+
+    old_sigterm = None
+    active_chunk_path: Path | None = None
+    active_chunk_index: int | None = None
+
+    def stop_handler(signum: int, _frame: object) -> None:
+        raise ODTimeExpansionInterrupted(checkpoint, f"OD-time expansion interrupted by signal {signum}")
+
+    try:
+        try:
+            old_sigterm = signal.signal(signal.SIGTERM, stop_handler)
+        except ValueError:
+            old_sigterm = None
+        if not resume:
+            report("started")
+        else:
+            report("resuming")
+        for chunk_index in range(total_chunks):
+            if chunk_index in completed:
+                continue
+            pair_slice = universe.pairs[chunk_index * chunk_size : (chunk_index + 1) * chunk_size]
+            rows: list[dict[str, object]] = []
+            active_chunk_path = checkpoint / f"chunk-{chunk_index:06d}.jsonl"
+            active_chunk_index = chunk_index
+            last_progress = time.monotonic()
+            for pair in pair_slice:
+                rows.extend(
+                    _expansion_rows_for_pair(
+                        pair,
+                        bins,
+                        universe,
+                        scenario=scenario,
+                        departures=departures,
+                        arrivals=arrivals,
+                        reachable=reachable,
+                        timetable_feasibility=timetable_feasibility,
+                        feasibility_index=feasibility_index,
+                        timetable_policy=policy,  # type: ignore[arg-type]
+                        **limits,
+                    )
+                )
+                if time.monotonic() - last_progress >= interval:
+                    report("running", chunk=chunk_index)
+                    last_progress = time.monotonic()
+            _atomic_jsonl(active_chunk_path, rows, maximum_bytes=maximum_temporary_bytes)
+            checksum = _file_sha256(active_chunk_path)
+            chunk_checksums[str(chunk_index)] = checksum
+            completed.add(chunk_index)
+            contract["completed_chunks"] = sorted(completed)
+            contract["chunk_checksums"] = dict(chunk_checksums)
+            contract["completed_cells"] = int(contract["completed_cells"]) + len(rows)
+            contract["retained_cells"] = int(contract["retained_cells"]) + sum(row["status"] == "retained" for row in rows)
+            contract["excluded_cells"] = int(contract["excluded_cells"]) + sum(row["status"] == "excluded" for row in rows)
+            contract["next_chunk"] = chunk_index + 1
+            _atomic_json(manifest_path, contract)
+            report("running", chunk=chunk_index)
+            active_chunk_path = None
+            active_chunk_index = None
+        def persisted_rows():
+            for chunk_index in sorted(completed):
+                chunk_path = checkpoint / f"chunk-{chunk_index:06d}.jsonl"
+                with chunk_path.open("r", encoding="utf-8") as stream:
+                    for line in stream:
+                        if line.strip():
+                            yield json.loads(line)
+
+        semantic = _semantic_checksum(persisted_rows())
+        contract.update({"status": "completed", "semantic_checksum": semantic, "checkpoint_reusable": False})
+        _atomic_json(manifest_path, contract)
+        report("completed", final=True)
+        return ODTimeExpansionRunResult(
+            checkpoint,
+            expansion_fingerprint,
+            semantic,
+            "completed",
+            total_chunks,
+            len(completed),
+            int(contract["completed_cells"]),
+            int(contract["retained_cells"]),
+            int(contract["excluded_cells"]),
+            int(contract["next_chunk"]),
+            reused,
+        )
+    except (KeyboardInterrupt, ODTimeExpansionInterrupted) as error:
+        if active_chunk_path is not None and active_chunk_index not in completed:
+            try:
+                active_chunk_path.unlink()
+            except FileNotFoundError:
+                pass
+        contract["status"] = "interrupted"
+        contract["next_chunk"] = min((index for index in range(total_chunks) if index not in completed), default=total_chunks)
+        _atomic_json(manifest_path, contract)
+        try:
+            report("interrupted", final=True)
+        except BaseException:
+            # A progress sink must not prevent the typed interruption from
+            # reaching the CLI after durable state has been written.
+            pass
+        if isinstance(error, ODTimeExpansionInterrupted):
+            raise
+        raise ODTimeExpansionInterrupted(checkpoint) from error
+    finally:
+        if old_sigterm is not None:
+            signal.signal(signal.SIGTERM, old_sigterm)
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 @dataclass(frozen=True, slots=True)

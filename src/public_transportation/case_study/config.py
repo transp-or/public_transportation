@@ -179,6 +179,17 @@ class TimeDiscretizationSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class ExpansionSettings:
+    """Checkpoint and observability controls for OD--time expansion."""
+
+    chunk_size_pairs: int = 512
+    progress_interval_seconds: float = 5.0
+    checkpoint_enabled: bool = True
+    resume_requires_explicit_flag: bool = True
+    maximum_temporary_bytes: int = 8 * 1024**3
+
+
+@dataclass(frozen=True, slots=True)
 class SamplingSettings:
     strategy: str
     samples_per_period: int | dict[str, int]
@@ -200,6 +211,7 @@ class CaseStudyConfig:
     prior_demand: PriorDemandSettings
     observations: ObservationMapping
     time_discretization: TimeDiscretizationSettings
+    expansion: ExpansionSettings
     structural_zero_config_file: Path
     reduced_od_config_file: Path
     model_config_file: Path
@@ -460,7 +472,7 @@ def load_case_study_config(path: str | Path, *, case_root: str | Path | None = N
         root,
         name="configuration",
         required={"schema_version", "case", "paths", "observations", "time_discretization", "structural_zeros", "model"},
-        optional={"sampling", "od_universe", "prior_demand"},
+        optional={"sampling", "od_universe", "prior_demand", "expansion"},
     )
     version = _positive_int(root["schema_version"], "schema_version")
     if version != CASE_CONFIG_SCHEMA_VERSION:
@@ -657,6 +669,47 @@ def load_case_study_config(path: str | Path, *, case_root: str | Path | None = N
     if settings.horizon_end_s <= settings.horizon_start_s:
         raise CaseStudyConfigError("time-discretization horizon_end must exceed horizon_start.")
 
+    expansion_root = root.get(
+        "expansion",
+        {
+            "chunk_size_pairs": 512,
+            "progress_interval_seconds": 5.0,
+            "checkpoint_enabled": True,
+            "resume_requires_explicit_flag": True,
+            "maximum_temporary_bytes": 8 * 1024**3,
+        },
+    )
+    if not isinstance(expansion_root, Mapping):
+        raise CaseStudyConfigError("expansion must be a TOML table.")
+    _keys(
+        expansion_root,
+        name="expansion",
+        required=set(),
+        optional={
+            "chunk_size_pairs",
+            "progress_interval_seconds",
+            "checkpoint_enabled",
+            "resume_requires_explicit_flag",
+            "maximum_temporary_bytes",
+        },
+    )
+    expansion = ExpansionSettings(
+        chunk_size_pairs=_positive_int(expansion_root.get("chunk_size_pairs", 512), "expansion.chunk_size_pairs"),
+        progress_interval_seconds=_finite(
+            expansion_root.get("progress_interval_seconds", 5.0), "expansion.progress_interval_seconds"
+        ),
+        checkpoint_enabled=_bool(expansion_root.get("checkpoint_enabled", True), "expansion.checkpoint_enabled"),
+        resume_requires_explicit_flag=_bool(
+            expansion_root.get("resume_requires_explicit_flag", True),
+            "expansion.resume_requires_explicit_flag",
+        ),
+        maximum_temporary_bytes=_positive_int(
+            expansion_root.get("maximum_temporary_bytes", 8 * 1024**3), "expansion.maximum_temporary_bytes"
+        ),
+    )
+    if expansion.progress_interval_seconds <= 0.0:
+        raise CaseStudyConfigError("expansion.progress_interval_seconds must be positive.")
+
     structural = _table(root, "structural_zeros")
     _keys(structural, name="structural_zeros", required={"configuration_file"})
     reduced = _table(root, "model")
@@ -760,6 +813,7 @@ def load_case_study_config(path: str | Path, *, case_root: str | Path | None = N
         prior_demand,
         mapping,
         settings,
+        expansion,
         structural_file,
         reduced_file,
         model_file,

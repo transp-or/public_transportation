@@ -6,9 +6,11 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import platform
 import re
 import sys
+import time
 from importlib.metadata import distribution
 from pathlib import Path
 from typing import Any, Sequence
@@ -34,7 +36,13 @@ from public_transportation.inference.reduced_od.contracts import (
 )
 from public_transportation.inference.reduced_od.reconstruction import reconstruct_full_od
 from public_transportation.preprocessing.materialize_time_bins import materialize_time_bins
-from public_transportation.preprocessing.od_universe import generate_prior_demand
+from public_transportation.preprocessing.od_universe import (
+    ODTimeExpansionInterrupted,
+    TimetableFeasibilityIndex,
+    _read_pair_priors,
+    expansion_contract_fingerprint,
+    run_candidate_od_time_expansion,
+)
 from public_transportation.inference.reduced_od import prepare_reduced_od_artifacts
 from public_transportation.preprocessing.structural_zeros import run_structural_zero_preprocessing
 from public_transportation.preprocessing.time_discretization import (
@@ -59,6 +67,46 @@ def _write_csv(path: Path, header: Sequence[str], rows: Sequence[Sequence[object
         writer = csv.writer(stream)
         writer.writerow(header)
         writer.writerows(rows)
+    return path
+
+
+def _write_csv_atomic(path: Path, header: Sequence[str], rows: Any) -> Path:
+    """Write a potentially large row iterator without exposing a partial file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(header)
+            for row in rows:
+                writer.writerow(row)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return path
+
+
+def _write_json_atomic(path: Path, payload: Any) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n",
+            encoding="utf-8",
+        )
+        with temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
     return path
 
 
@@ -147,6 +195,7 @@ class GenericCaseRunner:
     def _stage_provenance(self) -> dict[str, object]:
         return {
             "source_checksums": self._source_checksums(),
+            "scenario_checksums": self._source_checksums(),
             "package": self.package_info(),
             "configuration_fingerprint": self.config.fingerprint,
             "od_universe_policy": {
@@ -432,82 +481,306 @@ class GenericCaseRunner:
         self.emit({"stage": "materialize-bins", "status": "completed", "output": str(output), "reviewer": reviewer})
         return manifest
 
-    def expand_od(self) -> dict[str, object]:
-        """Expand the approved time bins across the independent OD universe."""
+    def _iter_checkpoint_rows(self, checkpoint: Path):
+        manifest_path = checkpoint / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("status") != "completed":
+            raise ValueError("OD-time expansion checkpoint is incomplete; resume or complete expand-od first")
+        for index in sorted(int(item) for item in manifest.get("completed_chunks", [])):
+            chunk = checkpoint / f"chunk-{index:06d}.jsonl"
+            if not chunk.is_file():
+                raise ValueError(f"OD-time expansion checkpoint chunk is missing: {chunk}")
+            with chunk.open("r", encoding="utf-8") as stream:
+                for line in stream:
+                    if line.strip():
+                        row = json.loads(line)
+                        if row.get("status") not in {"retained", "excluded"}:
+                            raise ValueError(f"invalid expansion row status in {chunk}")
+                        yield row
+
+    def _expansion_components_from_groups(
+        self,
+        origin_groups: set[tuple[str, str]],
+        destination_groups: set[tuple[str, str]],
+    ) -> dict[str, object]:
+        """Component provenance from streaming group sets (without retaining cells)."""
+        result: dict[str, object] = {}
+        for name, groups in (
+            ("production", origin_groups),
+            ("destination_attractiveness", destination_groups),
+        ):
+            spec = self.config.model.get(name)
+            if not isinstance(spec, dict):
+                result[name] = {"mode": "legacy_compatibility"}
+                continue
+            mode = str(spec["mode"])
+            scope = str(spec["correction_scope"])
+            estimated_dimension = 0 if mode != "estimated" else (1 if scope == "global" else max(len(groups) - 1, 0))
+            result[name] = {
+                "mode": mode,
+                "baseline": spec.get("baseline"),
+                "correction_scope": scope,
+                "transformation": spec.get("transformation"),
+                "constraint": spec.get("constraint"),
+                "regularization": spec.get("regularization"),
+                "prior_scale": spec.get("prior_scale"),
+                "group_count": len(groups),
+                "estimated_dimension": estimated_dimension,
+                "active_parameters": estimated_dimension,
+                "inactive_parameters": 0,
+                "derived_from_prior": False,
+                "derived_from_legacy_demand": False,
+            }
+        return result
+
+    def expand_od(self, *, resume: bool = False, fresh: bool = False) -> dict[str, object]:
+        """Expand approved bins with durable, deterministic checkpoints."""
+        if resume and fresh:
+            raise ValueError("expand-od accepts either --resume or --fresh, not both")
         if self.config.od_universe.source == "legacy_time_dependent_demand":
             payload = {
                 "status": "legacy_compatibility",
                 "input_semantics": "legacy_time_dependent_demand",
                 "message": "OD--time cells are read from legacy demand.csv.",
             }
-            _write_json(self._stage_path("audit", "od_time_expansion.json"), payload)
+            _write_json_atomic(self._stage_path("audit", "od_time_expansion.json"), payload)
             return payload
+        base = self.adapter.load_base_data()
         universe = self.adapter.load_persisted_universe()
-        expansion = self.adapter.build_od_time_expansion(universe)
-        _write_csv(
-            self._stage_path("audit", "od_time_exclusions.csv"),
-            ("origin_stop_id", "destination_stop_id", "time_bin_id", "reason", "detail"),
-            [
-                (item.origin_stop_id, item.destination_stop_id, item.time_bin_id, item.reason, item.detail)
-                for item in expansion.exclusions
-            ],
+        periods = self.adapter._approved_time_periods(require_materialized=True)
+        bins = tuple(JourneyTimePeriod(item.period_id, item.start_seconds, item.end_seconds) for item in periods)
+        approved_bins_fingerprint = self.adapter._time_bins_fingerprint(bins)
+        reduced = self.config.reduced_od_config
+        feasibility = {
+            "maximum_transfers": reduced.journeys.maximum_transfers,
+            "maximum_initial_wait_seconds": reduced.journeys.maximum_waiting_seconds,
+            "maximum_journey_seconds": reduced.journeys.maximum_journey_seconds,
+            "maximum_waiting_seconds": reduced.journeys.maximum_waiting_seconds,
+            "timetable_policy": "required",
+        }
+        expansion_config: dict[str, object] = {
+            **feasibility,
+            "chunk_size_pairs": self.config.expansion.chunk_size_pairs,
+            "progress_interval_seconds": self.config.expansion.progress_interval_seconds,
+            "checkpoint_enabled": self.config.expansion.checkpoint_enabled,
+            "resume_requires_explicit_flag": self.config.expansion.resume_requires_explicit_flag,
+            "maximum_temporary_bytes": self.config.expansion.maximum_temporary_bytes,
+            "configuration_fingerprint": self.config.fingerprint,
+            "package_revision": self._package_revision(),
+            "source_checksums": self._source_checksums(),
+            "scenario_checksums": self._source_checksums(),
+            "od_universe_fingerprint": universe.fingerprint,
+            "approved_time_bins_fingerprint": approved_bins_fingerprint,
+            "reduced_od_fingerprint": self.config.reduced_od_config.fingerprint,
+            "physical_stop_mapping": sorted(universe.physical_stop_mapping.items()),
+        }
+        expansion_fingerprint = expansion_contract_fingerprint(universe, bins, expansion_config)
+        checkpoint_root = self.results / "checkpoints" / "od_time_expansion"
+        checkpoint = (checkpoint_root / expansion_fingerprint).resolve()
+        if self.results.resolve() not in checkpoint.parents:
+            raise ValueError("expansion checkpoint escaped the configured results directory")
+        existing_checkpoints: list[Path] = []
+        if checkpoint_root.is_dir():
+            for candidate in sorted(checkpoint_root.iterdir()):
+                if not candidate.is_dir() or ".archive-" in candidate.name:
+                    continue
+                manifest_path = candidate / "manifest.json"
+                if manifest_path.is_file():
+                    existing_checkpoints.append(candidate)
+                    try:
+                        existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError) as error:
+                        raise ValueError(f"invalid expansion checkpoint manifest: {manifest_path}") from error
+                    if (
+                        not fresh
+                        and not resume
+                        and existing_manifest.get("od_universe_fingerprint") == universe.fingerprint
+                        and candidate != checkpoint
+                    ):
+                        raise ValueError(
+                            "an expansion checkpoint exists for this OD universe but its contract fingerprint differs; "
+                            "pass --fresh explicitly after reviewing it"
+                        )
+        if fresh:
+            for candidate in existing_checkpoints:
+                if (candidate / ".lock").exists():
+                    raise RuntimeError(f"cannot archive active expansion checkpoint {candidate}")
+                archive = candidate.with_name(f"{candidate.name}.archive-{time.time_ns()}")
+                os.replace(candidate, archive)
+        elif checkpoint.exists() and not resume and any(checkpoint.iterdir()):
+            raise FileExistsError(
+                f"checkpoint already exists at {checkpoint}; pass --resume or --fresh explicitly"
+            )
+        marker = self._stage_path("audit", "od_time_expansion.json")
+        incomplete_payload = {
+            "status": "running",
+            "input_semantics": "independent_od_universe",
+            "universe_fingerprint": universe.fingerprint,
+            "expansion_fingerprint": expansion_fingerprint,
+            "approved_time_bins_fingerprint": approved_bins_fingerprint,
+            "checkpoint_directory": str(checkpoint),
+            "configuration_fingerprint": self.config.fingerprint,
+            "source_checksums": self._source_checksums(),
+        }
+        _write_json_atomic(marker, incomplete_payload)
+        index = TimetableFeasibilityIndex.from_scenario(
+            base.scenario,
+            physical_stop_mapping=universe.physical_stop_mapping,
         )
-        _write_csv(
+        try:
+            result = run_candidate_od_time_expansion(
+                universe,
+                bins,
+                scenario=base.scenario,
+                feasibility_index=index,
+                configuration=expansion_config,
+                checkpoint_directory=checkpoint,
+                resume=resume,
+                progress=lambda event: self.emit({"stage": "expand-od", **dict(event)}),
+            )
+        except ODTimeExpansionInterrupted as error:
+            _write_json_atomic(
+                marker,
+                {
+                    **incomplete_payload,
+                    "status": "interrupted",
+                    "checkpoint_directory": str(error.checkpoint_directory),
+                },
+            )
+            raise
+
+        def rows():
+            return self._iter_checkpoint_rows(result.checkpoint_directory)
+        origin_groups: set[tuple[str, str]] = set()
+        destination_groups: set[tuple[str, str]] = set()
+        exclusion_counts: dict[str, int] = {}
+
+        def retained_rows():
+            for row in rows():
+                if row["status"] == "retained":
+                    origin_groups.add((str(row["origin_stop_id"]), str(row["time_bin_id"])))
+                    destination_groups.add((str(row["destination_stop_id"]), str(row["time_bin_id"])))
+                    yield (row["origin_stop_id"], row["destination_stop_id"], row["time_bin_id"])
+
+        def excluded_rows():
+            for row in rows():
+                if row["status"] == "excluded":
+                    reason = str(row.get("reason", ""))
+                    exclusion_counts[reason] = exclusion_counts.get(reason, 0) + 1
+                    yield (
+                        row["origin_stop_id"],
+                        row["destination_stop_id"],
+                        row["time_bin_id"],
+                        reason,
+                        row.get("detail", ""),
+                    )
+
+        _write_csv_atomic(
             self._stage_path("generated_inputs", "candidate_od_time.csv"),
             ("origin_stop_id", "destination_stop_id", "time_bin_id"),
-            [cell.tuple for cell in expansion.cells],
+            retained_rows(),
         )
-        periods = tuple(
-            JourneyTimePeriod(item[0], item[1], item[2]) for item in expansion.time_bins
+        _write_csv_atomic(
+            self._stage_path("audit", "od_time_exclusions.csv"),
+            ("origin_stop_id", "destination_stop_id", "time_bin_id", "reason", "detail"),
+            excluded_rows(),
         )
-        approved_bins_fingerprint = self.adapter._time_bins_fingerprint(periods)
+        source = self.config.prior_demand.source
+        prior_value = float(self.config.prior_demand.value or 1.0)
+        pair_values: dict[tuple[str, str], float] = {}
+        if source == "external_file":
+            if self.config.prior_demand.input_file is None:
+                raise ValueError("external_file prior requires prior_demand input_file")
+            pair_values = _read_pair_priors(self.config.prior_demand.input_file)
+        elif source != "all_ones":
+            raise NotImplementedError(f"checkpointed expansion does not support prior source {source!r}")
+        if source == "all_ones" and (not np.isfinite(prior_value) or prior_value <= 0.0):
+            raise ValueError("all_ones prior value must be finite and positive")
+
+        def prior_rows():
+            seen_pairs: set[tuple[str, str]] = set()
+            for row in retained_rows():
+                key = (str(row[0]), str(row[1]))
+                seen_pairs.add(key)
+                value = prior_value if source == "all_ones" else pair_values.get(key)
+                if value is None:
+                    raise ValueError(f"external prior is missing retained pair {key!r}")
+                yield (*row, float(value))
+            if source == "external_file":
+                extra = sorted(set(pair_values) - seen_pairs)
+                if extra:
+                    raise ValueError(f"external prior contains pairs not retained by expansion: {extra}")
+
+        _write_csv_atomic(
+            self._stage_path("generated_inputs", "prior_demand.csv"),
+            ("origin_stop_id", "destination_stop_id", "time_bin_id", "prior_value"),
+            prior_rows(),
+        )
         complexity = self.adapter.complexity_preflight(
             pair_count=universe.pair_count,
             pair_level_exclusions=len(universe.exclusions),
             time_bin_count=len(periods),
         )
         payload = {
-            **expansion.audit,
+            "status": "completed",
+            "input_semantics": "independent_od_universe",
+            "input_pair_count": universe.pair_count,
+            "time_bin_count": len(bins),
+            "expanded_od_time_count": result.total_cells,
+            "retained_cell_count": result.retained_cells,
+            "exclusion_counts": dict(sorted(exclusion_counts.items())),
+            "retained_cells": result.retained_cells,
+            "excluded_cells": result.excluded_cells,
+            "universe_fingerprint": universe.fingerprint,
             "pair_universe_fingerprint": universe.fingerprint,
-            "expansion_fingerprint": expansion.fingerprint,
-            "feasibility_settings": dict(expansion.policies),
+            "expansion_fingerprint": result.expansion_fingerprint,
+            "semantic_checksum": result.semantic_checksum,
+            "feasibility_settings": feasibility,
             "complexity_preflight": complexity,
             "approved_time_bins_fingerprint": approved_bins_fingerprint,
+            "checkpoint_directory": str(result.checkpoint_directory),
+            "checkpoint_reused": result.checkpoint_reused,
+            "completed_chunks": result.completed_chunks,
+            "total_chunks": result.total_chunks,
             **self._stage_provenance(),
         }
-        _write_json(self._stage_path("audit", "od_time_expansion.json"), payload)
-        prior_generation = generate_prior_demand(
-            expansion,
-            source=self.config.prior_demand.source,
-            value=float(self.config.prior_demand.value or 1.0),
-            semantics=self.config.prior_demand.semantics,
-            prior_file=self.config.prior_demand.input_file,
-        )
-        if prior_generation.values:
-            _write_csv(
-                self._stage_path("generated_inputs", "prior_demand.csv"),
-                ("origin_stop_id", "destination_stop_id", "time_bin_id", "prior_value"),
-                [(*cell.tuple, value) for cell, value in sorted(prior_generation.values.items())],
-            )
-            _write_json(
-                self._stage_path("audit", "prior_generation.json"),
-                {
-                    **self._stage_provenance(),
-                    **prior_generation.audit,
-                    "source": self.config.prior_demand.source,
-                    "semantics": self.config.prior_demand.semantics,
-                    "expansion": self.config.prior_demand.expansion,
-                    "cell_count": len(prior_generation.values),
-                    "universe_fingerprint": universe.fingerprint,
-                    "od_time_expansion_fingerprint": expansion.fingerprint,
-                    "approved_time_bins_fingerprint": approved_bins_fingerprint,
-                },
-            )
-        _write_json(
+        _write_json_atomic(marker, payload)
+        prior_parameters: dict[str, object]
+        if source == "all_ones":
+            prior_parameters = {"value": prior_value, "expansion": "one_per_retained_od_time_cell"}
+        else:
+            prior_parameters = {
+                "prior_file": str(self.config.prior_demand.input_file),
+                "expansion": "pair_value_repeated_over_retained_bins",
+            }
+        prior_payload = {
+            **self._stage_provenance(),
+            "source": source,
+            "semantics": self.config.prior_demand.semantics,
+            "parameters": prior_parameters,
+            "cell_count": result.retained_cells,
+            "universe_fingerprint": universe.fingerprint,
+            "od_time_expansion_fingerprint": result.expansion_fingerprint,
+            "approved_time_bins_fingerprint": approved_bins_fingerprint,
+            "generator_fingerprint": hashlib.sha256(
+                json.dumps(
+                    {"source": source, "semantics": self.config.prior_demand.semantics, "parameters": prior_parameters},
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest(),
+        }
+        prior_payload["fingerprint"] = hashlib.sha256(
+            json.dumps(
+                {"generator_fingerprint": prior_payload["generator_fingerprint"], "expansion_fingerprint": result.expansion_fingerprint},
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        _write_json_atomic(self._stage_path("audit", "prior_generation.json"), prior_payload)
+        _write_json_atomic(
             self._stage_path("audit", "production_attractiveness_provenance.json"),
             {
                 **self._stage_provenance(),
-                "components": self._component_provenance(expansion=expansion),
+                "components": self._expansion_components_from_groups(origin_groups, destination_groups),
                 "input_files": {
                     "production": None if self.config.paths.production_inputs is None else str(self.config.paths.production_inputs),
                     "destination_attractiveness": None if self.config.paths.destination_attractiveness is None else str(self.config.paths.destination_attractiveness),
@@ -517,44 +790,61 @@ class GenericCaseRunner:
                 "approved_time_bins_fingerprint": approved_bins_fingerprint,
             },
         )
-        self.emit({"stage": "expand-od", "status": "completed", "output": str(self._stage_path("audit", "od_time_expansion.json"))})
+        self.emit({"stage": "expand-od", "status": "completed", "output": str(marker), "checkpoint_reused": result.checkpoint_reused})
         return payload
 
     def structural_zeros(self) -> dict[str, object]:
         if self.config.od_universe.source != "legacy_time_dependent_demand":
-            expansion = self.adapter.load_persisted_expansion()
-            fixed = {
-                (item.origin_stop_id, item.destination_stop_id, item.time_bin_id): 0.0
-                for item in expansion.exclusions
-            }
-            _write_csv(
+            expansion_audit_path = self._stage_path("audit", "od_time_expansion.json")
+            if not expansion_audit_path.is_file():
+                raise FileNotFoundError("run expand-od before structural-zeros")
+            audit_payload = json.loads(expansion_audit_path.read_text(encoding="utf-8"))
+            if audit_payload.get("status") != "completed":
+                raise ValueError("OD-time expansion is incomplete; complete expand-od before structural-zeros")
+            reason_counts: dict[str, int] = {}
+
+            def fixed_rows():
+                for item in self.adapter.iter_persisted_expansion_records():
+                    if item["status"] == "excluded":
+                        reason = str(item.get("reason", ""))
+                        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+                        yield (item["origin_stop_id"], item["destination_stop_id"], item["time_bin_id"], 0.0)
+
+            _write_csv_atomic(
                 self._stage_path("generated_inputs", "fixed_demand.csv"),
                 ("origin_stop_id", "dest_stop_id", "time_bin_id", "fixed_flow"),
-                [(*key, value) for key, value in sorted(fixed.items())],
+                fixed_rows(),
             )
-            _write_csv(
+
+            def audit_rows():
+                for item in self.adapter.iter_persisted_expansion_records():
+                    if item["status"] == "excluded":
+                        yield (
+                            item["origin_stop_id"],
+                            item["destination_stop_id"],
+                            item["time_bin_id"],
+                            item.get("reason", ""),
+                            item.get("detail", ""),
+                        )
+
+            _write_csv_atomic(
                 self._stage_path("audit", "structural_zero_audit.csv"),
                 ("origin_stop_id", "destination_stop_id", "time_bin_id", "reason", "detail"),
-                [
-                    (
-                        item.origin_stop_id,
-                        item.destination_stop_id,
-                        item.time_bin_id,
-                        item.reason,
-                        item.detail,
-                    )
-                    for item in expansion.exclusions
-                ],
+                audit_rows(),
             )
             payload = {
-                "num_cells": expansion.audit["expanded_od_time_count"],
-                "num_structural_zero": len(fixed),
-                "num_retained": expansion.cell_count,
-                "num_fixed_merged": len(fixed),
-                "num_free_after_merge": expansion.cell_count,
-                "primary_reason_counts": expansion.audit["exclusion_counts"],
+                "num_cells": audit_payload.get("expanded_od_time_count"),
+                "num_structural_zero": audit_payload.get("excluded_cells", 0),
+                "num_retained": audit_payload.get("retained_cell_count", 0),
+                "num_fixed_merged": audit_payload.get("excluded_cells", 0),
+                "num_free_after_merge": audit_payload.get("retained_cell_count", 0),
+                "primary_reason_counts": dict(sorted(reason_counts.items())),
                 "input_semantics": "independent_od_universe",
-                "expansion_fingerprint": expansion.fingerprint,
+                "expansion_fingerprint": audit_payload.get("expansion_fingerprint"),
+                "expansion_status": audit_payload.get("status"),
+                "checkpoint_reused": audit_payload.get("checkpoint_reused", False),
+                "completed_chunks": audit_payload.get("completed_chunks"),
+                "checkpoint_directory": audit_payload.get("checkpoint_directory"),
                 "output_folder": str(self._stage_path("generated_inputs", "")),
                 "configuration_fingerprint": self.config.fingerprint,
             }
@@ -600,11 +890,26 @@ class GenericCaseRunner:
             cache_policy="reuse_or_build",
             progress=self.emit,
         )
+        expansion_report: dict[str, object] = {"status": "legacy_compatibility"}
+        expansion_audit_path = self._stage_path("audit", "od_time_expansion.json")
+        if expansion_audit_path.is_file():
+            audit_payload = json.loads(expansion_audit_path.read_text(encoding="utf-8"))
+            expansion_report = {
+                "status": audit_payload.get("status"),
+                "checkpoint_reused": audit_payload.get("checkpoint_reused", False),
+                "checkpoint_directory": audit_payload.get("checkpoint_directory"),
+                "completed_chunks": audit_payload.get("completed_chunks"),
+                "total_chunks": audit_payload.get("total_chunks"),
+                "retained_cells": audit_payload.get("retained_cell_count"),
+                "structural_zero_cells": audit_payload.get("excluded_cells"),
+                "expansion_fingerprint": audit_payload.get("expansion_fingerprint"),
+            }
         payload = {
             "directory": str(prepared.directory),
             "fingerprints": dict(prepared.fingerprints),
             "dimensions": prepared.dimensions,
             "phase_diagnostics": list(prepared.phase_diagnostics),
+            "expansion": expansion_report,
             "configuration_fingerprint": self.config.fingerprint,
         }
         output = _write_json(self._stage_path("artifacts", "prepare_summary.json"), payload)
@@ -831,9 +1136,15 @@ def run_case_stage(
     od_path: str | Path | None = None,
     json_progress: bool = False,
     dry_run: bool = False,
+    resume: bool = False,
+    fresh: bool = False,
 ) -> dict[str, object]:
     config = load_case_study_config(config_path, case_root=case_root)
+    if (resume or fresh) and stage != "expand-od":
+        raise ValueError("--resume/--fresh are only valid with the expand-od stage")
     if dry_run:
+        if resume or fresh:
+            raise ValueError("--resume/--fresh are only valid for a real expand-od run")
         output_categories = {
             "check": "audit",
             "od-universe": "audit",
@@ -864,7 +1175,7 @@ def run_case_stage(
         "check": runner.check,
         "od-universe": runner.od_universe,
         "time-discretization": runner.time_discretization,
-        "expand-od": runner.expand_od,
+        "expand-od": lambda: runner.expand_od(resume=resume, fresh=fresh),
         "structural-zeros": runner.structural_zeros,
         "prepare": runner.prepare,
         "preflight": runner.preflight,
@@ -905,6 +1216,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--od", type=Path, default=None)
     parser.add_argument("--json-progress", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--resume", action="store_true", help="resume the matching expand-od checkpoint")
+    parser.add_argument("--fresh", action="store_true", help="archive a matching checkpoint and start expand-od afresh")
     args = parser.parse_args(argv)
     try:
         payload = run_case_stage(
@@ -920,7 +1233,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             od_path=args.od,
             json_progress=args.json_progress,
             dry_run=args.dry_run,
+            resume=args.resume,
+            fresh=args.fresh,
         )
+    except ODTimeExpansionInterrupted as error:
+        print(json.dumps({"status": "interrupted", "error": str(error), "checkpoint_directory": str(error.checkpoint_directory)}, sort_keys=True), file=sys.stderr)
+        return error.exit_code
     except Exception as error:  # CLI boundary: preserve a non-zero status.
         print(json.dumps({"status": "failed", "error": str(error)}, sort_keys=True), file=sys.stderr)
         return 1
