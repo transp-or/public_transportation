@@ -49,6 +49,7 @@ class TimeDiscretizationConfig:
     horizon_start_s: int | None = None
     horizon_end_s: int | None = None
     measurement_types: tuple[str, ...] = ("boarding", "alighting")
+    allow_infeasible_budget: bool = False
 
     def __post_init__(self) -> None:
         if self.base_resolution_minutes <= 0:
@@ -76,6 +77,8 @@ class TimeDiscretizationConfig:
         if self.max_od_cells is not None and self.max_od_cells <= 0:
             raise ValueError("max_od_cells must be positive when provided")
         if (
+            not self.allow_infeasible_budget
+            and
             self.num_od_pairs is not None
             and self.max_od_cells is not None
             and self.max_od_cells < self.num_od_pairs
@@ -343,6 +346,7 @@ def recommend_time_discretization(
                 "max_bin_minutes": candidate.max_bin_minutes,
                 "events_per_bin": list(candidate.events_per_bin),
                 "estimated_od_cells": estimated_od_cells,
+                "max_od_cells": resolved.max_od_cells,
                 "time_bins": _time_bins(candidate.edges_s),
                 "edges": [
                     {"time_s": edge, "time": _format_time(edge)}
@@ -351,9 +355,11 @@ def recommend_time_discretization(
             }
         )
     valid = [item for item in candidates if item["valid"]]
-    if not valid:
-        raise ValueError("No candidate time discretization satisfies the configured constraints")
-    selected = min(valid, key=lambda item: (float(item["score"]), int(item["num_bins"]), str(item["name"])))
+    selected = (
+        min(valid, key=lambda item: (float(item["score"]), int(item["num_bins"]), str(item["name"])))
+        if valid
+        else None
+    )
     peak_intervals = []
     mask = np.asarray(profile.peak_mask, dtype=bool)
     start: int | None = None
@@ -368,9 +374,14 @@ def recommend_time_discretization(
                 }
             )
             start = None
-    return {
+    configuration = asdict(resolved)
+    configuration.pop("allow_infeasible_budget", None)
+    report = {
         "schema_version": SCHEMA_VERSION,
-        "configuration": asdict(resolved),
+        "status": "ok" if selected is not None else "blocked",
+        "retained_pair_count": resolved.num_od_pairs,
+        "max_od_cells": resolved.max_od_cells,
+        "configuration": configuration,
         "profile": {
             "start": _format_time(profile.start_s),
             "end": _format_time(profile.end_s),
@@ -387,6 +398,14 @@ def recommend_time_discretization(
             "it cannot recover variation hidden by prior aggregation."
         ],
     }
+    if selected is None:
+        report.update(
+            {
+                "reason": "no_candidate_within_max_od_cells",
+                "required_decision": "approve a larger budget or revise the time-bin policy",
+            }
+        )
+    return report
 
 
 def recommend_time_discretization_from_csv(

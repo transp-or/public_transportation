@@ -142,30 +142,7 @@ class GenericCaseRunner:
 
     def _source_checksums(self) -> dict[str, str]:
         """Return checksums for all configured source and contract files."""
-        paths = self.config.paths
-        candidates = [
-            ("measurements", paths.measurements),
-            ("candidate_demand", paths.candidate_demand),
-            ("od_pairs", paths.od_pairs),
-            ("prior_demand", paths.prior_demand),
-            ("fixed_demand", paths.fixed_demand),
-            ("production_inputs", paths.production_inputs),
-            ("destination_attractiveness", paths.destination_attractiveness),
-            ("od_universe_pair_file", self.config.od_universe.pair_file),
-            ("prior_input_file", self.config.prior_demand.input_file),
-        ]
-        checksums = {
-            name: hashlib.sha256(path.read_bytes()).hexdigest()
-            for name, path in candidates
-            if path is not None and path.is_file()
-        }
-        if paths.scenario_directory.is_dir():
-            for path in sorted(item for item in paths.scenario_directory.rglob("*") if item.is_file()):
-                checksums[f"scenario/{path.relative_to(paths.scenario_directory)}"] = hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in self.config.package_config_paths:
-            if path.is_file():
-                checksums[f"configuration/{path.name}"] = hashlib.sha256(path.read_bytes()).hexdigest()
-        return checksums
+        return self.adapter._current_source_checksums()
 
     def _stage_provenance(self) -> dict[str, object]:
         return {
@@ -182,6 +159,10 @@ class GenericCaseRunner:
             "service_day": self.config.service_day,
             "timezone": self.config.timezone,
         }
+
+    def _package_revision(self) -> str:
+        """Stable package identity used by freshness manifests."""
+        return self.adapter._current_package_revision()
 
     def _component_provenance(self, data: Any | None = None, *, expansion: Any | None = None) -> dict[str, object]:
         """Serialize explicit production/attractiveness semantics and dimensions."""
@@ -294,6 +275,14 @@ class GenericCaseRunner:
                 pair_level_exclusions=len(universe.exclusions),
                 time_bin_count=0,
             ),
+            "configured_max_bins": self.config.time_discretization.max_bins,
+            "worst_case_od_time_cells": universe.pair_count * self.config.time_discretization.max_bins,
+            "maximum_configured_od_cells": self.config.time_discretization.max_od_cells,
+            "worst_case_within_budget": (
+                self.config.time_discretization.max_od_cells is None
+                or universe.pair_count * self.config.time_discretization.max_bins
+                <= self.config.time_discretization.max_od_cells
+            ),
             **self._stage_provenance(),
         }
         _write_json(self._stage_path("audit", "od_universe.json"), payload)
@@ -301,26 +290,57 @@ class GenericCaseRunner:
         return payload
 
     def time_discretization(self) -> dict[str, object]:
-        audit = self.adapter.audit()
         settings = self.config.time_discretization
-        complexity = dict(audit.complexity)
-        if complexity.get("candidate_pair_count") is None and settings.max_od_cells is None:
-            raise ValueError("time-discretization requires an explicit complexity budget before OD-universe is audited.")
+        base = self.adapter.load_base_data()
+        od_audit = self.adapter.load_current_od_universe_audit(required=False)
+        if base.input_semantics == "independent_od_universe":
+            if od_audit is None:
+                if settings.num_od_pairs is None or settings.max_od_cells is None:
+                    raise FileNotFoundError(
+                        "run od-universe before time-discretization for an independent OD case"
+                    )
+                pair_count = settings.num_od_pairs
+                od_fingerprint = f"manual-approved:{pair_count}"
+            else:
+                pair_count = int(od_audit["retained_pair_count"])
+                od_fingerprint = str(od_audit["fingerprint"])
+        else:
+            pair_count = self.adapter._persisted_pair_count()
+            if pair_count is None:
+                raise ValueError("legacy time-discretization requires a candidate demand pair count")
+            od_fingerprint, _, _ = self.adapter._od_universe_identity()
+        complexity = self.adapter.complexity_preflight(
+            pair_count=pair_count,
+            time_bin_count=0,
+            raise_on_exceed=False,
+        )
         report = recommend_time_discretization(
-            self.adapter.load_base_data().measurements.records,
+            base.measurements.records,
             TimeDiscretizationConfig(
                 base_resolution_minutes=settings.base_resolution_minutes,
                 min_bin_minutes=settings.min_bin_minutes,
                 max_bin_minutes=settings.max_bin_minutes,
                 max_bins=settings.max_bins,
-                num_od_pairs=settings.num_od_pairs,
+                num_od_pairs=pair_count,
                 max_od_cells=settings.max_od_cells,
                 horizon_start_s=settings.horizon_start_s,
                 horizon_end_s=settings.horizon_end_s,
+                allow_infeasible_budget=True,
             ),
         )
         report["complexity_preflight"] = complexity
+        report["configuration_fingerprint"] = self.config.fingerprint
+        report["package_revision"] = self._package_revision()
+        report["od_universe_fingerprint"] = od_fingerprint
+        report["retained_pair_count"] = pair_count
+        report["time_discretization_fingerprint"] = self.config.time_discretization_fingerprint
+        report["source_checksums"] = self.adapter._current_source_checksums()
         output = _write_json(self._stage_path("audit", "time_discretization_recommendation.json"), report)
+        if report.get("status") == "blocked":
+            raise ValueError(
+                "no candidate time discretization satisfies max_od_cells; "
+                f"recommendation written to {output}. Review the budget and rerun."
+            )
         self.emit({"stage": "time-discretization", "status": "completed", "output": str(output)})
         return report
 
@@ -336,22 +356,79 @@ class GenericCaseRunner:
         recommendation = self._stage_path("audit", "time_discretization_recommendation.json")
         if not recommendation.is_file():
             raise FileNotFoundError("run time-discretization before materialize-bins.")
+        try:
+            recommendation_payload = json.loads(recommendation.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError("time-discretization recommendation is not valid JSON") from error
+        if not isinstance(recommendation_payload, dict):
+            raise ValueError("time-discretization recommendation must contain an object")
+        od_fingerprint, pair_count, _ = self.adapter._od_universe_identity()
+        expected = {
+            "configuration_fingerprint": self.config.fingerprint,
+            "package_revision": self._package_revision(),
+            "od_universe_fingerprint": od_fingerprint,
+            "retained_pair_count": pair_count,
+            "time_discretization_fingerprint": self.config.time_discretization_fingerprint,
+            "source_checksums": self.adapter._current_source_checksums(),
+        }
+        stale_reasons = [
+            key
+            for key, value in expected.items()
+            if recommendation_payload.get(key) != value
+        ]
+        if stale_reasons:
+            raise ValueError(
+                "STALE ARTIFACT: time_discretization_recommendation.json\n"
+                "Reason: " + ", ".join(stale_reasons) +
+                "\nAction: rerun time-discretization."
+            )
+        if recommendation_payload.get("status") == "blocked" or not isinstance(recommendation_payload.get("recommendation"), dict):
+            raise ValueError("time-discretization recommendation is blocked; review its budget before materialize-bins")
+        candidates = recommendation_payload.get("candidates", [])
+        selected = recommendation_payload.get("recommendation")
+        named = candidate == "recommendation" or (
+            isinstance(selected, dict) and selected.get("name") == candidate
+        )
+        if candidate != "recommendation" and not any(
+            isinstance(item, dict) and item.get("name") == candidate and item.get("valid") is True
+            for item in candidates if isinstance(candidates, list)
+        ):
+            named = False
+        if not named:
+            raise ValueError(f"candidate {candidate!r} is not a valid candidate in the current recommendation")
         output = self._stage_path("generated_inputs", "time_bins.csv")
         output.parent.mkdir(parents=True, exist_ok=True)
+        _, manifest_path = self.adapter._time_bin_artifact_paths()
+        if output.is_file() and not overwrite:
+            stale = self.adapter.stale_artifacts()
+            if stale:
+                reasons = ", ".join(item["reason"] for item in stale)
+                raise ValueError(
+                    f"STALE ARTIFACT: {output}\nReason: {reasons}\n"
+                    "Action: review the new recommendation and pass --overwrite explicitly."
+                )
         bins = materialize_time_bins(
             recommendation,
             output,
             candidate_name=candidate,
             overwrite=overwrite,
         )
+        periods = tuple(JourneyTimePeriod(item["bin_id"], int(item["start_s"]), int(item["end_s"])) for item in bins)
         manifest = {
             "candidate": candidate,
             "reviewer": reviewer,
             "recommendation": str(recommendation),
+            "recommendation_fingerprint": hashlib.sha256(recommendation.read_bytes()).hexdigest(),
             "time_bins": bins,
+            "time_bins_fingerprint": self.adapter._time_bins_fingerprint(periods),
             "configuration_fingerprint": self.config.fingerprint,
+            "package_revision": self._package_revision(),
+            "od_universe_fingerprint": od_fingerprint,
+            "retained_pair_count": pair_count,
+            "time_discretization_fingerprint": self.config.time_discretization_fingerprint,
+            "source_checksums": self.adapter._current_source_checksums(),
         }
-        _write_json(self._stage_path("generated_inputs", "time_bins_manifest.json"), manifest)
+        _write_json(manifest_path, manifest)
         self.emit({"stage": "materialize-bins", "status": "completed", "output": str(output), "reviewer": reviewer})
         return manifest
 

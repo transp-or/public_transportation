@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 
@@ -169,7 +170,17 @@ def test_clean_template_executes_admission_path(tmp_path: Path) -> None:
     assert run_case_stage(config_path, "check", **kwargs)["audit"]["resolved_measurement_count"] == 8
     run_case_stage(config_path, "od-universe", **kwargs)
     run_case_stage(config_path, "time-discretization", **kwargs)
-    run_case_stage(config_path, "materialize-bins", candidate="recommendation", reviewer="pytest", **kwargs)
+    manifest = run_case_stage(config_path, "materialize-bins", candidate="recommendation", reviewer="pytest", **kwargs)
+    assert {
+        "configuration_fingerprint",
+        "package_revision",
+        "od_universe_fingerprint",
+        "retained_pair_count",
+        "time_discretization_fingerprint",
+        "recommendation_fingerprint",
+        "candidate",
+        "reviewer",
+    }.issubset(manifest)
     run_case_stage(config_path, "expand-od", **kwargs)
     run_case_stage(config_path, "structural-zeros", **kwargs)
     prepared = run_case_stage(config_path, "prepare", **kwargs)
@@ -351,3 +362,130 @@ def test_expansion_fingerprint_mismatch_is_rejected(tmp_path: Path) -> None:
     bins.write_text("\n".join(lines) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="time-bin fingerprint"):
         run_case_stage(config_path, "structural-zeros", case_root=case)
+
+
+def test_stale_generated_bins_are_reported_but_not_used(tmp_path: Path) -> None:
+    case = _copy_case(tmp_path)
+    generated = case / "results/generated_inputs"
+    generated.mkdir(parents=True)
+    (generated / "time_bins.csv").write_text(
+        "bin_id,start_s,end_s\nold,0,3600\n", encoding="utf-8"
+    )
+    config_path = case / "config/case.toml"
+    audit = run_case_stage(config_path, "check", case_root=case)["audit"]
+    assert audit["source_time_bins"]["count"] == 1
+    assert audit["approved_time_bins"]["status"] == "not_available"
+    assert audit["stale_artifacts"][0]["reason"] == "missing_manifest"
+    run_case_stage(config_path, "od-universe", case_root=case)
+    run_case_stage(config_path, "time-discretization", case_root=case)
+
+
+def test_time_discretization_requires_current_od_audit(tmp_path: Path) -> None:
+    case = _copy_case(tmp_path)
+    with pytest.raises(FileNotFoundError, match="run od-universe before time-discretization"):
+        run_case_stage(case / "config/case.toml", "time-discretization", case_root=case)
+
+
+def test_time_discretization_uses_retained_pair_count_and_reports_worst_case(
+    tmp_path: Path,
+) -> None:
+    case = _copy_case(tmp_path)
+    config_path = case / "config/case.toml"
+    universe = run_case_stage(config_path, "od-universe", case_root=case)
+    recommendation = run_case_stage(config_path, "time-discretization", case_root=case)
+    assert recommendation["retained_pair_count"] == universe["retained_pair_count"]
+    assert recommendation["od_universe_fingerprint"] == universe["fingerprint"]
+    assert all(
+        item["estimated_od_cells"] == item["num_bins"] * universe["retained_pair_count"]
+        for item in recommendation["candidates"]
+    )
+    assert universe["worst_case_od_time_cells"] == universe["retained_pair_count"] * universe["configured_max_bins"]
+
+
+def test_blocked_time_discretization_report_is_written_without_budget_change(tmp_path: Path) -> None:
+    case = _copy_case(tmp_path)
+    text = _config_text(case).replace("max_od_cells = 48", "max_od_cells = 1")
+    _write_config(case, text)
+    (case / "config/time_discretization.toml").write_text(
+        (case / "config/time_discretization.toml").read_text(encoding="utf-8").replace(
+            "max_od_cells = 48", "max_od_cells = 1"
+        ),
+        encoding="utf-8",
+    )
+    config_path = case / "config/case.toml"
+    run_case_stage(config_path, "od-universe", case_root=case)
+    with pytest.raises(ValueError, match="recommendation written"):
+        run_case_stage(config_path, "time-discretization", case_root=case)
+    report = json.loads(
+        (case / "results/audit/time_discretization_recommendation.json").read_text(encoding="utf-8")
+    )
+    assert report["status"] == "blocked"
+    assert report["reason"] == "no_candidate_within_max_od_cells"
+    assert report["configuration"]["max_od_cells"] == 1
+
+
+def test_materialize_rejects_stale_recommendation(tmp_path: Path) -> None:
+    case = _copy_case(tmp_path)
+    config_path = _run_through_expansion(case)
+    recommendation = case / "results/audit/time_discretization_recommendation.json"
+    payload = json.loads(recommendation.read_text(encoding="utf-8"))
+    payload["retained_pair_count"] += 1
+    recommendation.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="STALE ARTIFACT"):
+        run_case_stage(
+            config_path,
+            "materialize-bins",
+            candidate="recommendation",
+            reviewer="pytest",
+            overwrite=True,
+            case_root=case,
+        )
+
+
+def test_legacy_demand_statistics_are_separate_for_independent_case(tmp_path: Path) -> None:
+    case = _copy_case(tmp_path)
+    source = case / "inputs/scenario/prior_demand.csv"
+    (case / "inputs/scenario/demand.csv").write_bytes(source.read_bytes())
+    audit = run_case_stage(case / "config/case.toml", "check", case_root=case)["audit"]
+    assert audit["input_semantics"] == "independent_od_universe"
+    assert audit["demand_cell_count"] == 0
+    assert audit["legacy_demand_file_present"] is True
+    assert audit["legacy_demand_row_count"] > 0
+    assert audit["legacy_demand_used"] is False
+
+
+def test_changed_pair_source_rejects_downstream_artifacts(tmp_path: Path) -> None:
+    case = _copy_case(tmp_path)
+    config_path = _run_through_expansion(case)
+    pairs = case / "inputs/od_pairs.csv"
+    with pairs.open("a", encoding="utf-8") as stream:
+        stream.write("A,D\n")
+    with pytest.raises(ValueError, match="OD-universe artifact"):
+        run_case_stage(config_path, "structural-zeros", case_root=case)
+
+
+def test_time_policy_change_keeps_pair_universe_fingerprint(tmp_path: Path) -> None:
+    case = _copy_case(tmp_path)
+    config_path = case / "config/case.toml"
+    first = run_case_stage(config_path, "od-universe", case_root=case)
+    text = _config_text(case).replace("max_bins = 24", "max_bins = 12")
+    _write_config(case, text)
+    (case / "config/time_discretization.toml").write_text(
+        (case / "config/time_discretization.toml").read_text(encoding="utf-8").replace(
+            "max_bins = 24", "max_bins = 12"
+        ),
+        encoding="utf-8",
+    )
+    second = run_case_stage(config_path, "od-universe", case_root=case)
+    assert second["fingerprint"] == first["fingerprint"]
+
+
+def test_manifest_pair_count_mismatch_is_reported_as_stale(tmp_path: Path) -> None:
+    case = _copy_case(tmp_path)
+    config_path = _run_through_expansion(case)
+    manifest_path = case / "results/generated_inputs/time_bins_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["retained_pair_count"] += 1
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    audit = run_case_stage(config_path, "check", case_root=case)["audit"]
+    assert any(item["reason"] == "retained_pair_count_mismatch" for item in audit["stale_artifacts"])

@@ -79,6 +79,11 @@ is the first expensive stage. It persists the approved pair-by-bin expansion,
 priors, and provenance; `structural-zeros` and `prepare` consume those files
 and fail on missing or incompatible fingerprints instead of recomputing them.
 Review the reported complexity estimate before allowing `expand-od` to run.
+For an independent case, `time-discretization` requires the current
+`results/audit/od_universe.json` and uses its `retained_pair_count`; it never
+uses legacy demand rows or a stale audit. If no candidate fits
+`max_od_cells`, it writes a blocked recommendation and stops without changing
+the configured budget.
 
 `config/case.toml` contains paths, source-column mappings, explicit time
 discretization limits, and references to the scientific contracts. The
@@ -91,9 +96,14 @@ the case repository only when the case owner explicitly decides to archive
 them.
 
 `materialize-bins` writes a reviewed candidate under
-`results/generated_inputs/`; it never overwrites the scenario's source
-`time_bins.csv`. For a real case, re-bin the demand and explicitly promote or
-repoint the reviewed file before `expand-od`, `structural-zeros` and `prepare`.
+`results/generated_inputs/` together with `time_bins_manifest.json`; it never
+overwrites the scenario's source `time_bins.csv`. The manifest binds the bins
+to the current configuration, package revision, OD-universe fingerprint and
+retained count, time-discretization policy, source checksums, recommendation,
+candidate, and reviewer. A stale or manifest-less generated file is reported
+as `STALE ARTIFACT` and is never used silently. For a real case, review the
+new recommendation and use `--overwrite` only as an explicit approval before
+`expand-od`, `structural-zeros` and `prepare`.
 The bundled
 template already uses the same one-bin contract in its committed scenario, so
 the smoke run needs no manual promotion.

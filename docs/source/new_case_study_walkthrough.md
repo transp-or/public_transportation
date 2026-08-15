@@ -427,6 +427,18 @@ od-universe
 reachable pair can therefore produce a timetable structural zero in one bin
 and a retained cell in another. Every exclusion reason is preserved.
 
+Generated artifacts are never trusted because their filenames happen to be
+present. Each pair, recommendation, materialized-bin, expansion, and
+preparation artifact carries the case-configuration fingerprint, package
+revision, source checksums, and the upstream identity it depends on. In
+particular, `results/generated_inputs/time_bins.csv` is an approved artifact
+only when its `time_bins_manifest.json` matches the current configuration,
+package, OD-universe fingerprint and retained pair count, time-discretization
+contract, source checksums, recommendation fingerprint, candidate, and
+reviewer. A mismatch is reported as `STALE ARTIFACT`; it is never silently
+used or deleted. Re-run the producing stage and explicitly review any
+`--overwrite` decision.
+
 An optional pair-level `inputs/prior_demand.csv` has columns
 `origin_stop_id,destination_stop_id,prior_value`. Alternatively, declare
 `[prior_demand] source = "all_ones"`, which generates one value per retained
@@ -733,12 +745,13 @@ another.
 
 ### 3.6 Choose a data-driven time discretization (mandatory when timestamps exist)
 
-If the source measurements retain event timestamps, running the standalone time
-discretization diagnostic is mandatory. It must happen after the raw-table
-audit and before structural-zero or reduced-journey preparation. An existing
-`time_bins.csv` is only a provisional input until this diagnostic has been run
-and a reviewer has recorded the adopted candidate. It must not automatically
-be accepted as final merely because it is present in the repository.
+If the source measurements retain event timestamps, running the time
+discretization diagnostic is mandatory. It must happen after the raw-table and
+current OD-universe audits and before structural-zero or reduced-journey
+preparation. Scenario time bins are source metadata for `check`; they are not an
+approved independent-OD discretization. An existing generated `time_bins.csv`
+is accepted only when its freshness manifest is current and a reviewer has
+recorded the adopted candidate.
 
 The required workflow is:
 
@@ -762,12 +775,14 @@ budget; do not silently treat the existing bins as validated.
 Before running the diagnostic, obtain the following values from the audited
 inputs and record them in the run manifest:
 
-1. `num_od_pairs`: the number of distinct ordered pairs in the independent
-   `od_pairs.csv` file or the network-derived universe, after applying the
-   declared spatial level and pair-level rules. Do not count time bins here;
-   this value must not change when the temporal resolution changes;
+1. `retained_pair_count`: for an independent network-derived case this is the
+   authoritative `retained_pair_count` in `results/audit/od_universe.json`,
+   after applying the declared spatial level and pair-level rules. Do not use
+   legacy `demand.csv` rows, a copied `num_od_pairs`, stale audits, or the
+   number of network stops. Do not count time bins here; this value must not
+   change when temporal resolution changes;
 2. `max_od_cells`: an approved upper bound on
-   `num_od_pairs × number_of_time_bins`, chosen by the case owner from the
+   `retained_pair_count × number_of_time_bins`, chosen by the case owner from the
    memory and estimation budget. There is no scientifically safe package
    default. If the owner has not approved this budget, stop;
 3. the analysis horizon, expressed in service-day seconds, from the source
@@ -782,8 +797,10 @@ inputs and record them in the run manifest:
 6. the candidate-bin selection rule and reviewer. The diagnostic recommends a
    candidate; it does not make the scientific decision automatically.
 
-For a pair universe stored as `od_pairs.csv`, this command computes
-`num_od_pairs` without reading any time-bin membership:
+For a file-supplied pair universe, this optional diagnostic computes a
+duplicate-free pair count without reading any time-bin membership. The
+authoritative value used by the workflow is still the retained count written
+by `run.py od-universe`:
 
 ```bash
 uv run --frozen python - <<'PY'
@@ -794,15 +811,18 @@ path = Path("case_studies/<case_name>/inputs/od_pairs.csv")
 with path.open(newline="", encoding="utf-8") as stream:
     rows = list(csv.DictReader(stream))
 pairs = {(row["origin_stop_id"], row["destination_stop_id"]) for row in rows}
-print("num_od_pairs:", len(pairs))
+print("candidate_pair_count_from_file:", len(pairs))
 PY
 ```
 
-If the universe is network-derived, `run.py od-universe` is the authoritative
-count and audit. Once the owner has selected an approved maximum number of
-bins, record `max_od_cells = num_od_pairs * approved_max_bins`; do not use a
-larger limit merely to make the diagnostic pass. Never replicate a legacy
-demand table across newly selected bins without an explicit scientific rule.
+If the universe is network-derived, `run.py od-universe` is mandatory before
+time-discretization. The stage reports the configured maximum-bin ceiling and
+the worst-case `retained_pair_count × max_bins` estimate without running
+timetable feasibility. Once the owner has selected an approved maximum number
+of bins, record `max_od_cells = retained_pair_count * approved_max_bins`; do
+not use a larger limit merely to make the diagnostic pass. Never replicate a
+legacy demand table across newly selected bins without an explicit scientific
+rule.
 
 For canonical timestamped measurements, this command reports the observed
 event-time range and the column-level measurement types. It does not infer the
@@ -835,20 +855,11 @@ measurement path and horizon to the case; the horizon is especially important
 when the source file contains only a subset of the service day:
 
 ```bash
-uv run --frozen python -m public_transportation.preprocessing.time_discretization \
-  --measurements case_studies/<case_name>/results/audit/measurements_boarding_alighting.csv \
-  --base-resolution-minutes 5 \
-  --min-bin-minutes 10 \
-  --max-bin-minutes 60 \
-  --max-bins 24 \
-  --num-od-pairs <audited_od_pair_count> \
-  --max-od-cells <approved_od_cell_budget> \
-  --horizon-start 05:00 \
-  --horizon-end 25:00 \
-  --output-json case_studies/<case_name>/results/audit/time_discretization_recommendation.json
+cd case_studies/<case_name>
+JAX_ENABLE_X64=true uv run --frozen python run.py time-discretization
 ```
 
-The command writes JSON only. Review the JSON before choosing a production
+The command writes JSON only (under `results/audit/`). Review the JSON before choosing a production
 discretization, in particular:
 
 - `profile` and `peak_intervals`, to confirm that the detected peaks are
@@ -856,8 +867,17 @@ discretization, in particular:
   observation window;
 - every entry in `candidates`, including `within_bin_deviance`, bin count,
   estimated OD-cell count, validity, and warnings;
+- every candidate's `estimated_od_cells` and `max_od_cells`, which are computed
+  using the current retained pair count;
 - `recommendation.time_bins`, its `estimated_od_cells`, and the warnings
   attached to the recommended candidate.
+
+If no candidate fits the explicit budget, the command writes a blocked report
+with `status = "blocked"`, `reason = "no_candidate_within_max_od_cells"`, the
+retained pair count, all candidate estimates, and
+`required_decision = "approve a larger budget or revise the time-bin policy"`.
+It then stops. Do not silently change `max_od_cells`, reduce the OD universe,
+or materialize a blocked candidate.
 
 The OD-cell limit is an operational guard, not part of the scientific identity
 of the data. If it rejects all candidates, increase the limit only after
@@ -876,22 +896,25 @@ validates the report schema, candidate validity, unique IDs, contiguous
 half-open edges, and writes the CSV atomically:
 
 ```bash
-uv run --frozen python -m public_transportation.preprocessing.materialize_time_bins \
-  --recommendation-json case_studies/<case_name>/results/audit/time_discretization_recommendation.json \
-  --output case_studies/<case_name>/inputs/time_bins.csv
+cd case_studies/<case_name>
+JAX_ENABLE_X64=true uv run --frozen python run.py materialize-bins \
+  --candidate recommendation --reviewer "<name>"
 ```
 
 This is the only step that turns the diagnostic JSON into a model input. The
-resulting CSV is what the case adapter and scenario loader consume; the JSON
-remains a review and provenance artifact.
+runner writes `results/generated_inputs/time_bins.csv` together with a
+freshness manifest. The resulting CSV is admitted by the case adapter only
+when that manifest is current; the JSON remains a review and provenance
+artifact.
 
 Use `--candidate peak_adaptive` (or another candidate name in the report) when
 you have deliberately selected a candidate other than the report's default
-recommendation. An existing `time_bins.csv` is never replaced unless
-`--overwrite` is supplied explicitly after review. Record the JSON report path
-and its fingerprint in the run manifest, then re-run Stage 1 after this
-change. Do not feed the diagnostic JSON directly to estimation and do not let
-the preparation script overwrite an existing `time_bins.csv` automatically.
+recommendation. An existing materialized file with a stale manifest is never
+replaced unless `--overwrite` is supplied explicitly after reviewing the new
+current recommendation. The manifest records the recommendation fingerprint,
+OD-universe identity and count, package/configuration identity, source
+checksums, candidate, and reviewer. Do not feed the diagnostic JSON directly
+to estimation and do not let preparation overwrite bins automatically.
 
 The handoff to the rest of the pipeline is therefore an ordinary scenario
 input, not a second report format. The adopted file must contain the columns
@@ -932,7 +955,7 @@ the copied case directory before step 2.
 | Order | Command | Location | May modify files? | Expected result / stop condition |
 |---:|---|---|---|---|
 | 1 | `git rev-parse HEAD`; `uv lock --check`; package provenance check | local | no | Correct case revision and locked public package; stop on mismatch. |
-| 2 | `test -f adapter.py &&`<br>`test -f run.py &&`<br>`test -f config/case.toml &&`<br>`test -f config/time_discretization.toml &&`<br>`test -f config/reduced_od.toml &&`<br>`test -f config/structural_zeros.toml &&`<br>`test -f config/model.toml` | local, from case-study root | no | Complete case setup; a missing path is a case-setup/documentation failure and identifies the missing path. |
+| 2 | `test -f adapter.py &&`<br>`test -f run.py &&`<br>`test -f config/case.toml &&`<br>`test -f config/time_discretization.toml &&`<br>`test -f config/reduced_od.toml &&`<br>`test -f config/structural_zeros.toml &&`<br>`test -f config/model.toml &&`<br>`test -f pyproject.toml` | local, from case-study root | no | Complete case setup; a missing path is a case-setup/documentation failure and identifies the missing path. |
 | 3 | `uv run --frozen python run.py check` | local | audit JSON and rejected-row files only | All source schemas and identities valid; stop on unexplained rows. |
 | 4 | `uv run --frozen python run.py od-universe` | local | pair universe and exclusion audit | Pair source, spatial level, and pair-level exclusions are reviewed. |
 | 5 | `uv run --frozen python run.py time-discretization` | local | recommendation JSON only | Candidate bins, horizon, and budget are explicit; stop if any input is unknown. |
@@ -948,9 +971,11 @@ If step 2 returns a nonzero status, identify the missing path explicitly before
 doing anything else:
 
 ```bash
+cd case_studies/<case_name>
 for required_path in \
   adapter.py run.py config/case.toml config/time_discretization.toml \
-  config/reduced_od.toml config/structural_zeros.toml config/model.toml
+  config/reduced_od.toml config/structural_zeros.toml config/model.toml \
+  pyproject.toml
 do
   if [[ ! -f "$required_path" ]]; then
     printf 'CASE-SETUP/DOCUMENTATION FAILURE: missing %s\n' "$required_path" >&2
@@ -984,7 +1009,11 @@ This stage must not construct expensive routing artifacts. It should:
 5. verify stop mapping and observation identities;
 6. report raw-network, pair-universe (when already audited), measurement,
    trip, stop-time, and physical-stop counts, plus the estimated OD-time
-   complexity and configured `max_od_cells` budget;
+   complexity and configured `max_od_cells` budget. For an independent case,
+   legacy `demand.csv` rows are reported separately as
+   `legacy_demand_row_count`; they are not the active candidate-cell count.
+   The audit also distinguishes source periods, current approved periods, and
+   stale generated artifacts;
 7. run `preflight_reduced_od_time_periods` and write its JSON report;
 8. estimate memory/disk needs where possible;
 9. write machine-readable audit JSON and any rejected-record CSV.
@@ -1024,6 +1053,11 @@ approved time-bin edges change. It does not form OD-time cells or run timetable
 feasibility. A static directed path is only a cheap pair-level filter; it is
 not evidence that a scheduled journey exists in every time interval.
 
+Before timetable search it also reports `configured_max_bins`,
+`worst_case_od_time_cells = retained_pair_count × configured_max_bins`,
+`maximum_configured_od_cells`, and `worst_case_within_budget`. This is a
+preflight warning only; it does not use or require approved bins.
+
 ## 6. Stage 3 — Time-bin approval and OD-time expansion
 
 Run `time-discretization`, review its recommendation, and materialize the
@@ -1036,6 +1070,14 @@ JAX_ENABLE_X64=true uv run --frozen python run.py materialize-bins \
   --candidate recommendation --reviewer "<name>"
 JAX_ENABLE_X64=true uv run --frozen python run.py expand-od
 ```
+
+For an independent case, `time-discretization` requires the current
+`results/audit/od_universe.json`; its `retained_pair_count` is the only pair
+count used for candidate complexity. `check` may still complete before
+`od-universe`, but it reports no active independent pair count and never uses
+legacy demand rows as a substitute. A blocked recommendation is a deliberate
+stop: approve a larger budget, revise the allowed bin policy, or revise the OD
+universe, then rerun the stage. No stage changes `max_od_cells` automatically.
 
 `expand-od` applies the declared active-origin, active-destination, directed
 connectivity, initial-wait, journey-time, and maximum-transfer rules once for
@@ -1169,6 +1211,38 @@ mismatch).
 `expand-od` completed for the current configuration and that their fingerprints
 match. Re-run the missing preceding stage; never let the downstream stage
 silently rebuild or overwrite the artifact.
+
+### A generated time-bin artifact is stale
+
+**Symptom:** `check`, `expand-od`, or `prepare` reports `STALE ARTIFACT` for
+`results/generated_inputs/time_bins.csv`.
+
+**Interpretation:** the bins or their manifest belong to a different case
+configuration, package revision, OD universe, retained pair count,
+time-discretization contract, source-data revision, or recommendation. A
+legacy file with no manifest is also stale.
+
+**Action:** inspect the listed reason, rerun `od-universe` and
+`time-discretization` as required, review the new recommendation, and run
+`materialize-bins` with an explicit reviewer. Do not delete the old file
+automatically and do not pass `--overwrite` until the new candidate has been
+approved.
+
+### The time-discretization budget blocks all candidates
+
+**Symptom:** the stage writes a report with
+`status = "blocked"` and `reason = "no_candidate_within_max_od_cells"`.
+
+**Interpretation:** the current retained OD universe multiplied by every
+candidate's number of bins exceeds the explicit computational budget. This is
+not evidence that the package should silently reduce the universe or change
+the budget.
+
+**Action:** review `retained_pair_count`, candidate bin counts, and
+`max_od_cells`. Record an explicit case-owner decision to increase the budget,
+reduce the maximum allowed bins, change the OD-universe policy, or reject the
+discretization. Then rerun `time-discretization`; do not materialize a blocked
+candidate.
 
 ### 7.1 The observation does not match a timetable event
 

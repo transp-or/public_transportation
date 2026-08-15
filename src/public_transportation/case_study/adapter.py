@@ -7,7 +7,9 @@ import hashlib
 import math
 import json
 from dataclasses import asdict, dataclass, field
+from importlib.metadata import distribution
 from pathlib import Path
+import re
 from collections.abc import Callable, Mapping
 from types import MappingProxyType
 from typing import Any
@@ -284,6 +286,13 @@ class GenericCaseAudit:
     od_time_expansion: dict[str, object] | None = None
     prior_generation: dict[str, object] | None = None
     input_semantics: str = "legacy_time_dependent_demand"
+    source_time_bins: dict[str, object] = field(default_factory=dict)
+    approved_time_bins: dict[str, object] = field(default_factory=dict)
+    stale_artifacts: list[dict[str, str]] = field(default_factory=list)
+    active_candidate_od_time_count: int | None = None
+    legacy_demand_file_present: bool = False
+    legacy_demand_row_count: int = 0
+    legacy_demand_used: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -302,6 +311,52 @@ class GenericCaseAdapter:
         self._universe: CandidateODUniverse | None = None
         self._expansion: ODTimeExpansion | None = None
         self._data: GenericCaseData | None = None
+
+    def _current_package_revision(self) -> str:
+        """Return the package identity used by generated-artifact contracts."""
+        lockfile = self.config.source_file.parent.parent / "uv.lock"
+        lock_text = lockfile.read_text(encoding="utf-8") if lockfile.is_file() else ""
+        marker = 'name = "public-transportation"'
+        if marker in lock_text:
+            block = lock_text[lock_text.index(marker) : lock_text.index(marker) + 4096]
+            match = re.search(r'\brev = "([0-9a-fA-F]+)"', block)
+            if match:
+                return match.group(1)
+        try:
+            return str(distribution("public_transportation").version)
+        except Exception:  # pragma: no cover - only malformed environments
+            return "unknown"
+
+    def _current_source_checksums(self) -> dict[str, str]:
+        """Checksum all configured source and contract files.
+
+        This mirrors the runner's provenance payload so that a persisted
+        artifact can be checked without running any expensive preparation.
+        """
+        paths = self.config.paths
+        candidates = [
+            ("measurements", paths.measurements),
+            ("candidate_demand", paths.candidate_demand),
+            ("od_pairs", paths.od_pairs),
+            ("prior_demand", paths.prior_demand),
+            ("fixed_demand", paths.fixed_demand),
+            ("production_inputs", paths.production_inputs),
+            ("destination_attractiveness", paths.destination_attractiveness),
+            ("od_universe_pair_file", self.config.od_universe.pair_file),
+            ("prior_input_file", self.config.prior_demand.input_file),
+        ]
+        checksums = {
+            name: _sha256(path)
+            for name, path in candidates
+            if path is not None and path.is_file()
+        }
+        if paths.scenario_directory.is_dir():
+            for path in sorted(item for item in paths.scenario_directory.rglob("*") if item.is_file()):
+                checksums[f"scenario/{path.relative_to(paths.scenario_directory)}"] = _sha256(path)
+        for path in self.config.package_config_paths:
+            if path.is_file():
+                checksums[f"configuration/{path.name}"] = _sha256(path)
+        return checksums
 
     @property
     def data(self) -> GenericCaseBaseData:
@@ -340,14 +395,12 @@ class GenericCaseAdapter:
                 ResponseCellKey(origin, destination, period): float(value)
                 for (origin, destination, period), value in fixed_domain.as_dict().items()
             }
-        generated_bins = self.config.paths.results_directory / "generated_inputs/time_bins.csv"
-        periods = (
-            _load_time_periods(generated_bins)
-            if generated_bins.is_file()
-            else tuple(
-                JourneyTimePeriod(str(item.bin_id), int(item.start.seconds_from_midnight), int(item.end.seconds_from_midnight))
-                for item in scenario.time_bins
-            )
+        # Base loading always uses the scenario's source periods.  A generated
+        # time_bins.csv is a reviewed downstream artifact and is admitted only
+        # through _approved_time_periods(), after its manifest is validated.
+        periods = tuple(
+            JourneyTimePeriod(str(item.bin_id), int(item.start.seconds_from_midnight), int(item.end.seconds_from_midnight))
+            for item in scenario.time_bins
         )
         physical_mapping = _load_physical_stop_mapping(
             self.config.reduced_od_config.stops.physical_stop_mapping_path
@@ -412,10 +465,135 @@ class GenericCaseAdapter:
         )
         return self._universe
 
+    def _od_universe_identity(self) -> tuple[str, int, dict[str, object] | None]:
+        """Return the current pair-universe identity without using stale audits."""
+        if self.config.od_universe.source == "legacy_time_dependent_demand":
+            base = self.load_base_data()
+            pairs = sorted({(str(item.origin_stop_id), str(item.dest_stop_id)) for item in base.scenario.demand.records})
+            encoded = json.dumps(pairs, separators=(",", ":")).encode("utf-8")
+            return f"legacy-demand:{hashlib.sha256(encoded).hexdigest()}", len(pairs), None
+        payload = self.load_current_od_universe_audit(required=True)
+        return str(payload["fingerprint"]), int(payload["retained_pair_count"]), payload
+
+    def load_current_od_universe_audit(self, *, required: bool = False) -> dict[str, object] | None:
+        """Load the current OD audit and reject stale pair-universe artifacts."""
+        if self.config.od_universe.source == "legacy_time_dependent_demand":
+            return None
+        path = self.config.paths.results_directory / "audit/od_universe.json"
+        if not path.is_file():
+            if required:
+                raise FileNotFoundError(
+                    "run od-universe before time-discretization for an independent OD case"
+                )
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"OD-universe audit is not valid JSON: {path}") from error
+        if not isinstance(payload, dict):
+            raise ValueError(f"OD-universe audit must contain an object: {path}")
+        reasons: list[str] = []
+        if payload.get("configuration_fingerprint") != self.config.fingerprint:
+            reasons.append("configuration_fingerprint_mismatch")
+        package = payload.get("package")
+        package_revision = payload.get("package_revision")
+        if package_revision is None and isinstance(package, Mapping):
+            package_revision = package.get("locked_revision") or package.get("distribution_version")
+        if package_revision != self._current_package_revision():
+            reasons.append("package_revision_mismatch")
+        source_checksums = payload.get("source_checksums")
+        if source_checksums != self._current_source_checksums():
+            reasons.append("source_checksum_mismatch")
+        try:
+            universe = self.load_persisted_universe()
+        except (FileNotFoundError, ValueError) as error:
+            reasons.append(f"pair_artifact_invalid:{error}")
+            universe = None
+        if universe is not None:
+            if payload.get("fingerprint") != universe.fingerprint:
+                reasons.append("od_universe_fingerprint_mismatch")
+            try:
+                retained_pair_count = int(payload.get("retained_pair_count", -1))
+            except (TypeError, ValueError):
+                retained_pair_count = -1
+            if retained_pair_count != universe.pair_count:
+                reasons.append("retained_pair_count_mismatch")
+        if reasons:
+            raise ValueError(
+                "STALE ARTIFACT: " + str(path) + "\nReason: " + ", ".join(reasons)
+                + "\nAction: rerun od-universe before continuing."
+            )
+        return payload
+
+    def _time_bin_artifact_paths(self) -> tuple[Path, Path]:
+        root = self.config.paths.results_directory / "generated_inputs"
+        return root / "time_bins.csv", root / "time_bins_manifest.json"
+
+    def _time_bin_staleness(self) -> list[dict[str, str]]:
+        """Return explicit reasons why a generated-bin artifact is unusable."""
+        generated_bins, manifest_path = self._time_bin_artifact_paths()
+        if not generated_bins.is_file():
+            if manifest_path.is_file():
+                return [{"path": str(manifest_path), "reason": "missing_time_bins"}]
+            return []
+        reasons: list[str] = []
+        if not manifest_path.is_file():
+            return [{"path": str(generated_bins), "reason": "missing_manifest"}]
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return [{"path": str(generated_bins), "reason": "invalid_manifest"}]
+        if not isinstance(manifest, Mapping):
+            return [{"path": str(generated_bins), "reason": "invalid_manifest"}]
+        expected_config = self.config.fingerprint
+        if manifest.get("configuration_fingerprint") != expected_config:
+            reasons.append("configuration_fingerprint_mismatch")
+        if manifest.get("package_revision") != self._current_package_revision():
+            reasons.append("package_revision_mismatch")
+        if manifest.get("time_discretization_fingerprint") != self.config.time_discretization_fingerprint:
+            reasons.append("time_discretization_fingerprint_mismatch")
+        try:
+            od_fingerprint, pair_count, _ = self._od_universe_identity()
+        except (FileNotFoundError, ValueError):
+            od_fingerprint, pair_count = "unavailable", -1
+            reasons.append("od_universe_not_current")
+        if manifest.get("od_universe_fingerprint") != od_fingerprint:
+            reasons.append("od_universe_fingerprint_mismatch")
+        if manifest.get("retained_pair_count") != pair_count:
+            reasons.append("retained_pair_count_mismatch")
+        if manifest.get("source_checksums") != self._current_source_checksums():
+            reasons.append("source_checksum_mismatch")
+        recommendation = manifest.get("recommendation")
+        recommendation_path = Path(str(recommendation)) if recommendation else self.config.paths.results_directory / "audit/time_discretization_recommendation.json"
+        if not recommendation_path.is_file():
+            reasons.append("recommendation_missing")
+        elif manifest.get("recommendation_fingerprint") != _sha256(recommendation_path):
+            reasons.append("recommendation_fingerprint_mismatch")
+        try:
+            periods = _load_time_periods(generated_bins)
+            actual_fingerprint = self._time_bins_fingerprint(periods)
+            if manifest.get("time_bins_fingerprint") != actual_fingerprint:
+                reasons.append("time_bins_fingerprint_mismatch")
+        except ValueError:
+            reasons.append("invalid_time_bins")
+        return [{"path": str(generated_bins), "reason": reason} for reason in sorted(set(reasons))]
+
+    def stale_artifacts(self) -> list[dict[str, str]]:
+        """Expose generated artifacts that are present but not current."""
+        return self._time_bin_staleness()
+
     def _approved_time_periods(self, *, require_materialized: bool) -> tuple[JourneyTimePeriod, ...]:
         base = self.load_base_data()
-        generated_bins = self.config.paths.results_directory / "generated_inputs/time_bins.csv"
+        generated_bins, _ = self._time_bin_artifact_paths()
         if generated_bins.is_file():
+            stale = self._time_bin_staleness()
+            if stale:
+                reasons = ", ".join(item["reason"] for item in stale)
+                raise ValueError(
+                    f"STALE ARTIFACT: {generated_bins}\nReason: {reasons}\n"
+                    "Action: rerun time-discretization and materialize-bins "
+                    "(time-bin fingerprint is not current)."
+                )
             return _load_time_periods(generated_bins)
         if require_materialized and self.config.od_universe.source != "legacy_time_dependent_demand":
             raise FileNotFoundError("run materialize-bins before expand-od")
@@ -427,13 +605,17 @@ class GenericCaseAdapter:
         pair_count: int | None = None,
         time_bin_count: int | None = None,
         pair_level_exclusions: int | None = None,
+        raise_on_exceed: bool = True,
     ) -> dict[str, object]:
         base = self.load_base_data()
         if pair_count is None:
-            pair_count = self._persisted_pair_count() or self._pair_file_count()
+            pair_count = self._persisted_pair_count()
+            if pair_count is None and self.config.od_universe.source == "legacy_time_dependent_demand":
+                pair_count = self._pair_file_count()
         if time_bin_count is None:
-            generated = self.config.paths.results_directory / "generated_inputs/time_bins.csv"
-            time_bin_count = len(_load_time_periods(generated)) if generated.is_file() else 0
+            # A missing value means that no approved bins are admitted.  In
+            # particular, never infer it from an unvalidated generated file.
+            time_bin_count = 0
         estimated = None if pair_count is None else int(pair_count) * int(time_bin_count)
         maximum = self.config.time_discretization.max_od_cells
         report = {
@@ -446,7 +628,7 @@ class GenericCaseAdapter:
             "maximum_configured_od_cells": maximum,
             "estimated_timetable_feasibility_calls": estimated,
         }
-        if estimated is not None and maximum is not None and estimated > maximum:
+        if raise_on_exceed and estimated is not None and maximum is not None and estimated > maximum:
             raise ValueError(
                 "estimated OD-time cells exceed max_od_cells before timetable expansion: "
                 f"{estimated} > {maximum} (pairs={pair_count}, bins={time_bin_count})."
@@ -500,15 +682,17 @@ class GenericCaseAdapter:
             return max(sum(1 for _ in stream) - 1, 0)
 
     def _persisted_pair_count(self) -> int | None:
-        path = self.config.paths.results_directory / "audit/od_universe.json"
-        if not path.is_file():
-            return None
+        if self.config.od_universe.source == "legacy_time_dependent_demand":
+            base = self.load_base_data()
+            return len({(str(item.origin_stop_id), str(item.dest_stop_id)) for item in base.scenario.demand.records})
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            value = payload.get("retained_pair_count")
-            return int(value) if value is not None else None
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            payload = self.load_current_od_universe_audit(required=False)
+        except ValueError:
             return None
+        if payload is None:
+            return None
+        value = payload.get("retained_pair_count")
+        return int(value) if value is not None else None
 
     def _pair_mapping(self, base: GenericCaseBaseData) -> dict[str, str]:
         if self.config.od_universe.level != "physical_stop":
@@ -560,6 +744,20 @@ class GenericCaseAdapter:
         expected = payload.get("fingerprint")
         if not expected or universe.fingerprint != expected:
             raise ValueError("OD-universe artifact fingerprint does not match its persisted contents.")
+        package = payload.get("package")
+        package_revision = payload.get("package_revision")
+        if package_revision is None and isinstance(package, Mapping):
+            package_revision = package.get("locked_revision") or package.get("distribution_version")
+        if package_revision != self._current_package_revision():
+            raise ValueError("OD-universe artifact package revision does not match the current package.")
+        if payload.get("source_checksums") != self._current_source_checksums():
+            raise ValueError("OD-universe artifact source checksums do not match current inputs.")
+        try:
+            retained_pair_count = int(payload.get("retained_pair_count", -1))
+        except (TypeError, ValueError):
+            retained_pair_count = -1
+        if retained_pair_count != universe.pair_count:
+            raise ValueError("OD-universe artifact retained pair count does not match its pair file.")
         self._universe = universe
         return universe
 
@@ -842,51 +1040,44 @@ class GenericCaseAdapter:
         )
         if not period_report.valid:
             raise ValueError(f"time-period preflight failed: {period_report.to_dict()}")
-        pair_count = (
-            len({(str(item.origin_stop_id), str(item.dest_stop_id)) for item in data.scenario.demand.records})
-            if data.input_semantics == "legacy_time_dependent_demand"
-            else (self._persisted_pair_count() or self._pair_file_count())
+        legacy_demand_file = (
+            (self.config.paths.candidate_demand is not None and self.config.paths.candidate_demand.is_file())
+            or (self.config.paths.scenario_directory / "demand.csv").is_file()
         )
+        legacy_demand_row_count = len(data.scenario.demand.records) if legacy_demand_file else 0
+        pair_count = self._persisted_pair_count()
         configured_pairs = self.config.time_discretization.num_od_pairs
         if configured_pairs is not None and pair_count is not None and configured_pairs != pair_count and data.input_semantics == "legacy_time_dependent_demand":
             raise ValueError(f"configured num_od_pairs={configured_pairs} does not match candidate demand count {pair_count}.")
         counts: dict[str, int] = {}
         for item in data.measurements.records:
             counts[item.measurement_type.value] = counts.get(item.measurement_type.value, 0) + 1
-        checksums = {
-            "measurements": _sha256(self.config.paths.measurements),
-            **({"candidate_demand": _sha256(self.config.paths.candidate_demand)} if self.config.paths.candidate_demand else {}),
-            **({"fixed_demand": _sha256(self.config.paths.fixed_demand)} if self.config.paths.fixed_demand else {}),
-        }
-        pair_file = self.config.od_universe.pair_file
-        if pair_file is not None:
-            checksums["od_pairs"] = _sha256(pair_file)
-        if self.config.prior_demand.input_file is not None:
-            checksums["prior_demand"] = _sha256(self.config.prior_demand.input_file)
-        for source in sorted(path for path in self.config.paths.scenario_directory.rglob("*") if path.is_file()):
-            checksums[f"scenario/{source.relative_to(self.config.paths.scenario_directory)}"] = _sha256(source)
-        for configuration_path in self.config.package_config_paths:
-            if configuration_path.is_file():
-                checksums[f"configuration/{configuration_path.name}"] = _sha256(configuration_path)
-        generated_bins = self.config.paths.results_directory / "generated_inputs/time_bins.csv"
-        approved_bin_count = len(_load_time_periods(generated_bins)) if generated_bins.is_file() else 0
+        checksums = self._current_source_checksums()
+        stale = self.stale_artifacts()
+        generated_bins, _ = self._time_bin_artifact_paths()
+        approved_bin_count = 0
+        approved_status = "not_available"
+        if generated_bins.is_file() and not stale:
+            approved_bin_count = len(_load_time_periods(generated_bins))
+            approved_status = "available"
         complexity = self.complexity_preflight(
             pair_count=pair_count,
             time_bin_count=approved_bin_count,
+            raise_on_exceed=False,
         )
         return GenericCaseAudit(
             case_name=self.config.case_name,
             configuration_fingerprint=self.config.fingerprint,
             source_checksums=checksums,
             scenario_stop_count=len(data.scenario.stops),
-            demand_cell_count=len(data.scenario.demand.records),
+            demand_cell_count=(len(data.scenario.demand.records) if data.input_semantics == "legacy_time_dependent_demand" else 0),
             candidate_od_pair_count=pair_count,
             measurement_count=len(data.measurements.records),
             measurement_type_counts=counts,
             resolved_measurement_count=len(resolved),
             time_period_count=len(data.time_periods),
             period_preflight=period_report.to_dict(),
-            od_universe_status="not_run" if data.input_semantics != "legacy_time_dependent_demand" else "legacy_compatibility",
+            od_universe_status=("current" if data.input_semantics != "legacy_time_dependent_demand" and pair_count is not None else ("not_run" if data.input_semantics != "legacy_time_dependent_demand" else "legacy_compatibility")),
             od_time_expansion_status="not_run",
             timetable_feasibility_status="not_run",
             complexity=complexity,
@@ -894,6 +1085,13 @@ class GenericCaseAdapter:
             od_time_expansion=None,
             prior_generation=None,
             input_semantics=data.input_semantics,
+            source_time_bins={"count": len(data.time_periods), "semantics": "legacy_source_bins"},
+            approved_time_bins={"status": approved_status, "count": approved_bin_count if approved_status == "available" else None},
+            stale_artifacts=stale,
+            active_candidate_od_time_count=None,
+            legacy_demand_file_present=legacy_demand_file,
+            legacy_demand_row_count=legacy_demand_row_count,
+            legacy_demand_used=data.input_semantics == "legacy_time_dependent_demand",
         )
 
     def build_preparation_inputs(self):

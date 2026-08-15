@@ -233,6 +233,18 @@ class CaseStudyConfig:
             self.model_config_file,
         )
 
+    @property
+    def time_discretization_fingerprint(self) -> str:
+        """Fingerprint of the time-discretization contract only.
+
+        Generated bins are deliberately excluded.  This value identifies the
+        policy that produced a recommendation and is therefore safe to embed
+        in recommendation/materialization manifests.
+        """
+        payload = _canonical(asdict(self.time_discretization))
+        payload.pop("configuration_file", None)
+        return hashlib.sha256(_json(payload).encode("utf-8")).hexdigest()
+
 
 def _load_toml(path: Path) -> dict[str, Any]:
     if not path.is_file():
