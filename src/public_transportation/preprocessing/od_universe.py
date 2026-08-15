@@ -17,6 +17,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import math
+from bisect import bisect_left
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -231,6 +232,109 @@ class PriorGenerationResult:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class TimetableFeasibilityIndex:
+    """Reusable schedule indexes for OD--time feasibility checks.
+
+    The old evaluator rebuilt trip sequences and scanned every stop-time record
+    for every candidate cell.  This index performs that work once per
+    expansion and keeps sorted departure/arrival lists for logarithmic lookup.
+    """
+
+    sequences: Mapping[str, tuple[object, ...]]
+    departures_by_stop: Mapping[str, tuple[tuple[int, str, int], ...]]
+    departure_seconds_by_stop: Mapping[str, tuple[int, ...]]
+    arrivals_by_stop: Mapping[str, tuple[tuple[int, str, int], ...]]
+    physical_stop_mapping: Mapping[str, str]
+
+    @classmethod
+    def from_scenario(
+        cls,
+        scenario: Scenario,
+        *,
+        physical_stop_mapping: Mapping[str, str] | None = None,
+    ) -> "TimetableFeasibilityIndex":
+        mapping = dict(physical_stop_mapping or {str(stop.stop_id): str(stop.stop_id) for stop in scenario.stops})
+        sequences = _trip_sequences(scenario, mapping)
+        departures: dict[str, list[tuple[int, str, int]]] = defaultdict(list)
+        arrivals: dict[str, list[tuple[int, str, int]]] = defaultdict(list)
+        for trip_id, sequence in sequences.items():
+            for index, stop_time in enumerate(sequence):
+                stop = mapping[str(stop_time.stop_id)]
+                departure = int(stop_time.departure.seconds_from_midnight)
+                arrival = int(stop_time.arrival.seconds_from_midnight)
+                departures[stop].append((departure, trip_id, index))
+                arrivals[stop].append((arrival, trip_id, index))
+        ordered_departures = {
+            stop: tuple(sorted(items, key=lambda item: (item[0], item[1], item[2])))
+            for stop, items in departures.items()
+        }
+        ordered_arrivals = {
+            stop: tuple(sorted(items, key=lambda item: (item[0], item[1], item[2])))
+            for stop, items in arrivals.items()
+        }
+        return cls(
+            sequences=MappingProxyType(dict(sequences)),
+            departures_by_stop=MappingProxyType(ordered_departures),
+            departure_seconds_by_stop=MappingProxyType(
+                {stop: tuple(item[0] for item in items) for stop, items in ordered_departures.items()}
+            ),
+            arrivals_by_stop=MappingProxyType(ordered_arrivals),
+            physical_stop_mapping=MappingProxyType(mapping),
+        )
+
+    def is_feasible(
+        self,
+        pair: CandidateODPair,
+        period: tuple[str, int, int],
+        *,
+        maximum_transfers: int,
+        maximum_initial_wait_seconds: int,
+        maximum_waiting_seconds: int,
+        maximum_journey_seconds: int,
+    ) -> bool:
+        origin = self.physical_stop_mapping.get(pair.origin_stop_id, pair.origin_stop_id)
+        destination = self.physical_stop_mapping.get(pair.destination_stop_id, pair.destination_stop_id)
+        start, end = period[1], period[2]
+        origin_departures = self.departures_by_stop.get(origin, ())
+        first_candidates = [
+            (trip_id, index, departure)
+            for departure, trip_id, index in origin_departures
+            if start <= departure < end and departure - start <= maximum_initial_wait_seconds
+        ]
+        queue: deque[tuple[str, int, int, int]] = deque(
+            (trip_id, index, departure, 0)
+            for trip_id, index, departure in first_candidates
+        )
+        visited: set[tuple[str, int, int]] = set()
+        while queue:
+            trip_id, board_index, first_departure, transfers = queue.popleft()
+            state_key = (trip_id, board_index, transfers)
+            if state_key in visited:
+                continue
+            visited.add(state_key)
+            sequence = self.sequences[trip_id]
+            for alight_index in range(board_index + 1, len(sequence)):
+                alight = sequence[alight_index]
+                arrival = int(alight.arrival.seconds_from_midnight)
+                if arrival - first_departure > maximum_journey_seconds:
+                    break
+                stop = self.physical_stop_mapping.get(str(alight.stop_id), str(alight.stop_id))
+                if stop == destination:
+                    return True
+                if transfers >= maximum_transfers:
+                    continue
+                departures = self.departures_by_stop.get(stop, ())
+                seconds = self.departure_seconds_by_stop.get(stop, ())
+                first = bisect_left(seconds, arrival)
+                for departure, next_trip_id, next_index in departures[first:]:
+                    if departure - arrival > maximum_waiting_seconds:
+                        break
+                    if next_trip_id != trip_id:
+                        queue.append((next_trip_id, next_index, first_departure, transfers + 1))
+        return False
+
+
 def _mapping_for_level(
     scenario: Scenario,
     *,
@@ -255,7 +359,13 @@ def _mapping_for_level(
             "physical-stop mapping must cover exactly the scenario stops; "
             f"missing={missing}, unknown={unknown}."
         )
-    return normalized
+    # Pair identifiers at ``physical_stop`` level are physical IDs, whereas
+    # timetable records still use platform/stop IDs.  Keep both namespaces in
+    # the index so the same mapping can resolve either kind of identifier.
+    return {
+        **normalized,
+        **{physical_id: physical_id for physical_id in set(normalized.values())},
+    }
 
 
 def _trip_sequences(scenario: Scenario, mapping: Mapping[str, str]) -> dict[str, tuple[object, ...]]:
@@ -545,6 +655,7 @@ def expand_candidate_od_time_cells(
     maximum_waiting_seconds: int = 3600,
     timetable_policy: TimetablePolicy = "required",
     timetable_feasibility: Callable[[CandidateODPair, tuple[str, int, int]], bool] | None = None,
+    feasibility_index: TimetableFeasibilityIndex | None = None,
 ) -> ODTimeExpansion:
     """Expand a pair universe across approved bins and audit each exclusion."""
     if maximum_transfers < 0 or maximum_initial_wait_seconds < 0 or maximum_journey_seconds <= 0 or maximum_waiting_seconds < 0:
@@ -563,6 +674,16 @@ def expand_candidate_od_time_cells(
     mapping = universe.physical_stop_mapping
     departures, arrivals = (set(), set()) if scenario is None else _service_activity(scenario, mapping)
     reachable = {} if scenario is None else _directed_reachability(scenario, mapping)
+    if (
+        timetable_feasibility is None
+        and feasibility_index is None
+        and timetable_policy == "required"
+        and scenario is not None
+        and scenario.timetable is not None
+    ):
+        feasibility_index = TimetableFeasibilityIndex.from_scenario(
+            scenario, physical_stop_mapping=mapping
+        )
     cells: list[CandidateODTimeCell] = []
     exclusions: list[ODTimeExclusion] = []
     for pair in universe.pairs:
@@ -588,6 +709,15 @@ def expand_candidate_od_time_cells(
                 feasible = None
             elif scenario is None or scenario.timetable is None:
                 feasible = False
+            elif feasibility_index is not None:
+                feasible = feasibility_index.is_feasible(
+                    pair,
+                    period,
+                    maximum_transfers=maximum_transfers,
+                    maximum_initial_wait_seconds=maximum_initial_wait_seconds,
+                    maximum_waiting_seconds=maximum_waiting_seconds,
+                    maximum_journey_seconds=maximum_journey_seconds,
+                )
             else:
                 feasible = _timetable_feasible(
                     scenario,

@@ -38,6 +38,12 @@ def test_template_has_deterministic_fingerprint() -> None:
     assert first.fingerprint_payload_json == second.fingerprint_payload_json
 
 
+def test_template_declares_data_only_setuptools_project() -> None:
+    pyproject = (TEMPLATE / "pyproject.toml").read_text(encoding="utf-8")
+    assert "[tool.setuptools]" in pyproject
+    assert "packages = []" in pyproject
+
+
 def test_missing_configuration_field_is_rejected(tmp_path: Path) -> None:
     case = _copy_case(tmp_path)
     _write_config(case, _config_text(case).replace('name = "template_small_multiline"\n', ""))
@@ -62,7 +68,7 @@ def test_invalid_configured_path_fails_before_processing(tmp_path: Path) -> None
 
 def test_missing_od_budget_is_rejected(tmp_path: Path) -> None:
     case = _copy_case(tmp_path)
-    _write_config(case, _config_text(case).replace("max_od_cells = 2", "max_od_cells = 0"))
+    _write_config(case, _config_text(case).replace("max_od_cells = 48", "max_od_cells = 0"))
     with pytest.raises(CaseStudyConfigError, match="max_od_cells"):
         load_case_study_config(case / "config/case.toml", case_root=case)
 
@@ -161,8 +167,10 @@ def test_clean_template_executes_admission_path(tmp_path: Path) -> None:
     config_path = case / "config/case.toml"
     kwargs = {"case_root": case}
     assert run_case_stage(config_path, "check", **kwargs)["audit"]["resolved_measurement_count"] == 8
+    run_case_stage(config_path, "od-universe", **kwargs)
     run_case_stage(config_path, "time-discretization", **kwargs)
     run_case_stage(config_path, "materialize-bins", candidate="recommendation", reviewer="pytest", **kwargs)
+    run_case_stage(config_path, "expand-od", **kwargs)
     run_case_stage(config_path, "structural-zeros", **kwargs)
     prepared = run_case_stage(config_path, "prepare", **kwargs)
     assert prepared["dimensions"]["measurements"] == 8
@@ -198,14 +206,17 @@ def test_independent_od_workflow_has_pair_and_expansion_audits(tmp_path: Path) -
     universe = run_case_stage(config_path, "od-universe", **kwargs)
     assert universe["source"] == "file"
     assert universe["retained_pair_count"] == 2
+    run_case_stage(config_path, "time-discretization", **kwargs)
+    run_case_stage(config_path, "materialize-bins", candidate="recommendation", reviewer="pytest", **kwargs)
     expansion = run_case_stage(config_path, "expand-od", **kwargs)
-    assert expansion["retained_cell_count"] == 2
+    assert expansion["retained_cell_count"] >= 2
     assert (case / "results/audit/od_pairs.csv").is_file()
     assert (case / "results/generated_inputs/prior_demand.csv").is_file()
+    run_case_stage(config_path, "structural-zeros", **kwargs)
     manifest = run_case_stage(config_path, "check", **kwargs)["manifest"]
     assert manifest["input_semantics"] == "independent_od_universe"
     assert manifest["prior_demand"]["source"] == "all_ones"
-    data = GenericCaseAdapter(load_case_study_config(config_path, case_root=case)).data
+    data = GenericCaseAdapter(load_case_study_config(config_path, case_root=case)).load_persisted_data()
     assert data.prior_demand is not None
     assert set(data.prior_demand.values()) == {1.0}
     assert set(data.production_inputs.values()) == {1.0}
@@ -229,6 +240,114 @@ def test_external_pair_prior_can_use_paths_fallback(tmp_path: Path) -> None:
         'source = "external_file"\nsemantics = "external_prior"',
     )
     _write_config(case, text)
-    config = load_case_study_config(case / "config/case.toml", case_root=case)
-    data = GenericCaseAdapter(config).data
+    config_path = case / "config/case.toml"
+    config = load_case_study_config(config_path, case_root=case)
+    run_case_stage(config_path, "od-universe", case_root=case)
+    run_case_stage(config_path, "time-discretization", case_root=case)
+    run_case_stage(config_path, "materialize-bins", candidate="recommendation", reviewer="pytest", case_root=case)
+    run_case_stage(config_path, "expand-od", case_root=case)
+    run_case_stage(config_path, "structural-zeros", case_root=case)
+    data = GenericCaseAdapter(config).load_persisted_data()
     assert set(data.prior_demand.values()) == {2.0, 3.0}
+
+
+def _run_through_expansion(case: Path) -> Path:
+    config_path = case / "config/case.toml"
+    kwargs = {"case_root": case}
+    run_case_stage(config_path, "od-universe", **kwargs)
+    run_case_stage(config_path, "time-discretization", **kwargs)
+    run_case_stage(
+        config_path,
+        "materialize-bins",
+        candidate="recommendation",
+        reviewer="pytest",
+        **kwargs,
+    )
+    run_case_stage(config_path, "expand-od", **kwargs)
+    return config_path
+
+
+def test_lightweight_stages_do_not_construct_timetable_expansion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = _copy_case(tmp_path)
+    (case / "inputs/scenario/prior_demand.csv").unlink()
+
+    def fail_expansion(*args: object, **kwargs: object) -> object:
+        raise AssertionError("lightweight stage invoked OD-time expansion")
+
+    monkeypatch.setattr(
+        "public_transportation.case_study.adapter.expand_candidate_od_time_cells",
+        fail_expansion,
+    )
+    config_path = case / "config/case.toml"
+    kwargs = {"case_root": case}
+    check = run_case_stage(config_path, "check", **kwargs)
+    assert check["audit"]["od_universe_status"] == "not_run"
+    assert check["audit"]["od_time_expansion_status"] == "not_run"
+    assert check["audit"]["timetable_feasibility_status"] == "not_run"
+    run_case_stage(config_path, "od-universe", **kwargs)
+    run_case_stage(config_path, "time-discretization", **kwargs)
+    run_case_stage(
+        config_path,
+        "materialize-bins",
+        candidate="recommendation",
+        reviewer="pytest",
+        **kwargs,
+    )
+
+
+def test_expand_constructs_one_reusable_timetable_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = _copy_case(tmp_path)
+    (case / "inputs/scenario/prior_demand.csv").unlink()
+    calls: list[int] = []
+    from public_transportation.preprocessing import od_universe as module
+
+    original = module.TimetableFeasibilityIndex.from_scenario
+
+    def counted(cls: object, *args: object, **kwargs: object) -> object:
+        calls.append(1)
+        return original.__func__(cls, *args, **kwargs)  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(
+        module.TimetableFeasibilityIndex,
+        "from_scenario",
+        classmethod(counted),
+    )
+    _run_through_expansion(case)
+    assert calls == [1]
+
+
+def test_structural_zeros_reuses_persisted_expansion_and_prepare_requires_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = _copy_case(tmp_path)
+    (case / "inputs/scenario/prior_demand.csv").unlink()
+    config_path = case / "config/case.toml"
+    with pytest.raises(FileNotFoundError, match="run expand-od before structural-zeros"):
+        run_case_stage(config_path, "structural-zeros", case_root=case)
+    with pytest.raises(FileNotFoundError, match="run expand-od before structural-zeros"):
+        run_case_stage(config_path, "prepare", case_root=case)
+    _run_through_expansion(case)
+    monkeypatch.setattr(
+        "public_transportation.case_study.adapter.expand_candidate_od_time_cells",
+        lambda *args, **kwargs: pytest.fail("structural-zeros recomputed expansion"),
+    )
+    run_case_stage(config_path, "structural-zeros", case_root=case)
+
+
+def test_expansion_fingerprint_mismatch_is_rejected(tmp_path: Path) -> None:
+    case = _copy_case(tmp_path)
+    (case / "inputs/scenario/prior_demand.csv").unlink()
+    config_path = _run_through_expansion(case)
+    bins = case / "results/generated_inputs/time_bins.csv"
+    # Change an approved edge while preserving a valid, sorted contract.
+    lines = bins.read_text(encoding="utf-8").splitlines()
+    first = lines[1].split(",")
+    first[1] = str(int(first[1]) + 1)
+    lines[1] = ",".join(first)
+    bins.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="time-bin fingerprint"):
+        run_case_stage(config_path, "structural-zeros", case_root=case)

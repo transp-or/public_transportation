@@ -34,12 +34,14 @@ from public_transportation.inference.reduced_od.contracts import (
 )
 from public_transportation.inference.reduced_od.reconstruction import reconstruct_full_od
 from public_transportation.preprocessing.materialize_time_bins import materialize_time_bins
+from public_transportation.preprocessing.od_universe import generate_prior_demand
 from public_transportation.inference.reduced_od import prepare_reduced_od_artifacts
 from public_transportation.preprocessing.structural_zeros import run_structural_zero_preprocessing
 from public_transportation.preprocessing.time_discretization import (
     TimeDiscretizationConfig,
     recommend_time_discretization,
 )
+from public_transportation.preprocessing.reduced_od import JourneyTimePeriod
 
 from .adapter import GenericCaseAdapter, GenericCaseHook
 from .config import CaseStudyConfig, load_case_study_config
@@ -181,9 +183,12 @@ class GenericCaseRunner:
             "timezone": self.config.timezone,
         }
 
-    def _component_provenance(self, data: Any) -> dict[str, object]:
+    def _component_provenance(self, data: Any | None = None, *, expansion: Any | None = None) -> dict[str, object]:
         """Serialize explicit production/attractiveness semantics and dimensions."""
-        expansion = data.od_time_expansion
+        if expansion is None:
+            if data is None:
+                raise ValueError("component provenance requires case data or an expansion")
+            expansion = data.od_time_expansion
         origin_groups = (
             set()
             if expansion is None
@@ -263,8 +268,8 @@ class GenericCaseRunner:
 
     def od_universe(self) -> dict[str, object]:
         """Validate/write the independent candidate pair universe."""
-        data = self.adapter.data
-        if data.candidate_od_universe is None:
+        universe = self.adapter.build_od_universe()
+        if universe is None:
             payload = {
                 "status": "legacy_compatibility",
                 "input_semantics": "legacy_time_dependent_demand",
@@ -272,7 +277,6 @@ class GenericCaseRunner:
             }
             _write_json(self._stage_path("audit", "od_universe.json"), payload)
             return payload
-        universe = data.candidate_od_universe
         _write_csv(
             self._stage_path("audit", "od_pairs.csv"),
             ("origin_stop_id", "destination_stop_id"),
@@ -285,6 +289,11 @@ class GenericCaseRunner:
         )
         payload = {
             **universe.audit,
+            "complexity_preflight": self.adapter.complexity_preflight(
+                pair_count=universe.pair_count,
+                pair_level_exclusions=len(universe.exclusions),
+                time_bin_count=0,
+            ),
             **self._stage_provenance(),
         }
         _write_json(self._stage_path("audit", "od_universe.json"), payload)
@@ -292,10 +301,13 @@ class GenericCaseRunner:
         return payload
 
     def time_discretization(self) -> dict[str, object]:
-        self.adapter.audit()
+        audit = self.adapter.audit()
         settings = self.config.time_discretization
+        complexity = dict(audit.complexity)
+        if complexity.get("candidate_pair_count") is None and settings.max_od_cells is None:
+            raise ValueError("time-discretization requires an explicit complexity budget before OD-universe is audited.")
         report = recommend_time_discretization(
-            self.adapter.data.measurements.records,
+            self.adapter.load_base_data().measurements.records,
             TimeDiscretizationConfig(
                 base_resolution_minutes=settings.base_resolution_minutes,
                 min_bin_minutes=settings.min_bin_minutes,
@@ -307,6 +319,7 @@ class GenericCaseRunner:
                 horizon_end_s=settings.horizon_end_s,
             ),
         )
+        report["complexity_preflight"] = complexity
         output = _write_json(self._stage_path("audit", "time_discretization_recommendation.json"), report)
         self.emit({"stage": "time-discretization", "status": "completed", "output": str(output)})
         return report
@@ -344,8 +357,7 @@ class GenericCaseRunner:
 
     def expand_od(self) -> dict[str, object]:
         """Expand the approved time bins across the independent OD universe."""
-        data = self.adapter.data
-        if data.od_time_expansion is None:
+        if self.config.od_universe.source == "legacy_time_dependent_demand":
             payload = {
                 "status": "legacy_compatibility",
                 "input_semantics": "legacy_time_dependent_demand",
@@ -353,7 +365,8 @@ class GenericCaseRunner:
             }
             _write_json(self._stage_path("audit", "od_time_expansion.json"), payload)
             return payload
-        expansion = data.od_time_expansion
+        universe = self.adapter.load_persisted_universe()
+        expansion = self.adapter.build_od_time_expansion(universe)
         _write_csv(
             self._stage_path("audit", "od_time_exclusions.csv"),
             ("origin_stop_id", "destination_stop_id", "time_bin_id", "reason", "detail"),
@@ -367,35 +380,48 @@ class GenericCaseRunner:
             ("origin_stop_id", "destination_stop_id", "time_bin_id"),
             [cell.tuple for cell in expansion.cells],
         )
-        approved_bins_fingerprint = hashlib.sha256(
-            json.dumps([list(item) for item in expansion.time_bins], separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
+        periods = tuple(
+            JourneyTimePeriod(item[0], item[1], item[2]) for item in expansion.time_bins
+        )
+        approved_bins_fingerprint = self.adapter._time_bins_fingerprint(periods)
+        complexity = self.adapter.complexity_preflight(
+            pair_count=universe.pair_count,
+            pair_level_exclusions=len(universe.exclusions),
+            time_bin_count=len(periods),
+        )
         payload = {
             **expansion.audit,
+            "pair_universe_fingerprint": universe.fingerprint,
+            "expansion_fingerprint": expansion.fingerprint,
+            "feasibility_settings": dict(expansion.policies),
+            "complexity_preflight": complexity,
             "approved_time_bins_fingerprint": approved_bins_fingerprint,
             **self._stage_provenance(),
         }
         _write_json(self._stage_path("audit", "od_time_expansion.json"), payload)
-        if data.prior_demand is not None:
+        prior_generation = generate_prior_demand(
+            expansion,
+            source=self.config.prior_demand.source,
+            value=float(self.config.prior_demand.value or 1.0),
+            semantics=self.config.prior_demand.semantics,
+            prior_file=self.config.prior_demand.input_file,
+        )
+        if prior_generation.values:
             _write_csv(
                 self._stage_path("generated_inputs", "prior_demand.csv"),
                 ("origin_stop_id", "destination_stop_id", "time_bin_id", "prior_value"),
-                [(*cell.tuple, value) for cell, value in sorted(data.prior_demand.items())],
+                [(*cell.tuple, value) for cell, value in sorted(prior_generation.values.items())],
             )
             _write_json(
                 self._stage_path("audit", "prior_generation.json"),
                 {
                     **self._stage_provenance(),
-                    **(
-                        {}
-                        if data.prior_generation is None
-                        else data.prior_generation.audit
-                    ),
+                    **prior_generation.audit,
                     "source": self.config.prior_demand.source,
                     "semantics": self.config.prior_demand.semantics,
                     "expansion": self.config.prior_demand.expansion,
-                    "cell_count": len(data.prior_demand),
-                    "universe_fingerprint": data.candidate_od_universe.fingerprint,
+                    "cell_count": len(prior_generation.values),
+                    "universe_fingerprint": universe.fingerprint,
                     "od_time_expansion_fingerprint": expansion.fingerprint,
                     "approved_time_bins_fingerprint": approved_bins_fingerprint,
                 },
@@ -404,7 +430,7 @@ class GenericCaseRunner:
             self._stage_path("audit", "production_attractiveness_provenance.json"),
             {
                 **self._stage_provenance(),
-                "components": self._component_provenance(data),
+                "components": self._component_provenance(expansion=expansion),
                 "input_files": {
                     "production": None if self.config.paths.production_inputs is None else str(self.config.paths.production_inputs),
                     "destination_attractiveness": None if self.config.paths.destination_attractiveness is None else str(self.config.paths.destination_attractiveness),
@@ -418,15 +444,15 @@ class GenericCaseRunner:
         return payload
 
     def structural_zeros(self) -> dict[str, object]:
-        data = self.adapter.data
-        if data.od_time_expansion is not None:
+        if self.config.od_universe.source != "legacy_time_dependent_demand":
+            expansion = self.adapter.load_persisted_expansion()
             fixed = {
                 (item.origin_stop_id, item.destination_stop_id, item.time_bin_id): 0.0
-                for item in data.od_time_expansion.exclusions
+                for item in expansion.exclusions
             }
             _write_csv(
                 self._stage_path("generated_inputs", "fixed_demand.csv"),
-                ("origin_stop_id", "dest_stop_id", "time_bin_id", "flow"),
+                ("origin_stop_id", "dest_stop_id", "time_bin_id", "fixed_flow"),
                 [(*key, value) for key, value in sorted(fixed.items())],
             )
             _write_csv(
@@ -440,17 +466,18 @@ class GenericCaseRunner:
                         item.reason,
                         item.detail,
                     )
-                    for item in data.od_time_expansion.exclusions
+                    for item in expansion.exclusions
                 ],
             )
             payload = {
-                "num_cells": data.od_time_expansion.audit["expanded_od_time_count"],
+                "num_cells": expansion.audit["expanded_od_time_count"],
                 "num_structural_zero": len(fixed),
-                "num_retained": data.od_time_expansion.cell_count,
+                "num_retained": expansion.cell_count,
                 "num_fixed_merged": len(fixed),
-                "num_free_after_merge": data.od_time_expansion.cell_count,
-                "primary_reason_counts": data.od_time_expansion.audit["exclusion_counts"],
-                "input_semantics": data.input_semantics,
+                "num_free_after_merge": expansion.cell_count,
+                "primary_reason_counts": expansion.audit["exclusion_counts"],
+                "input_semantics": "independent_od_universe",
+                "expansion_fingerprint": expansion.fingerprint,
                 "output_folder": str(self._stage_path("generated_inputs", "")),
                 "configuration_fingerprint": self.config.fingerprint,
             }
@@ -485,13 +512,13 @@ class GenericCaseRunner:
         return payload
 
     def prepare(self) -> dict[str, object]:
-        self.adapter.audit()
         self.emit({"stage": "prepare", "status": "started"})
+        data = self.adapter.load_persisted_data()
         prepared = prepare_reduced_od_artifacts(
-            scenario=self.adapter.data.scenario,
-            measurements=self.adapter.data.measurements,
+            scenario=data.scenario,
+            measurements=data.measurements,
             configuration=self.config.reduced_od_config,
-            inputs=self.adapter.preparation_inputs(),
+            inputs=self.adapter.build_preparation_inputs(),
             output_directory=self._stage_path("artifacts", "reduced_od"),
             cache_policy="reuse_or_build",
             progress=self.emit,

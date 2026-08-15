@@ -146,24 +146,42 @@ module internals.
 Each stage has one declared source of control. This table is part of the case
 contract and should be copied into the case README:
 
-| Stage | Configuration that controls it | Output class |
-|---|---|---|
-| `check` | `config/case.toml` paths, observation mappings, service-day and timestamp policies | audit/provenance only |
-| `od-universe` | `config/case.toml [od_universe]` and optional `inputs/od_pairs.csv` | pair universe and exclusion audit |
-| `time-discretization` | `config/case.toml [time_discretization]` and `config/time_discretization.toml` | recommendation JSON only |
-| `materialize-bins` | reviewed candidate plus reviewer identity | generated input (`time_bins.csv`) |
-| `expand-od` | approved bins plus the `od-universe` output | candidate OD-time cells and exclusion audit |
-| `structural-zeros` | `config/structural_zeros.toml` plus expanded OD-time cells | preprocessing artifacts/audit |
-| `prepare` | `config/reduced_od.toml`, sampling and input mappings | persistent reduced-OD artifacts |
-| `preflight` / `benchmark` | `config/model.toml` plus prepared-artifact fingerprints | read-only diagnostics |
-| `fit` | `config/model.toml` and explicit method/likelihood flags | fit result/checkpoint |
-| `diagnose` / `reconstruct` / `validate-detailed` | accepted fit and validation inputs | diagnostics/validation |
+| Stage | Configuration that controls it | Runtime class | Output class |
+|---|---|---|---|
+| `check` | `config/case.toml` paths, observation mappings, service-day and timestamp policies | lightweight; no OD-time search | audit/provenance only |
+| `od-universe` | `config/case.toml [od_universe]` and optional `inputs/od_pairs.csv` | lightweight pair generation only | pair universe and exclusion audit |
+| `time-discretization` | `config/case.toml [time_discretization]` and `config/time_discretization.toml` | lightweight timestamp analysis only | recommendation JSON only |
+| `materialize-bins` | reviewed candidate plus reviewer identity | file-only | generated input (`time_bins.csv`) |
+| `expand-od` | approved bins plus the `od-universe` output | first expensive timetable-feasibility stage | candidate OD-time cells, priors, and exclusion audit |
+| `structural-zeros` | persisted `expand-od` artifacts | artifact validation only; no recomputation | structural-zero artifacts/audit |
+| `prepare` | `config/reduced_od.toml`, sampling and persisted expansion/fixed inputs | reduced-OD preparation | persistent reduced-OD artifacts |
+| `preflight` / `benchmark` | `config/model.toml` plus prepared-artifact fingerprints | read-only diagnostics | diagnostics |
+| `fit` | `config/model.toml` and explicit method/likelihood flags | estimation | fit result/checkpoint |
+| `diagnose` / `reconstruct` / `validate-detailed` | accepted fit and validation inputs | post-fit | diagnostics/validation |
 
 The generic runner writes only beneath the configured `results_directory`,
 separates audit, generated-input, artifact, fit, and validation outputs, and
 records configuration and package fingerprints in each stage manifest. It
 supports `--dry-run` to print a planned stage and `--json-progress` for long
 stages.
+
+The first four stages are intentionally lazy. `check`, `od-universe`,
+`time-discretization`, and `materialize-bins` must not call
+`expand_candidate_od_time_cells`, construct journey alternatives, or run
+`_timetable_feasible`. `expand-od` is the first stage allowed to form the
+pair-by-bin Cartesian product and perform timetable feasibility. It persists
+the result; `structural-zeros` and `prepare` consume and fingerprint those
+artifacts rather than rebuilding them in their new process. A missing or
+incompatible artifact is a hard failure with an instruction to run the
+preceding stage. Do not bypass this order by calling internal functions.
+
+| Persisted artifact | Created by | Consumed by |
+|---|---|---|
+| `results/audit/od_pairs.csv`, `od_universe_exclusions.csv`, `od_universe.json` | `od-universe` | `expand-od`, review/audit |
+| `results/generated_inputs/time_bins.csv` and manifest | `materialize-bins` | `expand-od` |
+| `results/generated_inputs/candidate_od_time.csv`, `results/audit/od_time_exclusions.csv`, `od_time_expansion.json` | `expand-od` | `structural-zeros`, `prepare` |
+| `results/generated_inputs/prior_demand.csv`, `results/audit/prior_generation.json` | `expand-od` | `prepare`, model provenance |
+| `results/generated_inputs/fixed_demand.csv`, structural-zero audit/summary | `structural-zeros` | `prepare` |
 
 ### 2.2 What must exist before the first command
 
@@ -964,11 +982,19 @@ This stage must not construct expensive routing artifacts. It should:
 3. stream or load all source tables;
 4. audit service-day and time conventions;
 5. verify stop mapping and observation identities;
-6. report candidate OD-time, fixed, structural-zero candidate, measurement,
-   trip, stop-time, and physical-stop counts;
+6. report raw-network, pair-universe (when already audited), measurement,
+   trip, stop-time, and physical-stop counts, plus the estimated OD-time
+   complexity and configured `max_od_cells` budget;
 7. run `preflight_reduced_od_time_periods` and write its JSON report;
 8. estimate memory/disk needs where possible;
 9. write machine-readable audit JSON and any rejected-record CSV.
+
+For the independent workflow, the audit must explicitly contain
+`od_universe_status = "not_run"`,
+`od_time_expansion_status = "not_run"`, and
+`timetable_feasibility_status = "not_run"`. `check` must not call
+`expand_candidate_od_time_cells`, `_timetable_feasible`, or construct journey
+alternatives.
 
 Accept the stage only if all counts are explainable, every rejection has a
 documented policy reason, the package identity and case revision are correct,
@@ -994,9 +1020,9 @@ physical-stop level, same-node policy, active-service policy, directed
 connectivity policy, every excluded pair, and the pair-universe fingerprint.
 
 `od-universe` does not inspect count timestamps and does not change when the
-approved time-bin edges change. A static directed path is only a cheap
-pair-level filter; it is not evidence that a scheduled journey exists in every
-time interval.
+approved time-bin edges change. It does not form OD-time cells or run timetable
+feasibility. A static directed path is only a cheap pair-level filter; it is
+not evidence that a scheduled journey exists in every time interval.
 
 ## 6. Stage 3 — Time-bin approval and OD-time expansion
 
@@ -1018,7 +1044,12 @@ each pair/bin combination. It writes
 `results/audit/od_time_exclusions.csv`; a physically reachable pair may still
 be a timetable structural zero in one bin and retained in another. The
 generated `prior_demand.csv` is created only after this expansion and contains
-one value per retained OD-time cell.
+one value per retained OD-time cell. Before the search begins, the runner
+reports raw nodes, retained pairs, approved bins, estimated OD-time cells,
+estimated feasibility calls, and `max_od_cells`; it stops rather than silently
+truncating when the estimate exceeds the configured budget. This is the first
+stage that may construct the reusable timetable-feasibility index and perform
+the schedule search.
 
 ## 7. Stage 4 — Structural zeroes and feasibility
 
@@ -1034,6 +1065,12 @@ For the separate TOML-driven structural-zero tool, follow
 [`structural_zero_preprocessing.md`](structural_zero_preprocessing.md). Enable
 the same-stop, no-feasible-path, and maximum-transfer rules at minimum. The
 assignment feasibility settings must agree with the later routing assumptions.
+
+`structural-zeros` consumes the persisted `expand-od` files. It never silently
+recomputes them; a missing or incompatible expansion fails with
+`run expand-od before structural-zeros`. `prepare` similarly consumes the
+validated expansion and structural-zero artifacts and fails rather than
+rebuilding them.
 
 Review these generated files before estimation:
 
@@ -1103,6 +1140,35 @@ method until the retained measurement response is stable enough for the case.
 
 Use the following decision tree. Save every affected atomic record and its
 reason to a CSV; summary counts alone are insufficient.
+
+### A lightweight stage starts timetable searches
+
+**Symptom:** `check`, `od-universe`, or `time-discretization` hangs, consumes
+unexpected memory, or reports timetable-feasibility calls.
+
+**Classification:** public-package/workflow defect.
+
+**Expected behavior:** those stages load and validate sources, generate pairs,
+or analyze count timestamps only. They must not call
+`expand_candidate_od_time_cells` or `_timetable_feasible`. `expand-od` is the
+first expensive stage.
+
+**Action:** stop the run, save the traceback and public-package revision, and
+use a revision containing the lazy-stage fix. Do not bypass the stage runner or
+call internal feasibility functions directly.
+
+### A downstream stage cannot find its expansion artifact
+
+**Symptom:** `structural-zeros` or `prepare` reports
+`run expand-od before structural-zeros` (or an equivalent fingerprint
+mismatch).
+
+**Classification:** stage-order or stale-artifact failure.
+
+**Action:** verify that `od-universe`, approved `materialize-bins`, and
+`expand-od` completed for the current configuration and that their fingerprints
+match. Re-run the missing preceding stage; never let the downstream stage
+silently rebuild or overwrite the artifact.
 
 ### 7.1 The observation does not match a timetable event
 

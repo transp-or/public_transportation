@@ -9,3 +9,9 @@ dependencies = [
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+# This case repository contains configuration and data, not an installable
+# Python package.  Prevent setuptools from treating config/ or results/ as
+# packages during `uv sync`.
+[tool.setuptools]
+packages = []

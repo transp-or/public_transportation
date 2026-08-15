@@ -15,6 +15,7 @@ from .config import (
 )
 from .adapter import (
     GenericCaseAdapter,
+    GenericCaseBaseData,
     GenericCaseData,
     GenericCaseAudit,
     GenericCaseHook,
@@ -29,6 +30,7 @@ __all__ = [
     "GenericCaseAdapter",
     "GenericCaseAudit",
     "GenericCaseData",
+    "GenericCaseBaseData",
     "GenericCaseHook",
     "GenericCaseRunner",
     "load_canonical_measurements",

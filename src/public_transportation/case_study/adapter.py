@@ -5,9 +5,11 @@ from __future__ import annotations
 import csv
 import hashlib
 import math
-from dataclasses import asdict, dataclass
+import json
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from collections.abc import Callable, Mapping
+from types import MappingProxyType
 from typing import Any
 
 from public_transportation.domain import Scenario, TimeOfDay, read_fixed_demand_csv
@@ -27,12 +29,15 @@ from public_transportation.preprocessing.reduced_od import (
 )
 from public_transportation.preprocessing.od_universe import (
     CandidateODTimeCell,
+    CandidateODPair,
     CandidateODUniverse,
+    ODTimeExclusion,
     ODTimeExpansion,
+    ODUniverseExclusion,
     PriorGenerationResult,
+    TimetableFeasibilityIndex,
     expand_candidate_od_time_cells,
     generate_candidate_od_pairs,
-    generate_prior_demand,
 )
 
 from .config import CaseStudyConfig
@@ -232,22 +237,30 @@ def _load_component_values(path: Path, *, component: str) -> dict[tuple[str, str
 
 
 @dataclass(frozen=True, slots=True)
-class GenericCaseData:
+class GenericCaseBaseData:
+    """Data loaded by every stage without OD--time feasibility work."""
+
     scenario: Scenario
     measurements: MeasurementTable
     fixed_demand: dict[ResponseCellKey, float]
     time_periods: tuple[JourneyTimePeriod, ...]
-    production_inputs: dict[tuple[str, str], float]
-    destination_attractiveness: dict[tuple[str, str], float]
-    departure_seconds_by_origin: dict[str, tuple[int, ...]]
     departure_sampling: DepartureTimeSamplingConfig
     physical_stop_mapping: dict[str, str] | None
     footpaths: tuple[Footpath, ...]
+    production_inputs: dict[tuple[str, str], float] = field(default_factory=dict)
+    destination_attractiveness: dict[tuple[str, str], float] = field(default_factory=dict)
+    departure_seconds_by_origin: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    input_semantics: str = "legacy_time_dependent_demand"
+
+
+@dataclass(frozen=True, slots=True)
+class GenericCaseData(GenericCaseBaseData):
+    """Fully materialized case data used by reduced-OD preparation."""
+
     candidate_od_universe: CandidateODUniverse | None = None
     od_time_expansion: ODTimeExpansion | None = None
     prior_demand: Mapping[CandidateODTimeCell, float] | None = None
     prior_generation: PriorGenerationResult | None = None
-    input_semantics: str = "legacy_time_dependent_demand"
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,12 +270,16 @@ class GenericCaseAudit:
     source_checksums: dict[str, str]
     scenario_stop_count: int
     demand_cell_count: int
-    candidate_od_pair_count: int
+    candidate_od_pair_count: int | None
     measurement_count: int
     measurement_type_counts: dict[str, int]
     resolved_measurement_count: int
     time_period_count: int
     period_preflight: dict[str, object]
+    od_universe_status: str = "not_run"
+    od_time_expansion_status: str = "not_run"
+    timetable_feasibility_status: str = "not_run"
+    complexity: dict[str, object] = field(default_factory=dict)
     od_universe: dict[str, object] | None = None
     od_time_expansion: dict[str, object] | None = None
     prior_generation: dict[str, object] | None = None
@@ -281,15 +298,20 @@ class GenericCaseAdapter:
     def __init__(self, config: CaseStudyConfig, *, custom_hook: GenericCaseHook | None = None):
         self.config = config
         self.custom_hook = custom_hook
+        self._base_data: GenericCaseBaseData | None = None
+        self._universe: CandidateODUniverse | None = None
+        self._expansion: ODTimeExpansion | None = None
         self._data: GenericCaseData | None = None
 
     @property
-    def data(self) -> GenericCaseData:
-        if self._data is None:
-            self._data = self._load()
-        return self._data
+    def data(self) -> GenericCaseBaseData:
+        """Return base data only; this property never runs timetable search."""
+        return self.load_base_data()
 
-    def _load(self) -> GenericCaseData:
+    def load_base_data(self) -> GenericCaseBaseData:
+        """Load scenario, measurements, periods, mappings, and fixed inputs."""
+        if self._base_data is not None:
+            return self._base_data
         paths = self.config.paths
         for name, path in (("scenario_directory", paths.scenario_directory), ("measurements", paths.measurements)):
             if not path.exists():
@@ -330,15 +352,13 @@ class GenericCaseAdapter:
         physical_mapping = _load_physical_stop_mapping(
             self.config.reduced_od_config.stops.physical_stop_mapping_path
         )
-        candidate_universe: CandidateODUniverse | None = None
-        expansion: ODTimeExpansion | None = None
-        prior_values: Mapping[CandidateODTimeCell, float] | None = None
-        prior_generation: PriorGenerationResult | None = None
+        input_semantics = "legacy_time_dependent_demand" if legacy else "independent_od_universe"
+        production: dict[tuple[str, str], float] = {}
+        attraction: dict[tuple[str, str], float] = {}
+        origins: list[str] = []
         if legacy:
             demand_rows = tuple(scenario.demand.records)
             origins = sorted({str(item.origin_stop_id) for item in demand_rows})
-            production: dict[tuple[str, str], float] = {}
-            attraction: dict[tuple[str, str], float] = {}
             for record in demand_rows:
                 origin_key = (str(record.origin_stop_id), str(record.time_bin_id))
                 destination_key = (str(record.dest_stop_id), str(record.time_bin_id))
@@ -346,99 +366,410 @@ class GenericCaseAdapter:
                 attraction[destination_key] = attraction.get(destination_key, 0.0) + float(record.flow)
             if any(value <= 0.0 for value in attraction.values()):
                 raise ValueError("candidate demand gives a non-positive destination attractiveness.")
-            input_semantics = "legacy_time_dependent_demand"
-        else:
-            candidate_universe = generate_candidate_od_pairs(
-                scenario,
-                source=self.config.od_universe.source,  # type: ignore[arg-type]
-                level=self.config.od_universe.level,  # type: ignore[arg-type]
-                include_same_stop=self.config.od_universe.include_same_stop,
-                active_service_only=self.config.od_universe.active_service_only,
-                connectivity_policy=self.config.od_universe.connectivity_policy,  # type: ignore[arg-type]
-                od_pairs_path=self.config.od_universe.pair_file or paths.od_pairs,
-                physical_stop_mapping=physical_mapping,
-            )
-            reduced = self.config.reduced_od_config
-            expansion = expand_candidate_od_time_cells(
-                candidate_universe,
-                periods,
-                scenario=scenario,
-                maximum_transfers=reduced.journeys.maximum_transfers,
-                maximum_initial_wait_seconds=(
-                    reduced.journeys.maximum_waiting_seconds
-                ),
-                maximum_journey_seconds=reduced.journeys.maximum_journey_seconds,
-                maximum_waiting_seconds=reduced.journeys.maximum_waiting_seconds,
-                timetable_policy="required",
-            )
-            if expansion.cell_count == 0:
-                raise ValueError(
-                    "OD-time expansion retained no cells; review pair-level and "
-                    "timetable-feasibility rules before estimation."
-                )
-            generated_fixed = {
-                ResponseCellKey(
-                    item.origin_stop_id,
-                    item.destination_stop_id,
-                    item.time_bin_id,
-                ): 0.0
-                for item in expansion.exclusions
-            }
-            conflicts = sorted(
-                key.tuple
-                for key, value in generated_fixed.items()
-                if key in fixed and fixed[key] > 0.0
-            )
-            if conflicts:
-                raise ValueError(
-                    "positive fixed demand conflicts with an OD-time structural zero: "
-                    f"{conflicts}"
-                )
-            fixed.update(generated_fixed)
-            prior_values_result = generate_prior_demand(
-                expansion,
-                source=self.config.prior_demand.source,
-                value=float(self.config.prior_demand.value or 1.0),
-                semantics=self.config.prior_demand.semantics,
-                prior_file=self.config.prior_demand.input_file,
-            )
-            prior_generation = prior_values_result
-            prior_values = prior_values_result.values
-            origins = sorted({cell.origin_stop_id for cell in expansion.cells})
-            production, attraction = self._explicit_components(expansion)
-            input_semantics = "independent_od_universe"
         sampling = DepartureTimeSamplingConfig(
             strategy=self.config.sampling.strategy,
             samples_per_period=self.config.sampling.samples_per_period,
             time_step_seconds=self.config.sampling.time_step_seconds,
         )
         departures = {
-            origin: tuple(period.start_seconds + (period.end_seconds - period.start_seconds) // 2 for period in periods)
+            origin: tuple(
+                period.start_seconds + (period.end_seconds - period.start_seconds) // 2
+                for period in periods
+            )
             for origin in origins
         }
-        data = GenericCaseData(
+        self._base_data = GenericCaseBaseData(
             scenario=scenario,
             measurements=measurements,
             fixed_demand=fixed,
             time_periods=periods,
-            production_inputs=production,
-            destination_attractiveness=attraction,
-            departure_seconds_by_origin=departures,
             departure_sampling=sampling,
             physical_stop_mapping=physical_mapping,
             footpaths=(),
-            candidate_od_universe=candidate_universe,
-            od_time_expansion=expansion,
-            prior_demand=prior_values,
-            prior_generation=prior_generation,
+            production_inputs=production,
+            destination_attractiveness=attraction,
+            departure_seconds_by_origin=departures,
             input_semantics=input_semantics,
         )
+        return self._base_data
+
+    def build_od_universe(self) -> CandidateODUniverse | None:
+        """Generate/validate the pair universe without using time bins."""
+        if self._universe is not None:
+            return self._universe
+        base = self.load_base_data()
+        if self.config.od_universe.source == "legacy_time_dependent_demand":
+            return None
+        self._universe = generate_candidate_od_pairs(
+            base.scenario,
+            source=self.config.od_universe.source,  # type: ignore[arg-type]
+            level=self.config.od_universe.level,  # type: ignore[arg-type]
+            include_same_stop=self.config.od_universe.include_same_stop,
+            active_service_only=self.config.od_universe.active_service_only,
+            connectivity_policy=self.config.od_universe.connectivity_policy,  # type: ignore[arg-type]
+            od_pairs_path=self.config.od_universe.pair_file or self.config.paths.od_pairs,
+            physical_stop_mapping=base.physical_stop_mapping,
+        )
+        return self._universe
+
+    def _approved_time_periods(self, *, require_materialized: bool) -> tuple[JourneyTimePeriod, ...]:
+        base = self.load_base_data()
+        generated_bins = self.config.paths.results_directory / "generated_inputs/time_bins.csv"
+        if generated_bins.is_file():
+            return _load_time_periods(generated_bins)
+        if require_materialized and self.config.od_universe.source != "legacy_time_dependent_demand":
+            raise FileNotFoundError("run materialize-bins before expand-od")
+        return base.time_periods
+
+    def complexity_preflight(
+        self,
+        *,
+        pair_count: int | None = None,
+        time_bin_count: int | None = None,
+        pair_level_exclusions: int | None = None,
+    ) -> dict[str, object]:
+        base = self.load_base_data()
+        if pair_count is None:
+            pair_count = self._persisted_pair_count() or self._pair_file_count()
+        if time_bin_count is None:
+            generated = self.config.paths.results_directory / "generated_inputs/time_bins.csv"
+            time_bin_count = len(_load_time_periods(generated)) if generated.is_file() else 0
+        estimated = None if pair_count is None else int(pair_count) * int(time_bin_count)
+        maximum = self.config.time_discretization.max_od_cells
+        report = {
+            "raw_network_nodes": len(base.scenario.stops),
+            "candidate_pair_count": pair_count,
+            "pair_level_exclusions": pair_level_exclusions,
+            "retained_pair_count": pair_count,
+            "approved_time_bin_count": time_bin_count,
+            "estimated_od_time_cells": estimated,
+            "maximum_configured_od_cells": maximum,
+            "estimated_timetable_feasibility_calls": estimated,
+        }
+        if estimated is not None and maximum is not None and estimated > maximum:
+            raise ValueError(
+                "estimated OD-time cells exceed max_od_cells before timetable expansion: "
+                f"{estimated} > {maximum} (pairs={pair_count}, bins={time_bin_count})."
+            )
+        return report
+
+    def build_od_time_expansion(
+        self,
+        universe: CandidateODUniverse | None = None,
+    ) -> ODTimeExpansion:
+        """Run timetable feasibility for the approved bins exactly once."""
+        base = self.load_base_data()
+        universe = universe or self.build_od_universe()
+        if universe is None:
+            raise ValueError("independent OD-time expansion is unavailable for legacy demand.csv.")
+        periods = self._approved_time_periods(require_materialized=True)
+        self.complexity_preflight(
+            pair_count=universe.pair_count,
+            pair_level_exclusions=len(universe.exclusions),
+            time_bin_count=len(periods),
+        )
+        reduced = self.config.reduced_od_config
+        index = TimetableFeasibilityIndex.from_scenario(
+            base.scenario,
+            physical_stop_mapping=universe.physical_stop_mapping,
+        )
+        expansion = expand_candidate_od_time_cells(
+            universe,
+            periods,
+            scenario=base.scenario,
+            maximum_transfers=reduced.journeys.maximum_transfers,
+            maximum_initial_wait_seconds=reduced.journeys.maximum_waiting_seconds,
+            maximum_journey_seconds=reduced.journeys.maximum_journey_seconds,
+            maximum_waiting_seconds=reduced.journeys.maximum_waiting_seconds,
+            timetable_policy="required",
+            feasibility_index=index,
+        )
+        if expansion.cell_count == 0:
+            raise ValueError(
+                "OD-time expansion retained no cells; review pair-level and "
+                "timetable-feasibility rules before estimation."
+            )
+        self._expansion = expansion
+        return expansion
+
+    def _pair_file_count(self) -> int | None:
+        path = self.config.od_universe.pair_file or self.config.paths.od_pairs
+        if path is None or not path.is_file():
+            return None
+        with path.open("r", encoding="utf-8-sig") as stream:
+            return max(sum(1 for _ in stream) - 1, 0)
+
+    def _persisted_pair_count(self) -> int | None:
+        path = self.config.paths.results_directory / "audit/od_universe.json"
+        if not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            value = payload.get("retained_pair_count")
+            return int(value) if value is not None else None
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    def _pair_mapping(self, base: GenericCaseBaseData) -> dict[str, str]:
+        if self.config.od_universe.level != "physical_stop":
+            return {str(stop.stop_id): str(stop.stop_id) for stop in base.scenario.stops}
+        mapping = dict(base.physical_stop_mapping or {})
+        return {**mapping, **{value: value for value in mapping.values()}}
+
+    def load_persisted_universe(self) -> CandidateODUniverse:
+        """Read and validate the pair artifact produced by ``od-universe``."""
+        audit_path = self.config.paths.results_directory / "audit/od_universe.json"
+        pair_path = self.config.paths.results_directory / "audit/od_pairs.csv"
+        exclusion_path = self.config.paths.results_directory / "audit/od_universe_exclusions.csv"
+        if not audit_path.is_file() or not pair_path.is_file() or not exclusion_path.is_file():
+            raise FileNotFoundError("run od-universe before expand-od")
+        payload = json.loads(audit_path.read_text(encoding="utf-8"))
+        if payload.get("configuration_fingerprint") != self.config.fingerprint:
+            raise ValueError("OD-universe artifact configuration fingerprint does not match current configuration.")
+        base = self.load_base_data()
+        pairs: list[CandidateODPair] = []
+        with pair_path.open("r", newline="", encoding="utf-8-sig") as stream:
+            reader = csv.DictReader(stream)
+            if reader.fieldnames != ["origin_stop_id", "destination_stop_id"]:
+                raise ValueError("persisted OD-pair artifact has an invalid header.")
+            for row in reader:
+                pairs.append(CandidateODPair(row["origin_stop_id"], row["destination_stop_id"]))
+        exclusions: list[ODUniverseExclusion] = []
+        with exclusion_path.open("r", newline="", encoding="utf-8-sig") as stream:
+            reader = csv.DictReader(stream)
+            required = {"origin_stop_id", "destination_stop_id", "reason", "detail"}
+            if reader.fieldnames is None or set(reader.fieldnames) != required:
+                raise ValueError("persisted OD-universe exclusion artifact has an invalid header.")
+            for row in reader:
+                exclusions.append(
+                    ODUniverseExclusion(
+                        row["origin_stop_id"], row["destination_stop_id"], row["reason"], row["detail"]
+                    )
+                )
+        universe = CandidateODUniverse(
+            pairs=tuple(sorted(pairs)),
+            exclusions=tuple(sorted(exclusions, key=lambda item: item.tuple)),
+            source=self.config.od_universe.source,  # type: ignore[arg-type]
+            level=self.config.od_universe.level,  # type: ignore[arg-type]
+            include_same_stop=self.config.od_universe.include_same_stop,
+            active_service_only=self.config.od_universe.active_service_only,
+            connectivity_policy=self.config.od_universe.connectivity_policy,  # type: ignore[arg-type]
+            physical_stop_mapping=MappingProxyType(self._pair_mapping(base)),
+            generator_fingerprint=str(payload.get("generator_fingerprint", "")),
+        )
+        expected = payload.get("fingerprint")
+        if not expected or universe.fingerprint != expected:
+            raise ValueError("OD-universe artifact fingerprint does not match its persisted contents.")
+        self._universe = universe
+        return universe
+
+    @staticmethod
+    def _time_bins_fingerprint(periods: tuple[JourneyTimePeriod, ...]) -> str:
+        payload = json.dumps(
+            [[item.period_id, item.start_seconds, item.end_seconds] for item in periods],
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def load_persisted_expansion(self) -> ODTimeExpansion:
+        """Read and validate the expansion artifact; never rebuild it."""
+        audit_path = self.config.paths.results_directory / "audit/od_time_expansion.json"
+        cell_path = self.config.paths.results_directory / "generated_inputs/candidate_od_time.csv"
+        exclusion_path = self.config.paths.results_directory / "audit/od_time_exclusions.csv"
+        if not audit_path.is_file() or not cell_path.is_file() or not exclusion_path.is_file():
+            raise FileNotFoundError("run expand-od before structural-zeros")
+        payload = json.loads(audit_path.read_text(encoding="utf-8"))
+        if payload.get("configuration_fingerprint") != self.config.fingerprint:
+            raise ValueError("OD-time expansion artifact configuration fingerprint does not match current configuration.")
+        universe = self.load_persisted_universe()
+        if payload.get("universe_fingerprint") != universe.fingerprint:
+            raise ValueError("OD-time expansion artifact universe fingerprint does not match current pair artifact.")
+        periods = self._approved_time_periods(require_materialized=True)
+        bins = tuple((item.period_id, item.start_seconds, item.end_seconds) for item in periods)
+        bins_fingerprint = self._time_bins_fingerprint(periods)
+        if payload.get("approved_time_bins_fingerprint") != bins_fingerprint:
+            raise ValueError("OD-time expansion artifact time-bin fingerprint does not match approved bins.")
+        cells: list[CandidateODTimeCell] = []
+        with cell_path.open("r", newline="", encoding="utf-8-sig") as stream:
+            reader = csv.DictReader(stream)
+            if reader.fieldnames != ["origin_stop_id", "destination_stop_id", "time_bin_id"]:
+                raise ValueError("persisted candidate OD-time artifact has an invalid header.")
+            for row in reader:
+                cells.append(CandidateODTimeCell(row["origin_stop_id"], row["destination_stop_id"], row["time_bin_id"]))
+        exclusions: list[ODTimeExclusion] = []
+        with exclusion_path.open("r", newline="", encoding="utf-8-sig") as stream:
+            reader = csv.DictReader(stream)
+            required = {"origin_stop_id", "destination_stop_id", "time_bin_id", "reason", "detail"}
+            if reader.fieldnames is None or set(reader.fieldnames) != required:
+                raise ValueError("persisted OD-time exclusion artifact has an invalid header.")
+            for row in reader:
+                exclusions.append(
+                    ODTimeExclusion(
+                        row["origin_stop_id"], row["destination_stop_id"], row["time_bin_id"], row["reason"], row["detail"]
+                    )
+                )
+        policies = payload.get("feasibility_settings", payload.get("policies", {}))
+        expansion = ODTimeExpansion(
+            universe_fingerprint=universe.fingerprint,
+            cells=tuple(sorted(cells)),
+            exclusions=tuple(sorted(exclusions, key=lambda item: (item.origin_stop_id, item.destination_stop_id, item.time_bin_id, item.reason))),
+            time_bins=bins,
+            policies=MappingProxyType(dict(policies)),
+            fingerprint=str(payload.get("expansion_fingerprint", payload.get("fingerprint", ""))),
+        )
+        if expansion.fingerprint != payload.get("expansion_fingerprint", payload.get("fingerprint")):
+            raise ValueError("OD-time expansion artifact fingerprint does not match its persisted contents.")
+        self._universe = universe
+        self._expansion = expansion
+        return expansion
+
+    def _load_persisted_prior(
+        self, expansion: ODTimeExpansion
+    ) -> PriorGenerationResult:
+        path = self.config.paths.results_directory / "generated_inputs/prior_demand.csv"
+        audit_path = self.config.paths.results_directory / "audit/prior_generation.json"
+        if not path.is_file() or not audit_path.is_file():
+            raise FileNotFoundError("run expand-od before prepare")
+        payload = json.loads(audit_path.read_text(encoding="utf-8"))
+        if payload.get("od_time_expansion_fingerprint") != expansion.fingerprint:
+            raise ValueError("prior artifact expansion fingerprint does not match current expansion.")
+        values: dict[CandidateODTimeCell, float] = {}
+        with path.open("r", newline="", encoding="utf-8-sig") as stream:
+            reader = csv.DictReader(stream)
+            required = {"origin_stop_id", "destination_stop_id", "time_bin_id", "prior_value"}
+            if reader.fieldnames is None or set(reader.fieldnames) != required:
+                raise ValueError("persisted prior-demand artifact has an invalid header.")
+            for row in reader:
+                cell = CandidateODTimeCell(row["origin_stop_id"], row["destination_stop_id"], row["time_bin_id"])
+                value = float(row["prior_value"])
+                if not math.isfinite(value) or value <= 0.0:
+                    raise ValueError("persisted prior-demand values must be finite and positive.")
+                values[cell] = value
+        if set(values) != set(expansion.cells):
+            raise ValueError("persisted prior-demand cells do not match retained expansion cells.")
+        return PriorGenerationResult(
+            values=MappingProxyType(dict(sorted(values.items()))),
+            source=str(payload.get("source", self.config.prior_demand.source)),
+            semantics=str(payload.get("semantics", self.config.prior_demand.semantics)),
+            parameters=dict(payload.get("parameters", {})),
+            generator_fingerprint=str(payload.get("generator_fingerprint", "")),
+            fingerprint=str(payload.get("fingerprint", "")),
+        )
+
+    def _compose_data(
+        self,
+        base: GenericCaseBaseData,
+        *,
+        universe: CandidateODUniverse | None = None,
+        expansion: ODTimeExpansion | None = None,
+        prior_generation: PriorGenerationResult | None = None,
+    ) -> GenericCaseData:
+        if base.input_semantics == "legacy_time_dependent_demand":
+            data = GenericCaseData(
+                scenario=base.scenario,
+                measurements=base.measurements,
+                fixed_demand=dict(base.fixed_demand),
+                time_periods=base.time_periods,
+                production_inputs=dict(base.production_inputs),
+                destination_attractiveness=dict(base.destination_attractiveness),
+                departure_seconds_by_origin=dict(base.departure_seconds_by_origin),
+                departure_sampling=base.departure_sampling,
+                physical_stop_mapping=base.physical_stop_mapping,
+                footpaths=base.footpaths,
+                input_semantics=base.input_semantics,
+            )
+        else:
+            if universe is None or expansion is None or prior_generation is None:
+                raise ValueError("independent preparation requires persisted OD-universe, expansion, and prior artifacts.")
+            fixed = dict(base.fixed_demand)
+            generated_fixed = {
+                ResponseCellKey(item.origin_stop_id, item.destination_stop_id, item.time_bin_id): 0.0
+                for item in expansion.exclusions
+            }
+            conflicts = sorted(
+                key.tuple for key, value in generated_fixed.items() if key in fixed and value > 0.0
+            )
+            if conflicts:
+                raise ValueError(f"positive fixed demand conflicts with an OD-time structural zero: {conflicts}")
+            fixed.update(generated_fixed)
+            production, attraction = self._explicit_components(expansion)
+            periods = tuple(
+                JourneyTimePeriod(item[0], item[1], item[2]) for item in expansion.time_bins
+            )
+            origins = sorted({cell.origin_stop_id for cell in expansion.cells})
+            departures = {
+                origin: tuple(
+                    period.start_seconds + (period.end_seconds - period.start_seconds) // 2
+                    for period in periods
+                )
+                for origin in origins
+            }
+            data = GenericCaseData(
+                scenario=base.scenario,
+                measurements=base.measurements,
+                fixed_demand=fixed,
+                time_periods=periods,
+                production_inputs=production,
+                destination_attractiveness=attraction,
+                departure_seconds_by_origin=departures,
+                departure_sampling=base.departure_sampling,
+                physical_stop_mapping=base.physical_stop_mapping,
+                footpaths=base.footpaths,
+                candidate_od_universe=universe,
+                od_time_expansion=expansion,
+                prior_demand=prior_generation.values,
+                prior_generation=prior_generation,
+                input_semantics=base.input_semantics,
+            )
         if self.custom_hook is not None:
             transformed = self.custom_hook(self.config, data)
             if not isinstance(transformed, GenericCaseData):
                 raise TypeError("custom case-study hook must return GenericCaseData.")
             data = transformed
+        self._data = data
         return data
+
+    def load_persisted_data(self) -> GenericCaseData:
+        """Build preparation data from persisted artifacts only."""
+        base = self.load_base_data()
+        if base.input_semantics == "legacy_time_dependent_demand":
+            return self._compose_data(base)
+        expansion = self.load_persisted_expansion()
+        summary_path = self.config.paths.results_directory / "audit/structural_zero_summary.json"
+        fixed_path = self.config.paths.results_directory / "generated_inputs/fixed_demand.csv"
+        if not summary_path.is_file() or not fixed_path.is_file():
+            raise FileNotFoundError("run expand-od before structural-zeros, then run structural-zeros before prepare")
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if summary.get("configuration_fingerprint") != self.config.fingerprint:
+            raise ValueError("structural-zero artifact configuration fingerprint does not match current configuration.")
+        if summary.get("expansion_fingerprint") != expansion.fingerprint:
+            raise ValueError("structural-zero artifact expansion fingerprint does not match current expansion.")
+        persisted_fixed: dict[ResponseCellKey, float] = {}
+        with fixed_path.open("r", newline="", encoding="utf-8-sig") as stream:
+            reader = csv.DictReader(stream)
+            required = {"origin_stop_id", "dest_stop_id", "time_bin_id", "fixed_flow"}
+            if reader.fieldnames is None or set(reader.fieldnames) != required:
+                raise ValueError("persisted structural-zero artifact has an invalid header.")
+            for row in reader:
+                key = ResponseCellKey(
+                    _required_text(row.get("origin_stop_id"), location="fixed-demand origin_stop_id"),
+                    _required_text(row.get("dest_stop_id"), location="fixed-demand dest_stop_id"),
+                    _required_text(row.get("time_bin_id"), location="fixed-demand time_bin_id"),
+                )
+                value = float(row.get("fixed_flow", ""))
+                if not math.isfinite(value) or value != 0.0:
+                    raise ValueError("persisted structural-zero values must be exactly zero.")
+                if key in persisted_fixed:
+                    raise ValueError(f"persisted structural-zero artifact contains duplicate key {key.tuple!r}.")
+                persisted_fixed[key] = value
+        expected_fixed = {
+            ResponseCellKey(item.origin_stop_id, item.destination_stop_id, item.time_bin_id): 0.0
+            for item in expansion.exclusions
+        }
+        if persisted_fixed != expected_fixed:
+            raise ValueError("structural-zero artifact does not match persisted OD-time exclusions.")
+        prior = self._load_persisted_prior(expansion)
+        return self._compose_data(base, universe=self._universe, expansion=expansion, prior_generation=prior)
 
     def _explicit_components(
         self, expansion: ODTimeExpansion
@@ -484,16 +815,17 @@ class GenericCaseAdapter:
         )
 
     def _resolved_timetable(self):
+        base = self.load_base_data()
         timetable = prepare_reduced_od_timetable(
-            self.data.scenario,
+            base.scenario,
             configuration_fingerprint=self.config.reduced_od_config.fingerprint,
-            physical_stop_mapping=self.data.physical_stop_mapping,
+            physical_stop_mapping=base.physical_stop_mapping,
             mapping_policy=self.config.reduced_od_config.stops.mapping_policy,
         )
         return timetable
 
     def audit(self) -> GenericCaseAudit:
-        data = self.data
+        data = self.load_base_data()
         timetable = self._resolved_timetable()
         resolved = resolve_measurements(timetable, data.measurements)
         event_seconds = tuple(
@@ -511,12 +843,12 @@ class GenericCaseAdapter:
         if not period_report.valid:
             raise ValueError(f"time-period preflight failed: {period_report.to_dict()}")
         pair_count = (
-            data.candidate_od_universe.pair_count
-            if data.candidate_od_universe is not None
-            else len({(str(item.origin_stop_id), str(item.dest_stop_id)) for item in data.scenario.demand.records})
+            len({(str(item.origin_stop_id), str(item.dest_stop_id)) for item in data.scenario.demand.records})
+            if data.input_semantics == "legacy_time_dependent_demand"
+            else (self._persisted_pair_count() or self._pair_file_count())
         )
         configured_pairs = self.config.time_discretization.num_od_pairs
-        if configured_pairs is not None and configured_pairs != pair_count and data.input_semantics == "legacy_time_dependent_demand":
+        if configured_pairs is not None and pair_count is not None and configured_pairs != pair_count and data.input_semantics == "legacy_time_dependent_demand":
             raise ValueError(f"configured num_od_pairs={configured_pairs} does not match candidate demand count {pair_count}.")
         counts: dict[str, int] = {}
         for item in data.measurements.records:
@@ -536,28 +868,38 @@ class GenericCaseAdapter:
         for configuration_path in self.config.package_config_paths:
             if configuration_path.is_file():
                 checksums[f"configuration/{configuration_path.name}"] = _sha256(configuration_path)
+        generated_bins = self.config.paths.results_directory / "generated_inputs/time_bins.csv"
+        approved_bin_count = len(_load_time_periods(generated_bins)) if generated_bins.is_file() else 0
+        complexity = self.complexity_preflight(
+            pair_count=pair_count,
+            time_bin_count=approved_bin_count,
+        )
         return GenericCaseAudit(
-            self.config.case_name,
-            self.config.fingerprint,
-            checksums,
-            len(data.scenario.stops),
-            len(data.scenario.demand.records),
-            pair_count,
-            len(data.measurements.records),
-            counts,
-            len(resolved),
-            len(data.time_periods),
-            period_report.to_dict(),
-            None if data.candidate_od_universe is None else data.candidate_od_universe.audit,
-            None if data.od_time_expansion is None else data.od_time_expansion.audit,
-            None if data.prior_generation is None else data.prior_generation.audit,
-            data.input_semantics,
+            case_name=self.config.case_name,
+            configuration_fingerprint=self.config.fingerprint,
+            source_checksums=checksums,
+            scenario_stop_count=len(data.scenario.stops),
+            demand_cell_count=len(data.scenario.demand.records),
+            candidate_od_pair_count=pair_count,
+            measurement_count=len(data.measurements.records),
+            measurement_type_counts=counts,
+            resolved_measurement_count=len(resolved),
+            time_period_count=len(data.time_periods),
+            period_preflight=period_report.to_dict(),
+            od_universe_status="not_run" if data.input_semantics != "legacy_time_dependent_demand" else "legacy_compatibility",
+            od_time_expansion_status="not_run",
+            timetable_feasibility_status="not_run",
+            complexity=complexity,
+            od_universe=None,
+            od_time_expansion=None,
+            prior_generation=None,
+            input_semantics=data.input_semantics,
         )
 
-    def preparation_inputs(self):
+    def build_preparation_inputs(self):
         from public_transportation.inference.reduced_od import ReducedODPreparationInputs
 
-        data = self.data
+        data = self.load_persisted_data()
         return ReducedODPreparationInputs(
             departure_seconds_by_origin=data.departure_seconds_by_origin,
             production_inputs=data.production_inputs,
@@ -574,3 +916,7 @@ class GenericCaseAdapter:
             ),
             prior_demand=data.prior_demand,
         )
+
+    def preparation_inputs(self):
+        """Backward-compatible name for the persisted-artifact preparation path."""
+        return self.build_preparation_inputs()

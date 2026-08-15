@@ -73,6 +73,13 @@ progress events with `--json-progress`. The Slurm wrappers under `scripts/`
 derive the case-study root from their own location, so they remain correct
 even when `sbatch` is submitted from the parent repository.
 
+`check`, `od-universe`, `time-discretization`, and `materialize-bins` are
+lightweight and must not construct timetable-feasibility searches. `expand-od`
+is the first expensive stage. It persists the approved pair-by-bin expansion,
+priors, and provenance; `structural-zeros` and `prepare` consume those files
+and fail on missing or incompatible fingerprints instead of recomputing them.
+Review the reported complexity estimate before allowing `expand-od` to run.
+
 `config/case.toml` contains paths, source-column mappings, explicit time
 discretization limits, and references to the scientific contracts. The
 referenced files are `config/time_discretization.toml`,
@@ -122,6 +129,14 @@ regularization.
 
 The public template deliberately omits `uv.lock`; the case owner pins the
 selected immutable public-package commit and generates the lockfile locally.
+
+The template `pyproject.toml` explicitly declares `packages = []`: the case
+repository contains configuration and data, not an installable Python package,
+so `uv sync` must not attempt automatic discovery under `config/` or
+`results/`. After replacing the placeholder package revision and generating
+the lockfile, verify the setup with `uv lock`, `uv sync --frozen`, and
+`JAX_ENABLE_X64=true uv run --frozen python run.py check` before changing any
+scientific inputs.
 
 ## Configuration contract
 
