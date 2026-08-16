@@ -10,6 +10,15 @@ The configuration, result contracts, scheduled-topology adapter, path-metric
 engine, rule classification, and fixed-demand reconciliation documented here
 are available, together with deterministic output persistence.
 
+The scheduled topology consumes the same immutable canonical timetable index as
+assignment and OD-universe preprocessing. Identifiers and stop-time ordering
+are normalized once; centroid indexes and the destination-level reverse path
+profiles are then reused across origins and time bins. This preserves the
+scientific graph fingerprint while avoiding repeated timetable grouping and
+full-graph centroid searches. Structural-zero fingerprints record the
+scientific inputs and algorithm/serialization versions separately from any
+execution settings.
+
 ## Workflow
 
 1. Prepare a scenario folder containing the network and time-bin inputs.

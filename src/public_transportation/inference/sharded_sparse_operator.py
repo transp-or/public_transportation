@@ -7,7 +7,7 @@ import json
 import os
 import tempfile
 from collections import OrderedDict
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from threading import RLock
 from time import perf_counter
@@ -114,6 +114,11 @@ class ShardedOperatorManifest:
     od_chunk_size: int
     plan_summary: dict[str, object] | None = None
     schema_version: int = SHARDED_OPERATOR_SCHEMA_VERSION
+    # Execution settings describe how equivalent scientific content was
+    # packed and produced.  They are intentionally separate from
+    # ``provenance`` so changing workers or shard sizes does not change the
+    # scientific identity of support checkpoints.
+    execution_provenance: dict[str, object] = field(default_factory=dict)
 
     @property
     def provenance_hash(self) -> str:

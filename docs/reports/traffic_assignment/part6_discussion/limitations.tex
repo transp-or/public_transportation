@@ -55,7 +55,7 @@ remains expensive even with a linear response because solving a large,
 ill-conditioned inverse problem is fundamentally different from merely
 executing a forward neural-network pass. The low-dimensional gravity model
 addresses this boundary through modeling as well as software efficiency.
-Section~\ref{sec:why-raptor-scales} explains why the laptop-scale reduced
-workflow depends jointly on bounded timetable search, reuse of fixed responses,
-and parameter reduction. RAPTOR by itself does not remove the cost of exhaustive
-preprocessing or an unnecessarily large response representation.
+The laptop-scale fixed-routing workflow depends jointly on bounded timetable
+preprocessing, reuse of fixed responses, and parameter reduction. No single
+preprocessing representation removes the cost of exhaustive response
+construction or an unnecessarily large response representation.

@@ -84,6 +84,11 @@ JAX, synchronization, host-transfer, sparse-filtering, and persistence
 times.  Publication remains ordered and atomic, so worker completion order
 cannot change manifests or numerical artifacts.
 
+The group-level measurement unions, mapped-edge selections, and origin-support
+metadata used for these estimates are computed once and shared by preflight,
+planning, workers, and diagnostics.  This removes repeated set unions and
+membership scans without moving graph traversal into the edge-gather loop.
+
 Numerical shards carry the algorithm identifier
 \texttt{reachability-edge-gather-v1} in operator provenance.  A mismatch
 invalidates old numerical shards while the support checkpoint continues to
@@ -117,6 +122,42 @@ The fixture is intentionally too small to predict full-network wall time; the
 benchmark is a regression guard for artifact identity, execution accounting,
 and worker scaling.  A completed full-network artifact was subsequently
 validated and timed separately.
+
+\subsection{Shared timetable preprocessing and selective reuse}
+
+The direct-scheduled preprocessing path uses one immutable canonical timetable
+and event index.  Stop-time normalization, deterministic trip ordering,
+service activity, departures, arrivals, and event lookup are performed once and
+then consumed by candidate-pair generation, timetable feasibility, the
+time-expanded assignment graph, and structural-zero topology construction.
+Directed reachability is computed once for an OD universe and reused for pair
+filtering, fingerprints, and expansion.  Temporal feasibility is evaluated
+once for each distinct origin and approved time-bin pair; all destinations in
+that slice then use the same destination set.  This is an exact reorganization
+of the historical pairwise search, not a change in the feasibility definition.
+
+Artifact provenance is separated into scientific and execution components.
+Scientific identity covers the assignment and graph inputs, measurement
+mapping, OD and frozen-cell layouts, fixed $\theta$, approved time bins,
+support definition, and algorithm/schema versions.  Execution provenance
+records worker count, chunk and block sizes, storage packing, compression,
+memory limits, and checkpoint layout.  Consequently, a packing change can
+rebuild measurement shards while retaining compatible origin-support
+checkpoints.  A support-definition or numerical-kernel change invalidates only
+the affected downstream artifacts; a graph or OD-layout change invalidates all
+dependent artifacts.  Malformed or corrupt manifests are treated as clean
+incompatibility outcomes and are quarantined rather than reused.
+
+The bounded Geneva snapshot benchmark contains 62 stops, 173 trips, and
+15,128 OD/time cells.  The OD-time expansion decreased from 38.3 seconds in the
+baseline implementation to 12.4 seconds after canonical indexing and
+origin/time feasibility reuse.  The total measured preprocessing wall time
+decreased from 41.5 to 16.0 seconds, while graph arrays, ordered OD cells,
+fingerprints, dimensions, and retained outputs were unchanged.  These values
+are a bounded compatibility benchmark, not a claim about the full TPG network;
+the corresponding JSON diagnostics are stored in
+\texttt{benchmarks/preprocessing\_baseline\_geneva.json} and
+\texttt{benchmarks/preprocessing\_optimized\_geneva.json}.
 
 \subsection{Completed Full-Network Linear-Map Benchmark}
 

@@ -98,8 +98,10 @@ each storage shard, compatible tasks are grouped by destination group and
 routing state. One batch traverses the graph for the union of its bounded
 origins and supported mapping edges, then filters every OD column back to its
 exact origin-specific support. This avoids `OD chunk × all local measurements`
-while greatly reducing graph traversals and synchronization calls. Preflight
-reports batch temporary memory and estimated dispatch count.
+while greatly reducing graph traversals and synchronization calls. The group
+measurement unions, mapped-edge selections, and origin-support metadata are
+computed once and reused by preflight, planning, workers, and diagnostics.
+Preflight reports batch temporary memory and estimated dispatch count.
 
 Runtime metrics report batches, dispatches, synchronizations, support-edge
 blocks, origins and edges per dispatch, output values, timing quantiles, group
@@ -128,6 +130,17 @@ The manifest records global dimensions, aggregate storage-shard identities,
 completed storage shards, aggregate nonzeros, block configuration, schema and full
 provenance. Provenance includes assignment inputs, mapping, OD and compact
 layouts, routing parameter, dtype and zero tolerance.
+
+The persisted identity separates scientific inputs from execution and packing
+settings. Scientific provenance also records graph and frozen-cell
+fingerprints, support-definition and numerical-kernel versions, and the
+serialization version. The manifest's separate execution provenance records
+workers, chunk/block sizes, storage limits, and compression. Changing packing
+therefore rebuilds measurement shards without discarding a compatible
+origin-support checkpoint; changing the graph, OD layout, frozen cells, theta,
+mapping, or support definition invalidates the affected downstream artifacts.
+Malformed manifests and checkpoints are treated as incompatible and quarantined
+rather than reused.
 
 Each shard stores sorted global measurement rows, canonical local CSR arrays,
 sparse fixed-offset entries, construction metrics, a numerical content hash

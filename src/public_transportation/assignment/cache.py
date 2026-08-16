@@ -320,6 +320,7 @@ def load_or_prepare_assignment(
     config: AssignmentConfig,
     cache_directory: str | os.PathLike[str],
     policy: AssignmentCachePolicy = "auto",
+    timetable_index: Any | None = None,
 ) -> Any:
     """Load, build, refresh, or read an explicit assignment cache artifact."""
     if policy not in ("off", "auto", "refresh", "readonly"):
@@ -327,7 +328,9 @@ def load_or_prepare_assignment(
     from .assign import _prepare_assignment_uncached
 
     if policy == "off":
-        return _prepare_assignment_uncached(scenario=scenario, config=config)
+        return _prepare_assignment_uncached(
+            scenario=scenario, config=config, timetable_index=timetable_index
+        )
     fingerprint_started = perf_counter()
     provenance_json, cache_key = assignment_cache_provenance(scenario=scenario, config=config)
     fingerprint_seconds = perf_counter() - fingerprint_started
@@ -375,7 +378,9 @@ def load_or_prepare_assignment(
                 raise ValueError("Invalid read-only assignment cache entry.")
     elif policy == "readonly":
         raise FileNotFoundError(f"Read-only assignment cache entry not found: {path}")
-    built = _prepare_assignment_uncached(scenario=scenario, config=config)
+    built = _prepare_assignment_uncached(
+        scenario=scenario, config=config, timetable_index=timetable_index
+    )
     stored_bytes = _write(
         path=path, artifacts=built, provenance_json=provenance_json, cache_key=cache_key
     )

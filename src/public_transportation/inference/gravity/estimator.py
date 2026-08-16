@@ -250,7 +250,7 @@ def _compile_strategy(
     lowering = clock() - started
     try:
         lowered_bytes = len(lowered.as_text().encode("utf-8"))
-    except AttributeError, TypeError, ValueError:
+    except (AttributeError, TypeError, ValueError):
         lowered_bytes = None
     started = clock()
     compiled = lowered.compile()

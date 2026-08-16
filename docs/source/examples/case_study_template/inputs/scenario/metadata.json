@@ -1,7 +1,0 @@
-{
-  "title": "Generic case-study template network",
-  "description": "A small two-line synthetic network used for a clean public workflow smoke test.",
-  "timezone": "Europe/Zurich",
-  "cost_unit": "minutes",
-  "sources": ["synthetic"]
-}

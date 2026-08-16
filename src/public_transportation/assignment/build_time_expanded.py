@@ -70,6 +70,9 @@ from .graph_sentinels import (
 
 if TYPE_CHECKING:  # pragma: no cover
     from public_transportation.domain import Scenario
+    from public_transportation.preprocessing.canonical_timetable import (
+        CanonicalTimetableIndex,
+    )
 
 
 # =============================================================================
@@ -351,6 +354,7 @@ def _build_nodes(
     scenario: "Scenario",
     *,
     config: AssignmentConfig,
+    timetable_index: "CanonicalTimetableIndex | None" = None,
 ) -> _NodeIndex:
     """
     Build nodes:
@@ -435,11 +439,21 @@ def _build_nodes(
     # We store node->trip_index for all event nodes (ARR and DEP).
     event_trip_index_list: list[tuple[int, int]] = []  # (node_idx, trip_index)
 
-    trip_ids = [str(getattr(tr, "trip_id")) for tr in scenario.timetable.trips]
+    stop_times = (
+        scenario.timetable.stop_times
+        if timetable_index is None
+        else timetable_index.stop_times
+    )
+    trips = (
+        scenario.timetable.trips
+        if timetable_index is None
+        else timetable_index.trips
+    )
+    trip_ids = [str(getattr(tr, "trip_id")) for tr in trips]
     trip_index_by_id = {tid: i for i, tid in enumerate(trip_ids)}
     regularized_equal_times: list[tuple[str, str, int]] = []  # (trip_id, stop_id, arrival_s)
 
-    for st in scenario.timetable.stop_times:
+    for st in stop_times:
         stop_id = _get_stop_id(st)
         arr_s = _get_arrival_seconds(st)
         dep_s = _get_departure_seconds(st)
@@ -553,6 +567,7 @@ def _build_links(
     nodes: _NodeIndex,
     *,
     config: AssignmentConfig,
+    timetable_index: "CanonicalTimetableIndex | None" = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Build link arrays (tail, head, link_type, travel_time_min, capacity, link_trip_index).
@@ -596,7 +611,11 @@ def _build_links(
     max_transfer_s = int(round(max_transfer_min * 60.0))
 
     # Trip metadata
-    trips = list(scenario.timetable.trips)
+    trips = list(
+        scenario.timetable.trips
+        if timetable_index is None
+        else timetable_index.trips
+    )
     trip_ids = [str(getattr(tr, "trip_id")) for tr in trips]
     trip_index_by_id = {tid: i for i, tid in enumerate(trip_ids)}
     line_id_by_trip_index = [ _trip_line_id(tr) for tr in trips ]
@@ -679,7 +698,12 @@ def _build_links(
     # Ride links: consecutive stop_times within each trip, DEP(a) -> ARR(b)
     # -------------------------------------------------------------------------
     st_by_trip: dict[str, list[Any]] = {}
-    for st in scenario.timetable.stop_times:
+    stop_times = (
+        scenario.timetable.stop_times
+        if timetable_index is None
+        else timetable_index.stop_times
+    )
+    for st in stop_times:
         st_by_trip.setdefault(_get_trip_id(st), []).append(st)
 
     for trip_id in sorted(st_by_trip.keys()):
@@ -713,7 +737,7 @@ def _build_links(
     # This represents staying on the same vehicle (or dwell) at a stop.
     # -------------------------------------------------------------------------
     stop_times_sorted_for_dwell = sorted(
-        scenario.timetable.stop_times,
+        stop_times,
         key=lambda st: (
             _get_trip_id(st),
             _get_stop_id(st),
@@ -850,6 +874,7 @@ def build_jax_graph(
     *,
     config: AssignmentConfig,
     profile: dict[str, float] | None = None,
+    timetable_index: "CanonicalTimetableIndex | None" = None,
 ) -> JaxGraph:
     """
     Build a static, JAX-compatible time-expanded graph from a validated Scenario.
@@ -868,12 +893,21 @@ def build_jax_graph(
     config.validate()
     record("graph_configuration_validation", started)
 
+    if timetable_index is None:
+        from public_transportation.preprocessing.canonical_timetable import (
+            build_canonical_timetable_index,
+        )
+
+        timetable_index = build_canonical_timetable_index(scenario)
+
     started = perf_counter()
-    nodes = _build_nodes(scenario, config=config)
+    nodes = _build_nodes(
+        scenario, config=config, timetable_index=timetable_index
+    )
     record("stop_trip_line_timetable_time_bin_indexing_and_nodes", started)
     started = perf_counter()
     tail, head, link_type, travel_time_min, capacity, link_trip_index = _build_links(
-        scenario, nodes, config=config
+        scenario, nodes, config=config, timetable_index=timetable_index
     )
     record("link_creation_and_concatenation", started)
 
@@ -917,7 +951,7 @@ def build_jax_graph(
 
     # Python-side metadata
     started = perf_counter()
-    trips = list(scenario.timetable.trips)
+    trips = list(timetable_index.trips)
     trip_ids = tuple([str(getattr(tr, "trip_id")) for tr in trips])
     trip_line_ref = tuple([_trip_line_id(tr) for tr in trips])
     stop_ids_sorted = nodes.stop_ids

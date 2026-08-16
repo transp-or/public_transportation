@@ -1,0 +1,81 @@
+{
+  "assignment_artifact_preparation_seconds": 0.22929854085668921,
+  "assignment_input_adapter_seconds": 0.43156125000678003,
+  "benchmark": "direct_scheduled_preprocessing_baseline",
+  "candidate_pair_generation_seconds": 0.006426665931940079,
+  "canonical_timetable_index_seconds": 0.02034808392636478,
+  "dimensions": {
+    "candidate_pair_exclusions": 62,
+    "candidate_pairs": 3782,
+    "graph_links": 40020,
+    "graph_nodes": 9818,
+    "od_time_cells": 15128,
+    "retained_od_time_cells": 15128,
+    "routing_groups": 62,
+    "stop_times": 4754,
+    "stops": 62,
+    "structural_metric_records": 15128,
+    "trips": 173
+  },
+  "execution_provenance": {
+    "assignment_config": {
+      "beta_early": 2.0,
+      "beta_in_vehicle": 1.0,
+      "beta_late": 2.0,
+      "beta_transfer": 1.5,
+      "beta_wait": 1.0,
+      "capacity_penalty_alpha": 0.0,
+      "capacity_penalty_kappa": 1.0,
+      "egress_cost": 0.0,
+      "mask_strategy": "link_mask",
+      "max_access_deviation_min": 15.0,
+      "max_transfer_wait_min": 30.0,
+      "min_dwell_s": 1,
+      "theta_default": 5.0,
+      "theta_min": 0.1,
+      "use_capacity_penalty": false,
+      "use_global_egress_links": true
+    },
+    "worker_count": 1
+  },
+  "fixed_routing_shard_preparation_seconds": 0.15462279203347862,
+  "od_time_expansion_seconds": 38.329780583968386,
+  "peak_rss_bytes": 517095424,
+  "scenario_directory": "/Users/bierlair/MyFiles/github/public_transportation/docs/source/examples/geneva_gtfs/data",
+  "scenario_loading_and_validation_seconds": 0.29697845806367695,
+  "schema_version": 1,
+  "scientific_provenance": {
+    "canonical_timetable_fingerprint": "3f937f0cb4cba44f4d9de75423886b9adeb69afdd05ac08248ecdcd6604c525d",
+    "fixed_theta": 5.0,
+    "graph_arrays": {
+      "head": "637157348138f5a245372ac16d80106d89c49d549a167d1c662e58255a003ec4",
+      "link_type": "040f426b66296c8ca522eb201207667804086db67e12a04d550eb4dd4bf009b9",
+      "tail": "7beaeec8e6dcd563b670a58dc5a4995a44eb5401d8b617d0413d5eee3c363e5d",
+      "topo_order": "0efabb7451175caefc98220c78328bae1ca17399d392474f7fc1c335426e72de"
+    },
+    "od_time_expansion_fingerprint": "989459cffddaa204e84f1438abbb41684fdfaee5b43a822a2d7e3add461bca08",
+    "od_universe_fingerprint": "e6efe524b08bdc38aca9bac9ccbdd9293406beffc7cc40f8b552a813cbaa7bb6",
+    "scenario_fingerprint": "d8accf4ed02b4146e60744dcb57582956331fbf1e88e2d6a1ca4db4c829a3c6a",
+    "structural_topology_fingerprint": "418b1b5953e43158ba559e994c1822e094c92b061c177a7b88705c3acd21e403"
+  },
+  "structural_zero_path_metrics_seconds": 1.6946929160039872,
+  "structural_zero_topology_construction_seconds": 0.06941662519238889,
+  "time_expanded_graph_construction_seconds": 0.2480220829602331,
+  "time_expanded_graph_profile_seconds": {
+    "csr_adjacency_construction": 0.0019368331413716078,
+    "graph_configuration_validation": 5.166977643966675e-06,
+    "graph_metadata_and_diagnostic_construction": 3.9958860725164413e-05,
+    "graph_numpy_to_jax_device_transfer_and_synchronization": 0.1880545001477003,
+    "link_and_node_sorting_canonicalization": 0.0008122920989990234,
+    "link_creation_and_concatenation": 0.03898395807482302,
+    "mask_and_padded_array_construction": 0.008559624897316098,
+    "stop_trip_line_timetable_time_bin_indexing_and_nodes": 0.009180499939247966
+  },
+  "timetable_feasibility_index_seconds": 0.0022079171612858772,
+  "unavailable_retired_stages": {
+    "measurement_shard_seconds": null,
+    "reason": "timetable-journey response backend is retired",
+    "support_discovery_seconds": null
+  },
+  "wall_time_seconds": 41.549061375204474
+}

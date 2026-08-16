@@ -843,6 +843,9 @@ def _parallel_builder_case(
     directory,
     *,
     workers,
+    measurement_block_size=1,
+    target_nonzeros_per_storage_shard=1,
+    maximum_nonzeros_per_storage_shard=1,
     support_discovery_mode="compact",
     max_materialized_support_entries=125_000_000,
     maximum_storage_shards=256,
@@ -863,15 +866,15 @@ def _parallel_builder_case(
     compact = build_compact_od_assignment_layout(parameter_layout=layout)
     config = ShardedConstructionConfig(
         od_chunk_size=8,
-        measurement_block_size=1,
+        measurement_block_size=measurement_block_size,
         worker_memory_budget_bytes=100_000_000,
         workers=workers,
         support_discovery_mode=support_discovery_mode,
         max_materialized_support_entries=max_materialized_support_entries,
         maximum_storage_shards=maximum_storage_shards,
         maximum_resident_shards=2,
-        target_nonzeros_per_storage_shard=1,
-        maximum_nonzeros_per_storage_shard=1,
+        target_nonzeros_per_storage_shard=target_nonzeros_per_storage_shard,
+        maximum_nonzeros_per_storage_shard=maximum_nonzeros_per_storage_shard,
         manifest_checkpoint_shards=1,
         progress_interval_seconds=0.0,
         deadline_safety_margin_seconds=0.0,
@@ -1125,6 +1128,39 @@ def test_kernel_version_rebuilds_shards_but_reuses_support_checkpoint(
     assert (
         rebuilt.manifest.provenance["measurement_kernel_algorithm"]
         == sharded_builder.MEASUREMENT_KERNEL_ALGORITHM_VERSION
+    )
+
+
+def test_packing_changes_reuse_support_but_rebuild_measurement_shards(
+    all_free_operator, tmp_path, monkeypatch
+):
+    first = _parallel_builder_case(
+        all_free_operator,
+        tmp_path,
+        workers=1,
+        measurement_block_size=1,
+        target_nonzeros_per_storage_shard=1,
+        maximum_nonzeros_per_storage_shard=1,
+    )
+
+    def support_must_be_reused(**_kwargs):
+        raise AssertionError("support discovery should be reusable after repacking")
+
+    monkeypatch.setattr(sharded_builder, "_discover_support", support_must_be_reused)
+    repacked = _parallel_builder_case(
+        all_free_operator,
+        tmp_path,
+        workers=2,
+        measurement_block_size=2,
+        target_nonzeros_per_storage_shard=4,
+        maximum_nonzeros_per_storage_shard=4,
+    )
+    assert repacked.manifest.complete
+    assert repacked.rebuilt_shards > 0
+    assert repacked.manifest.execution_provenance["workers"] == 2
+    assert repacked.manifest.execution_provenance["measurement_block_size"] == 2
+    assert repacked.manifest.provenance["od_layout_fingerprint"] == (
+        first.manifest.provenance["od_layout_fingerprint"]
     )
 
 

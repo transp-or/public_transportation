@@ -366,6 +366,7 @@ def prepare_assignment(
     *,
     cache_directory: str | os.PathLike[str] | None = None,
     cache_policy: str | None = None,
+    timetable_index: Any | None = None,
 ) -> AssignmentArtifacts:
     """Build demand-independent artifacts, optionally using the persistent cache.
 
@@ -390,13 +391,17 @@ def prepare_assignment(
             config=config,
             cache_directory=selected_directory,
             policy=selected_policy,
+            timetable_index=timetable_index,
         )
-    return _prepare_assignment_uncached(scenario=scenario, config=config)
+    return _prepare_assignment_uncached(
+        scenario=scenario, config=config, timetable_index=timetable_index
+    )
 
 
 def _prepare_assignment_uncached(
     scenario: Scenario,
     config: AssignmentConfig,
+    timetable_index: Any | None = None,
 ) -> AssignmentArtifacts:
     """Uncached builder used by the public API and persistent cache."""
     stages: dict[str, float] = {}
@@ -409,7 +414,14 @@ def _prepare_assignment_uncached(
     stages["input_and_configuration_validation"] = perf_counter() - stage
 
     stage = perf_counter()
-    graph = build_time_expanded_graph(scenario=scenario, config=config, profile=stages)
+    graph_kwargs = {
+        "scenario": scenario,
+        "config": config,
+        "profile": stages,
+    }
+    if timetable_index is not None:
+        graph_kwargs["timetable_index"] = timetable_index
+    graph = build_time_expanded_graph(**graph_kwargs)
     stages["time_expanded_graph_construction"] = perf_counter() - stage
 
     stage = perf_counter()

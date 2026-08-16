@@ -104,23 +104,6 @@ For fixed-routing linear least squares with explicit regularization, run:
 python run_linear_fixed_routing.py
 ```
 
-For the reduced-dimensional gravity methodology, run from the repository root:
-
-```bash
-uv run python docs/source/examples/simple_example_01/estimation/run_gravity_estimation.py
-```
-
-This demonstration prepares scheduled path features and prior totals, builds or
-loads the fixed-routing operator, estimates the minimal negative-binomial model,
-and writes `estimation/results/gravity_estimation_summary.json`.
-
-Example 01 is particularly useful for checking frozen-positive demand. Two of
-its six cells are fixed at known nonzero values and are reconstructed exactly.
-Its four free cells each have only one destination in their origin-time choice
-set, so the gravity coefficients cannot redistribute those totals. This example
-tests the workflow and fixed offset, not behavioral identification or demand
-recovery. Example 02 supplies the richer model-development illustration.
-
 The estimation scripts read:
 
 ```text

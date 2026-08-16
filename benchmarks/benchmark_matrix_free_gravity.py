@@ -13,7 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from docs.source.examples.simple_gravity_workflow import _features
+from docs.source.examples.direct_scheduled_gravity_validation import _features
 from public_transportation.assignment import AssignmentConfig
 from public_transportation.assignment.assign import prepare_assignment
 from public_transportation.domain import Scenario, read_fixed_demand_csv

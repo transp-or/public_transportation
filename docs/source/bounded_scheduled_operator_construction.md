@@ -71,6 +71,40 @@ The finalized temporal artifact is also staged and published atomically. If a
 deadline is reached while staging, the staging directory is removed and the
 validated construction shards remain reusable.
 
+## Preprocessing reuse and provenance
+
+Direct-scheduled preprocessing now builds one immutable canonical timetable
+index. The same normalized stop-time ordering is consumed by candidate-pair
+generation, timetable feasibility, the time-expanded assignment graph, and
+structural-zero topology construction. Directed reachability is computed once
+per OD universe and reused for filtering, fingerprints, and expansion. For
+each origin and approved time bin, temporal feasibility is evaluated once and
+then applied to all destinations in that slice; this preserves the historical
+pairwise result while avoiding repeated timetable searches.
+
+Artifact identity is split into scientific and execution provenance. Scientific
+identity includes the assignment and graph fingerprints, measurement mapping,
+OD and frozen-cell layouts, fixed theta, approved time bins, support
+definition, and algorithm/schema versions. Execution provenance records worker
+counts, chunk and block sizes, packing limits, compression, and checkpoint
+layout. Changing only execution or packing settings therefore preserves the
+origin-support checkpoint, while a graph, mapping, OD-layout, theta, or support
+definition change invalidates the smallest affected downstream stage.
+
+Malformed, corrupt, or ambiguous manifests are treated as incompatible cache
+entries and rebuilt or quarantined; they are never silently reused. Numerical
+measurement-shard algorithm changes rebuild measurement shards while retaining
+compatible routing and support artifacts. The retired timetable-journey/
+reduced-OD response backend is not part of this workflow.
+
+On the packaged Geneva snapshot (62 stops, 173 trips, 15,128 OD/time cells),
+the bounded preprocessing benchmark reduced the OD-time expansion from about
+38.3 s to about 12.4 s, with identical scientific fingerprints and dimensions.
+The comparison is recorded in
+`benchmarks/preprocessing_baseline_geneva.json` and
+`benchmarks/preprocessing_optimized_geneva.json`; it is a bounded fixture
+benchmark, not a full-network run.
+
 ## Laptop and cluster usage
 
 The conservative default remains `workers=1`.  Measurement-shard construction

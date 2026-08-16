@@ -23,6 +23,8 @@ AUDIT_FILENAME = "structural_zero_audit.csv"
 SUMMARY_FILENAME = "structural_zero_summary.json"
 FINGERPRINTS_FILENAME = "fingerprints.json"
 RESOLVED_CONFIG_FILENAME = "resolved_config.toml"
+STRUCTURAL_ZERO_ALGORITHM_VERSION = "destination-profile-v1"
+STRUCTURAL_ZERO_SERIALIZATION_VERSION = "atomic-csv-json-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +85,18 @@ def write_structural_zero_outputs(
     payloads[FINGERPRINTS_FILENAME] = _json_bytes(
         {
             "schema_version": 1,
+            "scientific_provenance": {
+                "scenario_fingerprint": analysis.scenario_fingerprint,
+                "graph_fingerprint": analysis.graph_fingerprint,
+                "configuration_fingerprint": analysis.configuration_fingerprint,
+            },
+            "algorithm_versions": {
+                "structural_zero": STRUCTURAL_ZERO_ALGORITHM_VERSION,
+                "serialization": STRUCTURAL_ZERO_SERIALIZATION_VERSION,
+            },
+            "execution_provenance": {
+                "include_retained_cells_in_report": include_retained,
+            },
             "scenario_fingerprint": analysis.scenario_fingerprint,
             "graph_fingerprint": analysis.graph_fingerprint,
             "configuration_fingerprint": analysis.configuration_fingerprint,

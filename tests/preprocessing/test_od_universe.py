@@ -18,6 +18,8 @@ from public_transportation.domain import (
 )
 from public_transportation.domain.line import Line
 from public_transportation.preprocessing.od_universe import (
+    TimetableFeasibilityIndex,
+    _timetable_feasible,
     expand_candidate_od_time_cells,
     generate_candidate_od_pairs,
     generate_prior_demand,
@@ -175,6 +177,47 @@ def test_time_expansion_depends_on_bins_but_pair_fingerprint_does_not() -> None:
         sum(morning.audit["exclusion_counts"].values()) + morning.audit["retained_cell_count"]
         == morning.audit["expanded_od_time_count"]
     )
+
+
+def test_origin_period_feasibility_cache_matches_pairwise_search() -> None:
+    scenario = _scenario()
+    universe = generate_candidate_od_pairs(
+        scenario,
+        source="network_ordered_pairs",
+        active_service_only=True,
+        connectivity_policy="directed_reachable",
+    )
+    bins = [("morning", 8 * 3600, 9 * 3600), ("late", 9 * 3600, 10 * 3600)]
+    indexed = expand_candidate_od_time_cells(
+        universe,
+        bins,
+        scenario=scenario,
+        feasibility_index=TimetableFeasibilityIndex.from_scenario(
+            scenario, physical_stop_mapping=universe.physical_stop_mapping
+        ),
+    )
+
+    def pairwise(pair, period):
+        return _timetable_feasible(
+            scenario,
+            pair,
+            period,
+            mapping=universe.physical_stop_mapping,
+            maximum_transfers=2,
+            maximum_initial_wait_seconds=3600,
+            maximum_journey_seconds=7200,
+            maximum_waiting_seconds=3600,
+        )
+
+    reference = expand_candidate_od_time_cells(
+        universe,
+        bins,
+        scenario=scenario,
+        timetable_feasibility=pairwise,
+    )
+    assert indexed.cells == reference.cells
+    assert indexed.exclusions == reference.exclusions
+    assert indexed.fingerprint == reference.fingerprint
 
 
 def test_all_ones_prior_is_neutral_and_external_pair_prior_repeats_per_bin(tmp_path: Path) -> None:

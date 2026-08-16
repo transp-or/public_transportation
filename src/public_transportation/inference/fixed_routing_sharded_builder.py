@@ -8,7 +8,7 @@ import json
 import os
 import shutil
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 import tempfile
 import uuid
@@ -75,6 +75,8 @@ FixedRoutingSource = FixedRoutingInputs | ShardedFixedRoutingInputs
 # numerical implementation must invalidate stored shards, but must not force
 # the expensive topology-support discovery to run again.
 MEASUREMENT_KERNEL_ALGORITHM_VERSION = "reachability-edge-gather-v1"
+SUPPORT_DEFINITION_ALGORITHM_VERSION = "positive-probability-group-batched-reachability-v2"
+SERIALIZATION_ALGORITHM_VERSION = "npz-atomic-shard-v1"
 
 
 class _RoutingBatchReader:
@@ -239,6 +241,18 @@ class StorageShardPlan:
     task_keys: tuple[str, ...]
     estimated_nonzeros: int
     estimated_uncompressed_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class _GroupConstructionMetadata:
+    """Packed group metadata shared by planning, workers, and diagnostics."""
+
+    group: int
+    batch_measurements: np.ndarray
+    selected_links: np.ndarray
+    selected_local_rows: np.ndarray
+    od_indices: np.ndarray
+    od_support: dict[int, tuple[int, ...]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -596,6 +610,9 @@ class _Support:
     patterns: tuple[SupportPattern, ...]
     construction_tasks: tuple[ConstructionTask, ...]
     storage_task_keys: dict[str, tuple[str, ...]]
+    construction_metadata: dict[str, tuple[_GroupConstructionMetadata, ...]] = field(
+        default_factory=dict
+    )
 
 
 SUPPORT_CHECKPOINT_SCHEMA_VERSION = 1
@@ -1100,6 +1117,65 @@ def pack_storage_shards(
     return tuple(packed)
 
 
+def _build_construction_metadata(
+    *,
+    support: _Support,
+    storage_shards: tuple[StorageShardPlan, ...],
+    routing: FixedRoutingSource,
+    spec,
+) -> dict[str, tuple[_GroupConstructionMetadata, ...]]:
+    """Derive group unions and mapped edges once for each storage shard."""
+    task_by_key = {task.identity.key: task for task in support.construction_tasks}
+    mapping_links = np.asarray(spec.link_index, dtype=np.int64)
+    mapping_measurements = np.asarray(spec.measurement_index, dtype=np.int64)
+    routing_reader = _RoutingBatchReader(routing)
+    metadata: dict[str, tuple[_GroupConstructionMetadata, ...]] = {}
+    for storage_shard in storage_shards:
+        tasks_by_group: dict[int, list[ConstructionTask]] = {}
+        for key in storage_shard.task_keys:
+            task = task_by_key[key]
+            tasks_by_group.setdefault(task.group, []).append(task)
+        groups: list[_GroupConstructionMetadata] = []
+        for group, grouped_tasks in sorted(tasks_by_group.items()):
+            batch_measurements = np.asarray(
+                sorted({row for task in grouped_tasks for row in task.measurements}),
+                dtype=np.int64,
+            )
+            batch_lookup = np.full(spec.num_measurements, -1, dtype=np.int32)
+            batch_lookup[batch_measurements] = np.arange(
+                batch_measurements.size, dtype=np.int32
+            )
+            _, group_effective = routing_reader.host(group)
+            mapped_local_rows = batch_lookup[mapping_measurements]
+            selected_mapping = group_effective[mapping_links] & (
+                mapped_local_rows >= 0
+            )
+            selected_links = np.asarray(mapping_links[selected_mapping], dtype=np.int64)
+            selected_local_rows = np.asarray(
+                mapped_local_rows[selected_mapping], dtype=np.int64
+            )
+            od_support: dict[int, set[int]] = {}
+            for task in grouped_tasks:
+                for active_index in task.od_indices:
+                    od_support.setdefault(active_index, set()).update(task.measurements)
+            od_indices = np.asarray(sorted(od_support), dtype=np.int64)
+            groups.append(
+                _GroupConstructionMetadata(
+                    group=group,
+                    batch_measurements=batch_measurements,
+                    selected_links=selected_links,
+                    selected_local_rows=selected_local_rows,
+                    od_indices=od_indices,
+                    od_support={
+                        int(index): tuple(sorted(rows))
+                        for index, rows in sorted(od_support.items())
+                    },
+                )
+            )
+        metadata[storage_shard.identity.key] = tuple(groups)
+    return metadata
+
+
 def plan_sharded_fixed_routing_operator(
     *,
     inputs: AssignmentInputs,
@@ -1167,6 +1243,13 @@ def plan_sharded_fixed_routing_operator(
         shard.identity.key: shard.task_keys for shard in storage_shards
     }
     support = replace(support, storage_task_keys=storage_task_keys)
+    construction_metadata = _build_construction_metadata(
+        support=support,
+        storage_shards=storage_shards,
+        routing=routing,
+        spec=spec,
+    )
+    support = replace(support, construction_metadata=construction_metadata)
     # Forward reachability stores OD-chunk×node state and returns only one
     # bounded block of structurally supported mapping edges.
     estimated_kernel_bytes = int(
@@ -1190,33 +1273,23 @@ def plan_sharded_fixed_routing_operator(
     # Each worker shard uses a temporary write, validation open, staging rename,
     # and parent publication rename; manifests use temporary write and rename.
     filesystem_operations = len(storage_shards) * 5 + manifest_writes * 3
-    task_by_key = {task.identity.key: task for task in support.construction_tasks}
     estimated_batches = 0
     estimated_reachability_evaluations = 0
     estimated_edge_gather_evaluations = 0
     maximum_batch_rows = 0
     for storage_shard in storage_shards:
-        tasks_by_group: dict[int, list[ConstructionTask]] = {}
-        for key in storage_shard.task_keys:
-            task = task_by_key[key]
-            tasks_by_group.setdefault(task.group, []).append(task)
-        for group, grouped_tasks in tasks_by_group.items():
+        for group_metadata in construction_metadata[storage_shard.identity.key]:
             estimated_batches += 1
-            batch_origins = {
-                index for task in grouped_tasks for index in task.od_indices
-            }
-            batch_measurements = {
-                row for task in grouped_tasks for row in task.measurements
-            }
-            maximum_batch_rows = max(maximum_batch_rows, len(batch_measurements))
-            _, group_effective = routing_reader.host(group)
-            selected_edges = int(
-                np.count_nonzero(
-                    group_effective[mapping_links]
-                    & np.isin(mapping_measurements, tuple(batch_measurements))
-                )
+            maximum_batch_rows = max(
+                maximum_batch_rows, group_metadata.batch_measurements.size
             )
-            chunk_count = max(1, math.ceil(len(batch_origins) / config.od_chunk_size))
+            chunk_count = max(
+                1,
+                math.ceil(
+                    group_metadata.od_indices.size / config.od_chunk_size
+                ),
+            )
+            selected_edges = group_metadata.selected_links.size
             edge_block_count = max(
                 1, math.ceil(selected_edges / config.support_edge_block_size)
             )
@@ -1319,6 +1392,23 @@ def _manifest(
         measurement_block_size=config.measurement_block_size,
         od_chunk_size=config.od_chunk_size,
         plan_summary=plan_summary,
+        execution_provenance={
+            "workers": config.workers,
+            "od_chunk_size": config.od_chunk_size,
+            "measurement_block_size": config.measurement_block_size,
+            "origin_support_chunk_size": config.origin_support_chunk_size,
+            "support_edge_block_size": config.support_edge_block_size,
+            "target_nonzeros_per_storage_shard": (
+                config.target_nonzeros_per_storage_shard
+            ),
+            "maximum_nonzeros_per_storage_shard": (
+                config.maximum_nonzeros_per_storage_shard
+            ),
+            "maximum_patterns_per_storage_shard": (
+                config.maximum_patterns_per_storage_shard
+            ),
+            "compressed_shards": config.compressed_shards,
+        },
     )
 
 
@@ -1370,7 +1460,20 @@ def _construction_provenance(
     assignment_inputs_fingerprint_value: str | None = None,
     scientific_identity: dict[str, object] | None = None,
     include_measurement_kernel_version: bool = True,
+    include_execution_provenance: bool = True,
 ) -> dict[str, object]:
+    graph_digest = hashlib.sha256()
+    for value in (
+        inputs.graph.tail,
+        inputs.graph.head,
+        inputs.graph.topo_order,
+        inputs.graph.out_links,
+        inputs.graph.out_mask,
+    ):
+        array = np.ascontiguousarray(value)
+        graph_digest.update(str(array.dtype).encode("utf-8"))
+        graph_digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+        graph_digest.update(array.tobytes())
     provenance: dict[str, object] = {
         "assignment_fingerprint": str(assignment_fingerprint),
         "assignment_inputs_fingerprint": (
@@ -1379,38 +1482,75 @@ def _construction_provenance(
             else str(assignment_inputs_fingerprint_value)
         ),
         "mapping_fingerprint": measurement_mapping_fingerprint(spec),
+        "graph_fingerprint": graph_digest.hexdigest(),
         "od_layout_fingerprint": str(od_layout_fingerprint),
         "compact_layout_fingerprint": compact_layout.fingerprint,
+        "frozen_cell_fingerprint": compact_layout.fingerprint,
         "theta": float(theta),
         "dtype": str(np.dtype(inputs.base_link_cost.dtype)),
         "zero_tolerance": config.zero_tolerance,
         "measurement_block_size": config.measurement_block_size,
         "od_chunk_size": config.od_chunk_size,
         "origin_support_chunk_size": config.origin_support_chunk_size,
-        "support_strategy": "positive_probability_group_batched_reachability_v2",
+        "support_strategy": SUPPORT_DEFINITION_ALGORITHM_VERSION,
         "support_discovery_mode": config.support_discovery_mode,
-        "support_edge_block_size": config.support_edge_block_size,
-        "target_nonzeros_per_storage_shard": config.target_nonzeros_per_storage_shard,
-        "maximum_nonzeros_per_storage_shard": config.maximum_nonzeros_per_storage_shard,
-        "maximum_patterns_per_storage_shard": config.maximum_patterns_per_storage_shard,
         "construction_schema_version": SHARDED_OPERATOR_SCHEMA_VERSION,
+        "serialization_algorithm": SERIALIZATION_ALGORITHM_VERSION,
         "scientific_identity": (
             {} if scientific_identity is None else dict(scientific_identity)
         ),
     }
+    if include_execution_provenance:
+        provenance.update(
+            {
+                "support_edge_block_size": config.support_edge_block_size,
+                "target_nonzeros_per_storage_shard": config.target_nonzeros_per_storage_shard,
+                "maximum_nonzeros_per_storage_shard": config.maximum_nonzeros_per_storage_shard,
+                "maximum_patterns_per_storage_shard": config.maximum_patterns_per_storage_shard,
+                "compressed_shards": config.compressed_shards,
+            }
+        )
     if include_measurement_kernel_version:
         provenance["measurement_kernel_algorithm"] = (
             MEASUREMENT_KERNEL_ALGORITHM_VERSION
         )
+    if not include_execution_provenance:
+        for key in (
+            "zero_tolerance",
+            "serialization_algorithm",
+            "measurement_block_size",
+            "od_chunk_size",
+            "origin_support_chunk_size",
+            "support_edge_block_size",
+            "target_nonzeros_per_storage_shard",
+            "maximum_nonzeros_per_storage_shard",
+            "maximum_patterns_per_storage_shard",
+            "compressed_shards",
+        ):
+            provenance.pop(key, None)
     return provenance
 
 
 def _same_support_provenance(left: dict[str, object], right: dict[str, object]) -> bool:
-    """Return whether two manifests differ only in numerical-kernel version."""
+    """Return whether support is reusable despite packing/kernel changes."""
     left_support = dict(left)
     right_support = dict(right)
     left_support.pop("measurement_kernel_algorithm", None)
     right_support.pop("measurement_kernel_algorithm", None)
+    for key in (
+        "zero_tolerance",
+        "serialization_algorithm",
+        "measurement_block_size",
+        "od_chunk_size",
+        "origin_support_chunk_size",
+        "support_edge_block_size",
+        "target_nonzeros_per_storage_shard",
+        "maximum_nonzeros_per_storage_shard",
+        "maximum_patterns_per_storage_shard",
+        "compressed_shards",
+    ):
+        left_support.pop(key, None)
+        right_support.pop(key, None)
     return left_support == right_support
 
 
@@ -1433,7 +1573,12 @@ def load_complete_sharded_fixed_routing_cache(
     started = perf_counter()
     if not manifest_path(directory).exists():
         return None
-    manifest = load_sharded_operator_manifest(directory)
+    try:
+        manifest = load_sharded_operator_manifest(directory)
+    except (KeyError, OSError, ValueError, json.JSONDecodeError):
+        # A malformed or legacy manifest is an explicit cache miss.  Callers
+        # can rebuild safely; the decoder must not leak an unsafe exception.
+        return None
     provenance = _construction_provenance(
         inputs=inputs,
         spec=spec,
@@ -1520,32 +1665,20 @@ def _construct_measurement_shard(
     padded_buffer_allocations = 0
     routing_array_dispatch_uses = 0
     construction_start = perf_counter()
-    tasks_by_group: dict[int, list[ConstructionTask]] = {}
-    for task in shard_tasks:
-        tasks_by_group.setdefault(task.group, []).append(task)
-    for group, grouped_tasks in sorted(tasks_by_group.items()):
+    metadata_by_group = {
+        item.group: item
+        for item in support.construction_metadata.get(identity.key, ())
+    }
+    if not metadata_by_group:
+        raise ValueError("construction metadata is missing for measurement shard")
+    for group, group_metadata in sorted(metadata_by_group.items()):
         batch_start = perf_counter()
         construction_batches += 1
-        batch_measurements = np.asarray(
-            sorted({row for task in grouped_tasks for row in task.measurements}),
-            dtype=np.int64,
-        )
-        batch_lookup = np.full(plan.num_measurements, -1, dtype=np.int32)
-        batch_lookup[batch_measurements] = np.arange(
-            batch_measurements.size, dtype=np.int32
-        )
-        _, group_effective_host = routing_reader.host(group)
+        batch_measurements = group_metadata.batch_measurements
         group_probability_device, group_effective_device = routing_reader.device(group)
-        selected_mapping = group_effective_host[mapping_links] & (
-            batch_lookup[mapping_measurements] >= 0
-        )
-        selected_links = mapping_links[selected_mapping]
-        selected_local_rows = batch_lookup[mapping_measurements[selected_mapping]]
-        od_support: dict[int, set[int]] = {}
-        for task in grouped_tasks:
-            for active_index in task.od_indices:
-                od_support.setdefault(active_index, set()).update(task.measurements)
-        od_indices = np.asarray(sorted(od_support), dtype=np.int64)
+        selected_links = group_metadata.selected_links
+        selected_local_rows = group_metadata.selected_local_rows
+        od_indices = group_metadata.od_indices
         batch_to_shard = np.asarray(
             [shard_row_lookup[int(row)] for row in batch_measurements],
             dtype=np.int64,
@@ -1639,15 +1772,11 @@ def _construct_measurement_shard(
                     values[:, local_row] += edge_values[:, edge_position]
             phase_start = perf_counter()
             for local_od, active_index in enumerate(chunk):
-                allowed = np.asarray(
-                    sorted(
-                        batch_lookup[
-                            np.asarray(
-                                tuple(od_support[int(active_index)]), dtype=np.int64
-                            )
-                        ]
+                allowed = np.searchsorted(
+                    batch_measurements,
+                    np.asarray(
+                        group_metadata.od_support[int(active_index)], dtype=np.int64
                     ),
-                    dtype=np.int64,
                 )
                 supported_values = values[local_od, allowed]
                 column = support.free_column[active_index]
@@ -1824,9 +1953,14 @@ def prepare_sharded_fixed_routing_measurement_operator(
             force=True,
             checkpoint_location=str(directory),
         )
-        existing = load_sharded_operator_manifest(directory)
+        try:
+            existing = load_sharded_operator_manifest(directory)
+        except (KeyError, OSError, ValueError, json.JSONDecodeError):
+            quarantine = directory / f"manifest.invalid-{uuid.uuid4().hex}.json"
+            os.replace(manifest_path(directory), quarantine)
+            existing = None
         existing_manifest = existing
-        if existing.provenance != provenance:
+        if existing is not None and existing.provenance != provenance:
             if _same_support_provenance(existing.provenance, provenance):
                 # Numerical shards from an older kernel are deliberately not
                 # reused.  Keep the support checkpoint and let the normal
@@ -1835,7 +1969,7 @@ def prepare_sharded_fixed_routing_measurement_operator(
                 existing_manifest = None
             else:
                 raise ValueError("existing shard manifest provenance is incompatible.")
-        if (
+        if existing is not None and (
             existing_manifest is not None
             and existing.complete
             and existing.plan_summary is not None
@@ -1860,7 +1994,7 @@ def prepare_sharded_fixed_routing_measurement_operator(
                         shard_path(directory, identity),
                         expected_provenance_hash=existing.provenance_hash,
                     )
-                except KeyError, OSError, ValueError:
+                except (KeyError, OSError, ValueError):
                     valid = False
                     break
                 aggregate_nonzeros += loaded.metadata.nonzero_entries
@@ -1961,6 +2095,7 @@ def prepare_sharded_fixed_routing_measurement_operator(
         config=config,
         scientific_identity=scientific_identity,
         include_measurement_kernel_version=False,
+        include_execution_provenance=False,
     )
     support_provenance_hash = hashlib.sha256(
         json.dumps(support_provenance, sort_keys=True, separators=(",", ":")).encode()
@@ -1978,7 +2113,7 @@ def prepare_sharded_fixed_routing_measurement_operator(
                 provenance_hash=support_provenance_hash,
                 config=config,
             )
-        except KeyError, OSError, ValueError, json.JSONDecodeError:
+        except (KeyError, OSError, ValueError, json.JSONDecodeError):
             quarantine = support_checkpoint.with_name(
                 f"{support_checkpoint.name}.invalid-{uuid.uuid4().hex}"
             )
@@ -2083,6 +2218,16 @@ def prepare_sharded_fixed_routing_measurement_operator(
             config=config,
             discovered_support=support,
         )
+    if not support.construction_metadata:
+        support = replace(
+            support,
+            construction_metadata=_build_construction_metadata(
+                support=support,
+                storage_shards=plan.storage_shards,
+                routing=routing,
+                spec=spec,
+            ),
+        )
     planning_seconds = perf_counter() - planning_start
     if not plan.safe:
         raise ShardedConstructionPreflightError(plan)
@@ -2141,7 +2286,7 @@ def prepare_sharded_fixed_routing_measurement_operator(
             loaded = load_sparse_shard(
                 path, expected_provenance_hash=template.provenance_hash
             )
-        except KeyError, OSError, ValueError:
+        except (KeyError, OSError, ValueError):
             rejected += 1
             continue
         completed.add(identity.key)

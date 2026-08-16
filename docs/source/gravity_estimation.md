@@ -665,34 +665,11 @@ theta, batching, residency, estimator policy, JAX devices and relevant thread
 environment. Progress records are append-only, timestamped, flushed and
 optionally `fsync`-committed. Resume with the same manifest and configuration.
 
-The committed public Geneva integration exercises the complete workflow on 96 free
-cells, 15,128 full-layout cells, and 8,967 boarding/alighting measurements. Scheduled
-path metrics and synthetic prior demand prepare the gravity inputs. An exact
-scalar-column fixed-routing construction builds BCOO indices and data directly,
-avoiding the general node-by-measurement intermediate. The bounded run covers
-minimal estimation, adequacy, recommendations, an exact child warm start, lineage,
-and grouped journey holdout. Its iteration-limited metrics validate integration and
-are not converged scientific estimates.
-
-## Worked synthetic examples
-
-The two simple examples provide smaller, directly readable applications. Run
-either entry point from the repository root:
-
-```bash
-uv run python docs/source/examples/simple_example_01/estimation/run_gravity_estimation.py
-uv run python docs/source/examples/simple_example_02/estimation/run_gravity_estimation.py
-```
-
-Their shared orchestration in `docs/source/examples/simple_gravity_workflow.py`
-constructs scheduled path metrics, production totals, and attractiveness;
-prepares the frozen-cell layout; loads or builds a fingerprint-validated BCOO
-operator; estimates the minimal model; and computes adequacy and OD diagnostics.
-
-Simple Example 01 has four free cells and two frozen-positive cells. It verifies
-their exact reconstruction. Each free origin-time group has one destination, so
-it is not evidence that gravity impedance parameters are identifiable. Simple
-Example 02 has 70 free cells, two frozen-positive cells, and 270 measurements.
-It also creates a broad-period child, checks the exact parent warm start, records
-lineage, and re-estimates with a grouped vehicle-journey holdout. The committed
-summaries are instructional regression evidence, not scientific model selection.
+The committed public Geneva integration exercises the complete direct-scheduled
+gravity workflow on 96 free cells, 15,128 full-layout cells, and 8,967
+boarding/alighting measurements. Scheduled path metrics and synthetic prior demand
+prepare the gravity inputs. An exact scalar-column fixed-routing construction builds
+BCOO indices and data directly, avoiding the general node-by-measurement
+intermediate. The bounded run covers minimal estimation, adequacy, recommendations,
+an exact child warm start, lineage, and grouped journey holdout. Its iteration-limited
+metrics validate integration and are not converged scientific estimates.

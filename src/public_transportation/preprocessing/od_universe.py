@@ -25,14 +25,21 @@ import tempfile
 import time
 from bisect import bisect_left
 from collections import defaultdict, deque
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Literal, Mapping, Sequence
 
 from public_transportation.domain import Scenario
 
-from .reduced_od.artifacts import canonical_json
+if TYPE_CHECKING:  # pragma: no cover - import only for static analysis
+    from .canonical_timetable import CanonicalTimetableIndex
+
+
+
+def canonical_json(value: object) -> str:
+    """Serialize a fingerprint payload without a retired backend dependency."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
 
 ODUniverseSource = Literal["file", "network_ordered_pairs"]
@@ -109,6 +116,9 @@ class CandidateODUniverse:
     connectivity_policy: ConnectivityPolicy
     physical_stop_mapping: Mapping[str, str]
     generator_fingerprint: str
+    directed_reachability: Mapping[str, tuple[str, ...]] = field(
+        default_factory=dict
+    )
 
     def __post_init__(self) -> None:
         if self.pairs != tuple(sorted(self.pairs)):
@@ -267,19 +277,27 @@ def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
     _atomic_text(path, json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n")
 
 
-def _atomic_jsonl(path: Path, rows: Iterable[Mapping[str, object]], *, maximum_bytes: int) -> None:
+def _atomic_jsonl(
+    path: Path,
+    rows: Iterable[Mapping[str, object]],
+    *,
+    maximum_bytes: int,
+) -> str:
     """Atomically write one bounded chunk without a second serialized copy."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     written = 0
+    digest = hashlib.sha256()
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
             for row in rows:
                 line = json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
-                written += len(line.encode("utf-8"))
+                encoded = line.encode("utf-8")
+                written += len(encoded)
                 if written > maximum_bytes:
                     raise MemoryError("one expansion chunk exceeds expansion.maximum_temporary_bytes")
                 stream.write(line)
+                digest.update(encoded)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
@@ -288,6 +306,7 @@ def _atomic_jsonl(path: Path, rows: Iterable[Mapping[str, object]], *, maximum_b
             os.unlink(temporary)
         except FileNotFoundError:
             pass
+    return digest.hexdigest()
 
 
 def _memory_bytes() -> int | None:
@@ -358,6 +377,10 @@ def _expansion_rows_for_pair(
     timetable_policy: TimetablePolicy,
     timetable_feasibility: Callable[[CandidateODPair, tuple[str, int, int]], bool] | None,
     feasibility_index: TimetableFeasibilityIndex | None,
+    timetable_index: "CanonicalTimetableIndex | None",
+    feasible_destinations_by_origin_period: Mapping[
+        tuple[str, str], frozenset[str]
+    ] | None = None,
 ) -> list[dict[str, object]]:
     pair_reason: str | None = None
     if pair.origin_stop_id == pair.destination_stop_id and not universe.include_same_stop:
@@ -391,6 +414,16 @@ def _expansion_rows_for_pair(
                 feasible = None
             elif scenario is None or scenario.timetable is None:
                 feasible = False
+            elif feasible_destinations_by_origin_period is not None:
+                origin = universe.physical_stop_mapping.get(
+                    pair.origin_stop_id, pair.origin_stop_id
+                )
+                destination = universe.physical_stop_mapping.get(
+                    pair.destination_stop_id, pair.destination_stop_id
+                )
+                feasible = destination in feasible_destinations_by_origin_period[
+                    (origin, period[0])
+                ]
             elif feasibility_index is not None:
                 feasible = feasibility_index.is_feasible(
                     pair,
@@ -410,6 +443,7 @@ def _expansion_rows_for_pair(
                     maximum_initial_wait_seconds=maximum_initial_wait_seconds,
                     maximum_journey_seconds=maximum_journey_seconds,
                     maximum_waiting_seconds=maximum_waiting_seconds,
+                    timetable_index=timetable_index,
                 )
             if feasible is True or feasible is None:
                 row["status"] = "retained"
@@ -430,6 +464,7 @@ def run_candidate_od_time_expansion(
     resume: bool = False,
     progress: Callable[[Mapping[str, object]], None] | None = None,
     timetable_feasibility: Callable[[CandidateODPair, tuple[str, int, int]], bool] | None = None,
+    timetable_index: "CanonicalTimetableIndex | None" = None,
 ) -> ODTimeExpansionRunResult:
     """Expand candidate cells in deterministic, resumable pair chunks.
 
@@ -475,8 +510,30 @@ def run_candidate_od_time_expansion(
         raise FileNotFoundError(f"cannot resume without checkpoint manifest: {manifest_path}")
     total_chunks = (len(universe.pairs) + chunk_size - 1) // chunk_size
     total_rows = len(universe.pairs) * len(bins)
-    departures, arrivals = (set(), set()) if scenario is None else _service_activity(scenario, universe.physical_stop_mapping)
-    reachable = {} if scenario is None else _directed_reachability(scenario, universe.physical_stop_mapping)
+    departures, arrivals = (
+        (set(), set())
+        if scenario is None
+        else _service_activity(
+            scenario,
+            universe.physical_stop_mapping,
+            timetable_index=timetable_index,
+        )
+    )
+    if universe.directed_reachability:
+        reachable = {
+            origin: set(destinations)
+            for origin, destinations in universe.directed_reachability.items()
+        }
+    else:
+        reachable = (
+            {}
+            if scenario is None
+            else _directed_reachability(
+                scenario,
+                universe.physical_stop_mapping,
+                timetable_index=timetable_index,
+            )
+        )
     if (
         timetable_feasibility is None
         and feasibility_index is None
@@ -485,7 +542,9 @@ def run_candidate_od_time_expansion(
         and scenario.timetable is not None
     ):
         feasibility_index = TimetableFeasibilityIndex.from_scenario(
-            scenario, physical_stop_mapping=universe.physical_stop_mapping
+            scenario,
+            physical_stop_mapping=universe.physical_stop_mapping,
+            timetable_index=timetable_index,
         )
     policy = str(config.get("timetable_policy", "required"))
     if policy not in {"required", "defer", "none"}:
@@ -498,6 +557,20 @@ def run_candidate_od_time_expansion(
     }
     if any(value < 0 for value in limits.values()) or limits["maximum_journey_seconds"] <= 0:
         raise ValueError("feasibility limits must be non-negative (journey time positive)")
+    feasible_destinations_by_origin_period = None
+    if (
+        timetable_feasibility is None
+        and feasibility_index is not None
+        and policy == "required"
+        and scenario is not None
+        and scenario.timetable is not None
+    ):
+        feasible_destinations_by_origin_period = _precompute_temporal_feasibility(
+            universe=universe,
+            bins=bins,
+            feasibility_index=feasibility_index,
+            **limits,
+        )
     contract = {
         "status": "running",
         "algorithm_version": EXPANSION_ALGORITHM_VERSION,
@@ -507,7 +580,6 @@ def run_candidate_od_time_expansion(
         "package_revision": config.get("package_revision"),
         "scenario_checksums": config.get("scenario_checksums", config.get("source_checksums", {})),
         "od_universe_fingerprint": universe.fingerprint,
-        "reduced_od_fingerprint": config.get("reduced_od_fingerprint"),
         "approved_time_bins_fingerprint": config.get("approved_time_bins_fingerprint"),
         "approved_time_bins": [list(item) for item in bins],
         "chunk_size_pairs": chunk_size,
@@ -634,14 +706,19 @@ def run_candidate_od_time_expansion(
                         timetable_feasibility=timetable_feasibility,
                         feasibility_index=feasibility_index,
                         timetable_policy=policy,  # type: ignore[arg-type]
+                        timetable_index=timetable_index,
+                        feasible_destinations_by_origin_period=(
+                            feasible_destinations_by_origin_period
+                        ),
                         **limits,
                     )
                 )
                 if time.monotonic() - last_progress >= interval:
                     report("running", chunk=chunk_index)
                     last_progress = time.monotonic()
-            _atomic_jsonl(active_chunk_path, rows, maximum_bytes=maximum_temporary_bytes)
-            checksum = _file_sha256(active_chunk_path)
+            checksum = _atomic_jsonl(
+                active_chunk_path, rows, maximum_bytes=maximum_temporary_bytes
+            )
             chunk_checksums[str(chunk_index)] = checksum
             completed.add(chunk_index)
             contract["completed_chunks"] = sorted(completed)
@@ -750,16 +827,19 @@ class TimetableFeasibilityIndex:
         scenario: Scenario,
         *,
         physical_stop_mapping: Mapping[str, str] | None = None,
+        timetable_index: "CanonicalTimetableIndex | None" = None,
     ) -> "TimetableFeasibilityIndex":
         mapping = dict(physical_stop_mapping or {str(stop.stop_id): str(stop.stop_id) for stop in scenario.stops})
-        sequences = _trip_sequences(scenario, mapping)
+        sequences = _trip_sequences(
+            scenario, mapping, timetable_index=timetable_index
+        )
         departures: dict[str, list[tuple[int, str, int]]] = defaultdict(list)
         arrivals: dict[str, list[tuple[int, str, int]]] = defaultdict(list)
         for trip_id, sequence in sequences.items():
             for index, stop_time in enumerate(sequence):
                 stop = mapping[str(stop_time.stop_id)]
-                departure = int(stop_time.departure.seconds_from_midnight)
-                arrival = int(stop_time.arrival.seconds_from_midnight)
+                departure = _departure_seconds(stop_time)
+                arrival = _arrival_seconds(stop_time)
                 departures[stop].append((departure, trip_id, index))
                 arrivals[stop].append((arrival, trip_id, index))
         ordered_departures = {
@@ -792,18 +872,49 @@ class TimetableFeasibilityIndex:
     ) -> bool:
         origin = self.physical_stop_mapping.get(pair.origin_stop_id, pair.origin_stop_id)
         destination = self.physical_stop_mapping.get(pair.destination_stop_id, pair.destination_stop_id)
+        return destination in self.feasible_destinations(
+            origin,
+            period,
+            maximum_transfers=maximum_transfers,
+            maximum_initial_wait_seconds=maximum_initial_wait_seconds,
+            maximum_waiting_seconds=maximum_waiting_seconds,
+            maximum_journey_seconds=maximum_journey_seconds,
+        )
+
+    def feasible_destinations(
+        self,
+        origin: str,
+        period: tuple[str, int, int],
+        *,
+        maximum_transfers: int,
+        maximum_initial_wait_seconds: int,
+        maximum_waiting_seconds: int,
+        maximum_journey_seconds: int,
+    ) -> frozenset[str]:
+        """Return every destination feasible from one origin/time period.
+
+        The search state is identical to the historical per-destination
+        evaluator, but it is performed once per origin and period.  Expansion
+        can therefore classify all destinations in that origin/time slice
+        without repeating the same timetable traversal.
+        """
+        origin = self.physical_stop_mapping.get(origin, origin)
         start, end = period[1], period[2]
         origin_departures = self.departures_by_stop.get(origin, ())
+        departure_seconds = self.departure_seconds_by_stop.get(origin, ())
+        lower = bisect_left(departure_seconds, start)
+        upper_bound = min(end, start + maximum_initial_wait_seconds + 1)
+        upper = bisect_left(departure_seconds, upper_bound)
         first_candidates = [
             (trip_id, index, departure)
-            for departure, trip_id, index in origin_departures
-            if start <= departure < end and departure - start <= maximum_initial_wait_seconds
+            for departure, trip_id, index in origin_departures[lower:upper]
         ]
         queue: deque[tuple[str, int, int, int]] = deque(
             (trip_id, index, departure, 0)
             for trip_id, index, departure in first_candidates
         )
         visited: set[tuple[str, int, int]] = set()
+        destinations: set[str] = set()
         while queue:
             trip_id, board_index, first_departure, transfers = queue.popleft()
             state_key = (trip_id, board_index, transfers)
@@ -813,12 +924,11 @@ class TimetableFeasibilityIndex:
             sequence = self.sequences[trip_id]
             for alight_index in range(board_index + 1, len(sequence)):
                 alight = sequence[alight_index]
-                arrival = int(alight.arrival.seconds_from_midnight)
+                arrival = _arrival_seconds(alight)
                 if arrival - first_departure > maximum_journey_seconds:
                     break
                 stop = self.physical_stop_mapping.get(str(alight.stop_id), str(alight.stop_id))
-                if stop == destination:
-                    return True
+                destinations.add(stop)
                 if transfers >= maximum_transfers:
                     continue
                 departures = self.departures_by_stop.get(stop, ())
@@ -829,7 +939,46 @@ class TimetableFeasibilityIndex:
                         break
                     if next_trip_id != trip_id:
                         queue.append((next_trip_id, next_index, first_departure, transfers + 1))
-        return False
+        return frozenset(destinations)
+
+
+def _precompute_temporal_feasibility(
+    *,
+    universe: CandidateODUniverse,
+    bins: Sequence[tuple[str, int, int]],
+    feasibility_index: TimetableFeasibilityIndex,
+    maximum_transfers: int,
+    maximum_initial_wait_seconds: int,
+    maximum_waiting_seconds: int,
+    maximum_journey_seconds: int,
+) -> dict[tuple[str, str], frozenset[str]]:
+    """Evaluate each distinct origin/time slice once.
+
+    The historical expansion searched the timetable independently for every
+    destination.  The feasibility index can instead return all destinations
+    reached by the same search state, so this cache preserves the exact
+    per-pair result while eliminating repeated traversal work.
+    """
+    origins = sorted(
+        {
+            universe.physical_stop_mapping.get(
+                pair.origin_stop_id, pair.origin_stop_id
+            )
+            for pair in universe.pairs
+        }
+    )
+    return {
+        (origin, period[0]): feasibility_index.feasible_destinations(
+            origin,
+            period,
+            maximum_transfers=maximum_transfers,
+            maximum_initial_wait_seconds=maximum_initial_wait_seconds,
+            maximum_waiting_seconds=maximum_waiting_seconds,
+            maximum_journey_seconds=maximum_journey_seconds,
+        )
+        for origin in origins
+        for period in bins
+    }
 
 
 def _mapping_for_level(
@@ -865,9 +1014,19 @@ def _mapping_for_level(
     }
 
 
-def _trip_sequences(scenario: Scenario, mapping: Mapping[str, str]) -> dict[str, tuple[object, ...]]:
+def _trip_sequences(
+    scenario: Scenario,
+    mapping: Mapping[str, str],
+    *,
+    timetable_index: "CanonicalTimetableIndex | None" = None,
+) -> dict[str, tuple[object, ...]]:
     if scenario.timetable is None:
         return {}
+    if timetable_index is not None:
+        return {
+            str(trip_id): tuple(sequence)
+            for trip_id, sequence in timetable_index.trip_sequences.items()
+        }
     by_trip: dict[str, list[object]] = defaultdict(list)
     for stop_time in scenario.timetable.stop_times:
         by_trip[str(stop_time.trip_id)].append(stop_time)
@@ -885,12 +1044,19 @@ def _trip_sequences(scenario: Scenario, mapping: Mapping[str, str]) -> dict[str,
 def _service_activity(
     scenario: Scenario,
     mapping: Mapping[str, str],
+    *,
+    timetable_index: "CanonicalTimetableIndex | None" = None,
 ) -> tuple[set[str], set[str]]:
     departures: set[str] = set()
     arrivals: set[str] = set()
     if scenario.timetable is None:
         return departures, arrivals
-    for stop_time in scenario.timetable.stop_times:
+    stop_times = (
+        scenario.timetable.stop_times
+        if timetable_index is None
+        else timetable_index.stop_times
+    )
+    for stop_time in stop_times:
         physical = mapping[str(stop_time.stop_id)]
         departures.add(physical)
         arrivals.add(physical)
@@ -900,9 +1066,13 @@ def _service_activity(
 def _directed_reachability(
     scenario: Scenario,
     mapping: Mapping[str, str],
+    *,
+    timetable_index: "CanonicalTimetableIndex | None" = None,
 ) -> dict[str, set[str]]:
     adjacency: dict[str, set[str]] = defaultdict(set)
-    for sequence in _trip_sequences(scenario, mapping).values():
+    for sequence in _trip_sequences(
+        scenario, mapping, timetable_index=timetable_index
+    ).values():
         for left, right in zip(sequence, sequence[1:], strict=False):
             adjacency[mapping[str(left.stop_id)]].add(mapping[str(right.stop_id)])
     nodes = set(mapping.values())
@@ -974,6 +1144,7 @@ def generate_candidate_od_pairs(
     connectivity_policy: ConnectivityPolicy = "directed_reachable",
     od_pairs_path: str | Path | None = None,
     physical_stop_mapping: Mapping[str, str] | None = None,
+    timetable_index: "CanonicalTimetableIndex | None" = None,
 ) -> CandidateODUniverse:
     """Generate and validate an immutable ordered candidate OD universe.
 
@@ -999,13 +1170,17 @@ def generate_candidate_od_pairs(
         )
     else:
         nodes = sorted(set(mapping.values()))
-        raw_pairs = tuple(
+        raw_pairs = (
             CandidateODPair(origin, destination)
             for origin in nodes
             for destination in nodes
         )
-    departures, arrivals = _service_activity(scenario, mapping)
-    reachable = _directed_reachability(scenario, mapping)
+    departures, arrivals = _service_activity(
+        scenario, mapping, timetable_index=timetable_index
+    )
+    reachable = _directed_reachability(
+        scenario, mapping, timetable_index=timetable_index
+    )
     retained: list[CandidateODPair] = []
     exclusions: list[ODUniverseExclusion] = []
     for pair in raw_pairs:
@@ -1037,7 +1212,7 @@ def generate_candidate_od_pairs(
             "network_nodes": sorted(set(mapping.values())),
             "directed_edges": sorted(
                 (origin, destination)
-                for origin, destinations in _directed_reachability(scenario, mapping).items()
+                for origin, destinations in reachable.items()
                 for destination in destinations
             ),
         }
@@ -1052,6 +1227,12 @@ def generate_candidate_od_pairs(
         connectivity_policy=connectivity_policy,
         physical_stop_mapping=MappingProxyType(dict(mapping)),
         generator_fingerprint=generator_fingerprint,
+        directed_reachability=MappingProxyType(
+            {
+                origin: tuple(sorted(destinations))
+                for origin, destinations in sorted(reachable.items())
+            }
+        ),
     )
 
 
@@ -1077,6 +1258,26 @@ def _period_tuple(period: object) -> tuple[str, int, int]:
     return _text(period_id, "time period id"), start_i, end_i
 
 
+def _arrival_seconds(stop_time: object) -> int:
+    value = getattr(stop_time, "arrival_s", None)
+    if value is not None:
+        return int(value)
+    arrival = getattr(stop_time, "arrival", None)
+    if hasattr(arrival, "seconds_from_midnight"):
+        return int(arrival.seconds_from_midnight)
+    return int(arrival)
+
+
+def _departure_seconds(stop_time: object) -> int:
+    value = getattr(stop_time, "departure_s", None)
+    if value is not None:
+        return int(value)
+    departure = getattr(stop_time, "departure", None)
+    if hasattr(departure, "seconds_from_midnight"):
+        return int(departure.seconds_from_midnight)
+    return int(departure)
+
+
 def _timetable_feasible(
     scenario: Scenario,
     pair: CandidateODPair,
@@ -1087,9 +1288,12 @@ def _timetable_feasible(
     maximum_initial_wait_seconds: int,
     maximum_journey_seconds: int,
     maximum_waiting_seconds: int,
+    timetable_index: "CanonicalTimetableIndex | None" = None,
 ) -> bool:
     """Small schedule search used by expansion for an explicit feasibility rule."""
-    sequences = _trip_sequences(scenario, mapping)
+    sequences = _trip_sequences(
+        scenario, mapping, timetable_index=timetable_index
+    )
     if not sequences:
         return False
     origin = mapping[pair.origin_stop_id]
@@ -1099,7 +1303,7 @@ def _timetable_feasible(
     for trip_id, sequence in sequences.items():
         for index, stop_time in enumerate(sequence):
             if mapping[str(stop_time.stop_id)] == origin:
-                departure = int(stop_time.departure.seconds_from_midnight)
+                departure = _departure_seconds(stop_time)
                 if start <= departure < end and departure - start <= maximum_initial_wait_seconds:
                     boardings[trip_id].append((index, departure))
     queue: deque[tuple[str, int, int, int]] = deque(
@@ -1117,7 +1321,7 @@ def _timetable_feasible(
         sequence = sequences[trip_id]
         for alight_index in range(board_index + 1, len(sequence)):
             alight = sequence[alight_index]
-            arrival = int(alight.arrival.seconds_from_midnight)
+            arrival = _arrival_seconds(alight)
             if arrival - first_departure > maximum_journey_seconds:
                 break
             stop = mapping[str(alight.stop_id)]
@@ -1129,7 +1333,7 @@ def _timetable_feasible(
                 for next_index, next_stop_time in enumerate(next_sequence):
                     if mapping[str(next_stop_time.stop_id)] != stop:
                         continue
-                    departure = int(next_stop_time.departure.seconds_from_midnight)
+                    departure = _departure_seconds(next_stop_time)
                     if departure < arrival:
                         continue
                     if departure - arrival > maximum_waiting_seconds:
@@ -1153,6 +1357,7 @@ def expand_candidate_od_time_cells(
     timetable_policy: TimetablePolicy = "required",
     timetable_feasibility: Callable[[CandidateODPair, tuple[str, int, int]], bool] | None = None,
     feasibility_index: TimetableFeasibilityIndex | None = None,
+    timetable_index: "CanonicalTimetableIndex | None" = None,
 ) -> ODTimeExpansion:
     """Expand a pair universe across approved bins and audit each exclusion."""
     if maximum_transfers < 0 or maximum_initial_wait_seconds < 0 or maximum_journey_seconds <= 0 or maximum_waiting_seconds < 0:
@@ -1169,8 +1374,26 @@ def expand_candidate_od_time_cells(
     if any(left[2] > right[1] for left, right in zip(bins, bins[1:], strict=False)):
         raise ValueError("approved time periods must not overlap.")
     mapping = universe.physical_stop_mapping
-    departures, arrivals = (set(), set()) if scenario is None else _service_activity(scenario, mapping)
-    reachable = {} if scenario is None else _directed_reachability(scenario, mapping)
+    departures, arrivals = (
+        (set(), set())
+        if scenario is None
+        else _service_activity(
+            scenario, mapping, timetable_index=timetable_index
+        )
+    )
+    if universe.directed_reachability:
+        reachable = {
+            origin: set(destinations)
+            for origin, destinations in universe.directed_reachability.items()
+        }
+    else:
+        reachable = (
+            {}
+            if scenario is None
+            else _directed_reachability(
+                scenario, mapping, timetable_index=timetable_index
+            )
+        )
     if (
         timetable_feasibility is None
         and feasibility_index is None
@@ -1179,7 +1402,26 @@ def expand_candidate_od_time_cells(
         and scenario.timetable is not None
     ):
         feasibility_index = TimetableFeasibilityIndex.from_scenario(
-            scenario, physical_stop_mapping=mapping
+            scenario,
+            physical_stop_mapping=mapping,
+            timetable_index=timetable_index,
+        )
+    feasible_destinations_by_origin_period = None
+    if (
+        timetable_feasibility is None
+        and feasibility_index is not None
+        and timetable_policy == "required"
+        and scenario is not None
+        and scenario.timetable is not None
+    ):
+        feasible_destinations_by_origin_period = _precompute_temporal_feasibility(
+            universe=universe,
+            bins=bins,
+            feasibility_index=feasibility_index,
+            maximum_transfers=maximum_transfers,
+            maximum_initial_wait_seconds=maximum_initial_wait_seconds,
+            maximum_waiting_seconds=maximum_waiting_seconds,
+            maximum_journey_seconds=maximum_journey_seconds,
         )
     cells: list[CandidateODTimeCell] = []
     exclusions: list[ODTimeExclusion] = []
@@ -1206,6 +1448,14 @@ def expand_candidate_od_time_cells(
                 feasible = None
             elif scenario is None or scenario.timetable is None:
                 feasible = False
+            elif feasible_destinations_by_origin_period is not None:
+                origin = mapping.get(pair.origin_stop_id, pair.origin_stop_id)
+                destination = mapping.get(
+                    pair.destination_stop_id, pair.destination_stop_id
+                )
+                feasible = destination in feasible_destinations_by_origin_period[
+                    (origin, period[0])
+                ]
             elif feasibility_index is not None:
                 feasible = feasibility_index.is_feasible(
                     pair,
@@ -1225,6 +1475,7 @@ def expand_candidate_od_time_cells(
                     maximum_initial_wait_seconds=maximum_initial_wait_seconds,
                     maximum_journey_seconds=maximum_journey_seconds,
                     maximum_waiting_seconds=maximum_waiting_seconds,
+                    timetable_index=timetable_index,
                 )
             if feasible is False:
                 exclusions.append(

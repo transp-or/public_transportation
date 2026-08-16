@@ -38,6 +38,7 @@ from public_transportation.inference.fixed_routing_sharded_builder import (
 )
 from public_transportation.inference.gravity import (
     GravityGradientStrategy,
+    GravityFeatures,
     GravityLikelihood,
     GravityModelSpecification,
     GravityObjectiveProblem,
@@ -54,8 +55,84 @@ from public_transportation.measurement import (
     build_mapping_spec_strict,
     read_measurements_csv,
 )
+from public_transportation.preprocessing import (
+    ODTimeKey,
+    build_structural_zero_topology,
+    build_canonical_timetable_index,
+    compute_od_path_metrics,
+)
+from public_transportation.preprocessing.structural_zeros.config import (
+    StructuralZeroAssignmentConfig,
+)
 
-from docs.source.examples.simple_gravity_workflow import _features
+
+def _features(scenario, od_layout, compact, *, timetable_index=None):
+    """Prepare gravity features for the direct-scheduled validation example."""
+    free_indices = np.asarray(od_layout.free_od_indices, dtype=np.int64)
+    keys = [od_layout.od_keys[index] for index in free_indices]
+    topology = build_structural_zero_topology(
+        scenario,
+        StructuralZeroAssignmentConfig(),
+        timetable_index=timetable_index,
+    )
+    records = compute_od_path_metrics(
+        topology, keys=tuple(ODTimeKey(*key) for key in keys)
+    )
+    metrics = {record.key.tuple: record.metrics for record in records}
+    if any(not metrics[key].feasible for key in keys):
+        raise ValueError("Every free gravity cell must be scheduled-feasible.")
+
+    origins = sorted({key[0] for key in keys})
+    destinations = sorted({key[1] for key in keys})
+    periods = sorted({key[2] for key in keys})
+    origin_lookup = {value: index for index, value in enumerate(origins)}
+    destination_lookup = {value: index for index, value in enumerate(destinations)}
+    period_lookup = {value: index for index, value in enumerate(periods)}
+    group_pairs = sorted({(key[0], key[2]) for key in keys})
+    group_lookup = {value: index for index, value in enumerate(group_pairs)}
+
+    baseline = np.asarray(od_layout.free_baseline_values, dtype=np.float32)
+    totals = np.zeros(len(group_pairs), dtype=np.float32)
+    destination_totals: dict[tuple[str, str], float] = {}
+    for key, value in zip(keys, baseline, strict=True):
+        totals[group_lookup[(key[0], key[2])]] += value
+        destination_key = (key[1], key[2])
+        destination_totals[destination_key] = (
+            destination_totals.get(destination_key, 0.0) + float(value)
+        )
+
+    return GravityFeatures(
+        canonical_od_index=free_indices,
+        origin_index=np.asarray([origin_lookup[key[0]] for key in keys]),
+        destination_index=np.asarray(
+            [destination_lookup[key[1]] for key in keys]
+        ),
+        departure_time_index=np.asarray([period_lookup[key[2]] for key in keys]),
+        origin_time_group_index=np.asarray(
+            [group_lookup[(key[0], key[2])] for key in keys]
+        ),
+        journey_time=np.asarray(
+            [metrics[key].minimum_journey_time_minutes for key in keys],
+            dtype=np.float32,
+        ),
+        transfer_count=np.asarray(
+            [metrics[key].minimum_transfers for key in keys], dtype=np.int64
+        ),
+        structural_feasible=np.ones(len(keys), dtype=bool),
+        origin_time_totals=totals,
+        destination_attractiveness=np.asarray(
+            [destination_totals[(key[1], key[2])] for key in keys],
+            dtype=np.float32,
+        ),
+        num_origins=len(origins),
+        num_destinations=len(destinations),
+        num_departure_times=len(periods),
+        od_layout_fingerprint=compact.fingerprint,
+        journey_time_scale=30.0,
+        time_period_index=np.asarray(
+            [0 if period_lookup[key[2]] < len(periods) / 2 else 1 for key in keys]
+        ),
+    )
 
 
 def _canonical_index(scenario, layout, table):
@@ -122,8 +199,15 @@ def run_validation(
         fixed_demand=read_fixed_demand_csv(data / "fixed_demand.csv", scenario=scenario),
     )
     compact = build_compact_od_assignment_layout(parameter_layout=layout)
-    features = _features(scenario, layout, compact)
-    artifacts = prepare_assignment(scenario=scenario, config=AssignmentConfig())
+    timetable_index = build_canonical_timetable_index(scenario)
+    features = _features(
+        scenario, layout, compact, timetable_index=timetable_index
+    )
+    artifacts = prepare_assignment(
+        scenario=scenario,
+        config=AssignmentConfig(),
+        timetable_index=timetable_index,
+    )
     inputs = build_assignment_inputs(artifacts=artifacts, compact_layout=compact)
     id_manager = AssignmentIDManager.build(scenario=scenario, graph=artifacts.graph)
     table = read_measurements_csv(measurement_path)

@@ -22,6 +22,9 @@ from .config import StructuralZeroAssignmentConfig
 
 if TYPE_CHECKING:
     from public_transportation.domain.scenario import Scenario
+    from public_transportation.preprocessing.canonical_timetable import (
+        CanonicalTimetableIndex,
+    )
 
 
 class _Digest(Protocol):
@@ -87,6 +90,8 @@ class StructuralZeroTopology:
 def build_structural_zero_topology(
     scenario: Scenario,
     config: StructuralZeroAssignmentConfig,
+    *,
+    timetable_index: "CanonicalTimetableIndex | None" = None,
 ) -> StructuralZeroTopology:
     """Build the same feasible scheduled graph used by assignment.
 
@@ -103,7 +108,11 @@ def build_structural_zero_topology(
         min_dwell_s=config.minimum_dwell_seconds,
     )
     assignment_config.validate()
-    graph = build_jax_graph(scenario=scenario, config=assignment_config)
+    graph = build_jax_graph(
+        scenario=scenario,
+        config=assignment_config,
+        timetable_index=timetable_index,
+    )
 
     stop_ids = tuple(str(value) for value in graph.node_stop_id)
     if not stop_ids or len(stop_ids) != len(set(stop_ids)):
@@ -204,20 +213,20 @@ def _centroid_in_nodes(
     num_stops: int,
     num_bins: int,
 ) -> tuple[tuple[int, ...], ...]:
+    indexed: dict[tuple[int, int], list[int]] = {}
+    for node_index in np.flatnonzero(node_kind == NODE_KIND_CENTROID_IN):
+        key = (int(node_stop[node_index]), int(node_bin[node_index]))
+        indexed.setdefault(key, []).append(int(node_index))
     rows: list[tuple[int, ...]] = []
     for stop_index in range(num_stops):
         row: list[int] = []
         for bin_index in range(num_bins):
-            matches = np.flatnonzero(
-                (node_kind == NODE_KIND_CENTROID_IN)
-                & (node_stop == stop_index)
-                & (node_bin == bin_index)
-            )
-            if matches.size != 1:
+            matches = indexed.get((stop_index, bin_index), [])
+            if len(matches) != 1:
                 raise ValueError(
                     "Expected exactly one centroid-in node for "
                     f"stop index {stop_index}, time-bin index {bin_index}; "
-                    f"found {matches.size}."
+                    f"found {len(matches)}."
                 )
             row.append(int(matches[0]))
         rows.append(tuple(row))
@@ -231,15 +240,16 @@ def _centroid_out_nodes(
     node_stop: np.ndarray,
     num_stops: int,
 ) -> tuple[int, ...]:
+    indexed: dict[int, list[int]] = {}
+    for node_index in np.flatnonzero(node_kind == NODE_KIND_CENTROID_OUT):
+        indexed.setdefault(int(node_stop[node_index]), []).append(int(node_index))
     result: list[int] = []
     for stop_index in range(num_stops):
-        matches = np.flatnonzero(
-            (node_kind == NODE_KIND_CENTROID_OUT) & (node_stop == stop_index)
-        )
-        if matches.size != 1:
+        matches = indexed.get(stop_index, [])
+        if len(matches) != 1:
             raise ValueError(
                 "Expected exactly one centroid-out node for "
-                f"stop index {stop_index}; found {matches.size}."
+                f"stop index {stop_index}; found {len(matches)}."
             )
         result.append(int(matches[0]))
     return tuple(result)

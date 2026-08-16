@@ -10,6 +10,7 @@ from typing import Callable
 from public_transportation.domain.scenario import Scenario
 
 from .classification import analyze_structural_zeros
+from ..canonical_timetable import build_canonical_timetable_index
 from .config import StructuralZeroConfig, load_structural_zero_config
 from .persistence import StructuralZeroOutputPaths, write_structural_zero_outputs
 from .progress import StructuralZeroProgress, emit_phase
@@ -53,7 +54,12 @@ def run_structural_zero_preprocessing(
     emit_phase(progress, "load_scenario", completed=1, started=started)
     phase_started = perf_counter()
     emit_phase(progress, "build_topology", completed=0)
-    topology = build_structural_zero_topology(scenario, config.assignment)
+    timetable_index = build_canonical_timetable_index(scenario)
+    topology = build_structural_zero_topology(
+        scenario,
+        config.assignment,
+        timetable_index=timetable_index,
+    )
     emit_phase(progress, "build_topology", completed=1, started=phase_started)
     analysis = analyze_structural_zeros(
         topology,
