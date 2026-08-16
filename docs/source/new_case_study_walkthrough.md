@@ -105,7 +105,8 @@ case_studies/<case_name>/
     ├── checkpoints/
     ├── fits/
     ├── diagnostics/
-    └── validation/
+    ├── validation/
+    └── logs/
 ```
 
 ### 2.1 Explicit file contract
@@ -232,24 +233,26 @@ use subcommands or flags, but the actions must remain independent:
 
 ```bash
 cd case_studies/<case_name>
-python run.py check
-python run.py od-universe
-python run.py time-discretization
-python run.py materialize-bins --candidate recommendation --reviewer "name"
-python run.py expand-od
-python run.py structural-zeros
-python run.py prepare
-python run.py preflight
-python run.py benchmark
-python run.py fit --method map --likelihood poisson
-python run.py fit --method map --likelihood negative_binomial
-python run.py diagnose --fit <fit-result>
-python run.py reconstruct --fit <accepted-fit>
-python run.py validate-detailed --od <reconstructed-od>
+python run.py check --json-progress
+python run.py od-universe --json-progress
+python run.py time-discretization --json-progress
+python run.py materialize-bins --candidate recommendation --reviewer "name" --json-progress
+python run.py expand-od --json-progress
+python run.py structural-zeros --json-progress
+python run.py prepare --json-progress
+python run.py preflight --json-progress
+python run.py benchmark --json-progress
+python run.py fit --method map --likelihood poisson --json-progress
+python run.py fit --method map --likelihood negative_binomial --json-progress
+python run.py diagnose --fit <fit-result> --json-progress
+python run.py reconstruct --fit <accepted-fit> --json-progress
+python run.py validate-detailed --od <reconstructed-od> --json-progress
 ```
 
 The commands above are run from the case-study root, after the template has
-been copied and reviewed.
+been copied and reviewed. The `--json-progress` flag is the default
+recommendation for every invocation; it is harmless on lightweight stages and
+essential when a stage may become expensive.
 
 If an existing custom hook uses names such as `--check`, `--prepare`,
 `--smoke-objective`, or `--diagnose-production`, map them to the corresponding
@@ -374,6 +377,61 @@ public examples:
 These examples are templates, not files to import blindly: replace their
 paths, service-day assumptions, production semantics, and measurement policy
 with decisions documented for the new case.
+
+### Progress reporting and ETA
+
+Treat progress reporting as the default for every potentially long operation.
+The generic runner accepts `--json-progress` on every stage, so use it for
+expansion, structural-zero preprocessing, preparation, preflight, benchmarking,
+and fitting (and keep it on the lightweight stages for a uniform interface):
+
+```bash
+cd case_studies/<case_name>
+uv run --frozen python run.py expand-od --json-progress
+uv run --frozen python run.py structural-zeros --json-progress
+uv run --frozen python run.py prepare --json-progress
+uv run --frozen python run.py preflight --json-progress
+uv run --frozen python run.py benchmark --json-progress
+uv run --frozen python run.py fit --method map --likelihood poisson --json-progress
+```
+
+With this flag, `stdout` contains one machine-readable JSON object per line.
+Capture `stderr` separately because warnings, diagnostics, and errors belong
+there. Preprocessing events report `phase`, `status`, `completed_units`,
+`total_units`, `elapsed_seconds`, `throughput_units_per_second`,
+`estimated_remaining_seconds`, `eta_confidence`, and `current_unit`.
+Estimation events additionally report `iteration`, `objective`, rolling
+iteration time (for example `iteration_seconds` and
+`rolling_average_iteration_seconds`), estimated remaining time
+(`estimated_remaining_seconds`), and expected completion time
+(`expected_completion_utc`). The first ETA is provisional; it becomes more
+reliable as completed work
+accumulates and the observed rate stabilizes. An ETA is not promised for an
+operation that has no meaningful completed-unit measure.
+
+For example, save the two streams on persistent case-study storage and watch
+the progress file from a second terminal. Run the first block from the
+case-study root:
+
+```bash
+mkdir -p results/logs
+
+JAX_ENABLE_X64=true uv run --frozen python run.py prepare --json-progress \
+  > results/logs/prepare.progress.jsonl \
+  2> results/logs/prepare.stderr.log
+```
+
+In a second terminal, also from the case-study root:
+
+```bash
+tail -f results/logs/prepare.progress.jsonl
+```
+
+The latest JSON event gives the current rate and estimated remaining time.
+A run is complete only after the command exits successfully and its final
+summary artifact exists. Progress cannot be enabled retroactively: a process
+started without `--json-progress` remains silent on `stdout`, so only its
+durable artifacts and final summary can be monitored.
 
 ### 2.3 Minimal case-project dependency file
 
@@ -998,7 +1056,7 @@ when the source file contains only a subset of the service day:
 
 ```bash
 cd case_studies/<case_name>
-JAX_ENABLE_X64=true uv run --frozen python run.py time-discretization
+JAX_ENABLE_X64=true uv run --frozen python run.py time-discretization --json-progress
 ```
 
 The command writes JSON only (under `results/audit/`). Review the JSON before choosing a production
@@ -1040,7 +1098,7 @@ half-open edges, and writes the CSV atomically:
 ```bash
 cd case_studies/<case_name>
 JAX_ENABLE_X64=true uv run --frozen python run.py materialize-bins \
-  --candidate recommendation --reviewer "<name>"
+  --candidate recommendation --reviewer "<name>" --json-progress
 ```
 
 This is the only step that turns the diagnostic JSON into a model input. The
@@ -1098,15 +1156,15 @@ the copied case directory before step 2.
 |---:|---|---|---|---|
 | 1 | `git rev-parse HEAD`; `uv lock --check`; package provenance check | local | no | Correct case revision and locked public package; stop on mismatch. |
 | 2 | `test -f adapter.py &&`<br>`test -f run.py &&`<br>`test -f config/case.toml &&`<br>`test -f config/time_discretization.toml &&`<br>`test -f config/reduced_od.toml &&`<br>`test -f config/structural_zeros.toml &&`<br>`test -f config/model.toml &&`<br>`test -f pyproject.toml` | local, from case-study root | no | Complete case setup; a missing path is a case-setup/documentation failure and identifies the missing path. |
-| 3 | `uv run --frozen python run.py check` | local | audit JSON and rejected-row files only | All source schemas and identities valid; stop on unexplained rows. |
-| 4 | `uv run --frozen python run.py od-universe` | local | pair universe and exclusion audit | Pair source, spatial level, and pair-level exclusions are reviewed. |
-| 5 | `uv run --frozen python run.py time-discretization` | local | recommendation JSON only | Candidate bins, horizon, and budget are explicit; stop if any input is unknown. |
-| 6 | `uv run --frozen python run.py materialize-bins --candidate recommendation --reviewer "<name>"` | local | reviewed `time_bins.csv` | Reviewer adopts one candidate; stop if the bin contract is not approved. |
-| 7 | `uv run --frozen python run.py expand-od` | local | OD-time cells and exclusion audit | Pair universe is expanded over approved bins; every exclusion has a reason. |
-| 8 | `uv run --frozen python run.py structural-zeros` | local first, Jed if large | structural-zero artifacts | Timetable feasibility and reason counts reviewed; stop on positive fixed conflict. |
-| 9 | `uv run --frozen python run.py prepare` | local first, Jed if large | persistent phase artifacts | All phases complete or compatibly reused; stop on missing/invalid phase. |
-| 10 | `uv run --frozen python run.py preflight` | local or Jed | preflight JSON only | Read-only artifacts, dimensions, dtype, and fingerprints agree. |
-| 11 | `uv run --frozen python run.py benchmark` | local or Jed | benchmark JSON only | Finite warm value/gradient and no value-change recompilation. |
+| 3 | `uv run --frozen python run.py check --json-progress` | local | audit JSON and rejected-row files only | All source schemas and identities valid; stop on unexplained rows. |
+| 4 | `uv run --frozen python run.py od-universe --json-progress` | local | pair universe and exclusion audit | Pair source, spatial level, and pair-level exclusions are reviewed. |
+| 5 | `uv run --frozen python run.py time-discretization --json-progress` | local | recommendation JSON only | Candidate bins, horizon, and budget are explicit; stop if any input is unknown. |
+| 6 | `uv run --frozen python run.py materialize-bins --candidate recommendation --reviewer "<name>" --json-progress` | local | reviewed `time_bins.csv` | Reviewer adopts one candidate; stop if the bin contract is not approved. |
+| 7 | `uv run --frozen python run.py expand-od --json-progress` | local | OD-time cells and exclusion audit | Pair universe is expanded over approved bins; every exclusion has a reason. |
+| 8 | `uv run --frozen python run.py structural-zeros --json-progress` | local first, Jed if large | structural-zero artifacts | Timetable feasibility and reason counts reviewed; stop on positive fixed conflict. |
+| 9 | `uv run --frozen python run.py prepare --json-progress` | local first, Jed if large | persistent phase artifacts | All phases complete or compatibly reused; stop on missing/invalid phase. |
+| 10 | `uv run --frozen python run.py preflight --json-progress` | local or Jed | preflight JSON only | Read-only artifacts, dimensions, dtype, and fingerprints agree. |
+| 11 | `uv run --frozen python run.py benchmark --json-progress` | local or Jed | benchmark JSON only | Finite warm value/gradient and no value-change recompilation. |
 | 12 | `sbatch scripts/submit_chain.sh` | Jed only | checkpoints, fits, logs | Submit estimation only after stages 1–11 pass. |
 
 If step 2 returns a nonzero status, identify the missing path explicitly before
@@ -1139,7 +1197,7 @@ Run locally first:
 ```bash
 cd case_studies/<case_name>
 JAX_ENABLE_X64=true uv run --frozen python \
-  run.py check
+  run.py check --json-progress
 ```
 
 This stage must not construct expensive routing artifacts. It should:
@@ -1180,7 +1238,7 @@ Run this stage before choosing time bins:
 
 ```bash
 cd case_studies/<case_name>
-JAX_ENABLE_X64=true uv run --frozen python run.py od-universe
+JAX_ENABLE_X64=true uv run --frozen python run.py od-universe --json-progress
 ```
 
 The stage validates `inputs/od_pairs.csv` when the case declares
@@ -1207,10 +1265,10 @@ chosen bins. Then expand the immutable pair universe over those approved bins:
 
 ```bash
 cd case_studies/<case_name>
-JAX_ENABLE_X64=true uv run --frozen python run.py time-discretization
+JAX_ENABLE_X64=true uv run --frozen python run.py time-discretization --json-progress
 JAX_ENABLE_X64=true uv run --frozen python run.py materialize-bins \
-  --candidate recommendation --reviewer "<name>"
-JAX_ENABLE_X64=true uv run --frozen python run.py expand-od
+  --candidate recommendation --reviewer "<name>" --json-progress
+JAX_ENABLE_X64=true uv run --frozen python run.py expand-od --json-progress
 ```
 
 For an independent case, `time-discretization` requires the current
@@ -1315,7 +1373,7 @@ Run:
 ```bash
 cd case_studies/<case_name>
 JAX_ENABLE_X64=true uv run --frozen python \
-  run.py prepare
+  run.py prepare --json-progress
 ```
 
 The adapter should call `prepare_reduced_od_artifacts` with an explicit
@@ -1667,12 +1725,15 @@ the structural-zero preprocessor:
 ```bash
 uv run --frozen python \
   docs/source/examples/geneva_gtfs/pre_processing/run_structural_zeros.py \
-  --no-progress
+  --progress
 ```
 
 The command writes the TOML-declared outputs under
 `docs/source/examples/geneva_gtfs/pre_processing/results/structural_zeros/`
-and prints reason counts, retained/free counts, and the output folder. The
+and prints progress using its helper-specific `--progress` option, followed by
+reason counts, retained/free counts, and the output folder. This helper is not
+the generic case runner, so do not substitute `--json-progress` for its
+supported option. The
 expected committed snapshot has 15,128 candidate cells, 15,032 fixed zeroes,
 and 96 free cells; a positive fixed value conflicting with a structural zero
 must stop the run.
@@ -1692,7 +1753,7 @@ Run this before every new fit environment, especially on Jed:
 ```bash
 cd case_studies/<case_name>
 JAX_ENABLE_X64=true uv run --frozen python \
-  run.py preflight
+  run.py preflight --json-progress
 ```
 
 The stage should call `preflight_reduced_od_j0` (for the minimal model) or the
@@ -1711,6 +1772,14 @@ If incompatible, rerun preparation with `reuse_or_build`; do not copy a
 downstream artifact directory from another configuration.
 
 ## 11. Stage 7 — Objective and gradient admission benchmark
+
+Run the generic benchmark with progress enabled:
+
+```bash
+cd case_studies/<case_name>
+JAX_ENABLE_X64=true uv run --frozen python \
+  run.py benchmark --json-progress
+```
 
 Before optimization, benchmark the exact initial problem:
 
@@ -1748,6 +1817,12 @@ dispersion and is useful for localizing whether an unstable negative-binomial
 fit is driven by dispersion. It is not automatically the final scientific
 model.
 
+```bash
+cd case_studies/<case_name>
+JAX_ENABLE_X64=true uv run --frozen python \
+  run.py fit --method map --likelihood poisson --json-progress
+```
+
 Verify finite values, projected-gradient convergence, sensible production
 totals, non-pathological time/transfer coefficients, inactive accidental
 bounds, and residual structure.
@@ -1758,6 +1833,12 @@ Fit the same response and demand structure with the negative-binomial
 observation model. Compare objective, deviance, residuals, parameter stability,
 and fitted dispersion. Dispersion at its numerical floor or an extremely broad
 variance is a warning, not evidence of a successful model.
+
+```bash
+cd case_studies/<case_name>
+JAX_ENABLE_X64=true uv run --frozen python \
+  run.py fit --method map --likelihood negative_binomial --json-progress
+```
 
 ### 10.3 MAP and prior sensitivity
 
@@ -1808,7 +1889,7 @@ before resuming. Never edit checkpoint JSON by hand.
 From the case-study repository on Jed:
 
 ```bash
-mkdir -p case_studies/<case_name>/results
+mkdir -p case_studies/<case_name>/results/logs
 git rev-parse HEAD
 git status --short
 uv sync --frozen
@@ -1840,7 +1921,8 @@ threads. Adapt `<ACCOUNT>`, `<PARTITION>`, resources, and paths:
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=04:00:00
-#SBATCH --output=case_studies/<case_name>/results/slurm-%x-%j.out
+#SBATCH --output=case_studies/<case_name>/results/logs/%x-%j.out
+#SBATCH --error=case_studies/<case_name>/results/logs/%x-%j.err
 
 set -euo pipefail
 
@@ -1863,14 +1945,19 @@ export UV_CACHE_DIR="${TMPDIR:-/tmp}/uv-cache"
 mkdir -p "$MPLCONFIGDIR" "$XDG_CACHE_HOME" "$UV_CACHE_DIR"
 
 /usr/bin/time -v "$UV_EXECUTABLE" run --frozen python \
-  case_studies/<case_name>/run.py <stage-and-options>
+  case_studies/<case_name>/run.py <stage-and-options> --json-progress
 
 sstat --jobs="${SLURM_JOB_ID}.batch" \
   --format=JobID,AveCPU,MaxRSS,MaxVMSize 2>/dev/null || true
 ```
 
-Store reusable artifacts and checkpoints on persistent project storage, not
-`$TMPDIR`. Use `$TMPDIR` only for disposable caches. Every wrapper should print
+Replace `<stage-and-options>` with the requested stage and its options; keep
+the trailing `--json-progress` exactly once. The output and error directives
+above therefore produce `results/logs/<stage>-<job-id>.out` and the matching
+`.err` file on persistent storage.
+
+Store reusable artifacts, checkpoints, and progress logs on persistent project
+storage, not `$TMPDIR`. Use `$TMPDIR` only for disposable caches. Every wrapper should print
 the case-study revision, installed package version and locked source, resolved
 config fingerprint, job ID, host, allocation, and output directory before
 substantive work starts. A suitable hardware-probe template is available in
@@ -1949,8 +2036,15 @@ Useful commands are:
 squeue -u "$USER" -o '%.18i %.28j %.2t %.12M %.12l %.6D %R'
 scontrol show job <job-id>
 sacct -j <job-id> --format=JobID,State,Elapsed,AllocCPUS,MaxRSS,ExitCode
-tail -f case_studies/<case_name>/results/slurm-<job>-<id>.out
+tail -f case_studies/<case_name>/results/logs/<stage>-<job-id>.out
 ```
+
+The common wrapper passes `--json-progress` and Slurm writes its machine-
+readable `stdout` to the persistent `results/logs/<stage>-<job-id>.out` file
+and diagnostic `stderr` to the corresponding `.err` file. Monitor the progress
+stream with the `tail -f` command above. Do not place these logs in `$TMPDIR`,
+because they are needed to diagnose a long or interrupted run after the
+allocation ends.
 
 Interpret them carefully:
 
@@ -2068,6 +2162,17 @@ git diff --check
 ## 19. Final acceptance checklist
 
 A case is ready to report only when all applicable boxes can be checked.
+
+### Progress and logging
+
+- [ ] No potentially long `run.py` example omits `--json-progress`.
+- [ ] Resume and fresh expansion commands include `--json-progress`.
+- [ ] Progress logs are stored on persistent case/Jed storage, outside
+      temporary directories.
+- [ ] Machine-readable `stdout` and diagnostic `stderr` are kept separate.
+- [ ] Documentation does not promise an ETA for an operation that cannot
+      provide a meaningful completed-unit measure.
+- [ ] `git diff --check` passes.
 
 ### Reproducibility
 

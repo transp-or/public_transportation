@@ -32,7 +32,7 @@ test -f pyproject.toml
 
 uv lock
 uv sync --frozen
-JAX_ENABLE_X64=true uv run --frozen python run.py check
+JAX_ENABLE_X64=true uv run --frozen python run.py check --json-progress
 ```
 
 The template intentionally does not include a lockfile: the case owner must
@@ -74,20 +74,27 @@ canonical CSV files and the
 Run exactly one stage per invocation:
 
 ```bash
-JAX_ENABLE_X64=true uv run --frozen python run.py od-universe
-JAX_ENABLE_X64=true uv run --frozen python run.py time-discretization
+JAX_ENABLE_X64=true uv run --frozen python run.py od-universe --json-progress
+JAX_ENABLE_X64=true uv run --frozen python run.py time-discretization --json-progress
 JAX_ENABLE_X64=true uv run --frozen python run.py materialize-bins \
-  --candidate recommendation --reviewer "case owner"
-JAX_ENABLE_X64=true uv run --frozen python run.py expand-od
-JAX_ENABLE_X64=true uv run --frozen python run.py structural-zeros
-JAX_ENABLE_X64=true uv run --frozen python run.py prepare
-JAX_ENABLE_X64=true uv run --frozen python run.py preflight
-JAX_ENABLE_X64=true uv run --frozen python run.py benchmark
-JAX_ENABLE_X64=true uv run --frozen python run.py fit --method ml --likelihood poisson
-JAX_ENABLE_X64=true uv run --frozen python run.py diagnose --fit results/fits/ml_poisson.json
-JAX_ENABLE_X64=true uv run --frozen python run.py reconstruct --fit results/fits/ml_poisson.json
-JAX_ENABLE_X64=true uv run --frozen python run.py validate-detailed --od results/validation/reconstructed_od.json
+  --candidate recommendation --reviewer "case owner" --json-progress
+JAX_ENABLE_X64=true uv run --frozen python run.py expand-od --json-progress
+JAX_ENABLE_X64=true uv run --frozen python run.py structural-zeros --json-progress
+JAX_ENABLE_X64=true uv run --frozen python run.py prepare --json-progress
+JAX_ENABLE_X64=true uv run --frozen python run.py preflight --json-progress
+JAX_ENABLE_X64=true uv run --frozen python run.py benchmark --json-progress
+JAX_ENABLE_X64=true uv run --frozen python run.py fit --method ml --likelihood poisson --json-progress
+JAX_ENABLE_X64=true uv run --frozen python run.py diagnose --fit results/fits/ml_poisson.json --json-progress
+JAX_ENABLE_X64=true uv run --frozen python run.py reconstruct --fit results/fits/ml_poisson.json --json-progress
+JAX_ENABLE_X64=true uv run --frozen python run.py validate-detailed --od results/validation/reconstructed_od.json --json-progress
 ```
+
+Use `--json-progress` for every potentially long stage. It writes one JSON
+object per line to `stdout`; keep `stderr` separate for warnings and errors.
+The first ETA is provisional and improves as completed work accumulates. A
+stage is complete only after it exits successfully and its final summary
+artifact exists. Progress cannot be enabled retroactively on a process that
+was started without the flag.
 
 The `check` command plus the following stages through `benchmark` are the
 admission path. A failed stage stops the
@@ -118,6 +125,30 @@ To discard the matching checkpoint deliberately, archive it and start over:
 ```bash
 JAX_ENABLE_X64=true uv run --frozen python run.py expand-od --fresh --json-progress
 ```
+
+For a long local stage, keep progress and diagnostics in separate persistent
+logs. Run this block from the case-study root:
+
+```bash
+mkdir -p results/logs
+
+JAX_ENABLE_X64=true uv run --frozen python run.py prepare --json-progress \
+  > results/logs/prepare.progress.jsonl \
+  2> results/logs/prepare.stderr.log
+```
+
+In a second terminal, also from the case-study root:
+
+```bash
+tail -f results/logs/prepare.progress.jsonl
+```
+
+The latest JSON event reports the current phase, throughput, and estimated
+remaining time. For Slurm, retain the same `--json-progress` flag in the
+wrapper and configure its output/error directives to direct `stdout` to
+`results/logs/<stage>-<job-id>.out` and `stderr` to the corresponding `.err`
+file. Monitor progress with `tail -f results/logs/<stage>-<job-id>.out`. Do not
+store progress logs in temporary directories.
 
 An existing checkpoint is never reused implicitly. `manifest.json` records the
 package/configuration/OD/bin fingerprints, chunk checksums, completed counts,
@@ -192,8 +223,8 @@ repository contains configuration and data, not an installable Python package,
 so `uv sync` must not attempt automatic discovery under `config/` or
 `results/`. After replacing the placeholder package revision and generating
 the lockfile, verify the setup with `uv lock`, `uv sync --frozen`, and
-`JAX_ENABLE_X64=true uv run --frozen python run.py check` before changing any
-scientific inputs.
+`JAX_ENABLE_X64=true uv run --frozen python run.py check --json-progress`
+before changing any scientific inputs.
 
 ## Configuration contract
 
