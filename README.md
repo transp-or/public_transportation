@@ -42,6 +42,14 @@ Scalable global-product policies, restricted update schedules, and deferred
 validation are documented in
 [bounded_block_coordinate_pilots.md](docs/source/bounded_block_coordinate_pilots.md).
 
+The operational runbook for a new case study—including current
+direct-scheduled preparation, preflight, checkpointed fitting, Jed scheduling,
+and progress logs—is
+[new_case_study_walkthrough.md](docs/source/new_case_study_walkthrough.md).
+Reuse and migration rules for results produced by the former workflow are
+documented separately in
+[legacy_case_study_migration.md](docs/source/legacy_case_study_migration.md).
+
 Topology-driven structural-zero detection is configured entirely through TOML.
 Its rules, valid parameter values, conflict policy, audit artifacts, and Python
 workflow are documented in
