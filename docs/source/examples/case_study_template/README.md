@@ -46,6 +46,29 @@ review the contracts before running `uv lock`; the copied values are not a
 scientific approval. If the structural check fails, report the exact missing
 path as `CASE-SETUP/DOCUMENTATION FAILURE` before continuing.
 
+## File contract and filename conventions
+
+The generic scenario loader expects the following stems inside the directory
+configured by `[paths].scenario_directory`: `metadata.json` (exact JSON
+filename), and `stops`, `lines`, and `time_bins` with one of the supported
+extensions `.csv`, `.parquet`, or `.json`. `trips` and `stop_times` are an
+optional pair; if one is present, the other must be present too. For example,
+the template uses `inputs/scenario/stops.csv`, but that path is not a universal
+package requirement—the directory is configurable and the extension may vary.
+
+The measurement path is configurable through `[paths].measurements`.
+`inputs/measurements_boarding_alighting.csv` is only the template's example
+filename. The independent OD workflow does not require `demand.csv`,
+`demand_flat.csv`, or `demand_informed.csv`; those belong to legacy or
+case-specific workflows. A pair-only OD file is required only when
+`[od_universe].source = "file"`, and an external pair prior is required only
+when `[prior_demand].source = "external_file"`.
+
+The exact generated paths and their producing/consuming stages are listed in
+the public case-study walkthrough, including the distinction between final
+canonical CSV files and the
+`results/checkpoints/od_time_expansion/<fingerprint>/` checkpoint files.
+
 ## Independent OD-universe stages
 
 Run exactly one stage per invocation:
@@ -118,8 +141,9 @@ The template keeps that directory ignored; commit reports and checkpoints from
 the case repository only when the case owner explicitly decides to archive
 them.
 
-`materialize-bins` writes a reviewed candidate under
-`results/generated_inputs/` together with `time_bins_manifest.json`; it never
+`materialize-bins` writes a reviewed candidate to
+`results/generated_inputs/time_bins.csv` together with
+`results/generated_inputs/time_bins_manifest.json`; it never
 overwrites the scenario's source `time_bins.csv`. The manifest binds the bins
 to the current configuration, package revision, OD-universe fingerprint and
 retained count, time-discretization policy, source checksums, recommendation,
