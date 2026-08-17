@@ -745,6 +745,54 @@ Only after `prior_demand.csv` has been generated and this audit has been
 reviewed should the strict `check` stage start. Structural-zero preprocessing
 then operates on this generated prior.
 
+#### One scheduled-feasibility contract for bootstrap and check
+
+`bootstrap-prior` and the later `check`/feature-construction path use the same
+`ScheduledFeasibilityContract`. Its version, fingerprint, and four limits
+(`maximum_transfers`, `maximum_initial_wait_seconds`,
+`maximum_journey_seconds`, and `maximum_waiting_seconds`) are recorded in the
+expansion configuration and in the support audit. This is deliberately a
+single timetable-indexed evaluator: initial departures, transfer waits,
+journey limits, timetable indexing, and stop identity cannot silently diverge
+between stages.
+
+The check stage writes
+`results/audit/feasibility_support.json`. It reports the generated and retained
+cell counts, supported and unsupported retained cells, cells present only in
+the bootstrap support or only in feature support, counts by reason and time
+bin, and the scenario, timetable, time-bin, bootstrap, and contract
+fingerprints. Fixed cells that have no scheduled path are explicitly counted
+as `unsupported_fixed_cells` and written, together with unsupported free-cell
+diagnostics, to `results/audit/feasibility_support_cells.jsonl`; unsupported
+free cells are a hard failure. Any non-zero support-set mismatch is a public
+implementation failure and stops the workflow—it must not be hidden by
+dropping rows or disabling the exception.
+
+Do not reuse a prior-demand CSV after any change to these feasibility semantics
+or to the timetable identity. Regenerate it from a fresh identity-specific
+checkpoint, then rerun `check`; the support audit is a required stage report
+and must be reviewed before structural-zero analysis or estimation.
+
+The stable audit schema is:
+
+```text
+schema_version, status, support_domain,
+contract{version, fingerprint, maximum_transfers,
+         maximum_initial_wait_seconds, maximum_journey_seconds,
+         maximum_waiting_seconds},
+scenario_fingerprint, timetable_fingerprint, time_bins_fingerprint,
+bootstrap_expansion_fingerprint, bootstrap_configuration_fingerprint,
+bootstrap_package_revision, od_universe_fingerprint, od_layout_fingerprint,
+total_generated_prior_cells, retained_cells, evaluated_retained_cells,
+supported_cells, unsupported_retained_cells, unsupported_free_cells,
+unsupported_fixed_cells, cells_present_only_in_bootstrap_support,
+cells_present_only_in_feature_construction_support,
+counts_by_reason, counts_by_time_bin, unsupported_cells_path, audit_path
+```
+
+Each line of `feasibility_support_cells.jsonl` contains an OD/time key,
+`classification` (`unsupported_free` or `fixed`), and the evaluator `reason`.
+
 ## 1. Current package contract
 
 The current workflow uses the direct-scheduled assignment and estimation APIs.
@@ -1947,7 +1995,7 @@ by the stage and must be fingerprinted before a later stage consumes it.
 | count recommendation | **Example:** `inputs/measurements.csv`; **example settings:** resolution, horizon, `num_od_pairs`, and `max_od_cells` passed to `time_discretization` | `results/time_discretization/recommendation.json`; retain the input checksum and selected candidate | JSON `status = "ok"` and a valid `recommendation`; `blocked` is a stop condition | no; rerun after a deliberate input/policy change |
 | bin materialization | **Generated:** reviewed recommendation JSON; **example output:** `results/time_discretization/time_bins.reviewed.csv` | reviewed three-column CSV; later, the **convention** scenario input `inputs/scenario/time_bins.csv` after explicit adoption | materializer succeeds and the selected candidate is valid; scenario `time_bins.csv` is not replaced implicitly | no |
 | `bootstrap-prior` | **Convention:** approved `inputs/scenario/time_bins.csv`; **example:** network and explicit policy/resource values in `config/case.toml`; no demand file is required yet | `results/checkpoints/prior_demand/<expansion-contract-fingerprint>/manifest.json`, immutable `chunk-*.jsonl`, `progress.json`; `inputs/scenario/prior_demand.csv`; `results/audit/prior_demand_generation.json`; `results/manifests/bootstrap-prior.json`; `results/logs/bootstrap-prior.jsonl` | manifest and stage summary `status = "completed"`; checkpoint is complete, audit exists, and output checksum is present. `interrupted`, `failed`, and `deadline_stopped` stop the chain | yes, only with `bootstrap-prior --resume` and matching identity; a fresh run refuses an existing checkpoint |
-| `check` | **Convention:** `config/case.toml`, `config/structural_zeros.toml`, `config/model.toml`; **generated:** `inputs/scenario/prior_demand.csv` and its audit; **example:** other paths selected by those files under `inputs/` | `results/manifests/check.json`, `results/logs/check.jsonl`, and audit fingerprints | manifest `status = "completed"`, all fingerprints present | no |
+| `check` | **Convention:** `config/case.toml`, `config/structural_zeros.toml`, `config/model.toml`; **generated:** `inputs/scenario/prior_demand.csv` and its audit; **example:** other paths selected by those files under `inputs/` | `results/manifests/check.json`, `results/logs/check.jsonl`, `results/audit/feasibility_support.json`, `results/audit/feasibility_support_cells.jsonl`, and audit fingerprints | manifest `status = "completed"`, support audit `status = "completed"`, zero unsupported free/bootstrap-only cells, all fingerprints present | no |
 | `structural-zeros` | **Convention:** `config/structural_zeros.toml`; **generated:** scenario prior demand; **example:** existing fixed-demand path selected by it | `results/structural_zeros/fixed_demand.csv`, `results/structural_zeros/structural_zero_audit.csv`, `results/structural_zeros/structural_zero_summary.json`, `results/structural_zeros/fingerprints.json`, `results/structural_zeros/resolved_config.toml`, `results/manifests/structural-zeros.json`, `results/logs/structural-zeros.jsonl` | service returns without exception; summary and fingerprints exist | safe to rerun with the same roots |
 | `prepare` | **Generated:** structural-zero fixed demand (or **example:** reviewed fixed-demand file when the stage is disabled); **convention:** scenario/timetable and measurement contracts; **example:** resource limits in TOML | `results/artifacts/<identity>/manifest.json`, `blocks/block-*.npz`, `fixed_measurement_offset.npy`; `results/checkpoints/<identity>/`; stage manifest/log | artifact `complete = true`; routing `status = "completed"` | yes, only from a matching checkpoint |
 | `preflight` | **Generated:** complete preparation artifact; **example:** model settings and initial raw parameters | `results/manifests/preflight.json`, `results/logs/preflight.jsonl`, and optional **example** copy under `results/preflight/` | `completed_phase = recommendation` | no |

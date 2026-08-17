@@ -126,6 +126,33 @@ semantics, policies, fingerprints, retained/excluded counts, package revision,
 and output checksum. Only after this stage succeeds and the audit has been
 reviewed should the strict check stage be run.
 
+## Shared scheduled-feasibility contract
+
+The bootstrap expansion and the check-stage feature construction deliberately
+use one `ScheduledFeasibilityContract` over the canonical timetable index.
+The contract covers initial-departure interpretation, transfer handling,
+maximum transfers, initial waiting, journey duration, waiting between trips,
+and stop identity. Its version and fingerprint are included in the expansion
+configuration and in:
+
+```text
+results/audit/feasibility_support.json
+```
+
+That support audit reports total generated prior cells, retained cells,
+supported cells, unsupported retained cells, bootstrap-only and feature-only
+cells, counts by reason and time bin, and all relevant scenario, timetable,
+time-bin, bootstrap, and contract fingerprints. Individual unsupported cells
+are streamed to `results/audit/feasibility_support_cells.jsonl` with their
+classification and reason, so large cases do not require a support set in
+memory. Unsupported free cells stop the workflow with a diagnostic; unsupported
+fixed cells are explicitly classified in the audit rather than silently
+dropped. A mismatch is a public
+implementation failure, not a case-data warning. If the timetable or any
+feasibility limit changes, discard neither files nor rows silently: regenerate
+the prior from a fresh identity-specific checkpoint and rerun `check` before
+continuing.
+
 ## Resumable prior bootstrap
 
 The bootstrap stage is designed for a large OD--time universe. It uses the

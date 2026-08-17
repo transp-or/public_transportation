@@ -117,6 +117,17 @@ def test_direct_scheduled_template_complete_public_fixture(tmp_path: Path) -> No
     assert prior_audit["prior_source"] == "all_ones"
     assert prior_audit["expansion"]["retained_cell_count"] > 0
     assert prior_audit["output_sha256"]
+    support_audit = json.loads(
+        (case / "results/audit/feasibility_support.json").read_text(encoding="utf-8")
+    )
+    assert support_audit["status"] == "completed"
+    assert support_audit["unsupported_retained_cells"] == 0
+    assert support_audit["cells_present_only_in_bootstrap_support"] == 0
+    assert support_audit["cells_present_only_in_feature_construction_support"] == 0
+    assert support_audit["contract"]["fingerprint"] == prior_audit["expansion"]["configuration"]["feasibility_contract_fingerprint"]
+    support_cells = case / "results/audit/feasibility_support_cells.jsonl"
+    assert support_audit["unsupported_cells_path"] == str(support_cells)
+    assert support_cells.is_file()
 
 
 def test_check_writes_initial_progress_before_slow_context_loading(tmp_path: Path) -> None:

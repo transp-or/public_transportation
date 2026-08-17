@@ -13,6 +13,7 @@ PUBLIC_EXAMPLE_APPLICABILITY = {
     "simple_example_02": "complete_regularized_fixed_routing_block_map",
     "geneva_gtfs": "structural_preflight_bounded_anytime_and_slow_sweep",
     "case_study_template": "generic_configuration_driven_case_study_smoke_workflow",
+    "direct_scheduled_case_template": "direct_scheduled_checkpointed_prior_and_shared_feasibility_workflow",
 }
 
 

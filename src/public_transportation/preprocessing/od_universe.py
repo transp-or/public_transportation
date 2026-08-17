@@ -377,6 +377,7 @@ def _expansion_rows_for_pair(
     timetable_policy: TimetablePolicy,
     timetable_feasibility: Callable[[CandidateODPair, tuple[str, int, int]], bool] | None,
     feasibility_index: TimetableFeasibilityIndex | None,
+    feasibility_contract: ScheduledFeasibilityContract | None,
     timetable_index: "CanonicalTimetableIndex | None",
     feasible_destinations_by_origin_period: Mapping[
         tuple[str, str], frozenset[str]
@@ -425,14 +426,19 @@ def _expansion_rows_for_pair(
                     (origin, period[0])
                 ]
             elif feasibility_index is not None:
-                feasible = feasibility_index.is_feasible(
-                    pair,
-                    period,
-                    maximum_transfers=maximum_transfers,
-                    maximum_initial_wait_seconds=maximum_initial_wait_seconds,
-                    maximum_waiting_seconds=maximum_waiting_seconds,
-                    maximum_journey_seconds=maximum_journey_seconds,
-                )
+                if feasibility_contract is None:
+                    feasible = feasibility_index.is_feasible(
+                        pair,
+                        period,
+                        maximum_transfers=maximum_transfers,
+                        maximum_initial_wait_seconds=maximum_initial_wait_seconds,
+                        maximum_waiting_seconds=maximum_waiting_seconds,
+                        maximum_journey_seconds=maximum_journey_seconds,
+                    )
+                else:
+                    feasible = feasibility_contract.is_feasible(
+                        feasibility_index, pair, period
+                    )
             else:
                 feasible = _timetable_feasible(
                     scenario,
@@ -495,6 +501,11 @@ def run_candidate_od_time_expansion(
         raise ValueError("checkpoint_directory is required")
     checkpoint = Path(checkpoint_directory).expanduser().resolve()
     checkpoint.mkdir(parents=True, exist_ok=True)
+    feasibility_contract = ScheduledFeasibilityContract.from_mapping(config)
+    config.setdefault("feasibility_contract_version", feasibility_contract.version)
+    config.setdefault(
+        "feasibility_contract_fingerprint", feasibility_contract.fingerprint
+    )
     expansion_fingerprint = expansion_contract_fingerprint(universe, bins, config)
     manifest_path = checkpoint / "manifest.json"
     progress_path = checkpoint / "progress.json"
@@ -569,6 +580,7 @@ def run_candidate_od_time_expansion(
             universe=universe,
             bins=bins,
             feasibility_index=feasibility_index,
+            feasibility_contract=feasibility_contract,
             **limits,
         )
     contract = {
@@ -705,6 +717,7 @@ def run_candidate_od_time_expansion(
                         reachable=reachable,
                         timetable_feasibility=timetable_feasibility,
                         feasibility_index=feasibility_index,
+                        feasibility_contract=feasibility_contract,
                         timetable_policy=policy,  # type: ignore[arg-type]
                         timetable_index=timetable_index,
                         feasible_destinations_by_origin_period=(
@@ -836,6 +849,92 @@ class PriorCheckpointMaterializationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ScheduledFeasibilityContract:
+    """Single feasibility policy shared by OD expansion and feature support.
+
+    The contract intentionally contains only timetable-feasibility semantics;
+    candidate-universe rules (for example directed reachability) remain in the
+    surrounding OD-universe contract.  Its fingerprint is persisted with
+    support audits so a prior cannot be reused after a semantic change.
+    """
+
+    maximum_transfers: int = 2
+    maximum_initial_wait_seconds: int = 3600
+    maximum_journey_seconds: int = 7200
+    maximum_waiting_seconds: int = 3600
+    version: int = 1
+
+    def __post_init__(self) -> None:
+        if self.maximum_transfers < 0 or self.maximum_initial_wait_seconds < 0:
+            raise ValueError("transfer and initial-wait limits cannot be negative")
+        if self.maximum_journey_seconds <= 0 or self.maximum_waiting_seconds < 0:
+            raise ValueError("journey time must be positive and waiting time non-negative")
+
+    @property
+    def fingerprint(self) -> str:
+        return _sha256_payload(
+            {
+                "version": self.version,
+                "maximum_transfers": self.maximum_transfers,
+                "maximum_initial_wait_seconds": self.maximum_initial_wait_seconds,
+                "maximum_journey_seconds": self.maximum_journey_seconds,
+                "maximum_waiting_seconds": self.maximum_waiting_seconds,
+            }
+        )
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, object]) -> "ScheduledFeasibilityContract":
+        return cls(
+            maximum_transfers=int(values.get("maximum_transfers", 2)),
+            maximum_initial_wait_seconds=int(
+                values.get("maximum_initial_wait_seconds", 3600)
+            ),
+            maximum_journey_seconds=int(values.get("maximum_journey_seconds", 7200)),
+            maximum_waiting_seconds=int(values.get("maximum_waiting_seconds", 3600)),
+            version=int(values.get("feasibility_contract_version", 1)),
+        )
+
+    def path_metrics(
+        self,
+        index: "TimetableFeasibilityIndex",
+        *,
+        origin: str,
+        period: tuple[str, int, int],
+    ) -> Mapping[str, "TimetablePathMetrics"]:
+        return index.path_metrics(
+            origin,
+            period,
+            maximum_transfers=self.maximum_transfers,
+            maximum_initial_wait_seconds=self.maximum_initial_wait_seconds,
+            maximum_waiting_seconds=self.maximum_waiting_seconds,
+            maximum_journey_seconds=self.maximum_journey_seconds,
+        )
+
+    def is_feasible(
+        self,
+        index: "TimetableFeasibilityIndex",
+        pair: CandidateODPair,
+        period: tuple[str, int, int],
+    ) -> bool:
+        origin = index.physical_stop_mapping.get(pair.origin_stop_id, pair.origin_stop_id)
+        destination = index.physical_stop_mapping.get(
+            pair.destination_stop_id, pair.destination_stop_id
+        )
+        return destination in self.path_metrics(index, origin=origin, period=period)
+
+
+@dataclass(frozen=True, slots=True)
+class TimetablePathMetrics:
+    """Minimum path metrics produced by :class:`ScheduledFeasibilityContract`."""
+
+    minimum_transfers: int
+    minimum_initial_wait_seconds: int
+    minimum_journey_seconds: int
+    feasible_departure_count: int
+    earliest_arrival_seconds: int
+
+
+@dataclass(frozen=True, slots=True)
 class TimetableFeasibilityIndex:
     """Reusable schedule indexes for OD--time feasibility checks.
 
@@ -901,7 +1000,7 @@ class TimetableFeasibilityIndex:
     ) -> bool:
         origin = self.physical_stop_mapping.get(pair.origin_stop_id, pair.origin_stop_id)
         destination = self.physical_stop_mapping.get(pair.destination_stop_id, pair.destination_stop_id)
-        return destination in self.feasible_destinations(
+        return destination in self.path_metrics(
             origin,
             period,
             maximum_transfers=maximum_transfers,
@@ -927,6 +1026,28 @@ class TimetableFeasibilityIndex:
         can therefore classify all destinations in that origin/time slice
         without repeating the same timetable traversal.
         """
+        return frozenset(
+            self.path_metrics(
+                origin,
+                period,
+                maximum_transfers=maximum_transfers,
+                maximum_initial_wait_seconds=maximum_initial_wait_seconds,
+                maximum_waiting_seconds=maximum_waiting_seconds,
+                maximum_journey_seconds=maximum_journey_seconds,
+            )
+        )
+
+    def path_metrics(
+        self,
+        origin: str,
+        period: tuple[str, int, int],
+        *,
+        maximum_transfers: int,
+        maximum_initial_wait_seconds: int,
+        maximum_waiting_seconds: int,
+        maximum_journey_seconds: int,
+    ) -> Mapping[str, TimetablePathMetrics]:
+        """Return feasible destinations and metrics under one exact contract."""
         origin = self.physical_stop_mapping.get(origin, origin)
         start, end = period[1], period[2]
         origin_departures = self.departures_by_stop.get(origin, ())
@@ -943,7 +1064,7 @@ class TimetableFeasibilityIndex:
             for trip_id, index, departure in first_candidates
         )
         visited: set[tuple[str, int, int]] = set()
-        destinations: set[str] = set()
+        destination_metrics: dict[str, dict[str, Any]] = {}
         while queue:
             trip_id, board_index, first_departure, transfers = queue.popleft()
             state_key = (trip_id, board_index, transfers)
@@ -957,7 +1078,21 @@ class TimetableFeasibilityIndex:
                 if arrival - first_departure > maximum_journey_seconds:
                     break
                 stop = self.physical_stop_mapping.get(str(alight.stop_id), str(alight.stop_id))
-                destinations.add(stop)
+                candidate = destination_metrics.setdefault(
+                    stop,
+                    {
+                        "transfers": [],
+                        "initial_wait": [],
+                        "journey": [],
+                        "departures": set(),
+                        "arrivals": [],
+                    },
+                )
+                candidate["transfers"].append(transfers)
+                candidate["initial_wait"].append(first_departure - start)
+                candidate["journey"].append(arrival - first_departure)
+                candidate["departures"].add((trip_id, board_index, first_departure))
+                candidate["arrivals"].append(arrival)
                 if transfers >= maximum_transfers:
                     continue
                 departures = self.departures_by_stop.get(stop, ())
@@ -968,7 +1103,16 @@ class TimetableFeasibilityIndex:
                         break
                     if next_trip_id != trip_id:
                         queue.append((next_trip_id, next_index, first_departure, transfers + 1))
-        return frozenset(destinations)
+        return {
+            destination: TimetablePathMetrics(
+                minimum_transfers=min(values["transfers"]),
+                minimum_initial_wait_seconds=min(values["initial_wait"]),
+                minimum_journey_seconds=min(values["journey"]),
+                feasible_departure_count=len(values["departures"]),
+                earliest_arrival_seconds=min(values["arrivals"]),
+            )
+            for destination, values in destination_metrics.items()
+        }
 
 
 def _precompute_temporal_feasibility(
@@ -980,6 +1124,7 @@ def _precompute_temporal_feasibility(
     maximum_initial_wait_seconds: int,
     maximum_waiting_seconds: int,
     maximum_journey_seconds: int,
+    feasibility_contract: ScheduledFeasibilityContract | None = None,
 ) -> dict[tuple[str, str], frozenset[str]]:
     """Evaluate each distinct origin/time slice once.
 
@@ -988,6 +1133,12 @@ def _precompute_temporal_feasibility(
     reached by the same search state, so this cache preserves the exact
     per-pair result while eliminating repeated traversal work.
     """
+    contract = feasibility_contract or ScheduledFeasibilityContract(
+        maximum_transfers=maximum_transfers,
+        maximum_initial_wait_seconds=maximum_initial_wait_seconds,
+        maximum_journey_seconds=maximum_journey_seconds,
+        maximum_waiting_seconds=maximum_waiting_seconds,
+    )
     origins = sorted(
         {
             universe.physical_stop_mapping.get(
@@ -997,13 +1148,10 @@ def _precompute_temporal_feasibility(
         }
     )
     return {
-        (origin, period[0]): feasibility_index.feasible_destinations(
-            origin,
-            period,
-            maximum_transfers=maximum_transfers,
-            maximum_initial_wait_seconds=maximum_initial_wait_seconds,
-            maximum_waiting_seconds=maximum_waiting_seconds,
-            maximum_journey_seconds=maximum_journey_seconds,
+        (origin, period[0]): frozenset(
+            contract.path_metrics(
+                feasibility_index, origin=origin, period=period
+            )
         )
         for origin in origins
         for period in bins
@@ -1443,10 +1591,17 @@ def expand_candidate_od_time_cells(
         and scenario is not None
         and scenario.timetable is not None
     ):
+        feasibility_contract = ScheduledFeasibilityContract(
+            maximum_transfers=maximum_transfers,
+            maximum_initial_wait_seconds=maximum_initial_wait_seconds,
+            maximum_journey_seconds=maximum_journey_seconds,
+            maximum_waiting_seconds=maximum_waiting_seconds,
+        )
         feasible_destinations_by_origin_period = _precompute_temporal_feasibility(
             universe=universe,
             bins=bins,
             feasibility_index=feasibility_index,
+            feasibility_contract=feasibility_contract,
             maximum_transfers=maximum_transfers,
             maximum_initial_wait_seconds=maximum_initial_wait_seconds,
             maximum_waiting_seconds=maximum_waiting_seconds,
@@ -1512,6 +1667,12 @@ def expand_candidate_od_time_cells(
                 )
             else:
                 cells.append(CandidateODTimeCell(*pair.tuple, period[0]))
+    feasibility_contract = ScheduledFeasibilityContract(
+        maximum_transfers=maximum_transfers,
+        maximum_initial_wait_seconds=maximum_initial_wait_seconds,
+        maximum_journey_seconds=maximum_journey_seconds,
+        maximum_waiting_seconds=maximum_waiting_seconds,
+    )
     policies = MappingProxyType(
         {
             "maximum_transfers": maximum_transfers,
@@ -1519,6 +1680,8 @@ def expand_candidate_od_time_cells(
             "maximum_journey_seconds": maximum_journey_seconds,
             "maximum_waiting_seconds": maximum_waiting_seconds,
             "timetable_policy": timetable_policy,
+            "feasibility_contract_version": feasibility_contract.version,
+            "feasibility_contract_fingerprint": feasibility_contract.fingerprint,
         }
     )
     fingerprint = _sha256_payload(

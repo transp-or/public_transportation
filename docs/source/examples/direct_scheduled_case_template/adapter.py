@@ -68,18 +68,14 @@ from public_transportation.inference.scheduled_reference_operator import (
 )
 from public_transportation.measurement import build_mapping_spec_strict, read_measurements_csv
 from public_transportation.preprocessing import (
-    ODTimeKey,
     build_canonical_timetable_index,
-    build_structural_zero_topology,
-    compute_od_path_metrics,
     expansion_contract_fingerprint,
     generate_candidate_od_pairs,
     fingerprint_scenario,
     materialize_prior_demand_from_checkpoint,
     run_candidate_od_time_expansion,
-)
-from public_transportation.preprocessing.structural_zeros.config import (
-    StructuralZeroAssignmentConfig,
+    ScheduledFeasibilityContract,
+    TimetableFeasibilityIndex,
 )
 
 
@@ -343,6 +339,27 @@ def _time_bin_fingerprint(scenario: Scenario) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _write_json_atomically(path: Path, payload: Mapping[str, object]) -> None:
+    """Persist a small stage audit without exposing a partial JSON file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    temporary.replace(path)
+
+
+def _prior_expansion_audit(results_root: Path) -> dict[str, object]:
+    path = results_root / "audit/prior_demand_generation.json"
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read prior expansion audit {path}: {error}") from error
+    return payload if isinstance(payload, dict) else {}
+
+
 def bootstrap_prior_demand(
     root: str | Path,
     *,
@@ -459,6 +476,14 @@ def bootstrap_prior_demand(
             "time_bins_fingerprint": time_bins_fp,
         },
     }
+    feasibility_contract = ScheduledFeasibilityContract(
+        maximum_transfers=settings.maximum_transfers,
+        maximum_initial_wait_seconds=settings.maximum_initial_wait_seconds,
+        maximum_journey_seconds=settings.maximum_journey_seconds,
+        maximum_waiting_seconds=settings.maximum_waiting_seconds,
+    )
+    expansion_config["feasibility_contract_version"] = feasibility_contract.version
+    expansion_config["feasibility_contract_fingerprint"] = feasibility_contract.fingerprint
     config_identity = dict(expansion_config)
     expansion_config["configuration_fingerprint"] = hashlib.sha256(
         json.dumps(config_identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -615,22 +640,230 @@ def _features(
     compact: CompactODAssignmentLayout,
     *,
     timetable_index: Any,
+    feasibility_contract: ScheduledFeasibilityContract,
+    results_root: Path,
     journey_time_scale: float,
 ) -> GravityFeatures:
     free_indices = np.asarray(layout.free_od_indices, dtype=np.int64)
     keys = [layout.od_keys[index] for index in free_indices]
-    topology = build_structural_zero_topology(
-        scenario,
-        StructuralZeroAssignmentConfig(),
-        timetable_index=timetable_index,
+    if scenario.timetable is None:
+        raise ValueError("scheduled feature construction requires a scenario timetable")
+
+    # Evaluate the same indexed timetable contract used by bootstrap-prior.  A
+    # single origin/time slice is cached at a time; the complete OD--time
+    # support is never materialized in memory.
+    feasibility_index = TimetableFeasibilityIndex.from_scenario(
+        scenario, timetable_index=timetable_index
     )
-    records = compute_od_path_metrics(
-        topology, keys=tuple(ODTimeKey(*key) for key in keys)
+    periods = {
+        str(item.bin_id): (
+            str(item.bin_id),
+            int(item.start.seconds_from_midnight),
+            int(item.end.seconds_from_midnight),
+        )
+        for item in scenario.time_bins
+    }
+    cached_slice: tuple[str, str] | None = None
+    cached_slice_metrics: Mapping[str, Any] = {}
+    free_index_set = set(int(index) for index in free_indices)
+    fixed_index_set = set(layout.fixed_od_indices)
+    all_keys = tuple(layout.od_keys)
+    free_metrics: list[Any] = []
+    supported_cells = 0
+    unsupported_free_count = 0
+    unsupported_examples: list[tuple[str, str, str]] = []
+    unsupported_fixed = 0
+    counts_by_reason: dict[str, int] = {}
+    counts_by_time_bin: dict[str, dict[str, object]] = {}
+    support_cells_path = results_root / "audit/feasibility_support_cells.jsonl"
+    support_cells_tmp = support_cells_path.with_name(
+        f".{support_cells_path.name}.tmp"
     )
-    metrics = {record.key.tuple: record.metrics for record in records}
-    unsupported = [key for key in keys if not metrics[key].feasible]
-    if unsupported:
-        raise ValueError(f"free demand contains unsupported scheduled cells: {unsupported[:5]}")
+    support_cells_tmp.parent.mkdir(parents=True, exist_ok=True)
+
+    def time_bin_counts(time_bin: str) -> dict[str, object]:
+        return counts_by_time_bin.setdefault(
+            time_bin,
+            {
+                "supported": 0,
+                "unsupported_free": 0,
+                "unsupported_fixed": 0,
+                "reasons": {},
+            },
+        )
+
+    def metric_for(
+        origin: str, destination: str, time_bin: str
+    ) -> Any | None:
+        nonlocal cached_slice, cached_slice_metrics
+        period = periods.get(time_bin)
+        if period is None:
+            return None
+        slice_key = (origin, time_bin)
+        if slice_key != cached_slice:
+            cached_slice_metrics = feasibility_contract.path_metrics(
+                feasibility_index, origin=origin, period=period
+            )
+            cached_slice = slice_key
+        return cached_slice_metrics.get(destination)
+
+    with support_cells_tmp.open("w", encoding="utf-8") as support_stream:
+        support_order = sorted(
+            range(len(all_keys)),
+            key=lambda item: (
+                str(all_keys[item][0]),
+                str(all_keys[item][2]),
+                str(all_keys[item][1]),
+            ),
+        )
+        for index in support_order:
+            key = all_keys[index]
+            origin, destination, time_bin = (str(value) for value in key)
+            counts = time_bin_counts(time_bin)
+            metric = metric_for(origin, destination, time_bin)
+            reason = None if metric is not None else (
+                "unknown_time_bin"
+                if time_bin not in periods
+                else "no_feasible_path"
+            )
+            if reason is None:
+                supported_cells += 1
+                counts["supported"] += 1
+            elif index in free_index_set:
+                unsupported_free_count += 1
+                if len(unsupported_examples) < 5:
+                    unsupported_examples.append((origin, destination, time_bin))
+                counts["unsupported_free"] += 1
+                counts_by_reason[reason] = counts_by_reason.get(reason, 0) + 1
+                reason_counts = counts["reasons"]
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+                support_stream.write(
+                    json.dumps(
+                        {
+                            "origin_stop_id": origin,
+                            "destination_stop_id": destination,
+                            "time_bin_id": time_bin,
+                            "classification": "unsupported_free",
+                            "reason": reason,
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+            elif index in fixed_index_set:
+                unsupported_fixed += 1
+                counts["unsupported_fixed"] += 1
+                fixed_reason = "fixed_cell:" + reason
+                counts_by_reason[fixed_reason] = counts_by_reason.get(fixed_reason, 0) + 1
+                reason_counts = counts["reasons"]
+                reason_counts[fixed_reason] = reason_counts.get(fixed_reason, 0) + 1
+                support_stream.write(
+                    json.dumps(
+                        {
+                            "origin_stop_id": origin,
+                            "destination_stop_id": destination,
+                            "time_bin_id": time_bin,
+                            "classification": "fixed",
+                            "reason": reason,
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+            else:  # pragma: no cover - ODParameterLayout validates the partition
+                raise AssertionError(f"OD index {index} is neither free nor fixed")
+    support_cells_tmp.replace(support_cells_path)
+
+    prior_audit = _prior_expansion_audit(results_root)
+    expansion_audit = prior_audit.get("expansion", {})
+    if not isinstance(expansion_audit, dict):
+        expansion_audit = {}
+    total_generated = int(expansion_audit.get("total_cells", len(all_keys)))
+    retained_cells = int(expansion_audit.get("retained_cell_count", len(all_keys)))
+    bootstrap_only = max(retained_cells - len(all_keys), 0)
+    feature_only = max(len(all_keys) - retained_cells, 0)
+    if bootstrap_only:
+        counts_by_reason["bootstrap_support_not_in_scenario_demand"] = bootstrap_only
+    if feature_only:
+        counts_by_reason["feature_support_not_in_bootstrap"] = feature_only
+
+    support_audit: dict[str, object] = {
+        "schema_version": 1,
+        "status": (
+            "completed"
+            if not unsupported_free_count and not bootstrap_only and not feature_only
+            else "failed"
+        ),
+        "support_domain": "all retained prior cells; feature vectors use the free subset",
+        "contract": {
+            "version": feasibility_contract.version,
+            "fingerprint": feasibility_contract.fingerprint,
+            "maximum_transfers": feasibility_contract.maximum_transfers,
+            "maximum_initial_wait_seconds": feasibility_contract.maximum_initial_wait_seconds,
+            "maximum_journey_seconds": feasibility_contract.maximum_journey_seconds,
+            "maximum_waiting_seconds": feasibility_contract.maximum_waiting_seconds,
+        },
+        "scenario_fingerprint": fingerprint_scenario(scenario),
+        "timetable_fingerprint": getattr(timetable_index, "fingerprint", None),
+        "time_bins_fingerprint": _time_bin_fingerprint(scenario),
+        "bootstrap_expansion_fingerprint": expansion_audit.get("fingerprint"),
+        "bootstrap_package_revision": prior_audit.get("package_revision"),
+        "od_universe_fingerprint": prior_audit.get("od_universe", {}).get("fingerprint")
+        if isinstance(prior_audit.get("od_universe"), dict)
+        else None,
+        "bootstrap_configuration_fingerprint": (
+            expansion_audit.get("configuration", {}).get("configuration_fingerprint")
+            if isinstance(expansion_audit.get("configuration"), dict)
+            else None
+        ),
+        "total_generated_prior_cells": total_generated,
+        "retained_cells": retained_cells,
+        "evaluated_retained_cells": len(all_keys),
+        "supported_cells": supported_cells,
+        "unsupported_retained_cells": unsupported_free_count + unsupported_fixed,
+        "unsupported_free_cells": unsupported_free_count,
+        "unsupported_fixed_cells": unsupported_fixed,
+        "cells_present_only_in_bootstrap_support": bootstrap_only,
+        "cells_present_only_in_feature_construction_support": feature_only,
+        "od_layout_fingerprint": compact.fingerprint,
+        "counts_by_reason": counts_by_reason,
+        "counts_by_time_bin": counts_by_time_bin,
+        "unsupported_cells_path": str(support_cells_path),
+        "audit_path": str(results_root / "audit/feasibility_support.json"),
+    }
+    _write_json_atomically(results_root / "audit/feasibility_support.json", support_audit)
+    if unsupported_free_count or bootstrap_only or feature_only:
+        raise ValueError(
+            "bootstrap-prior/check feasibility support mismatch; see "
+            f"{results_root / 'audit/feasibility_support.json'}; "
+            f"unsupported free cells={unsupported_free_count}, "
+            f"bootstrap-only cells={bootstrap_only}, "
+            f"feature-only cells={feature_only}, examples={unsupported_examples}"
+        )
+
+    # Build the feature arrays in the layout's canonical free-cell order. The
+    # evaluator cache still contains only one origin/time slice at a time.
+    cached_slice = None
+    cached_slice_metrics = {}
+    free_metrics: list[Any] = [None] * len(keys)
+    free_positions = sorted(
+        enumerate(free_indices.tolist()),
+        key=lambda item: (
+            str(all_keys[int(item[1])][0]),
+            str(all_keys[int(item[1])][2]),
+            str(all_keys[int(item[1])][1]),
+        ),
+    )
+    for position, index in free_positions:
+        key = all_keys[int(index)]
+        metric = metric_for(str(key[0]), str(key[1]), str(key[2]))
+        if metric is None:  # pragma: no cover - support pass already validated
+            raise AssertionError(f"missing support metric for free cell {key!r}")
+        free_metrics[position] = metric
+
+    metrics = {
+        key: metric for key, metric in zip(keys, free_metrics, strict=True)
+    }
     origins = sorted({key[0] for key in keys})
     destinations = sorted({key[1] for key in keys})
     periods = sorted({key[2] for key in keys})
@@ -651,7 +884,7 @@ def _features(
         destination_index=np.asarray([destination_lookup[key[1]] for key in keys]),
         departure_time_index=np.asarray([period_lookup[key[2]] for key in keys]),
         origin_time_group_index=np.asarray([group_lookup[(key[0], key[2])] for key in keys]),
-        journey_time=np.asarray([metrics[key].minimum_journey_time_minutes for key in keys], dtype=np.float32),
+        journey_time=np.asarray([metrics[key].minimum_journey_seconds / 60.0 for key in keys], dtype=np.float32),
         transfer_count=np.asarray([metrics[key].minimum_transfers for key in keys], dtype=np.int64),
         structural_feasible=np.ones(len(keys), dtype=bool),
         origin_time_totals=totals,
@@ -762,11 +995,19 @@ def load_context(
     )
     _progress(progress, phase="identity_construction", status="completed", current_unit="artifact_identity")
     _progress(progress, phase="feature_construction", status="started", current_unit="gravity_features")
+    feasibility_contract = ScheduledFeasibilityContract(
+        maximum_transfers=settings.maximum_transfers,
+        maximum_initial_wait_seconds=settings.maximum_initial_wait_seconds,
+        maximum_journey_seconds=settings.maximum_journey_seconds,
+        maximum_waiting_seconds=settings.maximum_waiting_seconds,
+    )
     features = _features(
         scenario,
         layout,
         compact,
         timetable_index=timetable_index,
+        feasibility_contract=feasibility_contract,
+        results_root=settings.results,
         journey_time_scale=float(settings.model.get("journey_time_scale", 30.0)),
     )
     _progress(progress, phase="feature_construction", status="completed", current_unit="gravity_features")
