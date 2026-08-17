@@ -72,6 +72,37 @@ class PositiveBoardingSupportReport:
     def safe(self) -> bool:
         return self.unsupported_positive_boarding_rows == 0
 
+    @property
+    def unsupported_positive_boarding_share(self) -> float:
+        """Fraction of positive boarding rows with no model support.
+
+        The value is a fraction (rather than a percentage) in the JSON report;
+        callers that display it to people should format it as a percentage.
+        """
+        if self.positive_boarding_rows == 0:
+            return 0.0
+        return (
+            self.unsupported_positive_boarding_rows
+            / self.positive_boarding_rows
+        )
+
+    @property
+    def cause_summaries(self) -> tuple["PositiveBoardingCauseSummary", ...]:
+        """Group unsupported rows by deterministic failure cause."""
+        grouped: dict[str, list[PositiveBoardingSupportIssue]] = {}
+        for issue in self.issues:
+            grouped.setdefault(issue.cause, []).append(issue)
+        return tuple(
+            PositiveBoardingCauseSummary(
+                cause=cause,
+                rows=len(issues),
+                observed_mass=float(sum(issue.observed_value for issue in issues)),
+                explanation=issues[0].explanation,
+                remediation=issues[0].remediation,
+            )
+            for cause, issues in sorted(grouped.items())
+        )
+
     def to_payload(self) -> dict[str, object]:
         """Return a deterministic JSON-ready diagnostic payload."""
         return {
@@ -89,8 +120,28 @@ class PositiveBoardingSupportReport:
             "unsupported_positive_boarding_mass": (
                 self.unsupported_positive_boarding_mass
             ),
+            "unsupported_positive_boarding_share": (
+                self.unsupported_positive_boarding_share
+            ),
+            "cause_summaries": [
+                asdict(summary) for summary in self.cause_summaries
+            ],
+            # ``reasons`` is a readable alias retained in the diagnostic
+            # payload; ``cause_summaries`` is the canonical field name.
+            "reasons": [asdict(summary) for summary in self.cause_summaries],
             "issues": [asdict(issue) for issue in self.issues],
         }
+
+
+@dataclass(frozen=True, slots=True)
+class PositiveBoardingCauseSummary:
+    """Aggregate diagnostics for one positive-boarding failure cause."""
+
+    cause: PositiveBoardingFailureCause
+    rows: int
+    observed_mass: float
+    explanation: str
+    remediation: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,27 +165,119 @@ class UnsupportedPositiveBoardingError(ValueError):
         *,
         report_path: Path | None = None,
     ) -> None:
-        preview = "; ".join(
-            f"row {issue.row_index} ({issue.measurement_id!r}, "
-            f"value={issue.observed_value:g}): {issue.cause}"
-            for issue in report.issues[:5]
-        )
-        suffix = "" if len(report.issues) <= 5 else "; ..."
-        location = (
-            ""
-            if report_path is None
-            else f" Full machine-readable report: {report_path}."
-        )
         super().__init__(
-            f"{report.unsupported_positive_boarding_rows} positive boarding "
-            "measurement row(s), with observed mass "
-            f"{report.unsupported_positive_boarding_mass:g}, have no model support "
-            f"at {report.stage}. Expensive linear-map construction was stopped. "
-            f"{preview}{suffix}.{location}"
+            format_positive_boarding_support_failure(
+                report, report_path=report_path
+            )
         )
         self.report = report
         self.report_path = report_path
         self.details = report.to_payload()
+        if report_path is not None:
+            self.details["report_path"] = str(report_path)
+
+
+def _format_mass(value: float) -> str:
+    """Format observed mass without a distracting trailing ``.0``."""
+    return f"{value:g}"
+
+
+def _format_optional(value: object) -> str:
+    return "-" if value is None else str(value)
+
+
+def format_positive_boarding_support_failure(
+    report: PositiveBoardingSupportReport,
+    *,
+    report_path: Path | None = None,
+    maximum_row_details: int = 10,
+) -> str:
+    """Render the strict preflight failure as an actionable user report.
+
+    The JSON report remains the authoritative machine-readable representation;
+    this text deliberately contains the same headline counts and enough row
+    context for a case owner to identify a filtered copy manually.
+    """
+    if maximum_row_details < 1:
+        raise ValueError("maximum_row_details must be positive")
+    lines = [
+        "Positive boarding support preflight failed.",
+        f"Stage: {report.stage}",
+        "",
+        f"Measurement rows: {report.number_of_measurements:,}",
+        f"Positive boarding rows: {report.positive_boarding_rows:,}",
+        (
+            "Supported positive boarding rows: "
+            f"{report.supported_positive_boarding_rows:,}"
+        ),
+        (
+            "Unsupported positive boarding rows: "
+            f"{report.unsupported_positive_boarding_rows:,} "
+            f"({report.unsupported_positive_boarding_share:.4%})"
+        ),
+        (
+            "Unsupported positive boarding mass: "
+            f"{_format_mass(report.unsupported_positive_boarding_mass)}"
+        ),
+        "",
+        "Reasons:",
+    ]
+    for summary in report.cause_summaries:
+        lines.extend(
+            [
+                (
+                    f"- {summary.cause}: {summary.rows:,} rows, "
+                    f"mass {_format_mass(summary.observed_mass)}"
+                ),
+                f"  {summary.explanation}",
+                f"  Remediation: {summary.remediation}",
+            ]
+        )
+
+    shown = report.issues[:maximum_row_details]
+    if shown:
+        lines.extend(["", f"Affected rows (first {len(shown)}):"])
+        for issue in shown:
+            lines.append(
+                (
+                    f"- source row index {issue.row_index}; "
+                    f"measurement ID={issue.measurement_id}; "
+                    f"location={issue.location_id}; interval={issue.interval_id}; "
+                    f"line={_format_optional(issue.line_id)}; "
+                    f"trip={_format_optional(issue.trip_id)}; "
+                    f"time={_format_optional(issue.time_hms)}; "
+                    f"observed value={_format_mass(issue.observed_value)}; "
+                    f"cause={issue.cause}"
+                )
+            )
+        if len(report.issues) > len(shown):
+            lines.append(
+                f"- ... {len(report.issues) - len(shown):,} additional row(s) "
+                "are listed in the machine-readable report."
+            )
+
+    lines.extend(
+        [
+            "",
+            "Strict policy: unsupported positive boarding rows are not discarded "
+            "and estimation cannot continue.",
+            "Manual remediation:",
+            "1. Review the listed unsupported rows.",
+            "2. Preserve the original measurement file.",
+            "3. If the case-study owner confirms that they may be ignored, create "
+            "a filtered copy with exactly those rows removed.",
+            "4. Point the case configuration to the filtered copy.",
+            "5. Rerun the check stage before rerunning preparation.",
+        ]
+    )
+    if report_path is not None:
+        lines.extend(
+            [
+                "",
+                f"Full machine-readable report: {report_path}",
+            ]
+        )
+    return "\n".join(lines)
 
 
 @dataclass(frozen=True, slots=True)

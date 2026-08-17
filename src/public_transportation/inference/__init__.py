@@ -228,12 +228,14 @@ from .assignment_contract import (  # noqa: F401
 from .measurement_support_preflight import (  # noqa: F401
     POSITIVE_BOARDING_PREFLIGHT_SCHEMA_VERSION,
     PositiveBoardingPreflightContext,
+    PositiveBoardingCauseSummary,
     PositiveBoardingSupportIssue,
     PositiveBoardingSupportReport,
     UnsupportedPositiveBoardingError,
     audit_positive_boarding_support,
     boarding_access_supported_measurement_rows,
     enforce_positive_boarding_support,
+    format_positive_boarding_support_failure,
     write_positive_boarding_support_report,
 )
 from .scheduled_reference_operator import (  # noqa: F401

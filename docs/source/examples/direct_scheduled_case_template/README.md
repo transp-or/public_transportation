@@ -153,6 +153,80 @@ feasibility limit changes, discard neither files nor rows silently: regenerate
 the prior from a fresh identity-specific checkpoint and rerun `check` before
 continuing.
 
+### Positive boarding support preflight
+
+The direct-scheduled builder performs a strict positive-boarding support
+preflight before expensive linear-map construction. Its report is written to
+the identity-specific checkpoint as
+`positive_boarding_support_preflight.json`. The report includes total
+measurement rows, positive boarding rows, supported and unsupported rows,
+unsupported observed mass, and `unsupported_positive_boarding_share` as a
+fraction, together with grouped `cause_summaries` and row-level `issues`.
+The row details include source row index, measurement ID, location, interval,
+line, trip, time, observed value, and cause. A typical headline is:
+
+```text
+Measurement rows: <total measurement rows>
+Positive boarding rows: <positive boarding rows>
+Supported positive boarding rows: <supported positive boarding rows>
+Unsupported positive boarding rows: <unsupported rows> (<share>)
+Unsupported positive boarding mass: <observed mass>
+```
+
+This is a strict failure. The driver exits non-zero and does not silently
+discard rows or continue because the unsupported share is small. The default
+response is to stop and investigate the source data, time-bin definition, OD
+universe, and mapping contract. Review the listed rows and grouped causes.
+
+The reason code `origin_interval_absent_from_demand`, for example, means that
+no canonical OD cell starts at the boarding location in that departure
+interval, so the strict boarding mapper cannot assign model demand to the
+event. This differs from an observed zero and from a malformed CSV row. The
+software cannot decide whether a count should be ignored: that decision
+depends on the scientific interpretation and belongs to the case-study owner.
+
+If the owner explicitly confirms that particular unsupported observations may
+be excluded, follow this procedure. Unsupported rows are never removed
+automatically:
+
+1. Read `positive_boarding_support_preflight.json`.
+2. Record total measurement rows, positive boarding rows, supported positive
+   boarding rows, unsupported positive boarding rows, unsupported observed
+   mass, unsupported share, and grouped exclusion causes.
+3. Inspect every unsupported row using `measurement_id`, source row index,
+   location, interval, line, trip, timestamp, observed value, and cause.
+4. Preserve the original measurement file unchanged.
+5. Create a filtered copy with the same columns and schema, removing only the
+   explicitly approved rows. Store it under the durable results root, for
+   example `results/inputs/filtered/measurements_boarding_alighting.csv`;
+   this is an example path unless the adapter defines it explicitly.
+6. Verify the expected row count and checksum, no duplicate measurement IDs,
+   and unchanged values for every retained row.
+7. Point `config/case.toml` or the adapter to the filtered copy.
+8. Update its fingerprint and invalidate every downstream artifact or
+   checkpoint created from the unfiltered file.
+9. Rerun `check`.
+10. Continue to `structural-zeros` and `prepare` only after `check` succeeds.
+
+Retain the filtered file, checksum, removed-row identifiers, owner decision,
+and support-preflight report with the case results. The fit report must state
+whether any rows were excluded and why. Never overwrite the original input or
+add a silent ignore option.
+
+| Reason code | Meaning and required interpretation |
+|---|---|
+| `origin_interval_absent_from_demand` | No canonical OD cell starts at the boarding location in that departure interval, so the strict boarding mapper cannot assign model demand to the event. Investigate OD/time and event mapping; this is not an observed zero or a malformed CSV row. |
+| `origin_interval_all_fixed_zero` | All canonical OD cells at the location and interval are fixed at zero; review structural-zero and fixed-demand decisions. |
+| `mapped_boarding_access_link_has_no_active_origin` | Active OD cells exist, but the mapped access link has no active origin; inspect identity and timing rules. |
+| `no_retained_route_to_boarding_event` | Active origins exist, but retained routing has no contribution; inspect timetable feasibility and route retention. |
+
+Responsibility is split as follows: package/reporting problems belong to the
+public repository; missing or ambiguous filtering procedures belong to this
+walkthrough; decisions to ignore specific observations belong to the
+case-study owner; malformed or inconsistent source data belongs to the
+case-study data owner. The failed stage manifest and JSONL progress log retain
+the machine-readable report path.
+
 ## Resumable prior bootstrap
 
 The bootstrap stage is designed for a large OD--time universe. It uses the

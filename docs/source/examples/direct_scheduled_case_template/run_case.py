@@ -32,6 +32,9 @@ from public_transportation.preprocessing import (
     ODTimeExpansionInterrupted,
     run_structural_zero_preprocessing,
 )
+from public_transportation.inference.measurement_support_preflight import (
+    UnsupportedPositiveBoardingError,
+)
 
 from adapter import (
     CaseContext,
@@ -198,6 +201,9 @@ class _StageProgress:
                     "error": str(error),
                 }
             )
+            report_path = getattr(error, "report_path", None)
+            if report_path is not None:
+                payload["positive_boarding_support_report_path"] = str(report_path)
         self._event(payload)
 
 
@@ -246,6 +252,9 @@ def _failure_manifest(
             "error": str(error),
         }
     )
+    report_path = getattr(error, "report_path", None)
+    if report_path is not None:
+        payload["positive_boarding_support_report_path"] = str(report_path)
     write_json(progress.manifest_path, payload)
     return payload
 
@@ -706,12 +715,19 @@ def main() -> None:
     args = parser.parse_args()
     if args.resume and args.stage not in {"bootstrap-prior", "fit"}:
         parser.error("--resume is valid only for bootstrap-prior and fit stages")
-    if args.stage == "fit":
-        fit(args.root.resolve(), resume=args.resume)
-    elif args.stage == "bootstrap-prior":
-        bootstrap_prior(args.root.resolve(), resume=args.resume)
-    else:
-        STAGES[args.stage](args.root.resolve())
+    try:
+        if args.stage == "fit":
+            fit(args.root.resolve(), resume=args.resume)
+        elif args.stage == "bootstrap-prior":
+            bootstrap_prior(args.root.resolve(), resume=args.resume)
+        else:
+            STAGES[args.stage](args.root.resolve())
+    except UnsupportedPositiveBoardingError as error:
+        # This is an expected, actionable case-data/support failure.  The
+        # stage has already persisted its manifest and JSONL failure event;
+        # avoid burying the report in a generic Python traceback.
+        print(str(error), file=sys.stderr)
+        raise SystemExit(2) from None
 
 
 if __name__ == "__main__":

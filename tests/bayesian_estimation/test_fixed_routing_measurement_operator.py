@@ -834,6 +834,8 @@ def test_exact_positive_boarding_preflight_stops_before_numerical_kernel(
 
     assert caught.value.report.stage == "routing_support"
     assert caught.value.report.issues[0].row_index == 3
+    assert "Positive boarding support preflight failed." in str(caught.value)
+    assert "Strict policy" in str(caught.value)
     assert report_path.exists()
     assert not (tmp_path / "operator" / "manifest.json").exists()
 

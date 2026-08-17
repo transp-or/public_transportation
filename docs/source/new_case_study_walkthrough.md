@@ -1105,14 +1105,19 @@ blocks and checkpoints in the case.
 `results/structural_zeros/fixed_demand.csv` (or a reviewed **case-owned
 example** fixed-demand file when the structural stage is intentionally
 disabled), the **required-convention** scenario/timetable files, the
-case-owned measurement CSV, and the driver-selected construction limits in
-`config/model.toml` and `config/case.toml`. Outputs are **generated**
+case-owned measurement CSV (or a case-owner-approved filtered copy with its
+checksum and removed-row manifest), and the driver-selected construction
+limits in `config/model.toml` and `config/case.toml`. All positive observations
+must be supported unless an explicit, documented filtering decision exists.
+Outputs are **generated**
 identity-addressed artifacts under `results/artifacts/<identity>/` (including
 `manifest.json`, `blocks/block-*.npz`, and
 `fixed_measurement_offset.npy`) plus routing checkpoints under
 `results/checkpoints/<identity>/`, and the stage manifest/log. The directory
 names are current template conventions; the identity is generated, never
-handwritten.
+handwritten. Retain the measurement fingerprint, support-preflight report,
+removed-row identifiers, and owner decision with the case results; the fit
+report must state whether any rows were excluded and why.
 
 The current estimator uses a compact layout. Free cells are parameters; frozen
 zero cells are absent from the assignment representation; frozen positive cells
@@ -1426,6 +1431,98 @@ mapping, or OD candidate universe before proceeding. Do not drop the observation
 invent a route, or replace it by a nearby event without an explicit documented
 policy.
 
+### Positive boarding support preflight: summary and manual remediation
+
+Before the expensive linear-map construction, the direct-scheduled workflow
+runs a strict support preflight for every positive boarding observation. The
+preflight report is written to the identity-specific checkpoint as
+`positive_boarding_support_preflight.json`. It reports the total measurement
+rows, positive boarding rows, supported rows, unsupported rows, unsupported
+observed mass, and the unsupported share as a fraction. It also groups the
+failures by cause code and records, for each cause, the affected-row count,
+observed mass, a short explanation, and a remediation. The row-level `issues`
+array contains the source row index, measurement ID, location, interval, line,
+trip, time, observed value, and cause. For example, the human-readable failure
+summary has this case-specific form:
+
+```text
+Measurement rows: <total measurement rows>
+Positive boarding rows: <positive boarding rows>
+Supported positive boarding rows: <supported positive boarding rows>
+Unsupported positive boarding rows: <unsupported rows> (<share>)
+Unsupported positive boarding mass: <observed mass>
+```
+
+An unsupported share that is small, or an unsupported mass that is small, does
+not make the run safe. The default is strict: unsupported positive boarding
+rows are not silently discarded, and the driver exits non-zero before
+operator construction. The failed stage manifest and JSONL progress event
+record the path to the machine-readable report; inspect those artifacts before
+editing inputs. The default response is to stop and investigate the source data,
+time-bin definition, OD universe, and measurement-mapping contract.
+
+The reason code `origin_interval_absent_from_demand`, for example, means that
+no canonical OD cell starts at that location in that departure interval. The
+strict boarding mapper therefore cannot assign model demand to the event. This
+is different from an observed zero, which is a supported observation with zero
+mass, and different from a malformed CSV row, which is an input-validation
+failure. Other reason codes are explained in the machine-readable report and
+must be interpreted using the case's scientific and timetable conventions.
+
+The software cannot decide whether an observation should be ignored. A filtering
+decision depends on the scientific interpretation of the count and must be made
+by the case-study owner, not inferred solely from the unsupported share or from
+the cause code.
+
+If a case-study owner confirms that particular unsupported observations may be
+excluded, use this explicit manual procedure. Unsupported rows must never
+be removed automatically:
+
+1. Read the machine-readable `positive_boarding_support_preflight.json` report.
+2. Record its total measurement rows, positive boarding rows, supported
+   positive boarding rows, unsupported positive boarding rows, unsupported
+   observed mass, unsupported share, and grouped exclusion causes.
+3. Inspect every unsupported positive row using its stable identifiers:
+   `measurement_id`, source row index, location, interval, line, trip, timestamp,
+   observed value, and exclusion cause.
+4. Preserve the original measurement file unchanged.
+5. Create a filtered copy with the same columns and schema, removing only the
+   explicitly approved rows. Store it under the durable results root, for
+   example `results/inputs/filtered/measurements_boarding_alighting.csv`;
+   this is an example path unless the case adapter defines it explicitly.
+6. Verify that the filtered copy has the expected row count and checksum, no
+   duplicate measurement identifiers, and unchanged values for every retained
+   row.
+7. Point `config/case.toml` or the case adapter to the filtered copy.
+8. Treat the filtered file as a new input: update its fingerprint and invalidate
+   every downstream artifact or checkpoint created from the unfiltered file.
+9. Rerun `check`.
+10. Continue to `structural-zeros` and `prepare` only after `check` completes
+    successfully.
+
+Retain the filtered file, checksum, removed-row identifiers, owner decision,
+and support-preflight report with the case-study results. The fit report must
+state whether any measurement rows were excluded and why. Never overwrite the
+original input, and never add an automatic or silent “ignore unsupported rows”
+option.
+
+| Reason code | Meaning and required interpretation |
+|---|---|
+| `origin_interval_absent_from_demand` | No canonical OD cell starts at the boarding location in that departure interval, so the strict boarding mapper cannot assign model demand to the event. This is not an observed zero and is not a malformed CSV row; investigate the OD/time domain and event mapping before seeking owner approval to filter. |
+| `origin_interval_all_fixed_zero` | All canonical OD cells starting at the location and interval are fixed at zero; no free demand or positive fixed offset can explain the boarding event. Review structural-zero and fixed-demand decisions. |
+| `mapped_boarding_access_link_has_no_active_origin` | Active OD cells exist, but the mapped access link has no active assignment origin. Inspect stop/platform identity, departure timing, and initial-wait rules. |
+| `no_retained_route_to_boarding_event` | Active origins exist, but exact retained routing has no contribution to the event. Inspect timetable feasibility, route retention, and first-boarding versus transfer semantics. |
+
+Responsibility is split as follows: a package or report-formatting problem is a
+public-repository issue; a missing or ambiguous filtering procedure is a
+walkthrough issue; the decision that specific observations may be ignored
+belongs to the case-study owner; and malformed or inconsistent source data is
+owned by the case-study data owner.
+
+Do not invent a route, replace an event by a nearby timestamp, or reuse a prior
+after changing the feasibility or measurement-support semantics. A changed
+support contract requires a fresh identity-specific prior and preparation.
+
 ## 15. Jed scheduling and restartable long runs
 
 Read **Large outputs, scratch storage, and archival** before scheduling. It
@@ -1538,7 +1635,11 @@ Before calling the current case complete, verify:
 - [ ] `results/audit/prior_demand_generation.json` records the generation policies and output checksum;
 - [ ] scenario, observations, generated prior, fixed demand, and configurations are checksummed;
 - [ ] canonical timetable and measurement identities are stable;
-- [ ] all positive observations have supported modeled responses;
+- [ ] all positive observations have supported modeled responses, or an explicit
+      documented owner-approved filtering decision exists;
+- [ ] if rows were excluded: the filtered measurement file, checksum,
+      removed-row identifiers, owner decision, and support-preflight report are
+      retained with the case results;
 - [ ] structural-zero reconciliation has no positive fixed-demand conflict;
 - [ ] compact layout excludes frozen-zero cells from estimation and assignment;
 - [ ] direct-scheduled artifact manifest is complete and fingerprint-compatible;
@@ -1548,6 +1649,7 @@ Before calling the current case complete, verify:
 - [ ] convergence, time-budget stop, and iteration-limit statuses are distinguished;
 - [ ] progress and stderr logs are stored on persistent storage;
 - [ ] accepted fits are reconstructed and validated against observations;
+- [ ] the fit report states whether any measurement rows were excluded and why;
 - [ ] all case-specific scientific assumptions are documented in the private README.
 
 ## 17. Exact current API contracts

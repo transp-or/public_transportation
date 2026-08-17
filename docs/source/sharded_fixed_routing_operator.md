@@ -21,11 +21,28 @@ rejects any remaining positive boarding row that no retained free or
 fixed-positive route can reach. Valid cached operators are checked from their
 realized nonzero rows and fixed offset before reuse.
 
-Failures raise `UnsupportedPositiveBoardingError`. The full row-level report is
-written atomically to
+Failures raise `UnsupportedPositiveBoardingError`. Before the exception is
+raised, the preflight writes an atomic, machine-readable report to
 `positive_boarding_support_preflight.json` in the identity-specific checkpoint
-directory. Optional fixed-zero reason provenance lets callers report the exact
+directory. The report contains the total measurement rows, positive boarding
+rows, supported and unsupported rows, unsupported mass, and the unsupported
+share as a fraction (for example, `0.0001071` for `0.0107%`). It also contains
+`cause_summaries`, grouped by cause code with row count, observed mass, an
+explanation, and remediation, plus an `issues` array with source row index,
+measurement ID, location, interval, line, trip, time, observed value, and
+cause. Optional fixed-zero reason provenance lets callers report the exact
 preprocessing rules responsible for excluded origin cells.
+
+The exception text is intentionally a complete, human-readable report rather
+than a short preview. It reports the same headline counts, lists the first
+several affected rows, and explains the strict manual remediation: preserve
+the original measurement file, create a filtered copy only after the
+case-study owner confirms that the rows may be ignored, point the case
+configuration to that copy, and rerun `check` before `prepare`. Unsupported
+positive rows are never silently discarded and a small unsupported share does
+not permit estimation to continue. The generic case-study driver records the
+report path in both the failed stage manifest and its JSONL progress event,
+then exits non-zero without a raw traceback.
 
 The sharded builder instead partitions each destination group's structurally
 eligible measurements into fixed-width blocks. Its largest construction state
