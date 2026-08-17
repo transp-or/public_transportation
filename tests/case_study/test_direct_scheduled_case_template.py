@@ -16,6 +16,9 @@ def test_direct_scheduled_template_complete_public_fixture(tmp_path: Path) -> No
     shutil.copytree(template, case)
     (case / "inputs").mkdir()
     shutil.copytree(example / "data", case / "inputs/scenario")
+    # The current workflow must generate the prior rather than treating the
+    # fixture's prior file as a required pre-existing input.
+    (case / "inputs/scenario/prior_demand.csv").unlink()
     shutil.copy(example / "data/fixed_demand.csv", case / "inputs/fixed_demand.csv")
     shutil.copy(
         example / "pre_processing/results/measurements_boarding_alighting.csv",
@@ -43,6 +46,7 @@ def test_direct_scheduled_template_complete_public_fixture(tmp_path: Path) -> No
     try:
         namespace = runpy.run_path(str(case / "run_case.py"), run_name="template_test")
         for stage in (
+            "bootstrap-prior",
             "check",
             "structural-zeros",
             "prepare",
@@ -57,6 +61,7 @@ def test_direct_scheduled_template_complete_public_fixture(tmp_path: Path) -> No
 
     manifests = case / "results/manifests"
     for stage in (
+        "bootstrap-prior",
         "check",
         "structural-zeros",
         "prepare",
@@ -67,7 +72,8 @@ def test_direct_scheduled_template_complete_public_fixture(tmp_path: Path) -> No
     ):
         payload = json.loads((manifests / f"{stage}.json").read_text(encoding="utf-8"))
         assert payload["status"] == "completed"
-        assert payload["artifact_identity_fingerprint"]
+        if stage != "bootstrap-prior":
+            assert payload["artifact_identity_fingerprint"]
         progress = case / "results/logs" / f"{stage}.jsonl"
         assert progress.is_file()
         assert progress.read_text(encoding="utf-8").strip()
@@ -75,3 +81,9 @@ def test_direct_scheduled_template_complete_public_fixture(tmp_path: Path) -> No
     fit = json.loads((manifests / "fit.json").read_text(encoding="utf-8"))
     assert fit["result"]["status"] == "iteration_limit"
     assert json.loads((manifests / "validate.json").read_text(encoding="utf-8"))["acceptance"] == "diagnostic_only"
+    prior_header = (case / "inputs/scenario/prior_demand.csv").read_text(encoding="utf-8").splitlines()[0]
+    assert prior_header == "origin_stop_id,dest_stop_id,time_bin_id,flow"
+    prior_audit = json.loads((case / "results/audit/prior_demand_generation.json").read_text(encoding="utf-8"))
+    assert prior_audit["prior_source"] == "all_ones"
+    assert prior_audit["expansion"]["retained_cell_count"] > 0
+    assert prior_audit["output_sha256"]

@@ -30,7 +30,9 @@ from public_transportation.preprocessing import run_structural_zero_preprocessin
 
 from adapter import (
     CaseContext,
+    CaseSettings,
     activate,
+    bootstrap_prior_demand,
     evaluate_once,
     gravity_problem,
     initial_raw_parameters,
@@ -119,6 +121,37 @@ def check(root: Path) -> None:
     write_json(path, payload)
     sink = GravityJSONLProgressSink(log_path, durable=True, context={"stage": "check"})
     sink({"phase": "input_audit", "status": "completed", "current_unit": "canonical_mapping"})
+    print(json.dumps(_jsonable(payload), sort_keys=True))
+
+
+def bootstrap_prior(root: Path) -> None:
+    settings = CaseSettings.load(root)
+    manifests = settings.results / "manifests"
+    logs = settings.results / "logs"
+    manifests.mkdir(parents=True, exist_ok=True)
+    logs.mkdir(parents=True, exist_ok=True)
+    audit = bootstrap_prior_demand(root)
+    path = manifests / "bootstrap-prior.json"
+    log_path = logs / "bootstrap-prior.jsonl"
+    sink = GravityJSONLProgressSink(
+        log_path, durable=True, context={"stage": "bootstrap-prior"}
+    )
+    sink({
+        "phase": "prior_generation",
+        "status": "completed",
+        "completed_units": 1,
+        "total_units": 1,
+        "current_unit": "prior_demand.csv",
+        "output_file": audit["output_file"],
+    })
+    payload = {
+        "schema_version": 1,
+        "status": "completed",
+        "stage": "bootstrap-prior",
+        "package_revision": settings.package_revision,
+        "prior_generation": audit,
+    }
+    write_json(path, payload)
     print(json.dumps(_jsonable(payload), sort_keys=True))
 
 
@@ -303,6 +336,7 @@ def validate(root: Path) -> None:
 
 
 STAGES = {
+    "bootstrap-prior": bootstrap_prior,
     "check": check,
     "structural-zeros": structural_zeros,
     "prepare": prepare,

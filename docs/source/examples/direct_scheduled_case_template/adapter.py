@@ -8,6 +8,10 @@ specification, but should keep the identity checks and stage boundaries.
 from __future__ import annotations
 
 import json
+import csv
+import hashlib
+import os
+import tempfile
 import tomllib
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
@@ -71,6 +75,9 @@ from public_transportation.preprocessing import (
     build_canonical_timetable_index,
     build_structural_zero_topology,
     compute_od_path_metrics,
+    expand_candidate_od_time_cells,
+    generate_candidate_od_pairs,
+    generate_prior_demand,
 )
 from public_transportation.preprocessing.structural_zeros.config import (
     StructuralZeroAssignmentConfig,
@@ -109,6 +116,20 @@ class CaseSettings:
     expected_evaluations: int
     construction_time_budget_seconds: float | None
     safety_margin_seconds: float
+    od_universe_source: str
+    od_universe_level: str
+    od_pairs_file: Path | None
+    include_same_stop: bool
+    active_service_only: bool
+    connectivity_policy: str
+    prior_source: str
+    prior_value: float
+    prior_semantics: str
+    prior_file: Path | None
+    maximum_transfers: int
+    maximum_initial_wait_seconds: int
+    maximum_journey_seconds: int
+    maximum_waiting_seconds: int
     model: dict[str, object]
 
     @classmethod
@@ -148,6 +169,75 @@ class CaseSettings:
         margin = float(raw.get("safety_margin_seconds", 0.0))
         if budget < 0 or margin < 0:
             raise ValueError("construction budget and safety margin cannot be negative.")
+        required_policy_fields = (
+            "od_universe_source",
+            "od_universe_level",
+            "include_same_stop",
+            "active_service_only",
+            "connectivity_policy",
+            "prior_source",
+            "prior_value",
+            "prior_semantics",
+            "maximum_transfers",
+            "maximum_initial_wait_seconds",
+            "maximum_journey_seconds",
+            "maximum_waiting_seconds",
+        )
+        missing_policy_fields = [field for field in required_policy_fields if field not in raw]
+        if missing_policy_fields:
+            raise ValueError(
+                "config/case.toml must explicitly define prior/OD policy fields: "
+                f"{missing_policy_fields}"
+            )
+        od_universe_source = str(raw["od_universe_source"])
+        od_universe_level = str(raw["od_universe_level"])
+        od_pairs_file_value = raw.get("od_pairs_file")
+        od_pairs_file = (
+            None
+            if od_pairs_file_value in (None, "")
+            else (case_root / str(od_pairs_file_value)).resolve()
+        )
+        connectivity_policy = str(raw["connectivity_policy"])
+        prior_source = str(raw["prior_source"])
+        prior_semantics = str(raw["prior_semantics"])
+        prior_value = float(raw["prior_value"])
+        prior_file_value = raw.get("prior_file")
+        prior_file = (
+            None
+            if prior_file_value in (None, "")
+            else (case_root / str(prior_file_value)).resolve()
+        )
+        maximum_transfers = int(raw["maximum_transfers"])
+        maximum_initial_wait_seconds = int(raw["maximum_initial_wait_seconds"])
+        maximum_journey_seconds = int(raw["maximum_journey_seconds"])
+        maximum_waiting_seconds = int(raw["maximum_waiting_seconds"])
+        if od_universe_source not in {"file", "network_ordered_pairs"}:
+            raise ValueError("od_universe_source must be 'file' or 'network_ordered_pairs'.")
+        if od_universe_source == "file" and od_pairs_file is None:
+            raise ValueError("od_pairs_file is required when od_universe_source='file'.")
+        if od_universe_level not in {"stop", "physical_stop"}:
+            raise ValueError("od_universe_level must be 'stop' or 'physical_stop'.")
+        if not isinstance(raw["include_same_stop"], bool) or not isinstance(
+            raw["active_service_only"], bool
+        ):
+            raise ValueError("include_same_stop and active_service_only must be TOML booleans.")
+        if connectivity_policy not in {"none", "directed_reachable"}:
+            raise ValueError("connectivity_policy must be 'none' or 'directed_reachable'.")
+        if prior_source not in {
+            "all_ones",
+            "external_file",
+            "distance_decay",
+            "travel_time_decay",
+            "gravity_seed",
+            "destination_attractiveness_seed",
+        }:
+            raise ValueError(f"unsupported prior_source {prior_source!r}.")
+        if prior_source == "all_ones" and (not np.isfinite(prior_value) or prior_value <= 0.0):
+            raise ValueError("prior_value must be finite and positive.")
+        if maximum_transfers < 0 or maximum_initial_wait_seconds < 0:
+            raise ValueError("transfer and initial-wait limits cannot be negative.")
+        if maximum_journey_seconds <= 0 or maximum_waiting_seconds < 0:
+            raise ValueError("journey time must be positive and waiting time non-negative.")
         return cls(
             root=case_root,
             scenario=path("scenario"),
@@ -161,6 +251,20 @@ class CaseSettings:
             expected_evaluations=expected,
             construction_time_budget_seconds=None if budget == 0 else budget,
             safety_margin_seconds=margin,
+            od_universe_source=od_universe_source,
+            od_universe_level=od_universe_level,
+            od_pairs_file=od_pairs_file,
+            include_same_stop=bool(raw["include_same_stop"]),
+            active_service_only=bool(raw["active_service_only"]),
+            connectivity_policy=connectivity_policy,
+            prior_source=prior_source,
+            prior_value=prior_value,
+            prior_semantics=prior_semantics,
+            prior_file=prior_file,
+            maximum_transfers=maximum_transfers,
+            maximum_initial_wait_seconds=maximum_initial_wait_seconds,
+            maximum_journey_seconds=maximum_journey_seconds,
+            maximum_waiting_seconds=maximum_waiting_seconds,
             model=model,
         )
 
@@ -179,6 +283,139 @@ class CaseContext:
     canonical_index: Any
     features: GravityFeatures
     identity: Any
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _time_bin_fingerprint(scenario: Scenario) -> str:
+    payload = [
+        [
+            str(item.bin_id),
+            int(item.start.seconds_from_midnight),
+            int(item.end.seconds_from_midnight),
+        ]
+        for item in scenario.time_bins
+    ]
+    encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _write_prior_csv(path: Path, values: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(
+                stream,
+                fieldnames=("origin_stop_id", "dest_stop_id", "time_bin_id", "flow"),
+            )
+            writer.writeheader()
+            for cell, value in sorted(values.items(), key=lambda item: item[0]):
+                writer.writerow(
+                    {
+                        "origin_stop_id": cell.origin_stop_id,
+                        "dest_stop_id": cell.destination_stop_id,
+                        "time_bin_id": cell.time_bin_id,
+                        "flow": float(value),
+                    }
+                )
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def bootstrap_prior_demand(root: str | Path) -> dict[str, object]:
+    """Generate the scenario prior from the network and approved time bins."""
+    settings = CaseSettings.load(root)
+    if settings.scenario_demand is None:
+        raise ValueError("config/case.toml must define scenario_demand for prior generation.")
+
+    scenario = Scenario.from_folder(
+        settings.scenario,
+        strict=True,
+        allow_missing_demand=True,
+    )
+    timetable_index = build_canonical_timetable_index(scenario)
+    universe = generate_candidate_od_pairs(
+        scenario,
+        source=settings.od_universe_source,
+        level=settings.od_universe_level,
+        include_same_stop=settings.include_same_stop,
+        active_service_only=settings.active_service_only,
+        connectivity_policy=settings.connectivity_policy,
+        od_pairs_path=settings.od_pairs_file,
+        timetable_index=timetable_index,
+    )
+    expansion = expand_candidate_od_time_cells(
+        universe,
+        scenario.time_bins,
+        scenario=scenario,
+        maximum_transfers=settings.maximum_transfers,
+        maximum_initial_wait_seconds=settings.maximum_initial_wait_seconds,
+        maximum_journey_seconds=settings.maximum_journey_seconds,
+        maximum_waiting_seconds=settings.maximum_waiting_seconds,
+        timetable_policy="required",
+        timetable_index=timetable_index,
+    )
+    prior = generate_prior_demand(
+        expansion,
+        source=settings.prior_source,
+        value=settings.prior_value,
+        semantics=settings.prior_semantics,
+        prior_file=settings.prior_file,
+    )
+    _write_prior_csv(settings.scenario_demand, prior.values)
+    audit = {
+        "schema_version": 1,
+        "package_revision": settings.package_revision,
+        "prior_source": prior.source,
+        "prior_semantics": prior.semantics,
+        "prior_value": settings.prior_value,
+        "od_universe": {
+            "source": settings.od_universe_source,
+            "level": settings.od_universe_level,
+            "include_same_stop": settings.include_same_stop,
+            "active_service_only": settings.active_service_only,
+            "connectivity_policy": settings.connectivity_policy,
+            "fingerprint": universe.fingerprint,
+            "generated_pair_count": universe.pair_count + len(universe.exclusions),
+            "retained_pair_count": universe.pair_count,
+            "audit": universe.audit,
+        },
+        "time_bins": {
+            "fingerprint": _time_bin_fingerprint(scenario),
+            "count": len(scenario.time_bins),
+        },
+        "expansion": {
+            "maximum_transfers": settings.maximum_transfers,
+            "maximum_initial_wait_seconds": settings.maximum_initial_wait_seconds,
+            "maximum_journey_seconds": settings.maximum_journey_seconds,
+            "maximum_waiting_seconds": settings.maximum_waiting_seconds,
+            "timetable_policy": "required",
+            "fingerprint": expansion.fingerprint,
+            "retained_cell_count": expansion.cell_count,
+            "excluded_cell_count": len(expansion.exclusions),
+            "audit": expansion.audit,
+        },
+        "prior_generation": prior.audit,
+        "output_file": str(settings.scenario_demand),
+        "output_sha256": _sha256_file(settings.scenario_demand),
+    }
+    audit_path = settings.results / "audit/prior_demand_generation.json"
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    audit_path.write_text(json.dumps(audit, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return audit
 
 
 def _canonical_index(scenario: Scenario, layout: ODParameterLayout, table: Any) -> Any:
