@@ -37,3 +37,11 @@ maximum_transfers = 2
 maximum_initial_wait_seconds = 3600
 maximum_journey_seconds = 7200
 maximum_waiting_seconds = 3600
+
+# Resumable expansion controls. These are explicit because they affect the
+# checkpoint identity and resource requirements. `chunk_size_pairs` controls
+# work per immutable JSONL chunk; `progress_interval_seconds` controls event
+# frequency; `maximum_temporary_bytes` bounds one chunk's temporary file.
+chunk_size_pairs = 512
+progress_interval_seconds = 5.0
+maximum_temporary_bytes = 8589934592

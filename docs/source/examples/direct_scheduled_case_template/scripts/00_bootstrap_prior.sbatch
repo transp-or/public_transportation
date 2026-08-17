@@ -1,8 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=od-bootstrap-prior
-#SBATCH --time=00:30:00
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=8G
+# Bootstrap may scan a large OD--time universe. These are deliberately
+# conservative defaults; the case owner may increase them after a pilot.
+#SBATCH --time=24:00:00
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
 #SBATCH --output=results/logs/bootstrap-prior-%j.out
 #SBATCH --error=results/logs/bootstrap-prior-%j.err
 set -euo pipefail

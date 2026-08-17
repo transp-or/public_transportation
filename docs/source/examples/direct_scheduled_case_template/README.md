@@ -76,6 +76,9 @@ maximum_transfers = 2
 maximum_initial_wait_seconds = 3600
 maximum_journey_seconds = 7200
 maximum_waiting_seconds = 3600
+chunk_size_pairs = 512
+progress_interval_seconds = 5.0
+maximum_temporary_bytes = 8589934592
 ```
 
 `network_ordered_pairs`, `level = "stop"`, `include_same_stop = false`,
@@ -110,6 +113,7 @@ configured timetable-feasibility rules, generates the selected prior, and
 writes:
 
 ```text
+results/checkpoints/prior_demand/<expansion-contract-fingerprint>/
 inputs/scenario/prior_demand.csv
 results/audit/prior_demand_generation.json
 results/manifests/bootstrap-prior.json
@@ -121,6 +125,42 @@ The generated demand CSV has exactly
 semantics, policies, fingerprints, retained/excluded counts, package revision,
 and output checksum. Only after this stage succeeds and the audit has been
 reviewed should the strict check stage be run.
+
+## Resumable prior bootstrap
+
+The bootstrap stage is designed for a large OD--time universe. It uses the
+public `run_candidate_od_time_expansion` API and does not construct the full
+expansion in memory. Immutable JSONL chunks are written below the
+identity-specific directory
+`results/checkpoints/prior_demand/<expansion-contract-fingerprint>/`, together
+with `manifest.json`, chunk checksums, a semantic checksum, and the latest
+`progress.json`. The explicit `chunk_size_pairs`,
+`progress_interval_seconds`, and `maximum_temporary_bytes` settings are part
+of the expansion identity. The timetable policy, feasibility limits,
+approved-bin fingerprint, scenario checksum, and package revision are also
+recorded there.
+
+The final `inputs/scenario/prior_demand.csv` is streamed from a completed and
+validated checkpoint by
+`materialize_prior_demand_from_checkpoint`. It has exactly
+`origin_stop_id,dest_stop_id,time_bin_id,flow`. Materialization uses a
+temporary sibling and atomic replacement: a checksum failure, fingerprint
+mismatch, interruption, or incomplete checkpoint leaves no partial new prior
+and does not replace an existing one. The manifest and stage summary must have
+`status = "completed"` before any downstream stage starts.
+
+If a run is interrupted or reaches a scheduler limit, inspect the durable
+manifest and resume exactly once after the previous process has exited:
+
+```bash
+uv run --frozen python run_case.py bootstrap-prior --resume
+tail -f results/logs/bootstrap-prior.jsonl
+```
+
+A fresh run refuses an existing checkpoint. Resume is accepted only for the
+same scenario, approved bins, explicit configuration, package revision, and
+expansion fingerprint. Do not delete chunks to force a fresh run; archive the
+checkpoint under a case-owned name if a deliberate policy change is intended.
 
 Zero construction budget means no deadline. `expected_evaluations` is used
 to choose and record the construction policy; it is not a demand value.
@@ -180,7 +220,14 @@ interactive workflow. Submit the dependency chain with:
 bash scripts/submit_chain.sh
 ```
 
-The chain is `bootstrap-prior → check → structural-zeros → prepare → preflight
-→ benchmark → fit → validate`. Never start two writers against one checkpoint or artifact root;
-resume a time-budget stop as a new dependent job after the predecessor has
-finished cleanly.
+The bootstrap wrapper requests 24 hours, 8 CPUs, and 32 GB of memory by
+default because prior expansion can be the longest preprocessing stage. These
+are case-owned scheduler settings, not scientific or package defaults; review
+them against the Jed partition. The chain is
+`bootstrap-prior → check → structural-zeros → prepare → preflight → benchmark
+→ fit → validate`. Never start two writers against one checkpoint or artifact
+root; resume a time-budget stop as a new dependent job after the predecessor
+has finished cleanly. Monitor
+`results/logs/bootstrap-prior-<job-id>.out` and
+`results/logs/bootstrap-prior-<job-id>.err`; proceed only after the completed
+manifest and final prior file exist.

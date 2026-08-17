@@ -807,6 +807,35 @@ class PriorGenerationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class PriorCheckpointMaterializationResult:
+    """Audit information for a prior streamed from a completed expansion."""
+
+    output_path: Path
+    source: str
+    semantics: str
+    value: float | None
+    cell_count: int
+    expansion_fingerprint: str
+    generator_fingerprint: str
+    fingerprint: str
+    output_sha256: str
+
+    @property
+    def audit(self) -> dict[str, object]:
+        return {
+            "source": self.source,
+            "semantics": self.semantics,
+            "value": self.value,
+            "cell_count": self.cell_count,
+            "expansion_fingerprint": self.expansion_fingerprint,
+            "generator_fingerprint": self.generator_fingerprint,
+            "fingerprint": self.fingerprint,
+            "output_path": str(self.output_path),
+            "output_sha256": self.output_sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class TimetableFeasibilityIndex:
     """Reusable schedule indexes for OD--time feasibility checks.
 
@@ -1616,3 +1645,288 @@ def generate_prior_demand(
         generator_fingerprint=generator_fingerprint,
         fingerprint=fingerprint,
     )
+
+
+def materialize_prior_demand_from_checkpoint(
+    checkpoint_directory: str | Path,
+    output_path: str | Path,
+    *,
+    source: str = "all_ones",
+    value: float = 1.0,
+    semantics: str = "neutral_seed",
+    prior_file: str | Path | None = None,
+    scenario: Scenario | None = None,
+    package_revision: str | None = None,
+    expansion_fingerprint: str | None = None,
+    configuration_fingerprint: str | None = None,
+    approved_time_bins: Sequence[object] | None = None,
+    approved_time_bins_fingerprint: str | None = None,
+    scenario_fingerprint: str | None = None,
+    progress: Callable[[Mapping[str, object]], None] | None = None,
+) -> PriorCheckpointMaterializationResult:
+    """Stream a prior from a validated, completed OD-time checkpoint.
+
+    The final output is written through a temporary file and is replaced only
+    after every immutable chunk, checksum, row count, and semantic checksum has
+    been validated.  Interrupted or corrupt checkpoints therefore cannot leave
+    a new partial scenario demand file behind.
+    """
+    checkpoint = Path(checkpoint_directory).expanduser().resolve()
+    manifest_path = checkpoint / "manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"checkpoint manifest does not exist: {manifest_path}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"checkpoint manifest is not valid JSON: {manifest_path}") from error
+    if not isinstance(manifest, Mapping):
+        raise ValueError("checkpoint manifest must contain a JSON object")
+    if manifest.get("status") != "completed":
+        raise ValueError(
+            "cannot materialize a prior from an incomplete checkpoint; "
+            f"status={manifest.get('status')!r}"
+        )
+    checkpoint_expansion = str(manifest.get("expansion_fingerprint", ""))
+    if not checkpoint_expansion:
+        raise ValueError("checkpoint manifest has no expansion fingerprint")
+    if expansion_fingerprint is not None and expansion_fingerprint != checkpoint_expansion:
+        raise ValueError("checkpoint expansion fingerprint does not match the requested fingerprint")
+    checkpoint_revision = str(manifest.get("package_revision", ""))
+    if not checkpoint_revision:
+        raise ValueError("checkpoint manifest has no package identity")
+    if package_revision is not None and package_revision != checkpoint_revision:
+        raise ValueError("checkpoint package revision does not match the requested revision")
+    recorded_configuration_fingerprint = manifest.get("configuration_fingerprint")
+    if configuration_fingerprint is not None and recorded_configuration_fingerprint != configuration_fingerprint:
+        raise ValueError("checkpoint configuration fingerprint does not match the requested configuration")
+    recorded_time_bins_fingerprint = manifest.get("approved_time_bins_fingerprint")
+    if approved_time_bins_fingerprint is not None and recorded_time_bins_fingerprint != approved_time_bins_fingerprint:
+        raise ValueError("checkpoint approved time-bin fingerprint does not match the requested bins")
+    if approved_time_bins is not None:
+        expected_bins = tuple(_period_tuple(item) for item in approved_time_bins)
+        recorded_bins = tuple(
+            _period_tuple(item) for item in manifest.get("approved_time_bins", ())
+        )
+        if expected_bins != recorded_bins:
+            raise ValueError("checkpoint approved time bins do not match the scenario")
+    recorded_scenario_fingerprint = manifest.get("scenario_checksums", {})
+    if scenario_fingerprint is not None:
+        if not isinstance(recorded_scenario_fingerprint, Mapping):
+            raise ValueError("checkpoint has no scenario checksum payload")
+        if recorded_scenario_fingerprint.get("scenario_fingerprint") != scenario_fingerprint:
+            raise ValueError("checkpoint scenario fingerprint does not match the requested scenario")
+
+    try:
+        total_chunks = int(manifest["total_chunks"])
+        total_rows = int(manifest["total_rows"])
+        expected_completed_cells = int(manifest["completed_cells"])
+        expected_retained_cells = int(manifest["retained_cells"])
+        expected_excluded_cells = int(manifest["excluded_cells"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("checkpoint manifest is missing numeric completion fields") from error
+    if (
+        total_chunks < 0
+        or total_rows < 0
+        or expected_completed_cells < 0
+        or expected_retained_cells < 0
+        or expected_excluded_cells < 0
+    ):
+        raise ValueError("checkpoint manifest contains negative completion fields")
+    completed_chunks_raw = manifest.get("completed_chunks")
+    if not isinstance(completed_chunks_raw, list):
+        raise ValueError("checkpoint manifest has no completed chunk list")
+    completed_chunks = {int(item) for item in completed_chunks_raw}
+    if len(completed_chunks_raw) != len(completed_chunks):
+        raise ValueError("checkpoint manifest contains duplicate completed chunks")
+    if completed_chunks != set(range(total_chunks)):
+        raise ValueError("completed checkpoint does not contain every expected chunk")
+    checksums = manifest.get("chunk_checksums")
+    if not isinstance(checksums, Mapping):
+        raise ValueError("checkpoint manifest has no chunk checksums")
+    for chunk_index in range(total_chunks):
+        chunk_path = checkpoint / f"chunk-{chunk_index:06d}.jsonl"
+        expected_checksum = str(checksums.get(str(chunk_index), ""))
+        if not chunk_path.is_file() or not expected_checksum:
+            raise ValueError(f"checkpoint chunk is missing or unsigned: {chunk_path}")
+        if _file_sha256(chunk_path) != expected_checksum:
+            raise ValueError(f"checkpoint chunk checksum mismatch: {chunk_path}")
+
+    if not isinstance(semantics, str) or not semantics.strip():
+        raise ValueError("prior semantics must be a non-empty string")
+    if source == "all_ones":
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError("all_ones value must be finite and positive")
+        pair_values: dict[tuple[str, str], float] | None = None
+        parameters: dict[str, object] = {
+            "value": float(value),
+            "expansion": "one_per_retained_od_time_cell",
+        }
+    elif source == "external_file":
+        if prior_file is None:
+            raise ValueError("source='external_file' requires prior_file")
+        pair_values = _read_pair_priors(prior_file)
+        parameters = {
+            "prior_file": str(Path(prior_file).expanduser().resolve()),
+            "expansion": "pair_value_repeated_over_retained_bins",
+        }
+    elif source in {
+        "distance_decay",
+        "travel_time_decay",
+        "gravity_seed",
+        "destination_attractiveness_seed",
+    }:
+        raise NotImplementedError(
+            f"prior generator {source!r} is reserved for a future explicit implementation."
+        )
+    else:
+        raise ValueError(f"unsupported prior source {source!r}")
+
+    generator_fingerprint = _sha256_payload(
+        {"source": source, "semantics": semantics, "parameters": parameters}
+    )
+    output = Path(output_path).expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    prior_digest = hashlib.sha256()
+    prior_digest.update(
+        canonical_json(
+            {
+                "expansion_fingerprint": checkpoint_expansion,
+                "generator_fingerprint": generator_fingerprint,
+            }
+        ).encode("utf-8")
+    )
+    prior_digest.update(b"\n")
+    row_count = 0
+    retained_count = 0
+    excluded_count = 0
+    retained_pairs: set[tuple[str, str]] = set()
+    semantic_digest = hashlib.sha256()
+    try:
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{output.name}.", suffix=".tmp", dir=output.parent
+        )
+        temporary_path = Path(temporary_name)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(
+                stream,
+                fieldnames=("origin_stop_id", "dest_stop_id", "time_bin_id", "flow"),
+            )
+            writer.writeheader()
+            for chunk_index in range(total_chunks):
+                chunk_path = checkpoint / f"chunk-{chunk_index:06d}.jsonl"
+                with chunk_path.open("r", encoding="utf-8") as chunk_stream:
+                    for line_number, line in enumerate(chunk_stream, start=1):
+                        if not line.strip():
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except json.JSONDecodeError as error:
+                            raise ValueError(
+                                f"checkpoint chunk contains invalid JSON: {chunk_path}:{line_number}"
+                            ) from error
+                        if not isinstance(row, Mapping):
+                            raise ValueError(f"checkpoint row is not an object: {chunk_path}:{line_number}")
+                        for field in ("origin_stop_id", "destination_stop_id", "time_bin_id", "status"):
+                            if field not in row:
+                                raise ValueError(f"checkpoint row is missing {field!r}: {chunk_path}:{line_number}")
+                        status = str(row["status"])
+                        if status not in {"retained", "excluded"}:
+                            raise ValueError(f"checkpoint row has invalid status {status!r}")
+                        semantic_digest.update(
+                            canonical_json(
+                                [
+                                    str(row["origin_stop_id"]),
+                                    str(row["destination_stop_id"]),
+                                    str(row["time_bin_id"]),
+                                    status,
+                                    str(row.get("reason", "")),
+                                ]
+                            ).encode("utf-8")
+                        )
+                        semantic_digest.update(b"\n")
+                        row_count += 1
+                        if status == "excluded":
+                            excluded_count += 1
+                            continue
+                        retained_count += 1
+                        key = (str(row["origin_stop_id"]), str(row["destination_stop_id"]))
+                        retained_pairs.add(key)
+                        row_value = float(value) if pair_values is None else pair_values.get(key)
+                        if row_value is None:
+                            raise ValueError(f"external prior is missing retained pair {key!r}")
+                        if not math.isfinite(row_value) or row_value < 0.0:
+                            raise ValueError(f"prior value for pair {key!r} is invalid")
+                        cell_payload = [str(row["origin_stop_id"]), str(row["destination_stop_id"]), str(row["time_bin_id"]), row_value]
+                        prior_digest.update(canonical_json(cell_payload).encode("utf-8"))
+                        prior_digest.update(b"\n")
+                        output_row = {
+                            "origin_stop_id": str(row["origin_stop_id"]),
+                            "dest_stop_id": str(row["destination_stop_id"]),
+                            "time_bin_id": str(row["time_bin_id"]),
+                            "flow": row_value,
+                        }
+                        writer.writerow(output_row)
+                if progress is not None:
+                    progress(
+                        {
+                            "phase": "materialize_prior",
+                            "status": "running",
+                            "completed_chunks": chunk_index + 1,
+                            "total_chunks": total_chunks,
+                            "completed_cells": row_count,
+                            "total_cells": total_rows,
+                            "retained_cells": retained_count,
+                            "excluded_cells": excluded_count,
+                            "checkpoint_directory": str(checkpoint),
+                            "expansion_fingerprint": checkpoint_expansion,
+                            "current_unit": f"chunk-{chunk_index:06d}",
+                        }
+                    )
+            stream.flush()
+            os.fsync(stream.fileno())
+        if row_count != total_rows or row_count != expected_completed_cells:
+            raise ValueError("checkpoint row count does not match the manifest")
+        if retained_count != expected_retained_cells or excluded_count != expected_excluded_cells:
+            raise ValueError("checkpoint retained/excluded counts do not match the manifest")
+        semantic = semantic_digest.hexdigest()
+        if semantic != str(manifest.get("semantic_checksum", "")):
+            raise ValueError("checkpoint semantic checksum mismatch")
+        prior_fingerprint = prior_digest.hexdigest()
+        if pair_values is not None:
+            extra_pairs = sorted(set(pair_values) - retained_pairs)
+            if extra_pairs:
+                raise ValueError(f"external prior contains pairs absent from the checkpoint: {extra_pairs}")
+        if progress is not None:
+            progress(
+                {
+                    "phase": "materialize_prior",
+                    "status": "completed",
+                    "completed_chunks": total_chunks,
+                    "total_chunks": total_chunks,
+                    "completed_cells": row_count,
+                    "total_cells": total_rows,
+                    "retained_cells": retained_count,
+                    "excluded_cells": excluded_count,
+                    "checkpoint_directory": str(checkpoint),
+                    "expansion_fingerprint": checkpoint_expansion,
+                    "current_unit": output.name,
+                }
+            )
+        os.replace(temporary_path, output)
+        temporary_path = None
+        result = PriorCheckpointMaterializationResult(
+            output_path=output,
+            source=source,
+            semantics=semantics,
+            value=float(value) if source == "all_ones" else None,
+            cell_count=retained_count,
+            expansion_fingerprint=checkpoint_expansion,
+            generator_fingerprint=generator_fingerprint,
+            fingerprint=prior_fingerprint,
+            output_sha256=_file_sha256(output),
+        )
+        return result
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)

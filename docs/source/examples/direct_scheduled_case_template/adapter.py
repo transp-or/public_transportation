@@ -8,10 +8,7 @@ specification, but should keep the identity checks and stage boundaries.
 from __future__ import annotations
 
 import json
-import csv
 import hashlib
-import os
-import tempfile
 import tomllib
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
@@ -75,9 +72,11 @@ from public_transportation.preprocessing import (
     build_canonical_timetable_index,
     build_structural_zero_topology,
     compute_od_path_metrics,
-    expand_candidate_od_time_cells,
+    expansion_contract_fingerprint,
     generate_candidate_od_pairs,
-    generate_prior_demand,
+    fingerprint_scenario,
+    materialize_prior_demand_from_checkpoint,
+    run_candidate_od_time_expansion,
 )
 from public_transportation.preprocessing.structural_zeros.config import (
     StructuralZeroAssignmentConfig,
@@ -130,6 +129,9 @@ class CaseSettings:
     maximum_initial_wait_seconds: int
     maximum_journey_seconds: int
     maximum_waiting_seconds: int
+    chunk_size_pairs: int
+    progress_interval_seconds: float
+    maximum_temporary_bytes: int
     model: dict[str, object]
 
     @classmethod
@@ -182,6 +184,9 @@ class CaseSettings:
             "maximum_initial_wait_seconds",
             "maximum_journey_seconds",
             "maximum_waiting_seconds",
+            "chunk_size_pairs",
+            "progress_interval_seconds",
+            "maximum_temporary_bytes",
         )
         missing_policy_fields = [field for field in required_policy_fields if field not in raw]
         if missing_policy_fields:
@@ -211,6 +216,9 @@ class CaseSettings:
         maximum_initial_wait_seconds = int(raw["maximum_initial_wait_seconds"])
         maximum_journey_seconds = int(raw["maximum_journey_seconds"])
         maximum_waiting_seconds = int(raw["maximum_waiting_seconds"])
+        chunk_size_pairs = int(raw["chunk_size_pairs"])
+        progress_interval_seconds = float(raw["progress_interval_seconds"])
+        maximum_temporary_bytes = int(raw["maximum_temporary_bytes"])
         if od_universe_source not in {"file", "network_ordered_pairs"}:
             raise ValueError("od_universe_source must be 'file' or 'network_ordered_pairs'.")
         if od_universe_source == "file" and od_pairs_file is None:
@@ -238,6 +246,8 @@ class CaseSettings:
             raise ValueError("transfer and initial-wait limits cannot be negative.")
         if maximum_journey_seconds <= 0 or maximum_waiting_seconds < 0:
             raise ValueError("journey time must be positive and waiting time non-negative.")
+        if chunk_size_pairs <= 0 or progress_interval_seconds <= 0 or maximum_temporary_bytes <= 0:
+            raise ValueError("expansion chunk, progress interval, and temporary-byte limit must be positive.")
         return cls(
             root=case_root,
             scenario=path("scenario"),
@@ -265,6 +275,9 @@ class CaseSettings:
             maximum_initial_wait_seconds=maximum_initial_wait_seconds,
             maximum_journey_seconds=maximum_journey_seconds,
             maximum_waiting_seconds=maximum_waiting_seconds,
+            chunk_size_pairs=chunk_size_pairs,
+            progress_interval_seconds=progress_interval_seconds,
+            maximum_temporary_bytes=maximum_temporary_bytes,
             model=model,
         )
 
@@ -306,37 +319,19 @@ def _time_bin_fingerprint(scenario: Scenario) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _write_prior_csv(path: Path, values: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    temporary_path = Path(temporary)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
-            writer = csv.DictWriter(
-                stream,
-                fieldnames=("origin_stop_id", "dest_stop_id", "time_bin_id", "flow"),
-            )
-            writer.writeheader()
-            for cell, value in sorted(values.items(), key=lambda item: item[0]):
-                writer.writerow(
-                    {
-                        "origin_stop_id": cell.origin_stop_id,
-                        "dest_stop_id": cell.destination_stop_id,
-                        "time_bin_id": cell.time_bin_id,
-                        "flow": float(value),
-                    }
-                )
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary_path, path)
-    finally:
-        temporary_path.unlink(missing_ok=True)
+def bootstrap_prior_demand(
+    root: str | Path,
+    *,
+    resume: bool = False,
+    progress: Callable[[dict[str, object]], None] | None = None,
+) -> dict[str, object]:
+    """Generate the scenario prior through a resumable expansion checkpoint.
 
-
-def bootstrap_prior_demand(root: str | Path) -> dict[str, object]:
-    """Generate the scenario prior from the network and approved time bins."""
+    The final scenario-demand CSV is materialized only after the completed
+    checkpoint, all chunk checksums, and all expansion fingerprints have been
+    validated.  Large cases therefore retain durable progress without holding
+    the full OD--time expansion in memory.
+    """
     settings = CaseSettings.load(root)
     if settings.scenario_demand is None:
         raise ValueError("config/case.toml must define scenario_demand for prior generation.")
@@ -357,30 +352,76 @@ def bootstrap_prior_demand(root: str | Path) -> dict[str, object]:
         od_pairs_path=settings.od_pairs_file,
         timetable_index=timetable_index,
     )
-    expansion = expand_candidate_od_time_cells(
+    scenario_fp = fingerprint_scenario(scenario)
+    time_bins_fp = _time_bin_fingerprint(scenario)
+    expansion_config: dict[str, object] = {
+        "chunk_size_pairs": settings.chunk_size_pairs,
+        "progress_interval_seconds": settings.progress_interval_seconds,
+        "maximum_temporary_bytes": settings.maximum_temporary_bytes,
+        "maximum_transfers": settings.maximum_transfers,
+        "maximum_initial_wait_seconds": settings.maximum_initial_wait_seconds,
+        "maximum_journey_seconds": settings.maximum_journey_seconds,
+        "maximum_waiting_seconds": settings.maximum_waiting_seconds,
+        "timetable_policy": "required",
+        "package_revision": settings.package_revision,
+        "approved_time_bins_fingerprint": time_bins_fp,
+        "scenario_checksums": {
+            "scenario_fingerprint": scenario_fp,
+            "time_bins_fingerprint": time_bins_fp,
+        },
+    }
+    config_identity = dict(expansion_config)
+    expansion_config["configuration_fingerprint"] = hashlib.sha256(
+        json.dumps(config_identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    expansion_fp = expansion_contract_fingerprint(
+        universe, scenario.time_bins, expansion_config
+    )
+    checkpoint = settings.results / "checkpoints/prior_demand" / expansion_fp
+
+    if progress is not None:
+        progress(
+            {
+                "phase": "candidate_universe",
+                "status": "completed",
+                "current_unit": "candidate_od_pairs",
+                "completed_units": universe.pair_count,
+                "total_units": universe.pair_count,
+                "expansion_fingerprint": expansion_fp,
+                "checkpoint_directory": str(checkpoint),
+            }
+        )
+    expansion = run_candidate_od_time_expansion(
         universe,
         scenario.time_bins,
         scenario=scenario,
-        maximum_transfers=settings.maximum_transfers,
-        maximum_initial_wait_seconds=settings.maximum_initial_wait_seconds,
-        maximum_journey_seconds=settings.maximum_journey_seconds,
-        maximum_waiting_seconds=settings.maximum_waiting_seconds,
-        timetable_policy="required",
+        configuration=expansion_config,
+        checkpoint_directory=checkpoint,
+        resume=resume,
+        progress=progress,
         timetable_index=timetable_index,
     )
-    prior = generate_prior_demand(
-        expansion,
+    materialized = materialize_prior_demand_from_checkpoint(
+        expansion.checkpoint_directory,
+        settings.scenario_demand,
         source=settings.prior_source,
         value=settings.prior_value,
         semantics=settings.prior_semantics,
         prior_file=settings.prior_file,
+        scenario=scenario,
+        package_revision=settings.package_revision,
+        expansion_fingerprint=expansion.expansion_fingerprint,
+        configuration_fingerprint=str(expansion_config["configuration_fingerprint"]),
+        approved_time_bins=scenario.time_bins,
+        approved_time_bins_fingerprint=time_bins_fp,
+        scenario_fingerprint=scenario_fp,
+        progress=progress,
     )
-    _write_prior_csv(settings.scenario_demand, prior.values)
     audit = {
         "schema_version": 1,
         "package_revision": settings.package_revision,
-        "prior_source": prior.source,
-        "prior_semantics": prior.semantics,
+        "prior_source": materialized.source,
+        "prior_semantics": materialized.semantics,
         "prior_value": settings.prior_value,
         "od_universe": {
             "source": settings.od_universe_source,
@@ -398,19 +439,31 @@ def bootstrap_prior_demand(root: str | Path) -> dict[str, object]:
             "count": len(scenario.time_bins),
         },
         "expansion": {
+            "checkpoint_directory": str(expansion.checkpoint_directory),
+            "configuration": expansion_config,
             "maximum_transfers": settings.maximum_transfers,
             "maximum_initial_wait_seconds": settings.maximum_initial_wait_seconds,
             "maximum_journey_seconds": settings.maximum_journey_seconds,
             "maximum_waiting_seconds": settings.maximum_waiting_seconds,
             "timetable_policy": "required",
-            "fingerprint": expansion.fingerprint,
-            "retained_cell_count": expansion.cell_count,
-            "excluded_cell_count": len(expansion.exclusions),
-            "audit": expansion.audit,
+            "fingerprint": expansion.expansion_fingerprint,
+            "semantic_checksum": expansion.semantic_checksum,
+            "retained_cell_count": expansion.retained_cells,
+            "excluded_cell_count": expansion.excluded_cells,
+            "total_chunks": expansion.total_chunks,
+            "completed_chunks": expansion.completed_chunks,
+            "checkpoint_reused": expansion.checkpoint_reused,
+            "audit": {
+                "status": expansion.status,
+                "total_cells": expansion.total_cells,
+                "next_chunk": expansion.next_chunk,
+                "checkpoint_reused": expansion.checkpoint_reused,
+            },
         },
-        "prior_generation": prior.audit,
+        "prior_generation": materialized.audit,
         "output_file": str(settings.scenario_demand),
         "output_sha256": _sha256_file(settings.scenario_demand),
+        "checkpoint_directory": str(checkpoint),
     }
     audit_path = settings.results / "audit/prior_demand_generation.json"
     audit_path.parent.mkdir(parents=True, exist_ok=True)

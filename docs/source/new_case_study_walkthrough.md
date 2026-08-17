@@ -190,136 +190,128 @@ bin-file checksum.
 ### 0.2 Generate the candidate OD universe and prior demand
 
 The scenario demand file is not an unexplained pre-existing case-owner input.
-After the final time bins have been reviewed and adopted, generate the
-candidate OD universe, apply timetable-dependent feasibility, and create the
-numerical prior. This stage must finish before strict input checking and before
-structural-zero analysis.
+After the final time bins have been reviewed and adopted, this stage generates
+the candidate OD universe, applies timetable-dependent feasibility, and creates
+the numerical prior. It must finish before strict input checking and before
+structural-zero analysis. For a large case, do **not** call the in-memory
+`expand_candidate_od_time_cells`/`generate_prior_demand` pair directly: those
+APIs remain useful for small tests, while the case workflow must use the
+checkpointed runner and streamed materializer.
 
-Load the network without requiring a demand table:
+The **inputs** are the required scenario network and approved
+`inputs/scenario/time_bins.csv`, the policy fields in `config/case.toml`, and
+the selected public-package revision. The policy fields are explicit and
+identity-bearing:
+
+```text
+od_universe_source, od_universe_level, od_pairs_file,
+include_same_stop, active_service_only, connectivity_policy,
+maximum_transfers, maximum_initial_wait_seconds,
+maximum_journey_seconds, maximum_waiting_seconds,
+chunk_size_pairs, progress_interval_seconds, maximum_temporary_bytes,
+prior_source, prior_file, prior_value, prior_semantics
+```
+
+`network_ordered_pairs`/`stop`/`directed_reachable` and the other policy values
+have the meanings described in the template README. Every value is recorded in
+the expansion contract; none is silently replaced by a function default.
+
+The case driver calls the public APIs in this order:
 
 ```python
-from public_transportation.domain import Scenario
 from public_transportation.preprocessing import (
     generate_candidate_od_pairs,
-    expand_candidate_od_time_cells,
-    generate_prior_demand,
+    run_candidate_od_time_expansion,
+    materialize_prior_demand_from_checkpoint,
 )
 
-scenario = Scenario.from_folder(
-    "inputs/scenario",
-    strict=True,
-    allow_missing_demand=True,
-)
-```
-
-Generate the static candidate pair universe with explicit policies:
-
-```python
-universe = generate_candidate_od_pairs(
-    scenario,
-    source="network_ordered_pairs",
-    level="stop",
-    include_same_stop=False,
-    active_service_only=True,
-    connectivity_policy="directed_reachable",
-)
-```
-
-These policies mean:
-
-- `network_ordered_pairs` generates all ordered stop pairs from the network;
-- `level="stop"` uses network stops as origins and destinations;
-- `include_same_stop=False` excludes same-stop pairs;
-- `active_service_only=True` excludes stops without service activity;
-- `connectivity_policy="directed_reachable"` excludes pairs that are not
-  reachable in the directed network topology.
-
-This is a static network check. It does not yet apply timetable-dependent
-feasibility. The universe has a deterministic fingerprint and an exclusion
-audit; preserve both.
-
-Expand the reviewed bins with explicit timetable rules:
-
-```python
-approved_time_bins = tuple(scenario.time_bins)
-expansion = expand_candidate_od_time_cells(
+universe = generate_candidate_od_pairs(scenario, ...)
+expansion = run_candidate_od_time_expansion(
     universe,
-    approved_time_bins,
+    scenario.time_bins,
     scenario=scenario,
-    maximum_transfers=2,
-    maximum_initial_wait_seconds=3600,
-    maximum_journey_seconds=7200,
-    maximum_waiting_seconds=3600,
-    timetable_policy="required",
+    configuration=explicit_expansion_configuration,
+    checkpoint_directory=identity_specific_checkpoint,
+    resume=resume,
+    progress=progress_callback,
+    timetable_index=timetable_index,
+)
+materialized = materialize_prior_demand_from_checkpoint(
+    expansion.checkpoint_directory,
+    "inputs/scenario/prior_demand.csv",
+    source=prior_source,
+    value=prior_value,
+    semantics=prior_semantics,
+    scenario=scenario,
+    package_revision=package_revision,
+    expansion_fingerprint=expansion.expansion_fingerprint,
+    configuration_fingerprint=configuration_fingerprint,
+    approved_time_bins=scenario.time_bins,
+    approved_time_bins_fingerprint=time_bins_fingerprint,
+    scenario_fingerprint=scenario_fingerprint,
+    progress=progress_callback,
 )
 ```
 
-Every feasibility parameter must be explicit and recorded. This stage applies
-timetable-dependent feasibility and may remove additional OD-time cells. Its
-fingerprint and retained/excluded counts are part of the prior-generation
-audit. Do not silently rely on function defaults.
-
-Generate the default numerical prior:
-
-```python
-prior = generate_prior_demand(
-    expansion,
-    source="all_ones",
-    value=1.0,
-    semantics="neutral_seed",
-)
-```
+The checkpoint directory is generated as
+`results/checkpoints/prior_demand/<expansion_contract_fingerprint>/`. A fresh
+run refuses an existing checkpoint; `--resume` is valid only for that exact
+configuration, scenario, approved-bin fingerprint, and package identity. The
+runner writes immutable `chunk-*.jsonl`, `manifest.json`, and `progress.json`.
+Only a manifest with `status = "completed"`, valid chunk checksums, matching
+row counts, and a matching semantic checksum can be materialized. The final
+CSV is written to a temporary sibling and atomically replaced only after all
+validation succeeds, so interruption, checksum failure, or identity mismatch
+cannot leave a partial new prior. An existing prior remains untouched on
+failure.
 
 `all_ones` assigns the same positive value to every retained OD-time cell. It
 is a neutral numerical seed, not an observation, production total, or
-destination-attractiveness estimate; it does not use the measurements. The
-current implementation repeats the selected pair value over every retained
-time bin. The only currently implemented sources are `all_ones` and
-`external_file`. The sources `distance_decay`, `travel_time_decay`,
-`gravity_seed`, and `destination_attractiveness_seed` are reserved and raise
-`NotImplementedError` if selected.
-
-Write the generated scenario demand with the exact four-column schema:
-
-```python
-import csv
-from pathlib import Path
-
-output = Path("inputs/scenario/prior_demand.csv")
-output.parent.mkdir(parents=True, exist_ok=True)
-with output.open("w", encoding="utf-8", newline="") as stream:
-    writer = csv.DictWriter(
-        stream,
-        fieldnames=("origin_stop_id", "dest_stop_id", "time_bin_id", "flow"),
-    )
-    writer.writeheader()
-    for cell, value in sorted(prior.values.items(), key=lambda item: item[0].tuple):
-        writer.writerow({
-            "origin_stop_id": cell.origin_stop_id,
-            "dest_stop_id": cell.destination_stop_id,
-            "time_bin_id": cell.time_bin_id,
-            "flow": float(value),
-        })
-```
-
-The path `inputs/scenario/prior_demand.csv` is the **required current-template
-output convention**; its contents are generated, not hardcoded. This differs
-from the optional `external_file` input accepted by `generate_prior_demand`,
-which is a pair-level file with exactly:
+destination-attractiveness estimate. `external_file` reads pair-level values
+from the optional file with exactly:
 
 ```csv
 origin_stop_id,destination_stop_id,prior_value
 ```
 
-Persist the prior-generation audit as the generated file
-`results/audit/prior_demand_generation.json`. At minimum it must contain the
-prior source, semantics, value, OD-universe source and policies, OD-universe
-fingerprint, generated and retained pair counts, time-bin fingerprint,
-expansion feasibility parameters, expansion fingerprint, retained and
-excluded OD-time counts, public-package revision, output path, and output
-checksum. The current template writes the corresponding stage manifest and
-JSONL log as `results/manifests/bootstrap-prior.json` and
-`results/logs/bootstrap-prior.jsonl`.
+The **outputs** are the generated checkpoint directory above,
+`inputs/scenario/prior_demand.csv` with exactly
+`origin_stop_id,dest_stop_id,time_bin_id,flow`,
+`results/audit/prior_demand_generation.json`,
+`results/manifests/bootstrap-prior.json`, and
+`results/logs/bootstrap-prior.jsonl`. The audit contains the source, semantics,
+policies, all identity fingerprints, retained/excluded counts, checkpoint
+status, package revision, output path, and output checksum. The stage manifest
+is successful only with `status = "completed"` and the final CSV plus audit
+present. `interrupted`, `failed`, and `deadline_stopped` are terminal
+non-success statuses; no downstream stage may start for them.
+
+Run the stage from the case-study root:
+
+```bash
+uv run --frozen python run_case.py bootstrap-prior
+```
+
+For a clean interrupted or scheduler-stopped run, use exactly one subsequent
+writer:
+
+```bash
+uv run --frozen python run_case.py bootstrap-prior --resume
+```
+
+The adapter emits durable JSONL progress while the universe, each expansion
+chunk, and the final materialization are processed. Monitor the persistent log
+and checkpoint `manifest.json`; do not infer completion from a partial CSV or
+from the existence of a directory alone.
+For medium or large cases, submit this stage on Jed rather than tying up a
+laptop; the local laptop run is appropriate for a bounded fixture or pilot.
+
+Classify failures before changing the case: inability of the checkpoint engine
+to resume or validate is a **public-package issue**; a template that still
+calls the in-memory expansion or emits no durable progress is a **public-template
+issue**; and an unsuitable Jed time, memory, partition, or account request is a
+**case-owned scheduler configuration issue**. Never silently fall back to
+`expand_candidate_od_time_cells` for a long case.
 
 Only after `prior_demand.csv` has been generated and this audit has been
 reviewed should the strict `check` stage start. Structural-zero preprocessing
@@ -943,6 +935,41 @@ memory, and wall-time requests, and persistent output/error paths. Copy the
 wrappers rather than inventing a second stage order; adjust resources only
 after the warm benchmark justifies the change.
 
+`00_bootstrap_prior.sbatch` is intentionally a long-run job: its example
+requests 24 hours, 8 CPUs, and 32 GB of memory. Review those requests against
+the local Jed partition and the candidate-pair count before submission. Its
+checkpoint and JSONL log must be on persistent case storage, never in a node
+temporary directory. Monitor them while the job runs:
+
+```bash
+sbatch scripts/00_bootstrap_prior.sbatch
+tail -f results/logs/bootstrap-prior-<job-id>.out
+tail -f results/logs/bootstrap-prior.jsonl
+cat results/manifests/bootstrap-prior.json
+cat results/checkpoints/prior_demand/<expansion-contract-fingerprint>/manifest.json
+cat results/checkpoints/prior_demand/<expansion-contract-fingerprint>/progress.json
+```
+
+If the job reaches a wall-time limit or is interrupted, classify the terminal
+manifest as `interrupted` (or `deadline_stopped` if the case driver uses that
+explicit scheduler status). Do not start `check`, structural-zero analysis, or
+any downstream stage. Submit one dependent resume job, after the first job has
+finished and released its lock:
+
+```bash
+sbatch --dependency=afterany:<bootstrap-job-id> \
+  --output=results/logs/bootstrap-prior-resume-%j.out \
+  --error=results/logs/bootstrap-prior-resume-%j.err \
+  --wrap='cd "$SLURM_SUBMIT_DIR" && uv run --frozen python run_case.py bootstrap-prior --resume'
+```
+
+Resume is accepted only when the checkpoint identity matches the current
+scenario, approved time bins, explicit expansion configuration, and package
+revision. A fresh invocation against an existing checkpoint is refused; never
+delete chunks to force it. Proceed to the next dependency only after
+`results/manifests/bootstrap-prior.json` says `status = "completed"` and the
+prior CSV and audit checksum are present.
+
 Each fit segment must use the same model fingerprint and checkpoint path. The
 first segment starts a fresh fit; later segments resume it. Never launch a
 second writer against the same checkpoint. Use separate fit IDs for sensitivity
@@ -1061,6 +1088,18 @@ expand_candidate_od_time_cells(
     timetable_index: CanonicalTimetableIndex | None = None,
 ) -> ODTimeExpansion
 
+run_candidate_od_time_expansion(
+    universe: CandidateODUniverse,
+    time_periods: Sequence[object],
+    *,
+    scenario: Scenario | None = None,
+    configuration: Mapping[str, object],
+    checkpoint_directory: str | Path,
+    resume: bool = False,
+    progress: Callable[[Mapping[str, object]], None] | None = None,
+    timetable_index: CanonicalTimetableIndex | None = None,
+) -> ODTimeExpansionRunResult
+
 generate_prior_demand(
     expansion: ODTimeExpansion,
     *,
@@ -1069,11 +1108,33 @@ generate_prior_demand(
     semantics: str = "neutral_seed",
     prior_file: str | Path | None = None,
 ) -> PriorGenerationResult
+
+materialize_prior_demand_from_checkpoint(
+    checkpoint_directory: str | Path,
+    output_path: str | Path,
+    *,
+    source: str = "all_ones",
+    value: float = 1.0,
+    semantics: str = "neutral_seed",
+    prior_file: str | Path | None = None,
+    scenario: Scenario | None = None,
+    package_revision: str | None = None,
+    expansion_fingerprint: str | None = None,
+    configuration_fingerprint: str | None = None,
+    approved_time_bins: Sequence[object] | None = None,
+    approved_time_bins_fingerprint: str | None = None,
+    scenario_fingerprint: str | None = None,
+    progress: Callable[[Mapping[str, object]], None] | None = None,
+) -> PriorCheckpointMaterializationResult
 ```
 
 The `all_ones` and `external_file` prior sources are implemented. The other
 declared source names are reserved and raise `NotImplementedError`; do not
-document them as available estimators.
+document them as available estimators. `expand_candidate_od_time_cells` and
+`generate_prior_demand` are retained for small in-memory examples and tests.
+Case-study preprocessing must use the checkpointed runner and streamed
+materializer so its memory use is bounded by one pair chunk and its output is
+published only after checksum and identity validation.
 
 ### Assignment and identifiers
 
@@ -1405,7 +1466,7 @@ by the stage and must be fingerprinted before a later stage consumes it.
 |---|---|---|---|---|
 | count recommendation | **Example:** `inputs/measurements.csv`; **example settings:** resolution, horizon, `num_od_pairs`, and `max_od_cells` passed to `time_discretization` | `results/time_discretization/recommendation.json`; retain the input checksum and selected candidate | JSON `status = "ok"` and a valid `recommendation`; `blocked` is a stop condition | no; rerun after a deliberate input/policy change |
 | bin materialization | **Generated:** reviewed recommendation JSON; **example output:** `results/time_discretization/time_bins.reviewed.csv` | reviewed three-column CSV; later, the **convention** scenario input `inputs/scenario/time_bins.csv` after explicit adoption | materializer succeeds and the selected candidate is valid; scenario `time_bins.csv` is not replaced implicitly | no |
-| `bootstrap-prior` | **Convention:** approved `inputs/scenario/time_bins.csv`; **example:** network and policy values in `config/case.toml`; no demand file is required yet | `inputs/scenario/prior_demand.csv`, `results/audit/prior_demand_generation.json`, `results/manifests/bootstrap-prior.json`, `results/logs/bootstrap-prior.jsonl` | manifest `status = "completed"`; audit and output checksum exist | safe to rerun after a deliberate policy or bin change |
+| `bootstrap-prior` | **Convention:** approved `inputs/scenario/time_bins.csv`; **example:** network and explicit policy/resource values in `config/case.toml`; no demand file is required yet | `results/checkpoints/prior_demand/<expansion-contract-fingerprint>/manifest.json`, immutable `chunk-*.jsonl`, `progress.json`; `inputs/scenario/prior_demand.csv`; `results/audit/prior_demand_generation.json`; `results/manifests/bootstrap-prior.json`; `results/logs/bootstrap-prior.jsonl` | manifest and stage summary `status = "completed"`; checkpoint is complete, audit exists, and output checksum is present. `interrupted`, `failed`, and `deadline_stopped` stop the chain | yes, only with `bootstrap-prior --resume` and matching identity; a fresh run refuses an existing checkpoint |
 | `check` | **Convention:** `config/case.toml`, `config/structural_zeros.toml`, `config/model.toml`; **generated:** `inputs/scenario/prior_demand.csv` and its audit; **example:** other paths selected by those files under `inputs/` | `results/manifests/check.json`, `results/logs/check.jsonl`, and audit fingerprints | manifest `status = "completed"`, all fingerprints present | no |
 | `structural-zeros` | **Convention:** `config/structural_zeros.toml`; **generated:** scenario prior demand; **example:** existing fixed-demand path selected by it | `results/structural_zeros/fixed_demand.csv`, `results/structural_zeros/structural_zero_audit.csv`, `results/structural_zeros/structural_zero_summary.json`, `results/structural_zeros/fingerprints.json`, `results/structural_zeros/resolved_config.toml`, `results/manifests/structural-zeros.json`, `results/logs/structural-zeros.jsonl` | service returns without exception; summary and fingerprints exist | safe to rerun with the same roots |
 | `prepare` | **Generated:** structural-zero fixed demand (or **example:** reviewed fixed-demand file when the stage is disabled); **convention:** scenario/timetable and measurement contracts; **example:** resource limits in TOML | `results/artifacts/<identity>/manifest.json`, `blocks/block-*.npz`, `fixed_measurement_offset.npy`; `results/checkpoints/<identity>/`; stage manifest/log | artifact `complete = true`; routing `status = "completed"` | yes, only from a matching checkpoint |

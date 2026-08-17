@@ -10,6 +10,7 @@ from public_transportation.domain.line import Line
 from public_transportation.preprocessing.od_universe import (
     ODTimeExpansionInterrupted,
     generate_candidate_od_pairs,
+    materialize_prior_demand_from_checkpoint,
     run_candidate_od_time_expansion,
 )
 
@@ -173,3 +174,95 @@ def test_changed_contract_rejects_resume(tmp_path: Path) -> None:
             checkpoint_directory=checkpoint,
             resume=True,
         )
+
+
+def test_completed_checkpoint_materializes_exact_prior_schema(tmp_path: Path) -> None:
+    scenario, universe, bins, configuration = _inputs()
+    checkpoint = tmp_path / "checkpoint"
+    result = run_candidate_od_time_expansion(
+        universe,
+        bins,
+        scenario=scenario,
+        configuration=configuration,
+        checkpoint_directory=checkpoint,
+    )
+    output = tmp_path / "scenario" / "prior_demand.csv"
+    materialized = materialize_prior_demand_from_checkpoint(
+        checkpoint,
+        output,
+        scenario=scenario,
+        package_revision="test-revision",
+        expansion_fingerprint=result.expansion_fingerprint,
+    )
+    lines = output.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "origin_stop_id,dest_stop_id,time_bin_id,flow"
+    assert len(lines) == result.retained_cells + 1
+    assert materialized.cell_count == result.retained_cells
+    assert materialized.output_sha256
+    assert materialized.fingerprint
+
+
+def test_interrupted_checkpoint_resumes_before_materialization(tmp_path: Path) -> None:
+    scenario, universe, bins, configuration = _inputs()
+    checkpoint = tmp_path / "checkpoint"
+
+    def interrupt(event: dict[str, object]) -> None:
+        if event.get("status") == "running":
+            raise KeyboardInterrupt
+
+    with pytest.raises(ODTimeExpansionInterrupted):
+        run_candidate_od_time_expansion(
+            universe,
+            bins,
+            scenario=scenario,
+            configuration=configuration,
+            checkpoint_directory=checkpoint,
+            progress=interrupt,
+        )
+    output = tmp_path / "prior.csv"
+    with pytest.raises(ValueError, match="incomplete"):
+        materialize_prior_demand_from_checkpoint(checkpoint, output)
+    resumed = run_candidate_od_time_expansion(
+        universe,
+        bins,
+        scenario=scenario,
+        configuration=configuration,
+        checkpoint_directory=checkpoint,
+        resume=True,
+    )
+    materialize_prior_demand_from_checkpoint(
+        checkpoint,
+        output,
+        scenario=scenario,
+        package_revision="test-revision",
+        expansion_fingerprint=resumed.expansion_fingerprint,
+    )
+    assert output.is_file()
+
+
+def test_materialization_rejects_identity_or_checksum_failure_without_replacing_prior(
+    tmp_path: Path,
+) -> None:
+    scenario, universe, bins, configuration = _inputs()
+    checkpoint = tmp_path / "checkpoint"
+    run_candidate_od_time_expansion(
+        universe,
+        bins,
+        scenario=scenario,
+        configuration=configuration,
+        checkpoint_directory=checkpoint,
+    )
+    output = tmp_path / "prior.csv"
+    output.write_text("old\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="fingerprint"):
+        materialize_prior_demand_from_checkpoint(
+            checkpoint,
+            output,
+            expansion_fingerprint="wrong",
+        )
+    assert output.read_text(encoding="utf-8") == "old\n"
+    chunk = next(checkpoint.glob("chunk-*.jsonl"))
+    chunk.write_text(chunk.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="checksum"):
+        materialize_prior_demand_from_checkpoint(checkpoint, output)
+    assert output.read_text(encoding="utf-8") == "old\n"

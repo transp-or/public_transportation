@@ -26,7 +26,10 @@ from public_transportation.inference.gravity.preflight import (
     GravityPreflightPhase,
     run_gravity_preflight,
 )
-from public_transportation.preprocessing import run_structural_zero_preprocessing
+from public_transportation.preprocessing import (
+    ODTimeExpansionInterrupted,
+    run_structural_zero_preprocessing,
+)
 
 from adapter import (
     CaseContext,
@@ -124,34 +127,116 @@ def check(root: Path) -> None:
     print(json.dumps(_jsonable(payload), sort_keys=True))
 
 
-def bootstrap_prior(root: Path) -> None:
+def bootstrap_prior(root: Path, resume: bool = False) -> None:
     settings = CaseSettings.load(root)
     manifests = settings.results / "manifests"
     logs = settings.results / "logs"
     manifests.mkdir(parents=True, exist_ok=True)
     logs.mkdir(parents=True, exist_ok=True)
-    audit = bootstrap_prior_demand(root)
     path = manifests / "bootstrap-prior.json"
     log_path = logs / "bootstrap-prior.jsonl"
     sink = GravityJSONLProgressSink(
         log_path, durable=True, context={"stage": "bootstrap-prior"}
     )
     sink({
-        "phase": "prior_generation",
+        "stage": "bootstrap-prior",
+        "phase": "bootstrap_prior",
+        "status": "started",
+        "current_unit": "candidate_od_time_expansion",
+        "resume": resume,
+    })
+
+    def progress(event: dict[str, object]) -> None:
+        # Normalize expansion/materialization dictionaries into the same
+        # durable progress vocabulary used by the other long stages.
+        normalized = dict(event)
+        normalized.setdefault("stage", "bootstrap-prior")
+        normalized.setdefault(
+            "phase",
+            "expand_od_time" if "completed_chunks" in normalized else "materialize_prior",
+        )
+        if "completed_cells" in normalized:
+            normalized.setdefault("completed_units", normalized["completed_cells"])
+        if "total_cells" in normalized:
+            normalized.setdefault("total_units", normalized["total_cells"])
+        if "eta_seconds" in normalized:
+            normalized.setdefault(
+                "estimated_remaining_seconds", normalized["eta_seconds"]
+            )
+        normalized.setdefault(
+            "current_unit", normalized.get("next_chunk", normalized.get("chunk"))
+        )
+        sink(normalized)
+
+    try:
+        audit = bootstrap_prior_demand(root, resume=resume, progress=progress)
+    except ODTimeExpansionInterrupted as error:
+        payload = {
+            "schema_version": 1,
+            "status": "interrupted",
+            "stage": "bootstrap-prior",
+            "package_revision": settings.package_revision,
+            "checkpoint_directory": str(error.checkpoint_directory),
+            "error_type": type(error).__name__,
+            "error": str(error),
+        }
+        write_json(path, payload)
+        sink({"stage": "bootstrap-prior", "phase": "bootstrap_prior", "status": "interrupted", **payload})
+        raise SystemExit(error.exit_code) from error
+    except KeyboardInterrupt as error:
+        payload = {
+            "schema_version": 1,
+            "status": "interrupted",
+            "stage": "bootstrap-prior",
+            "package_revision": settings.package_revision,
+            "error_type": type(error).__name__,
+            "error": "bootstrap-prior interrupted by the user",
+        }
+        write_json(path, payload)
+        sink({"stage": "bootstrap-prior", "phase": "bootstrap_prior", "status": "interrupted", **payload})
+        raise SystemExit(130) from error
+    except TimeoutError as error:
+        payload = {
+            "schema_version": 1,
+            "status": "deadline_stopped",
+            "stage": "bootstrap-prior",
+            "package_revision": settings.package_revision,
+            "error_type": type(error).__name__,
+            "error": str(error),
+        }
+        write_json(path, payload)
+        sink({"stage": "bootstrap-prior", "phase": "bootstrap_prior", "status": "deadline_stopped", **payload})
+        raise SystemExit("bootstrap-prior stopped at a deadline; resume the checkpoint") from error
+    except Exception as error:
+        payload = {
+            "schema_version": 1,
+            "status": "failed",
+            "stage": "bootstrap-prior",
+            "package_revision": settings.package_revision,
+            "error_type": type(error).__name__,
+            "error": str(error),
+        }
+        write_json(path, payload)
+        sink({"stage": "bootstrap-prior", "phase": "bootstrap_prior", "status": "failed", **payload})
+        raise
+    payload = {
+        "schema_version": 1,
+        "status": "completed",
+        "stage": "bootstrap-prior",
+        "package_revision": settings.package_revision,
+        "checkpoint_directory": audit["checkpoint_directory"],
+        "prior_generation": audit,
+    }
+    write_json(path, payload)
+    sink({
+        "stage": "bootstrap-prior",
+        "phase": "bootstrap_prior",
         "status": "completed",
         "completed_units": 1,
         "total_units": 1,
         "current_unit": "prior_demand.csv",
         "output_file": audit["output_file"],
     })
-    payload = {
-        "schema_version": 1,
-        "status": "completed",
-        "stage": "bootstrap-prior",
-        "package_revision": settings.package_revision,
-        "prior_generation": audit,
-    }
-    write_json(path, payload)
     print(json.dumps(_jsonable(payload), sort_keys=True))
 
 
@@ -353,13 +438,15 @@ def main() -> None:
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent)
     parser.add_argument(
         "--resume", action="store_true",
-        help="resume the identity-matching gravity checkpoint (fit stage only)",
+        help="resume the identity-matching bootstrap or gravity checkpoint",
     )
     args = parser.parse_args()
-    if args.resume and args.stage != "fit":
-        parser.error("--resume is valid only for the fit stage")
+    if args.resume and args.stage not in {"bootstrap-prior", "fit"}:
+        parser.error("--resume is valid only for bootstrap-prior and fit stages")
     if args.stage == "fit":
         fit(args.root.resolve(), resume=args.resume)
+    elif args.stage == "bootstrap-prior":
+        bootstrap_prior(args.root.resolve(), resume=args.resume)
     else:
         STAGES[args.stage](args.root.resolve())
 
