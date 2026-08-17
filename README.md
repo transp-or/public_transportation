@@ -46,6 +46,8 @@ The operational runbook for a new case study—including current
 direct-scheduled preparation, preflight, checkpointed fitting, Jed scheduling,
 and progress logs—is
 [new_case_study_walkthrough.md](docs/source/new_case_study_walkthrough.md).
+The matching TPG-agnostic driver skeleton and Slurm wrappers are in
+[direct_scheduled_case_template](docs/source/examples/direct_scheduled_case_template/).
 Reuse and migration rules for results produced by the former workflow are
 documented separately in
 [legacy_case_study_migration.md](docs/source/legacy_case_study_migration.md).

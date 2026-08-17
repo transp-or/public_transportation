@@ -1,0 +1,30 @@
+version = 1
+
+[scenario]
+folder = "../inputs/scenario"
+demand_file = "../inputs/scenario/prior_demand.csv"
+
+[output]
+folder = "../results/structural_zeros"
+include_retained_cells_in_report = true
+
+[rules.enabled]
+same_stop = false
+no_feasible_path = true
+maximum_transfers = true
+maximum_initial_wait = false
+maximum_journey_time = false
+minimum_feasible_departures = false
+
+[rules.no_feasible_path]
+
+[rules.maximum_transfers]
+max_transfers = 2
+
+[assignment]
+max_access_deviation_minutes = 15.0
+max_transfer_wait_minutes = 30.0
+minimum_dwell_seconds = 1
+
+[existing_fixed_demand]
+file = "../inputs/fixed_demand.csv"

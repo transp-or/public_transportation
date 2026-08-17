@@ -1,0 +1,11 @@
+scenario = "inputs/scenario"
+scenario_demand = "inputs/scenario/prior_demand.csv"
+measurements = "inputs/measurements.csv"
+fixed_demand = "inputs/fixed_demand.csv"
+results = "results"
+package_revision = "REPLACE_WITH_PUBLIC_TRANSPORTATION_COMMIT"
+theta = 1.0
+rho = 1.0
+expected_evaluations = 100
+construction_time_budget_seconds = 0.0
+safety_margin_seconds = 0.0

@@ -10,15 +10,196 @@ persistence APIs.
 
 This document describes only the current workflow.
 
+## 0. Start here — required files and organization
+
+Before running a case, make a case-study root and check that the required
+inputs and configuration are present. The paths below use the public template
+and therefore contain **example names**; the case owner may choose different
+names, but must change the corresponding values in `config/case.toml` and
+record the choices in the case README.
+
+There are three kinds of paths in this document:
+
+- **Required convention** means a filename or directory used by the current
+  template/driver contract (`run_case.py`, `config/case.toml`, and the
+  `results/manifests/` and `results/logs/` roots). Do not rename these without
+  changing the driver and its tests.
+- **Case-owned example** means a data or configuration path shown to make the
+  commands concrete (`inputs/measurements.csv`, `inputs/scenario/`, and the
+  values inside the TOML files). These are not hardcoded by the public
+  package; `config/case.toml` selects the actual files.
+- **Generated** means an output written by the current driver or a public
+  preparation service. Generated files are inputs to later stages only after
+  their manifest says that they are complete and their fingerprints match.
+
+In short: paths marked **required convention** are the current driver's
+hardcoded interface; paths marked **case-owned example** are deliberately not
+hardcoded and must be resolved through the case configuration; paths marked
+**generated** are created at run time and must never be supplied from an
+unrelated case.
+
+Use this initial layout as a checklist:
+
+```text
+case_studies/<case_name>/                 # case-owned example root
+├── README.md                             # required case documentation
+├── pyproject.toml                        # required; authored by case owner
+├── uv.lock                               # required; authored by case owner
+├── config/                               # required convention
+│   ├── case.toml                         # required convention; paths/provenance
+│   ├── structural_zeros.toml             # required when topology rules are used
+│   └── model.toml                         # required for gravity/MAP settings
+├── inputs/                               # case-owned example root
+│   ├── scenario/                         # metadata, stops, lines, bins, trips
+│   │   ├── metadata.json
+│   │   ├── stops.csv
+│   │   ├── lines.csv
+│   │   ├── time_bins.csv                 # required before `check`
+│   │   ├── trips.csv                     # required for scheduled assignment
+│   │   ├── stop_times.csv                # required for scheduled assignment
+│   │   └── prior_demand.csv              # example selected by case.toml
+│   ├── measurements.csv                  # example selected by case.toml
+│   └── fixed_demand.csv                  # example; empty-header file is valid
+├── adapter.py                            # required convention in the template
+├── run_case.py                           # required convention in the template
+├── scripts/                              # optional, scheduler-specific wrappers
+└── results/                              # required persistent output root
+    ├── audit/
+    ├── artifacts/
+    ├── checkpoints/
+    ├── fits/
+    ├── logs/
+    ├── manifests/
+    ├── preflight/
+    ├── structural_zeros/
+    ├── time_discretization/
+    └── validation/
+```
+
+The public template supplies `adapter.py`, `run_case.py`, the three example
+TOML files, and scheduler wrappers. It intentionally does **not** supply
+`pyproject.toml` or `uv.lock`: the case owner must create those files, pin an
+immutable public-package commit, and generate the lockfile. Copy and inspect
+the template from the case-study parent directory as follows:
+
+```bash
+CASE_ROOT=case_studies/<case_name>
+cp -R docs/source/examples/direct_scheduled_case_template "$CASE_ROOT"
+cd "$CASE_ROOT"
+
+# These files must be supplied by the case owner before the frozen environment
+# can be created; they are not copied from the public template.
+test -f pyproject.toml
+test -f uv.lock
+
+test -f adapter.py &&
+test -f run_case.py &&
+test -f config/case.toml &&
+test -f config/structural_zeros.toml &&
+test -f config/model.toml &&
+test -f inputs/scenario/metadata.json &&
+test -f inputs/scenario/stops.csv &&
+test -f inputs/scenario/lines.csv &&
+test -f inputs/scenario/time_bins.csv &&
+test -f inputs/scenario/trips.csv &&
+test -f inputs/scenario/stop_times.csv &&
+test -f inputs/scenario/prior_demand.csv &&
+test -f inputs/measurements.csv &&
+test -f inputs/fixed_demand.csv
+```
+
+If a case uses a different prior-demand or measurement filename, the `test`
+commands above are only examples: check the paths resolved from
+`config/case.toml` instead. A failed check identifies a case-setup failure,
+not an estimation failure. Review the template values before running it; a
+copied template is not scientifically ready until the case owner has supplied
+the data, units, service-day convention, time-bin policy, frozen-demand policy,
+and model assumptions.
+
+### 0.1 Determine time bins from the count data before the audit
+
+For a new case, do not choose time-bin edges only because they are convenient.
+The public package includes a preparation diagnostic that profiles the finest
+timestamped boarding and alighting counts, compares uniform and peak-adaptive
+schemes, and recommends candidate half-open intervals. This is a
+**recommendation**, not an automatic mutation of the scenario. It must be run
+before `check` when the case does not already have approved bins. The report
+schema and scoring details are documented in
+[`time_discretization.md`](time_discretization.md).
+
+Run it from the case-study root, replacing the example paths and budgets with
+the case owner's decisions:
+
+```bash
+mkdir -p results/time_discretization
+uv run --frozen python -m public_transportation.preprocessing.time_discretization \
+  --measurements inputs/measurements.csv \
+  --base-resolution-minutes 5 \
+  --min-bin-minutes 10 \
+  --max-bin-minutes 60 \
+  --max-bins 24 \
+  --num-od-pairs <retained_pair_count> \
+  --max-od-cells <approved_od_cell_budget> \
+  --output-json results/time_discretization/recommendation.json
+```
+
+The measurement path and all numeric options in that command are **case-owned
+examples**, not hardcoded defaults for the scientific analysis. The module
+does have documented defaults, but a production case should record the chosen
+resolution, horizon, bin limits, OD-cell budget, and source checksum in its
+manifest. The output
+`results/time_discretization/recommendation.json` is a **generated review
+artifact**. Inspect `status`, `profile`, `peak_intervals`, every candidate's
+`valid` and `invalid_reasons`, `estimated_od_cells`, and the selected
+`recommendation`. A `blocked` report is a stop condition: approve a larger
+budget or revise the time-bin policy explicitly; never select an invalid
+candidate silently.
+
+If the retained OD-pair count is not known yet, omit `--num-od-pairs` and
+`--max-od-cells` for this first diagnostic, or use a documented conservative
+upper bound. After a candidate has been reviewed and structural-zero analysis
+has established the actual retained count, rerun the recommendation with the
+real budget before adopting it. The budget options constrain computational
+complexity; they do not change the count profile or the scientific meaning of
+the observations.
+
+After a reviewer has selected a valid candidate, materialize it separately so
+that an existing scenario file is not overwritten accidentally:
+
+```bash
+uv run --frozen python -m public_transportation.preprocessing.materialize_time_bins \
+  --recommendation-json results/time_discretization/recommendation.json \
+  --candidate recommendation \
+  --output results/time_discretization/time_bins.reviewed.csv
+```
+
+`results/time_discretization/time_bins.reviewed.csv` is a **generated review
+artifact**. Compare it with any existing `inputs/scenario/time_bins.csv`, then
+adopt the reviewed file by an explicit, recorded case-owner action. The final
+`inputs/scenario/time_bins.csv` is a **required scenario input convention**
+for `Scenario.from_folder`; it is not inferred by `check`, structural-zero
+preprocessing, or estimation. If the adopted bins change, update the demand
+rows' `time_bin_id` values and rerun structural-zero reconciliation and all
+downstream preparation. Keep the JSON recommendation and reviewer decision in
+`results/time_discretization/` for provenance. If bins were already approved,
+skip the recommendation only after recording that decision and the existing
+bin-file checksum.
+
 ## 1. Current package contract
 
 The current workflow uses the direct-scheduled assignment and estimation APIs.
-There is no generic `case_study.runner` dispatcher or case-specific template
-inside the public package. The private case-study repository must provide a
-small driver that assembles the public objects and writes case-specific
-summaries.
+The public package does not ship a generic case-study dispatcher. The private
+case-study repository must provide a small driver that assembles the public
+objects and writes case-specific summaries. A tested starting point is the
+current-version template at
+`docs/source/examples/direct_scheduled_case_template/`.
 
 Record the exact package revision and runtime before any run:
+
+At the time this walkthrough was updated, `main` was
+`cfd76f5deaf8b238e2156ea7d8fa0f41f1315239`. Treat that value as a provenance
+example, not as permission to silently upgrade a case; each case must pin and
+record the exact commit it actually uses.
 
 ```bash
 git rev-parse HEAD
@@ -72,28 +253,32 @@ case_studies/<case_name>/
 ├── pyproject.toml
 ├── uv.lock
 ├── config/
+│   ├── case.toml                  # paths, package revision, numerical roots
 │   ├── structural_zeros.toml       # if topology rules are enabled
-│   └── model.toml                  # optional gravity/MAP settings
+│   └── model.toml                  # required for gravity/MAP settings
 ├── inputs/
 │   ├── scenario/                   # metadata, stops, lines, trips, stop_times, bins
-│   ├── measurements_boarding_alighting.csv
-│   ├── prior_demand.csv
-│   └── fixed_demand.csv
+│   ├── measurements.csv            # example name selected by case.toml
+│   └── fixed_demand.csv             # example name selected by case.toml
 ├── run_case.py                     # case-owned orchestration driver
 ├── scripts/
 │   ├── 00_check.sbatch
-│   ├── 10_prepare.sbatch
-│   ├── 20_preflight.sbatch
-│   ├── 30_benchmark.sbatch
-│   ├── 40_fit_01.sbatch
-│   ├── 41_fit_02.sbatch
+│   ├── 10_structural_zeros.sbatch
+│   ├── 20_prepare.sbatch
+│   ├── 30_preflight.sbatch
+│   ├── 40_benchmark.sbatch
+│   ├── 50_fit.sbatch
+│   ├── 60_validate.sbatch
 │   └── submit_chain.sh
 └── results/
     ├── audit/
     ├── checkpoints/
     ├── artifacts/
     ├── logs/
+    ├── manifests/
     ├── preflight/
+    ├── structural_zeros/
+    ├── time_discretization/
     ├── fits/
     └── validation/
 ```
@@ -127,6 +312,8 @@ inputs, fingerprints, or prerequisites are invalid.
 The current workflow is:
 
 ```text
+count-based time-bin recommendation and explicit materialization (new cases)
+  →
 strict scenario and measurement audit
   → canonical timetable and OD/measurement indexes
   → structural-zero analysis and fixed-demand reconciliation
@@ -142,7 +329,22 @@ The direct-scheduled operator is the current scalable representation. It uses
 content-addressed, persistent artifacts and exposes forward/adjoint products
 without requiring a global dense measurement-by-OD matrix.
 
+The count-based time-discretization diagnostic is deliberately outside the
+seven driver commands: it is a public preparation utility that produces a
+reviewable JSON recommendation and an explicit `time_bins.csv` handoff. Once
+the bins and demand rows are approved, the ordinary driver sequence starts at
+`check`; no downstream stage silently re-estimates or changes the bins.
+
 ## 5. Stage 0 — freeze provenance and inputs
+
+**Stage contract.** Inputs are the **required-convention** case root,
+`pyproject.toml`, `uv.lock`, `config/case.toml`, `config/structural_zeros.toml`,
+`config/model.toml`, and the **case-owned example** files selected by
+`config/case.toml` (`inputs/scenario/`, `inputs/measurements.csv`, and
+`inputs/fixed_demand.csv`). Outputs are the **generated** provenance manifest
+and checksums under `results/audit/` (the exact filenames are case-driver
+choices and must be recorded in the manifest). This stage does not create an
+estimation artifact.
 
 Before running any expensive stage, record:
 
@@ -168,6 +370,14 @@ result and cache roots, never in a temporary directory.
 
 ## 6. Stage 1 — strict input and mapping audit
 
+**Stage contract.** Inputs are the **required-convention** scenario files
+(`inputs/scenario/metadata.json`, `stops.csv`, `lines.csv`, `time_bins.csv`,
+and, for a scheduled case, `trips.csv` and `stop_times.csv`), plus the
+**case-owned example** prior-demand, fixed-demand, and measurement paths from
+`config/case.toml`. Outputs are the **generated** audit files under
+`results/audit/` and the canonical timetable/measurement/assignment
+fingerprints. The audit must not publish a routing or fit artifact.
+
 The case driver must load the scenario with strict validation:
 
 ```python
@@ -176,7 +386,7 @@ from public_transportation.domain import Scenario
 scenario = Scenario.from_folder(
     "inputs/scenario",
     strict=True,
-    demand_file="inputs/prior_demand.csv",
+    demand_file="inputs/scenario/prior_demand.csv",
 )
 ```
 
@@ -207,8 +417,27 @@ under `results/audit/`.
 
 ## 7. Stage 2 — structural zeros and fixed demand
 
+**Stage contract.** Inputs are the **required-convention**
+`config/structural_zeros.toml`, the **case-owned example** scenario and prior
+demand selected by that TOML file, and any existing fixed-demand file named in
+its configuration. Outputs are the **generated** files
+`results/structural_zeros/fixed_demand.csv`,
+`structural_zero_audit.csv`, `structural_zero_summary.json`,
+`fingerprints.json`, and `resolved_config.toml`, together with the stage
+manifest and JSONL log under `results/manifests/` and `results/logs/`. The
+template uses these exact output filenames; a different driver must preserve
+their meaning and record any renamed paths in its manifest.
+
 Topology-driven structural-zero preprocessing is TOML-driven. A
 structural-zero TOML file can be passed to the public service:
+
+```text
+run_structural_zero_preprocessing(
+    config_file: str | Path,
+    *,
+    progress: Callable[[StructuralZeroProgress], None] | None = None,
+) -> StructuralZeroExecutionResult
+```
 
 ```python
 from public_transportation.preprocessing import run_structural_zero_preprocessing
@@ -222,11 +451,11 @@ result = run_structural_zero_preprocessing(
 The service writes:
 
 ```text
-fixed_demand.csv
-structural_zero_audit.csv
-structural_zero_summary.json
-fingerprints.json
-resolved_config.toml
+results/structural_zeros/fixed_demand.csv
+results/structural_zeros/structural_zero_audit.csv
+results/structural_zeros/structural_zero_summary.json
+results/structural_zeros/fingerprints.json
+results/structural_zeros/resolved_config.toml
 ```
 
 The structural-zero summary reports the number of candidate cells,
@@ -245,6 +474,19 @@ Before proceeding, verify:
   scenario.
 
 ## 8. Stage 3 — compact OD layout and direct-scheduled preparation
+
+**Stage contract.** Inputs are the **generated** structural-zero
+`results/structural_zeros/fixed_demand.csv` (or a reviewed **case-owned
+example** fixed-demand file when the structural stage is intentionally
+disabled), the **required-convention** scenario/timetable files, the
+case-owned measurement CSV, and the driver-selected construction limits in
+`config/model.toml` and `config/case.toml`. Outputs are **generated**
+identity-addressed artifacts under `results/artifacts/<identity>/` (including
+`manifest.json`, `blocks/block-*.npz`, and
+`fixed_measurement_offset.npy`) plus routing checkpoints under
+`results/checkpoints/<identity>/`, and the stage manifest/log. The directory
+names are current template conventions; the identity is generated, never
+handwritten.
 
 The current estimator uses a compact layout. Free cells are parameters; frozen
 zero cells are absent from the assignment representation; frozen positive cells
@@ -273,6 +515,11 @@ compact_layout = build_compact_od_assignment_layout(
     parameter_layout=od_layout,
 )
 ```
+
+When structural-zero preprocessing has run, replace the input path in this
+snippet with its reviewed `results/structural_zeros/fixed_demand.csv` output;
+the template does this automatically after the structural-zero stage. Record
+which file was used in the stage manifest.
 
 For direct-scheduled gravity/MAP, the driver then builds the canonical
 measurement index and calls
@@ -315,6 +562,14 @@ is never published as complete until all blocks validate.
 
 ## 9. Stage 4 — bounded preflight
 
+**Stage contract.** Inputs are the **generated** complete preparation artifact
+and matching routing checkpoint, the **case-owned** `config/model.toml`, and
+the **case-owned example** initial raw-parameter values. Outputs are the
+**generated** `results/preflight/` summary (if the driver stores a separate
+copy), `results/manifests/preflight.json`, and `results/logs/preflight.jsonl`.
+The completion field is `completed_phase` equal to
+`GravityPreflightPhase.RECOMMENDATION`; no fit checkpoint is written here.
+
 Do not begin a full fit before preflight. For a gravity problem, construct a
 `GravityObjectiveProblem` and call:
 
@@ -350,6 +605,15 @@ has `status == "completed"` and `result.complete is True`.
 
 ## 10. Stage 5 — warm benchmark
 
+**Stage contract.** Inputs are the same **generated** operator/artifact and
+problem used by the intended fit, the **case-owned** model specification and
+initial parameters, and the preflight recommendation. Outputs are the
+**generated** `results/manifests/benchmark.json` and
+`results/logs/benchmark.jsonl` (plus any case-driver benchmark JSON under
+`results/preflight/`). The benchmark is complete only when the manifest says
+the timings are finite and gradient agreement is within the declared
+tolerance; it is not a replacement for a fit result.
+
 The warm benchmark must measure the exact operator and model that will be fit.
 At minimum, record:
 
@@ -380,8 +644,15 @@ with the selected machine or Jed allocation.
 
 ## 11. Progress reporting and durable logs
 
-The current package does not support the former generic `--json-progress`
-command-line flag. Progress is enabled by passing callbacks. For gravity
+**Stage contract.** This is a cross-cutting requirement rather than a separate
+estimation stage. Every potentially long stage receives a progress callback
+and writes a **generated** JSONL file under the required-convention
+`results/logs/` root. The input is the stage's ordinary contract; the output is
+the progress log plus the stage's normal manifest. A log without the matching
+successful stage manifest is diagnostic evidence only, not a completed stage.
+
+The current package uses callbacks rather than a package-wide command-line
+progress switch. Progress is enabled by passing callbacks. For gravity
 estimation, use the durable JSONL sink:
 
 ```python
@@ -417,6 +688,16 @@ provisional; it becomes more reliable after completed units accumulate.
 
 ## 12. Stage 6 — initial MAP/gravity fit
 
+**Stage contract.** Inputs are the **generated** complete operator artifact,
+matching preflight and benchmark manifests, the **case-owned** model and
+optimizer settings in `config/model.toml`, and a persistent checkpoint root
+under the required-convention `results/checkpoints/`. Outputs are the
+**generated** fit manifest/result/checkpoint and progress log. In the current
+template these are `results/manifests/fit.json`,
+`results/fits/result.json`, the identity-bound checkpoint below
+`results/checkpoints/`, and `results/logs/fit.jsonl`; a private driver may add a
+fit-id directory but must preserve the same completion/status semantics.
+
 The recommended production fit is the smallest declared gravity model with
 MAP regularization or prior structure, after a short Poisson diagnostic fit.
 The case driver must create a `GravityEstimatorConfig` and
@@ -442,8 +723,8 @@ Checkpoints are identity-bound. Resume only with the same scientific model,
 OD layout, routing, mapping, observations, and checkpoint identity. A changed
 resource budget may be allowed; a changed model or artifact identity is not.
 
-The current public package has no generic `run.py fit` command. The private
-driver owns the fit command and should write at least:
+The public package does not own a case-driver fit command. The private driver
+owns the fit command and should write at least:
 
 ```text
 results/fits/<fit-id>/manifest.json
@@ -453,6 +734,17 @@ results/logs/<fit-id>.progress.jsonl
 ```
 
 ## 13. Stage 7 — diagnostics, reconstruction, and validation
+
+**Stage contract.** Inputs are the **generated** accepted fit result, the
+matching operator/artifact and fingerprints, the **required-convention**
+scenario/timetable, and the **case-owned example** observation CSV. Outputs
+must include the **generated** `results/manifests/validate.json` and
+`results/logs/validate.jsonl`. The full reconstructed OD, predicted counts,
+and residual tables should be written under `results/validation/` (for example,
+`full_od.csv`, `predicted_measurements.csv`, and `residuals.csv`; these names
+are **case-owned examples**, not package hardcodes).
+`acceptance = accepted` is written only for a converged successful fit; an
+iteration-limit or deadline-stopped fit produces `diagnostic_only`.
 
 Only after accepting a fit:
 
@@ -488,26 +780,33 @@ Use separate jobs for preparation, preflight, benchmark, and fit. Keep each job
 below the scheduler wall-time limit and preserve checkpoint/artifact roots on
 persistent storage.
 
-A typical dependency chain is:
+A tested dependency chain is provided by the public template. After copying it
+into the private case and reviewing the resource requests:
 
 ```bash
-PREPARE_JOB=$(sbatch --parsable scripts/10_prepare.sbatch)
-PREFLIGHT_JOB=$(sbatch --parsable \
-  --dependency=afterok:${PREPARE_JOB} scripts/20_preflight.sbatch)
-BENCHMARK_JOB=$(sbatch --parsable \
-  --dependency=afterok:${PREFLIGHT_JOB} scripts/30_benchmark.sbatch)
-FIT_1_JOB=$(sbatch --parsable \
-  --dependency=afterok:${BENCHMARK_JOB} scripts/40_fit_01.sbatch)
-FIT_2_JOB=$(sbatch --parsable \
-  --dependency=afterok:${FIT_1_JOB} scripts/41_fit_02.sbatch)
-printf 'prepare=%s preflight=%s benchmark=%s fit=%s,%s\n' \
-  "$PREPARE_JOB" "$PREFLIGHT_JOB" "$BENCHMARK_JOB" "$FIT_1_JOB" "$FIT_2_JOB"
+mkdir -p results/logs results/manifests results/checkpoints results/artifacts
+bash scripts/submit_chain.sh
 ```
+
+The template submits `00_check.sbatch`, `10_structural_zeros.sbatch`,
+`20_prepare.sbatch`, `30_preflight.sbatch`, `40_benchmark.sbatch`,
+`50_fit.sbatch`, and `60_validate.sbatch` with `afterok` dependencies. Each
+wrapper uses `SLURM_SUBMIT_DIR`, the frozen `uv` environment, explicit CPU,
+memory, and wall-time requests, and persistent output/error paths. Copy the
+wrappers rather than inventing a second stage order; adjust resources only
+after the warm benchmark justifies the change.
 
 Each fit segment must use the same model fingerprint and checkpoint path. The
 first segment starts a fresh fit; later segments resume it. Never launch a
 second writer against the same checkpoint. Use separate fit IDs for sensitivity
 runs.
+
+The template resumes a clean time-budget stop with the same identity-bound
+checkpoint using:
+
+```bash
+uv run --frozen python run_case.py fit --resume
+```
 
 Slurm wrappers should write stdout and stderr to persistent files:
 
@@ -545,3 +844,461 @@ Before calling the current case complete, verify:
 - [ ] progress and stderr logs are stored on persistent storage;
 - [ ] accepted fits are reconstructed and validated against observations;
 - [ ] all case-specific scientific assumptions are documented in the private README.
+
+## 17. Exact current API contracts
+
+The following signatures are the contracts used by the template. They are
+copied from the current package revision; keep a recorded package revision
+alongside every case manifest because signatures and fingerprints are versioned
+contracts, not informal suggestions.
+
+### Scenario and timetable
+
+```text
+Scenario.from_folder(
+    folder: str | Path,
+    *,
+    strict: bool = False,
+    demand_file: str | Path | None = None,
+    allow_missing_demand: bool = False,
+) -> Scenario
+```
+
+`folder` must contain `metadata.json`, `stops`, `lines`, and `time_bins`; a
+scheduled case also needs matching `trips` and `stop_times`. With `strict=True`
+the loader validates the complete scenario and raises on errors. If
+`demand_file` is supplied it is the authoritative prior-demand table; the
+package does not guess between several demand files.
+
+```text
+build_canonical_timetable_index(
+    scenario: Scenario,
+) -> CanonicalTimetableIndex
+```
+
+The returned index carries `schema_version`, `source_fingerprint`, ordered
+`stop_ids`, `time_bins`, trips, stop-times, lookup maps, and a deterministic
+`fingerprint`. It is passed to assignment preparation and structural-topology
+construction so that event coordinates are shared.
+
+### Assignment and identifiers
+
+```text
+prepare_assignment(
+    scenario: Scenario,
+    config: AssignmentConfig,
+    *,
+    cache_directory: str | os.PathLike[str] | None = None,
+    cache_policy: str | None = None,
+    timetable_index: Any | None = None,
+) -> AssignmentArtifacts
+```
+
+`cache_policy` is one of `off`, `auto`, `refresh`, or `readonly`. The result
+contains the assignment `graph`, `od_groups`, base cost parts, the effective
+configuration, cache metrics, and provenance JSON/fingerprint. Do not pass a
+different timetable index to later stages.
+
+```text
+AssignmentIDManager.build(
+    *, scenario: Scenario, graph: JaxGraph
+) -> AssignmentIDManager
+```
+
+The manager supplies canonical stop/trip/node/link maps, scenario/canonical OD
+permutations, node and link metadata, and `fingerprint`. It is the authority
+used by strict measurement mapping; never build a second ad-hoc stop index.
+
+Minimal verified assembly:
+
+```python
+scenario = Scenario.from_folder(
+    "inputs/scenario", strict=True,
+    demand_file="inputs/scenario/prior_demand.csv",
+)
+timetable = build_canonical_timetable_index(scenario)
+artifacts = prepare_assignment(
+    scenario=scenario, config=AssignmentConfig(), timetable_index=timetable,
+)
+ids = AssignmentIDManager.build(scenario=scenario, graph=artifacts.graph)
+```
+
+### Fixed demand and compact OD coordinates
+
+```text
+read_fixed_demand_csv(
+    path: str | Path, *, scenario: Scenario
+) -> FixedODDemand
+
+build_od_parameter_layout(
+    *, scenario: Scenario,
+    fixed_demand: FixedODDemand | None = None,
+) -> ODParameterLayout
+
+build_compact_od_assignment_layout(
+    *, parameter_layout: ODParameterLayout
+) -> CompactODAssignmentLayout
+```
+
+`read_fixed_demand_csv` returns canonical, sorted records. A record freezes a
+complete `(origin_stop_id, dest_stop_id, time_bin_id)` key; missing or blank
+`fixed_flow` is zero. `ODParameterLayout` records `od_keys`, full indices,
+free indices, fixed-zero indices, positive fixed values, baseline values, and
+its fingerprint. Free cells must have finite, strictly positive baselines;
+frozen cells may be zero. The compact layout reports `num_free`,
+`num_fixed_positive`, `num_removed_zero`, `full_to_compact`, and a fingerprint.
+Only `num_free` is passed to the estimator and assignment operator.
+
+### Measurements and canonical event mapping
+
+```text
+read_measurements_csv(path: str | Path) -> MeasurementTable
+
+build_mapping_spec_strict(
+    *, id_manager: AssignmentIDManager,
+    table: MeasurementTable,
+    include_link_lists_for_report: bool = False,
+) -> MappingSpecResult
+```
+
+`MeasurementTable` records have `method_id`, `measurement_type`, `stop_id`,
+`time`, `value`, optional `trip_id`, and optional `line_id`. The strict reader
+requires `measurement_type` to be `boarding` or `alighting`, time in
+`HH:MM:SS`, and a finite non-negative numeric value. Strict mapping resolves
+each row to exactly one timetable event and at least one contributing link;
+the result contains `y_obs`, a JAX-safe `AggregationSpec`, and `MappingInfo`
+with one entry per row and a mapping fingerprint.
+
+The driver must then create canonical coordinates explicitly:
+
+```python
+CanonicalTimeInterval(interval_id, start_seconds, end_seconds)
+CanonicalMeasurement(
+    row_index, measurement_id, event, location_id, interval_id
+)
+build_canonical_assignment_index(
+    *, parameter_layout, time_intervals, measurements
+) -> CanonicalAssignmentIndex
+```
+
+The canonical index checks half-open, non-overlapping intervals, contiguous
+OD/measurement coordinates, unique physical keys, and unique measurement IDs.
+Its `artifact_fingerprint` identifies physical coordinates; its
+`binding_fingerprint` additionally identifies free/fixed roles and values.
+
+### Direct-scheduled activation
+
+The complete current signature is:
+
+```text
+activate_direct_scheduled_temporal_operator(
+    *, mode, expected_evaluations, construction_seconds,
+    reference_evaluation_seconds, operator_evaluation_seconds,
+    checkpoint_root, artifact_root, inputs, routing_factory, theta, spec,
+    compact_layout, canonical_index, observations, identity,
+    assignment_fingerprint, od_layout_fingerprint, config=None,
+    progress=None, deadline=None, time_budget_seconds=None,
+    safety_margin_seconds=0.0, progress_interval_seconds=1.0,
+    predicted_routing_seconds=None, bounded_routing_factory=None,
+    routing_preparation_config=None, measurement_info=None,
+    fixed_zero_reasons_by_full_index=None,
+) -> DirectScheduledActivationResult
+```
+
+`inputs` is produced by `build_assignment_inputs(artifacts=..., compact_layout=...)`;
+`routing_factory` returns `FixedRoutingInputs` for the declared `theta`;
+`observations` is the mapped observation vector. `identity` is a complete
+`AssignmentArtifactIdentity` (canonical-index, network, timetable,
+temporal-discretization, route-choice, departure-choice, feasibility,
+measurement-mapping, coefficient-policy fingerprints, numeric dtype, and
+schema version). The result contains a `decision`, an optional `operator`, an
+optional construction record, and an optional termination record. A complete
+operator has a persisted artifact manifest with `complete: true`, matching
+identity/provenance, dimensions, nonzero count, block list, and fixed-offset
+hash. A deadline termination is resumable; it is not a completed operator.
+
+The template's `adapter.activate` is a minimal executable example of this
+assembly. It uses persistent `results/checkpoints/` and `results/artifacts/`
+roots, strict mapping, the compact layout, and bounded shard settings.
+
+The adapter helpers used in that assembly have these signatures:
+
+```text
+build_assignment_inputs(
+    *, artifacts: AssignmentArtifacts,
+    compact_layout: CompactODAssignmentLayout | None = None,
+) -> AssignmentInputs
+
+prepare_fixed_routing(
+    *, inputs: AssignmentInputs, theta: float,
+    diagnostics_callback: FixedRoutingDiagnosticsCallback | None = None,
+    absolute_deadline: float | None = None,
+    clock: Clock = perf_counter,
+) -> FixedRoutingInputs
+
+build_scheduled_reference_artifact_identity(
+    *, inputs: AssignmentInputs, spec: AggregationSpec,
+    canonical_index: CanonicalAssignmentIndex, theta: float,
+    temporal_discretization_fingerprint: str,
+    departure_choice_fingerprint: str,
+    feasibility_fingerprint: str,
+    coefficient_policy_fingerprint: str,
+) -> AssignmentArtifactIdentity
+```
+
+`build_assignment_inputs` compacts the assignment OD groups and converts their
+arrays to JAX-safe dtypes. `prepare_fixed_routing` depends on graph/timetable
+state and `theta`, but not on demand. The identity builder hashes the
+assignment-input and measurement mappings and requires explicit scientific
+fingerprints for every remaining dependency.
+
+The assembly order is significant and should look like this (case-specific
+feature construction is the only intentional extension point):
+
+```python
+inputs = build_assignment_inputs(
+    artifacts=artifacts, compact_layout=compact_layout
+)
+table = read_measurements_csv("inputs/measurements.csv")
+mapped = build_mapping_spec_strict(id_manager=id_manager, table=table)
+canonical = build_canonical_assignment_index(
+    parameter_layout=od_layout,
+    time_intervals=canonical_intervals_from_scenario(scenario),
+    measurements=canonical_measurements_from_table(table),
+)
+identity = build_scheduled_reference_artifact_identity(
+    inputs=inputs, spec=mapped.spec, canonical_index=canonical,
+    theta=theta,
+    temporal_discretization_fingerprint="case-time-bins-v1",
+    departure_choice_fingerprint="case-departure-choice-v1",
+    feasibility_fingerprint="case-assignment-config-v1",
+    coefficient_policy_fingerprint="exact-float32-v1",
+)
+activated = activate_direct_scheduled_temporal_operator(
+    mode="direct", expected_evaluations=expected_evaluations,
+    construction_seconds=None, reference_evaluation_seconds=reference_seconds,
+    operator_evaluation_seconds=operator_seconds,
+    checkpoint_root=Path("results/checkpoints"),
+    artifact_root=Path("results/artifacts"),
+    inputs=inputs,
+    routing_factory=lambda: prepare_fixed_routing(inputs=inputs, theta=theta),
+    theta=theta, spec=mapped.spec, compact_layout=compact_layout,
+    canonical_index=canonical, observations=np.asarray(mapped.y_obs),
+    identity=identity,
+    assignment_fingerprint=id_manager.fingerprint,
+    od_layout_fingerprint=od_layout.fingerprint,
+    config=ShardedConstructionConfig(...), progress=progress,
+    time_budget_seconds=construction_budget,
+    safety_margin_seconds=safety_margin,
+    measurement_info=mapped.info,
+)
+```
+
+The three ellipses above are deliberately named, not inferred values: the
+case owner must supply measured/reference timings, resource limits, and the
+two canonical-coordinate helper results. The public template contains the
+complete concrete implementation of those helpers and uses no private-network
+assumptions.
+
+### Gravity preflight and estimation
+
+```text
+run_gravity_preflight(
+    *, problem: GravityObjectiveProblem,
+    raw_parameters: object,
+    stop_after: GravityPreflightPhase = GravityPreflightPhase.RECOMMENDATION,
+    projected_optimizer_iterations: int = 25,
+) -> GravityPreflightResult
+```
+
+The complete result has `completed_phase == GravityPreflightPhase.RECOMMENDATION`
+and reports cache shards, phase timings, objective values, gradient agreement,
+peak RSS, resident routing bytes, and a derivative-strategy recommendation.
+
+```text
+estimate_gravity_model(
+    *, problem: GravityObjectiveProblem,
+    compact_layout: CompactODAssignmentLayout,
+    initial_raw_parameters: object,
+    config: GravityEstimatorConfig = GravityEstimatorConfig(),
+    execution: GravityExecutionPolicy = GravityExecutionPolicy(),
+    resume: bool = False,
+    progress: Callable[[GravityEstimatorProgress], None] | None = None,
+    clock: Callable[[], float] = perf_counter,
+) -> GravityEstimationResult
+```
+
+`GravityEstimatorConfig` controls iteration and objective/gradient tolerances.
+`GravityExecutionPolicy` controls `gradient_strategy` (`auto`,
+`batched_forward`, or `adjoint`), wall-time budget, checkpoint path,
+progress interval, and persistent JAX compilation cache. The result contains
+status/success/message, raw and physical parameters, free/active/full demand,
+predicted measurements, objective and likelihood, gradient, iteration count,
+elapsed time, model/specification fingerprints, strategy diagnostics, resume
+state, and checkpoint path. A checkpoint can be resumed only when its model
+fingerprint and parameter dimension match; the caller must pass `resume=True`.
+
+### Durable progress sink
+
+```text
+GravityJSONLProgressSink(
+    path: Path,
+    durable: bool = True,
+    context: Mapping[str, object] | None = None,
+)
+```
+
+Calling the sink appends one JSON object per line with `schema_version`, UTC
+timestamp, `event_type`, optional context, and a serialized `event`. It accepts
+the gravity estimator progress dataclass and construction dictionaries/events.
+The sink is thread-safe and creates its parent directory. A minimal verified
+use is:
+
+```python
+sink = GravityJSONLProgressSink(Path("results/logs/fit.jsonl"), durable=True)
+result = estimate_gravity_model(
+    problem=problem, compact_layout=compact_layout,
+    initial_raw_parameters=initial_raw, execution=execution,
+    progress=sink,
+)
+```
+
+The template fixture executes all seven stages against the committed
+`simple_example_02` data in
+`tests/case_study/test_direct_scheduled_case_template.py`. It verifies all
+stage manifests, persistent artifacts, and non-empty JSONL logs without adding
+an absolute checkout path to the driver.
+
+## 18. Input file contract
+
+The following columns and types are mandatory; values are never inferred from
+filenames or from another case.
+
+| File | Required columns and types | Notes |
+|---|---|---|
+| `metadata.json` | `title: str` (other keys optional: `description`, `timezone`, `cost_unit`, `created_at`, `sources`, `extra`) | JSON object consumed by `Metadata`; record the source feed and service-day convention. |
+| `stops.csv` | `stop_id: str`, `lat: float`, `lon: float`; optional `name` | IDs must be unique; coordinates are required by `Scenario.from_folder`. |
+| `lines.csv` | `line_id: str`; optional `short_name`, `long_name`, `mode`, `agency_id` | IDs must be unique. |
+| `time_bins.csv` | `bin_id: str`, `start_s: int/time`, `end_s: int/time` | Half-open, non-overlapping intervals; start < end. |
+| `demand.csv` or explicit prior file | `origin_stop_id: str`, `dest_stop_id: str`, `time_bin_id: str`, `flow: finite float >= 0` | One unique OD-time key per row. |
+| `trips.csv` | `trip_id: str`, `line_id: str` | Required for scheduled assignment. |
+| `stop_times.csv` | `trip_id: str`, `stop_id: str`, `sequence: int`, `arrival_s: int/time`, `departure_s: int/time` | Times use the service-day convention; sequences are increasing per trip. |
+| fixed demand | `origin_stop_id: str`, `dest_stop_id: str`, `time_bin_id: str`, optional `fixed_flow: finite float >= 0` | Every key must be in the scenario demand; blank means zero. |
+| measurements | `method_id: str`, `measurement_type: boarding/alighting`, `stop_id: str`, `time: HH:MM:SS`, `value: finite float >= 0`, optional `trip_id`, `line_id` | Every row is strict-mapped to one event and at least one link. |
+
+`config/structural_zeros.toml` is mandatory when topology rules are used; it
+declares scenario/output paths, all `[rules.enabled]` booleans, each enabled
+rule's parameters, assignment tolerances, and optional existing fixed-demand
+file. `config/model.toml` declares likelihood, gravity components and sources,
+transformations, constraints, regularization, initial raw values, derivative
+strategy, tolerances, checkpoint policy, wall-time budget, and direct-scheduled
+construction limits (`od_chunk_size`, `measurement_block_size`, worker memory,
+storage-shard limits, and manifest checkpoint interval). The package does not
+infer a prior, frozen values, measurement units, likelihood, or model
+components from the CSV contents.
+
+## 19. Stage outputs and completion criteria
+
+The case driver should use the following durable locations and status rules.
+The labels in the input/output columns are intentional: **convention** means
+the current template expects that name, **example** means the case owner may
+change the path in configuration, and **generated** means the file is created
+by the stage and must be fingerprinted before a later stage consumes it.
+
+| Stage | Inputs (convention vs example) | Required outputs (generated) | Success/completion field | Resumable? |
+|---|---|---|---|---|
+| count recommendation | **Example:** `inputs/measurements.csv`; **example settings:** resolution, horizon, `num_od_pairs`, and `max_od_cells` passed to `time_discretization` | `results/time_discretization/recommendation.json`; retain the input checksum and selected candidate | JSON `status = "ok"` and a valid `recommendation`; `blocked` is a stop condition | no; rerun after a deliberate input/policy change |
+| bin materialization | **Generated:** reviewed recommendation JSON; **example output:** `results/time_discretization/time_bins.reviewed.csv` | reviewed three-column CSV; later, the **convention** scenario input `inputs/scenario/time_bins.csv` after explicit adoption | materializer succeeds and the selected candidate is valid; scenario `time_bins.csv` is not replaced implicitly | no |
+| `check` | **Convention:** `config/case.toml`, `config/structural_zeros.toml`, `config/model.toml`; **example:** paths selected by those files under `inputs/` | `results/manifests/check.json`, `results/logs/check.jsonl`, and audit fingerprints | manifest `status = "completed"`, all fingerprints present | no |
+| `structural-zeros` | **Convention:** `config/structural_zeros.toml`; **example:** scenario, prior, and existing fixed-demand paths selected by it | `results/structural_zeros/fixed_demand.csv`, `results/structural_zeros/structural_zero_audit.csv`, `results/structural_zeros/structural_zero_summary.json`, `results/structural_zeros/fingerprints.json`, `results/structural_zeros/resolved_config.toml`, `results/manifests/structural-zeros.json`, `results/logs/structural-zeros.jsonl` | service returns without exception; summary and fingerprints exist | safe to rerun with the same roots |
+| `prepare` | **Generated:** structural-zero fixed demand (or **example:** reviewed fixed-demand file when the stage is disabled); **convention:** scenario/timetable and measurement contracts; **example:** resource limits in TOML | `results/artifacts/<identity>/manifest.json`, `blocks/block-*.npz`, `fixed_measurement_offset.npy`; `results/checkpoints/<identity>/`; stage manifest/log | artifact `complete = true`; routing `status = "completed"` | yes, only from a matching checkpoint |
+| `preflight` | **Generated:** complete preparation artifact; **example:** model settings and initial raw parameters | `results/manifests/preflight.json`, `results/logs/preflight.jsonl`, and optional **example** copy under `results/preflight/` | `completed_phase = recommendation` | no |
+| `benchmark` | **Generated:** the exact artifact/problem used for the fit and preflight recommendation; **example:** benchmark repetitions and tolerances | `results/manifests/benchmark.json`, `results/logs/benchmark.jsonl`, and optional **example** benchmark JSON under `results/preflight/` | finite timings and gradient agreement within the declared tolerance | no |
+| `fit` | **Generated:** complete artifact, preflight, benchmark; **convention:** `results/checkpoints/`; **example:** model/optimizer settings and fit ID | `results/manifests/fit.json`, `results/fits/result.json` (or `.npz`), identity-bound checkpoint, `results/logs/fit.jsonl` | optimizer status is explicit; `success` must be checked separately from stage completion | yes for a valid time-budget checkpoint |
+| `validate` | **Generated:** accepted fit result and matching artifact; **convention:** scenario/timetable; **example:** observation path and reporting choices | `results/manifests/validate.json`, `results/logs/validate.jsonl`; **example:** `results/validation/full_od.csv`, `predicted_measurements.csv`, `residuals.csv` | identity matches fit/operator; `acceptance = "accepted"` only for a converged successful fit, otherwise `diagnostic_only` | no |
+
+An artifact filename or a zero exit code without the durable summary is never
+enough. Keep output roots outside temporary storage and never overwrite a
+different fingerprint in place.
+
+## 20. Minimal gravity/MAP specification
+
+The template's verified specification estimates a production scale and a
+destination-attractiveness correction while retaining positive journey-time,
+transfer, and negative-binomial dispersion components from the package's
+default gravity contract:
+
+```python
+specification = GravityModelSpecification(
+    components=(
+        GravityComponentSpecification(
+            "production", GravityEffectScope.GLOBAL,
+            GravityParameterization.LOG_MULTIPLIER,
+            source="origin_time_totals",
+        ),
+        GravityComponentSpecification(
+            "destination_attractiveness", GravityEffectScope.DESTINATION,
+            GravityParameterization.ADDITIVE,
+            grouping="destination_index", group_count=num_destinations,
+            constraint=GravityConstraint.SUM_ZERO,
+            regularization=GravityRegularization(
+                GravityRegularizationType.RIDGE, 1.0
+            ), source="feature_cache",
+        ),
+    ),
+    likelihood=GravityLikelihoodSpecification(
+        family="negative_binomial",
+        calibration_mask="supported_measurements",
+    ),
+)
+```
+
+The production component uses externally supplied origin-time totals; the
+destination feature is supplied by the case adapter; both are not estimated
+from the same count row. Positive raw-to-physical transformations are applied
+to journey time, transfer, and dispersion; destination deviations use a
+sum-zero constraint and ridge penalty. Start with finite raw values (the
+template uses zero except for explicitly configured raw starts), choose the
+derivative strategy recommended by preflight, and accept a fit only when the
+objective, gradient, checkpoint identity, and reconstructed counts pass the
+case's tolerances.
+
+## 21. Reuse and incompatibility boundary
+
+The current direct-scheduled artifacts are a new format. Artifacts produced by
+the retired `478c473` reduced-OD workflow cannot be consumed by current main,
+even if their filenames look similar. They may be retained in an archival
+directory for provenance, but current preparation must use new artifact and
+checkpoint roots and current fingerprints. There is no automatic converter.
+
+| Earlier material | Current use |
+|---|---|
+| Raw network, timetable, observations, and reviewed scientific decisions | reusable after current strict audit |
+| Human-reviewed topology/time audits | potentially reusable as evidence, never as current artifacts without matching fingerprints |
+| Retired preparation summaries, reduced-OD directories, old routing shards, old fingerprints/checkpoints | not consumable by current main; retain only as provenance |
+
+Reuse is allowed only when content, configuration, package, numerical dtype,
+and algorithm fingerprints all match. A filename, directory name, or apparent
+shape match never establishes compatibility.
+
+## 22. Failure classification
+
+Before changing inputs or code, classify the failure:
+
+1. **Walkthrough/documentation error** — a public instruction or example does
+   not match the current API.
+2. **Public-package/API error** — the documented current call fails on valid,
+   package-supported inputs or violates its own contract.
+3. **Private-driver/orchestration error** — the adapter passes the wrong object,
+   omits a fingerprint, or starts stages out of order.
+4. **Data/file-format error** — malformed CSV/JSON, duplicate key, unknown ID,
+   unsupported event, or inconsistent time convention.
+5. **Environment/dependency error** — wrong Python/package lock, missing JAX
+   backend, or unavailable native dependency.
+6. **Scheduler/resource error** — wall-time, memory, CPU, filesystem, or job
+   dependency failure.
+
+Do not silently repair inputs, drop unsupported observations, substitute local
+package code, or mix artifacts across fingerprints. Record the failing command,
+revision, configuration, traceback, and durable artifact state before applying
+a narrowly scoped correction.
