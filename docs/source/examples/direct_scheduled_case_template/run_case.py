@@ -12,7 +12,9 @@ import platform
 import sys
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
+from threading import Event, Thread
 from time import perf_counter
+from typing import Mapping
 
 import numpy as np
 
@@ -62,12 +64,196 @@ def _jsonable(value: object) -> object:
     return value
 
 
-def _paths(context: CaseContext, stage: str) -> tuple[Path, Path]:
-    manifests = context.settings.results / "manifests"
-    logs = context.settings.results / "logs"
-    manifests.mkdir(parents=True, exist_ok=True)
-    logs.mkdir(parents=True, exist_ok=True)
-    return manifests / f"{stage}.json", logs / f"{stage}.jsonl"
+class _StageProgress:
+    """Durable stage progress with heartbeats for uninstrumented work."""
+
+    def __init__(self, settings: CaseSettings, stage: str) -> None:
+        self.settings = settings
+        self.stage = stage
+        self.manifest_path = settings.results / "manifests" / f"{stage}.json"
+        self.log_path = settings.results / "logs" / f"{stage}.jsonl"
+        self.sink = GravityJSONLProgressSink(
+            self.log_path,
+            durable=True,
+            context={"stage": stage},
+        )
+        self._started = perf_counter()
+        self._phase = "initialization"
+        self._current_unit = "load_context"
+        self._stop = Event()
+        self._heartbeat_thread: Thread | None = None
+        self._finished = False
+
+    @property
+    def elapsed_seconds(self) -> float:
+        return perf_counter() - self._started
+
+    def _event(self, event: Mapping[str, object]) -> None:
+        payload = dict(event)
+        payload.setdefault("schema_version", 1)
+        payload.setdefault("stage", self.stage)
+        payload.setdefault("elapsed_seconds", self.elapsed_seconds)
+        self.sink(payload)
+
+    def start(self) -> None:
+        """Write the first durable event before context loading begins."""
+        self._event(
+            {
+                "phase": "initialization",
+                "status": "started",
+                "elapsed_seconds": 0.0,
+                "current_unit": "load_context",
+                "estimated_remaining_seconds": None,
+                "eta_confidence": "unavailable",
+            }
+        )
+        self._heartbeat_thread = Thread(
+            target=self._heartbeat_loop,
+            name=f"{self.stage}-progress-heartbeat",
+            daemon=True,
+        )
+        self._heartbeat_thread.start()
+
+    def _heartbeat_loop(self) -> None:
+        interval = float(self.settings.progress_interval_seconds)
+        while not self._stop.wait(interval):
+            self._event(
+                {
+                    "phase": self._phase,
+                    "status": "running",
+                    "current_unit": self._current_unit,
+                    "estimated_remaining_seconds": None,
+                    "eta_confidence": "unavailable",
+                    "heartbeat": True,
+                }
+            )
+
+    def __call__(self, event: object) -> None:
+        """Forward adapter/package events and track the active phase."""
+        if isinstance(event, Mapping):
+            payload = dict(event)
+        else:
+            payload = {
+                "phase": self._phase,
+                "status": "running",
+                "current_unit": self._current_unit,
+                "source_event_type": type(event).__name__,
+            }
+        phase = payload.get("phase")
+        current_unit = payload.get("current_unit")
+        if isinstance(phase, str):
+            self._phase = phase
+        if isinstance(current_unit, str) and current_unit:
+            self._current_unit = current_unit
+        payload.setdefault("phase", self._phase)
+        payload.setdefault("status", "running")
+        payload.setdefault("current_unit", self._current_unit)
+        self._event(payload)
+
+    def phase_started(self, phase: str, current_unit: str) -> None:
+        self._phase = phase
+        self._current_unit = current_unit
+        self(
+            {
+                "phase": phase,
+                "status": "running",
+                "current_unit": current_unit,
+                "estimated_remaining_seconds": None,
+                "eta_confidence": "unavailable",
+            }
+        )
+
+    def phase_completed(self, phase: str, current_unit: str) -> None:
+        self._phase = phase
+        self._current_unit = current_unit
+        self(
+            {
+                "phase": phase,
+                "status": "completed",
+                "current_unit": current_unit,
+            }
+        )
+
+    def finish(
+        self,
+        status: str,
+        *,
+        error: BaseException | None = None,
+    ) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        self._stop.set()
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join(timeout=max(1.0, self.settings.progress_interval_seconds * 2.0))
+        payload: dict[str, object] = {
+            "phase": "stage_completion",
+            "status": status,
+            "current_unit": self.stage,
+        }
+        if error is not None:
+            payload.update(
+                {
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                }
+            )
+        self._event(payload)
+
+
+def _start_stage(root: Path, stage: str) -> tuple[CaseSettings, _StageProgress]:
+    """Load only settings, then open progress before context construction."""
+    settings = CaseSettings.load(root)
+    settings.results.joinpath("manifests").mkdir(parents=True, exist_ok=True)
+    settings.results.joinpath("logs").mkdir(parents=True, exist_ok=True)
+    progress = _StageProgress(settings, stage)
+    progress.start()
+    return settings, progress
+
+
+def _failure_manifest(
+    settings: CaseSettings,
+    progress: _StageProgress,
+    error: BaseException,
+    *,
+    context: CaseContext | None = None,
+    status: str = "failed",
+) -> dict[str, object]:
+    existing: dict[str, object] = {}
+    if progress.manifest_path.is_file():
+        try:
+            candidate = json.loads(progress.manifest_path.read_text(encoding="utf-8"))
+            if isinstance(candidate, dict):
+                existing = candidate
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+    if existing:
+        payload = existing
+        payload["status"] = status
+    elif context is None:
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "status": status,
+            "stage": progress.stage,
+            "package_revision": settings.package_revision,
+        }
+    else:
+        payload = _base(context, progress.stage)
+        payload["status"] = status
+    payload.update(
+        {
+            "error_type": type(error).__name__,
+            "error": str(error),
+        }
+    )
+    write_json(progress.manifest_path, payload)
+    return payload
+
+
+def _is_deadline_stop(error: BaseException) -> bool:
+    return isinstance(error, TimeoutError) or (
+        isinstance(error, SystemExit) and "stopped" in str(error).lower()
+    )
 
 
 def _base(context: CaseContext, stage: str) -> dict[str, object]:
@@ -109,48 +295,38 @@ def _activation_summary(activated: object) -> dict[str, object]:
 
 
 def check(root: Path) -> None:
-    context = load_context(root)
-    path, log_path = _paths(context, "check")
-    payload = _base(context, "check") | {
-        "scenario": str(context.settings.scenario),
-        "measurements": str(context.settings.measurements),
-        "fixed_demand": str(context.settings.fixed_demand),
-        "num_physical_od_cells": context.parameter_layout.num_od_total,
-        "num_free_od_cells": context.compact_layout.num_free,
-        "num_fixed_positive_cells": context.compact_layout.num_fixed_positive,
-        "num_removed_zero_cells": context.compact_layout.num_removed_zero,
-        "num_measurements": context.mapping.spec.num_measurements,
-    }
-    write_json(path, payload)
-    sink = GravityJSONLProgressSink(log_path, durable=True, context={"stage": "check"})
-    sink({"phase": "input_audit", "status": "completed", "current_unit": "canonical_mapping"})
-    print(json.dumps(_jsonable(payload), sort_keys=True))
+    settings, progress = _start_stage(root, "check")
+    context: CaseContext | None = None
+    try:
+        context = load_context(root, settings=settings, progress=progress)
+        payload = _base(context, "check") | {
+            "scenario": str(context.settings.scenario),
+            "measurements": str(context.settings.measurements),
+            "fixed_demand": str(context.settings.fixed_demand),
+            "num_physical_od_cells": context.parameter_layout.num_od_total,
+            "num_free_od_cells": context.compact_layout.num_free,
+            "num_fixed_positive_cells": context.compact_layout.num_fixed_positive,
+            "num_removed_zero_cells": context.compact_layout.num_removed_zero,
+            "num_measurements": context.mapping.spec.num_measurements,
+        }
+        write_json(progress.manifest_path, payload)
+        progress({"phase": "input_audit", "status": "completed", "current_unit": "canonical_mapping"})
+        progress.finish("completed")
+        print(json.dumps(_jsonable(payload), sort_keys=True))
+    except BaseException as error:
+        status = "deadline_stopped" if _is_deadline_stop(error) else (
+            "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
+        )
+        _failure_manifest(settings, progress, error, context=context, status=status)
+        progress.finish(status, error=error)
+        raise
 
 
 def bootstrap_prior(root: Path, resume: bool = False) -> None:
-    settings = CaseSettings.load(root)
-    manifests = settings.results / "manifests"
-    logs = settings.results / "logs"
-    manifests.mkdir(parents=True, exist_ok=True)
-    logs.mkdir(parents=True, exist_ok=True)
-    path = manifests / "bootstrap-prior.json"
-    log_path = logs / "bootstrap-prior.jsonl"
-    sink = GravityJSONLProgressSink(
-        log_path, durable=True, context={"stage": "bootstrap-prior"}
-    )
-    sink({
-        "stage": "bootstrap-prior",
-        "phase": "bootstrap_prior",
-        "status": "started",
-        "current_unit": "candidate_od_time_expansion",
-        "resume": resume,
-    })
+    settings, progress = _start_stage(root, "bootstrap-prior")
 
-    def progress(event: dict[str, object]) -> None:
-        # Normalize expansion/materialization dictionaries into the same
-        # durable progress vocabulary used by the other long stages.
+    def normalized_progress(event: Mapping[str, object]) -> None:
         normalized = dict(event)
-        normalized.setdefault("stage", "bootstrap-prior")
         normalized.setdefault(
             "phase",
             "expand_od_time" if "completed_chunks" in normalized else "materialize_prior",
@@ -166,258 +342,317 @@ def bootstrap_prior(root: Path, resume: bool = False) -> None:
         normalized.setdefault(
             "current_unit", normalized.get("next_chunk", normalized.get("chunk"))
         )
-        sink(normalized)
+        progress(normalized)
 
     try:
-        audit = bootstrap_prior_demand(root, resume=resume, progress=progress)
-    except ODTimeExpansionInterrupted as error:
+        progress({
+            "phase": "bootstrap_prior",
+            "status": "running",
+            "current_unit": "candidate_od_time_expansion",
+            "resume": resume,
+        })
+        audit = bootstrap_prior_demand(
+            root,
+            resume=resume,
+            settings=settings,
+            progress=normalized_progress,
+        )
         payload = {
             "schema_version": 1,
-            "status": "interrupted",
+            "status": "completed",
             "stage": "bootstrap-prior",
             "package_revision": settings.package_revision,
-            "checkpoint_directory": str(error.checkpoint_directory),
-            "error_type": type(error).__name__,
-            "error": str(error),
+            "checkpoint_directory": audit["checkpoint_directory"],
+            "prior_generation": audit,
         }
-        write_json(path, payload)
-        sink({"stage": "bootstrap-prior", "phase": "bootstrap_prior", "status": "interrupted", **payload})
-        raise SystemExit(error.exit_code) from error
-    except KeyboardInterrupt as error:
-        payload = {
-            "schema_version": 1,
-            "status": "interrupted",
-            "stage": "bootstrap-prior",
-            "package_revision": settings.package_revision,
-            "error_type": type(error).__name__,
-            "error": "bootstrap-prior interrupted by the user",
-        }
-        write_json(path, payload)
-        sink({"stage": "bootstrap-prior", "phase": "bootstrap_prior", "status": "interrupted", **payload})
-        raise SystemExit(130) from error
-    except TimeoutError as error:
-        payload = {
-            "schema_version": 1,
-            "status": "deadline_stopped",
-            "stage": "bootstrap-prior",
-            "package_revision": settings.package_revision,
-            "error_type": type(error).__name__,
-            "error": str(error),
-        }
-        write_json(path, payload)
-        sink({"stage": "bootstrap-prior", "phase": "bootstrap_prior", "status": "deadline_stopped", **payload})
-        raise SystemExit("bootstrap-prior stopped at a deadline; resume the checkpoint") from error
-    except Exception as error:
-        payload = {
-            "schema_version": 1,
-            "status": "failed",
-            "stage": "bootstrap-prior",
-            "package_revision": settings.package_revision,
-            "error_type": type(error).__name__,
-            "error": str(error),
-        }
-        write_json(path, payload)
-        sink({"stage": "bootstrap-prior", "phase": "bootstrap_prior", "status": "failed", **payload})
+        write_json(progress.manifest_path, payload)
+        progress({
+            "phase": "bootstrap_prior",
+            "status": "completed",
+            "completed_units": 1,
+            "total_units": 1,
+            "current_unit": "prior_demand.csv",
+            "output_file": audit["output_file"],
+        })
+        progress.finish("completed")
+        print(json.dumps(_jsonable(payload), sort_keys=True))
+    except BaseException as error:
+        status = "deadline_stopped" if _is_deadline_stop(error) else (
+            "interrupted" if isinstance(error, (KeyboardInterrupt, ODTimeExpansionInterrupted)) else "failed"
+        )
+        payload = _failure_manifest(settings, progress, error, status=status)
+        if isinstance(error, ODTimeExpansionInterrupted):
+            payload["checkpoint_directory"] = str(error.checkpoint_directory)
+            write_json(progress.manifest_path, payload)
+        progress.finish(status, error=error)
+        if isinstance(error, ODTimeExpansionInterrupted):
+            raise SystemExit(error.exit_code) from error
         raise
-    payload = {
-        "schema_version": 1,
-        "status": "completed",
-        "stage": "bootstrap-prior",
-        "package_revision": settings.package_revision,
-        "checkpoint_directory": audit["checkpoint_directory"],
-        "prior_generation": audit,
-    }
-    write_json(path, payload)
-    sink({
-        "stage": "bootstrap-prior",
-        "phase": "bootstrap_prior",
-        "status": "completed",
-        "completed_units": 1,
-        "total_units": 1,
-        "current_unit": "prior_demand.csv",
-        "output_file": audit["output_file"],
-    })
-    print(json.dumps(_jsonable(payload), sort_keys=True))
 
 
 def structural_zeros(root: Path) -> None:
-    context = load_context(root)
-    path, log_path = _paths(context, "structural-zeros")
-    sink = GravityJSONLProgressSink(log_path, durable=True, context={"stage": "structural-zeros"})
-    config_path = context.settings.root / "config/structural_zeros.toml"
+    settings, progress = _start_stage(root, "structural-zeros")
+    context: CaseContext | None = None
+    try:
+        config_path = settings.root / "config/structural_zeros.toml"
+        progress.phase_started("structural_zero_preprocessing", "configuration_and_topology")
 
-    def progress(event: object) -> None:
-        # StructuralZeroProgress exposes ETA as properties; materialize them
-        # into the durable event rather than relying on a human presentation.
-        if hasattr(event, "phase") and hasattr(event, "completed"):
-            completed = int(getattr(event, "completed"))
-            total = int(getattr(event, "total"))
-            sink({
-                "phase": str(getattr(event, "phase")),
-                "status": "completed" if total and completed == total else "running",
-                "completed_units": completed,
-                "total_units": total,
-                "elapsed_seconds": float(getattr(event, "elapsed_seconds")),
-                "throughput_units_per_second": getattr(event, "throughput_units_per_second"),
-                "estimated_remaining_seconds": getattr(event, "estimated_remaining_seconds"),
-                "eta_confidence": str(getattr(event, "eta_confidence")),
-                "current_unit": getattr(event, "message", None),
-            })
-        else:
-            sink(event)
+        def structural_progress(event: object) -> None:
+            if hasattr(event, "phase") and hasattr(event, "completed"):
+                completed = int(getattr(event, "completed"))
+                total = int(getattr(event, "total"))
+                progress({
+                    "phase": str(getattr(event, "phase")),
+                    "status": "completed" if total and completed == total else "running",
+                    "completed_units": completed,
+                    "total_units": total,
+                    "elapsed_seconds": float(getattr(event, "elapsed_seconds")),
+                    "throughput_units_per_second": getattr(event, "throughput_units_per_second"),
+                    "estimated_remaining_seconds": getattr(event, "estimated_remaining_seconds"),
+                    "eta_confidence": str(getattr(event, "eta_confidence")),
+                    "current_unit": getattr(event, "message", None),
+                })
+            else:
+                progress(event)
 
-    result = run_structural_zero_preprocessing(config_path, progress=progress)
-    payload = _base(context, "structural-zeros") | {
-        "scenario_fingerprint": result.scenario_fingerprint,
-        "configuration_fingerprint": result.config.fingerprint,
-        "topology_fingerprint": result.topology.fingerprint,
-        "num_cells": result.analysis.num_cells,
-        "num_structural_zero": result.analysis.num_structural_zero,
-        "fixed_demand_output": str(result.outputs.fixed_demand),
-        "audit_output": str(result.outputs.audit),
-        "summary_output": str(result.outputs.summary),
-    }
-    write_json(path, payload)
-    print(json.dumps(_jsonable(payload), sort_keys=True))
+        result = run_structural_zero_preprocessing(config_path, progress=structural_progress)
+        progress.phase_completed("structural_zero_preprocessing", "structural_zero_outputs")
+        progress.phase_started("context_initialization", "load_context")
+        context = load_context(root, settings=settings, progress=progress)
+        payload = _base(context, "structural-zeros") | {
+            "scenario_fingerprint": result.scenario_fingerprint,
+            "configuration_fingerprint": result.config.fingerprint,
+            "topology_fingerprint": result.topology.fingerprint,
+            "num_cells": result.analysis.num_cells,
+            "num_structural_zero": result.analysis.num_structural_zero,
+            "fixed_demand_output": str(result.outputs.fixed_demand),
+            "audit_output": str(result.outputs.audit),
+            "summary_output": str(result.outputs.summary),
+        }
+        write_json(progress.manifest_path, payload)
+        progress.finish("completed")
+        print(json.dumps(_jsonable(payload), sort_keys=True))
+    except BaseException as error:
+        status = "deadline_stopped" if _is_deadline_stop(error) else (
+            "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
+        )
+        _failure_manifest(settings, progress, error, context=context, status=status)
+        progress.finish(status, error=error)
+        raise
 
 
 def prepare(root: Path) -> None:
-    context = load_context(root)
-    path, log_path = _paths(context, "prepare")
-    sink = GravityJSONLProgressSink(log_path, durable=True, context={"stage": "prepare"})
-    activated = activate(context, progress=sink)
-    payload = _base(context, "prepare") | {
-        **_activation_summary(activated),
-        "artifact_root": str(context.settings.results / "artifacts"),
-        "checkpoint_root": str(context.settings.results / "checkpoints"),
-    }
-    if activated.operator is None:
-        payload["status"] = "deadline_stopped"
-    else:
-        payload["operator_representation"] = activated.operator.representation
-        payload["operator_fingerprint"] = context.identity.fingerprint
-    write_json(path, payload)
-    print(json.dumps(_jsonable(payload), sort_keys=True))
-    if activated.operator is None:
-        raise SystemExit("preparation stopped at a resumable deadline; rerun prepare")
+    settings, progress = _start_stage(root, "prepare")
+    context: CaseContext | None = None
+    try:
+        context = load_context(root, settings=settings, progress=progress)
+        progress.phase_started("operator_activation", "direct_scheduled_operator")
+        activated = activate(context, progress=progress)
+        progress.phase_completed("operator_activation", "direct_scheduled_operator")
+        payload = _base(context, "prepare") | {
+            **_activation_summary(activated),
+            "artifact_root": str(context.settings.results / "artifacts"),
+            "checkpoint_root": str(context.settings.results / "checkpoints"),
+        }
+        if activated.operator is None:
+            payload["status"] = "deadline_stopped"
+        else:
+            payload["operator_representation"] = activated.operator.representation
+            payload["operator_fingerprint"] = context.identity.fingerprint
+        write_json(progress.manifest_path, payload)
+        progress.finish(str(payload["status"]))
+        print(json.dumps(_jsonable(payload), sort_keys=True))
+        if activated.operator is None:
+            raise SystemExit("preparation stopped at a resumable deadline; rerun prepare")
+    except BaseException as error:
+        status = "deadline_stopped" if _is_deadline_stop(error) else (
+            "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
+        )
+        _failure_manifest(settings, progress, error, context=context, status=status)
+        progress.finish(status, error=error)
+        raise
 
 
-def _operator_and_problem(root: Path, stage: str) -> tuple[CaseContext, object, object, object, Path]:
-    context = load_context(root)
-    _, log_path = _paths(context, stage)
-    sink = GravityJSONLProgressSink(log_path, durable=True, context={"stage": stage})
-    activated = activate(context, progress=sink)
+def _operator_and_problem(
+    root: Path,
+    stage: str,
+    settings: CaseSettings,
+    progress: _StageProgress,
+) -> tuple[CaseContext, object, object, object]:
+    context = load_context(root, settings=settings, progress=progress)
+    progress.phase_started("operator_activation", "direct_scheduled_operator")
+    activated = activate(context, progress=progress)
     if activated.operator is None:
         raise RuntimeError("no complete direct-scheduled artifact is available; run prepare")
+    progress.phase_completed("operator_activation", "direct_scheduled_operator")
     problem, parameters = gravity_problem(context, activated.operator)
-    return context, activated.operator, problem, parameters, log_path
+    return context, activated.operator, problem, parameters
 
 
 def preflight(root: Path) -> None:
-    context, operator, problem, parameters, _ = _operator_and_problem(root, "preflight")
-    path, _ = _paths(context, "preflight")
-    result = run_gravity_preflight(
-        problem=problem,
-        raw_parameters=initial_raw_parameters(parameters, context.settings.model),
-        stop_after=GravityPreflightPhase.RECOMMENDATION,
-    )
-    payload = _base(context, "preflight") | {"result": _jsonable(result)}
-    write_json(path, payload)
-    print(json.dumps(_jsonable(payload), sort_keys=True))
+    settings, progress = _start_stage(root, "preflight")
+    context: CaseContext | None = None
+    try:
+        context, operator, problem, parameters = _operator_and_problem(
+            root, "preflight", settings, progress
+        )
+        progress.phase_started("preflight_evaluation", "recommendation")
+        result = run_gravity_preflight(
+            problem=problem,
+            raw_parameters=initial_raw_parameters(parameters, context.settings.model),
+            stop_after=GravityPreflightPhase.RECOMMENDATION,
+        )
+        progress.phase_completed("preflight_evaluation", "recommendation")
+        payload = _base(context, "preflight") | {"result": _jsonable(result)}
+        write_json(progress.manifest_path, payload)
+        progress.finish("completed")
+        print(json.dumps(_jsonable(payload), sort_keys=True))
+    except BaseException as error:
+        status = "deadline_stopped" if _is_deadline_stop(error) else (
+            "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
+        )
+        _failure_manifest(settings, progress, error, context=context, status=status)
+        progress.finish(status, error=error)
+        raise
 
 
 def benchmark(root: Path) -> None:
-    context, operator, problem, parameters, _ = _operator_and_problem(root, "benchmark")
-    path, _ = _paths(context, "benchmark")
-    started = __import__("time").perf_counter()
-    evaluation = evaluate_once(problem, initial_raw_parameters(parameters, context.settings.model))
-    evaluation["elapsed_seconds"] = __import__("time").perf_counter() - started
-    payload = _base(context, "benchmark") | {"result": evaluation}
-    write_json(path, payload)
-    print(json.dumps(_jsonable(payload), sort_keys=True))
+    settings, progress = _start_stage(root, "benchmark")
+    context: CaseContext | None = None
+    try:
+        context, operator, problem, parameters = _operator_and_problem(
+            root, "benchmark", settings, progress
+        )
+        progress.phase_started("benchmark_evaluation", "objective_and_gradient")
+        started = perf_counter()
+        evaluation = evaluate_once(problem, initial_raw_parameters(parameters, context.settings.model))
+        evaluation["elapsed_seconds"] = perf_counter() - started
+        progress.phase_completed("benchmark_evaluation", "objective_and_gradient")
+        payload = _base(context, "benchmark") | {"result": evaluation}
+        write_json(progress.manifest_path, payload)
+        progress.finish("completed")
+        print(json.dumps(_jsonable(payload), sort_keys=True))
+    except BaseException as error:
+        status = "deadline_stopped" if _is_deadline_stop(error) else (
+            "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
+        )
+        _failure_manifest(settings, progress, error, context=context, status=status)
+        progress.finish(status, error=error)
+        raise
 
 
 def fit(root: Path, resume: bool = False) -> None:
-    context, operator, problem, parameters, log_path = _operator_and_problem(root, "fit")
-    path, _ = _paths(context, "fit")
-    model = context.settings.model
-    checkpoint = context.settings.results / "checkpoints/gravity.json"
-    wall = float(model.get("wall_time_seconds", 0.0))
-    execution = GravityExecutionPolicy(
-        gradient_strategy=str(model.get("gradient_strategy", "auto")),
-        wall_time_seconds=None if wall == 0 else wall,
-        checkpoint_path=checkpoint,
-        progress_interval=int(model.get("progress_interval", 1)),
-        jax_compilation_cache_directory=context.settings.results / "jax-cache",
-    )
-    config = GravityEstimatorConfig(
-        maximum_iterations=int(model.get("maximum_iterations", 100)),
-        gradient_tolerance=float(model.get("gradient_tolerance", 1.0e-6)),
-        objective_tolerance=float(model.get("objective_tolerance", 1.0e-9)),
-    )
-    sink = GravityJSONLProgressSink(log_path, durable=True, context={"stage": "fit"})
-    fit_started = perf_counter()
+    settings, progress = _start_stage(root, "fit")
+    context: CaseContext | None = None
+    try:
+        context, operator, problem, parameters = _operator_and_problem(
+            root, "fit", settings, progress
+        )
+        model = context.settings.model
+        checkpoint = context.settings.results / "checkpoints/gravity.json"
+        wall = float(model.get("wall_time_seconds", 0.0))
+        execution = GravityExecutionPolicy(
+            gradient_strategy=str(model.get("gradient_strategy", "auto")),
+            wall_time_seconds=None if wall == 0 else wall,
+            checkpoint_path=checkpoint,
+            progress_interval=int(model.get("progress_interval", 1)),
+            jax_compilation_cache_directory=context.settings.results / "jax-cache",
+        )
+        config = GravityEstimatorConfig(
+            maximum_iterations=int(model.get("maximum_iterations", 100)),
+            gradient_tolerance=float(model.get("gradient_tolerance", 1.0e-6)),
+            objective_tolerance=float(model.get("objective_tolerance", 1.0e-9)),
+        )
+        fit_started = perf_counter()
 
-    def fit_progress(event: object) -> None:
-        iteration = int(getattr(event, "iteration"))
-        elapsed = float(getattr(event, "elapsed_seconds"))
-        total = config.maximum_iterations
-        rate = iteration / elapsed if iteration and elapsed > 0 else None
-        remaining = None if rate is None else max(0.0, (total - iteration) / rate)
-        sink({
-            "phase": "gravity_fit",
-            "status": "completed" if iteration >= total else "running",
-            "completed_units": iteration,
-            "total_units": total,
-            "elapsed_seconds": elapsed,
-            "throughput_units_per_second": rate,
-            "estimated_remaining_seconds": remaining,
-            "eta_confidence": "low" if iteration < 3 else "medium",
-            "current_unit": f"iteration-{iteration}",
-            "iteration": iteration,
-            "objective": float(getattr(event, "objective")),
-            "gradient_inf_norm": float(getattr(event, "gradient_inf_norm")),
-            "checkpoint_written": bool(getattr(event, "checkpoint_written")),
-            "wall_clock_seconds": perf_counter() - fit_started,
-        })
+        def fit_progress(event: object) -> None:
+            iteration = int(getattr(event, "iteration"))
+            elapsed = float(getattr(event, "elapsed_seconds"))
+            total = config.maximum_iterations
+            rate = iteration / elapsed if iteration and elapsed > 0 else None
+            remaining = None if rate is None else max(0.0, (total - iteration) / rate)
+            progress({
+                "phase": "gravity_fit",
+                "status": "completed" if iteration >= total else "running",
+                "completed_units": iteration,
+                "total_units": total,
+                "elapsed_seconds": elapsed,
+                "throughput_units_per_second": rate,
+                "estimated_remaining_seconds": remaining,
+                "eta_confidence": "low" if iteration < 3 else "medium",
+                "current_unit": f"iteration-{iteration}",
+                "iteration": iteration,
+                "objective": float(getattr(event, "objective")),
+                "gradient_inf_norm": float(getattr(event, "gradient_inf_norm")),
+                "checkpoint_written": bool(getattr(event, "checkpoint_written")),
+                "wall_clock_seconds": perf_counter() - fit_started,
+            })
 
-    result = estimate_gravity_model(
-        problem=problem,
-        compact_layout=context.compact_layout,
-        initial_raw_parameters=initial_raw_parameters(parameters, context.settings.model),
-        config=config,
-        execution=execution,
-        resume=resume,
-        progress=fit_progress,
-    )
-    payload = _base(context, "fit") | {"result": _jsonable(result)}
-    write_json(path, payload)
-    write_json(context.settings.results / "fits/result.json", result)
-    print(json.dumps(_jsonable(payload), sort_keys=True))
-    if result.status not in {"converged", "iteration_limit", "stopped_by_time_budget"}:
-        raise SystemExit(f"gravity fit failed: {result.status}")
+        progress.phase_started("gravity_fit", "initialization")
+        result = estimate_gravity_model(
+            problem=problem,
+            compact_layout=context.compact_layout,
+            initial_raw_parameters=initial_raw_parameters(parameters, context.settings.model),
+            config=config,
+            execution=execution,
+            resume=resume,
+            progress=fit_progress,
+        )
+        payload = _base(context, "fit") | {"result": _jsonable(result)}
+        write_json(progress.manifest_path, payload)
+        write_json(context.settings.results / "fits/result.json", result)
+        stage_status = "completed" if result.status in {
+            "converged", "iteration_limit", "stopped_by_time_budget"
+        } else "failed"
+        progress.finish(stage_status)
+        print(json.dumps(_jsonable(payload), sort_keys=True))
+        if stage_status == "failed":
+            raise SystemExit(f"gravity fit failed: {result.status}")
+    except BaseException as error:
+        status = "deadline_stopped" if _is_deadline_stop(error) else (
+            "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
+        )
+        _failure_manifest(settings, progress, error, context=context, status=status)
+        progress.finish(status, error=error)
+        raise
 
 
 def validate(root: Path) -> None:
-    context, operator, problem, parameters, _ = _operator_and_problem(root, "validate")
-    fit_path, _ = _paths(context, "fit")
-    if not fit_path.is_file():
-        raise RuntimeError("fit manifest is missing; run fit before validate")
-    fit_payload = json.loads(fit_path.read_text(encoding="utf-8"))
-    raw = np.asarray(fit_payload["result"]["raw_parameters"], dtype=np.float64)
-    evaluation = evaluate_once(problem, raw)
-    path, _ = _paths(context, "validate")
-    fit_result = fit_payload["result"]
-    accepted = fit_result["status"] == "converged" and bool(fit_result["success"])
-    payload = _base(context, "validate") | {
-        "fit_status": fit_result["status"],
-        "objective": evaluation["objective"],
-        "gradient_inf_norm": evaluation["gradient_inf_norm"],
-        "predicted_measurements": evaluation["measurement_mean"],
-        "acceptance": "accepted" if accepted else "diagnostic_only",
-    }
-    write_json(path, payload)
-    print(json.dumps(_jsonable(payload), sort_keys=True))
+    settings, progress = _start_stage(root, "validate")
+    context: CaseContext | None = None
+    try:
+        context, operator, problem, parameters = _operator_and_problem(
+            root, "validate", settings, progress
+        )
+        progress.phase_started("fit_result_loading", "fit_manifest")
+        fit_path = context.settings.results / "manifests/fit.json"
+        if not fit_path.is_file():
+            raise RuntimeError("fit manifest is missing; run fit before validate")
+        fit_payload = json.loads(fit_path.read_text(encoding="utf-8"))
+        raw = np.asarray(fit_payload["result"]["raw_parameters"], dtype=np.float64)
+        progress.phase_completed("fit_result_loading", "fit_manifest")
+        progress.phase_started("validation_evaluation", "objective_and_predictions")
+        evaluation = evaluate_once(problem, raw)
+        progress.phase_completed("validation_evaluation", "objective_and_predictions")
+        fit_result = fit_payload["result"]
+        accepted = fit_result["status"] == "converged" and bool(fit_result["success"])
+        payload = _base(context, "validate") | {
+            "fit_status": fit_result["status"],
+            "objective": evaluation["objective"],
+            "gradient_inf_norm": evaluation["gradient_inf_norm"],
+            "predicted_measurements": evaluation["measurement_mean"],
+            "acceptance": "accepted" if accepted else "diagnostic_only",
+        }
+        write_json(progress.manifest_path, payload)
+        progress.finish("completed")
+        print(json.dumps(_jsonable(payload), sort_keys=True))
+    except BaseException as error:
+        status = "deadline_stopped" if _is_deadline_stop(error) else (
+            "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
+        )
+        _failure_manifest(settings, progress, error, context=context, status=status)
+        progress.finish(status, error=error)
+        raise
 
 
 STAGES = {

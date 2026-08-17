@@ -4,6 +4,7 @@ import json
 import runpy
 import shutil
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -81,6 +82,11 @@ def test_direct_scheduled_template_complete_public_fixture(tmp_path: Path) -> No
         progress = case / "results/logs" / f"{stage}.jsonl"
         assert progress.is_file()
         assert progress.read_text(encoding="utf-8").strip()
+        assert progress.resolve().is_relative_to((case / "results").resolve())
+        events = [json.loads(line) for line in progress.read_text(encoding="utf-8").splitlines()]
+        assert events[0]["event"]["phase"] == "initialization"
+        assert events[0]["event"]["status"] == "started"
+        assert all(record["schema_version"] == 1 for record in events)
 
     bootstrap_events = [
         json.loads(line)["event"]
@@ -111,6 +117,143 @@ def test_direct_scheduled_template_complete_public_fixture(tmp_path: Path) -> No
     assert prior_audit["prior_source"] == "all_ones"
     assert prior_audit["expansion"]["retained_cell_count"] > 0
     assert prior_audit["output_sha256"]
+
+
+def test_check_writes_initial_progress_before_slow_context_loading(tmp_path: Path) -> None:
+    repository = Path(__file__).parents[2]
+    template = repository / "docs/source/examples/direct_scheduled_case_template"
+    example = repository / "docs/source/examples/simple_example_02"
+    case = tmp_path / "case"
+    shutil.copytree(template, case)
+    shutil.copytree(example / "data", case / "inputs/scenario")
+    shutil.copy(example / "data/fixed_demand.csv", case / "inputs/fixed_demand.csv")
+    shutil.copy(
+        example / "pre_processing/results/measurements_boarding_alighting.csv",
+        case / "inputs/measurements.csv",
+    )
+    case_config = case / "config/case.toml"
+    case_config.write_text(
+        case_config.read_text(encoding="utf-8").replace(
+            "REPLACE_WITH_PUBLIC_TRANSPORTATION_COMMIT",
+            "public-fixture-progress-test-revision",
+        ),
+        encoding="utf-8",
+    )
+
+    sys.path.insert(0, str(case))
+    try:
+        namespace = runpy.run_path(str(case / "run_case.py"), run_name="progress_test")
+        check_globals = namespace["check"].__globals__
+        original_load_context = check_globals["load_context"]
+        observed: dict[str, object] = {}
+
+        def delayed_load_context(root: Path, **kwargs: object) -> object:
+            progress_path = case / "results/logs/check.jsonl"
+            assert progress_path.is_file()
+            first = json.loads(progress_path.read_text(encoding="utf-8").splitlines()[0])
+            observed["first"] = first["event"]
+            time.sleep(0.01)
+            return original_load_context(root, **kwargs)
+
+        check_globals["load_context"] = delayed_load_context
+        namespace["check"](case)
+    finally:
+        sys.path.remove(str(case))
+
+    assert observed["first"] == {
+        "current_unit": "load_context",
+        "elapsed_seconds": 0.0,
+        "estimated_remaining_seconds": None,
+        "eta_confidence": "unavailable",
+        "phase": "initialization",
+        "schema_version": 1,
+        "stage": "check",
+        "status": "started",
+    }
+
+
+def test_stage_progress_heartbeats_do_not_fabricate_work_or_eta(tmp_path: Path) -> None:
+    repository = Path(__file__).parents[2]
+    template = repository / "docs/source/examples/direct_scheduled_case_template"
+    example = repository / "docs/source/examples/simple_example_02"
+    case = tmp_path / "case"
+    shutil.copytree(template, case)
+    shutil.copytree(example / "data", case / "inputs/scenario")
+    shutil.copy(example / "data/fixed_demand.csv", case / "inputs/fixed_demand.csv")
+    shutil.copy(
+        example / "pre_processing/results/measurements_boarding_alighting.csv",
+        case / "inputs/measurements.csv",
+    )
+    case_config = case / "config/case.toml"
+    case_config.write_text(
+        case_config.read_text(encoding="utf-8")
+        .replace("REPLACE_WITH_PUBLIC_TRANSPORTATION_COMMIT", "heartbeat-test-revision")
+        .replace("progress_interval_seconds = 5.0", "progress_interval_seconds = 0.005"),
+        encoding="utf-8",
+    )
+
+    sys.path.insert(0, str(case))
+    try:
+        namespace = runpy.run_path(str(case / "run_case.py"), run_name="heartbeat_test")
+        settings = namespace["CaseSettings"].load(case)
+        progress = namespace["_StageProgress"](settings, "heartbeat")
+        progress.start()
+        progress.phase_started("mapping_construction", "mapping_construction")
+        time.sleep(0.03)
+        progress.finish("completed")
+    finally:
+        sys.path.remove(str(case))
+
+    events = [
+        json.loads(line)["event"]
+        for line in (case / "results/logs/heartbeat.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    heartbeats = [event for event in events if event.get("heartbeat") is True]
+    assert heartbeats
+    assert all("completed_units" not in event for event in heartbeats)
+    assert all("total_units" not in event for event in heartbeats)
+    assert all(event["estimated_remaining_seconds"] is None for event in heartbeats)
+    assert all(event["eta_confidence"] == "unavailable" for event in heartbeats)
+    assert events[-1]["status"] == "completed"
+
+
+def test_check_failure_writes_terminal_progress_and_manifest(tmp_path: Path) -> None:
+    repository = Path(__file__).parents[2]
+    template = repository / "docs/source/examples/direct_scheduled_case_template"
+    case = tmp_path / "case"
+    shutil.copytree(template, case)
+    case_config = case / "config/case.toml"
+    case_config.write_text(
+        case_config.read_text(encoding="utf-8").replace(
+            "REPLACE_WITH_PUBLIC_TRANSPORTATION_COMMIT", "failure-progress-test-revision"
+        ),
+        encoding="utf-8",
+    )
+
+    sys.path.insert(0, str(case))
+    try:
+        namespace = runpy.run_path(str(case / "run_case.py"), run_name="failure_test")
+
+        def fail_load_context(root: Path, **kwargs: object) -> object:
+            raise RuntimeError("deliberate context failure")
+
+        namespace["check"].__globals__["load_context"] = fail_load_context
+        with pytest.raises(RuntimeError, match="deliberate context failure"):
+            namespace["check"](case)
+    finally:
+        sys.path.remove(str(case))
+
+    manifest = json.loads((case / "results/manifests/check.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "failed"
+    assert manifest["error_type"] == "RuntimeError"
+    events = [
+        json.loads(line)["event"]
+        for line in (case / "results/logs/check.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert events[0]["phase"] == "initialization"
+    assert events[-1]["phase"] == "stage_completion"
+    assert events[-1]["status"] == "failed"
+    assert events[-1]["error_type"] == "RuntimeError"
 
 
 def test_template_bootstrap_interrupts_resumes_and_publishes_only_on_completion(

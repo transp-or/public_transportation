@@ -1265,6 +1265,16 @@ Direct-scheduled construction accepts the same kind of callback through
 temporary directories. A run is complete only after the process exits
 successfully and its complete artifact/result manifest exists.
 
+The template driver creates the durable JSONL file before loading the complete
+case context. Its first event is an `initialization`/`started` record, and
+heartbeat records continue while scenario loading, timetable construction,
+mapping, layout construction, or operator activation is still running. When
+an operation exposes no measurable work, the heartbeat must not invent unit
+counts or an ETA: use `estimated_remaining_seconds = null` and
+`eta_confidence = "unavailable"`. Monitor both the Slurm stdout/stderr logs
+and the durable JSONL file; neither replaces verification of the terminal
+stage manifest.
+
 The JSONL records include schema, timestamp, event type, model context, and
 serialized event data. Construction events report phase, status, completed and
 total units, elapsed and remaining time, current unit, cache counters, and

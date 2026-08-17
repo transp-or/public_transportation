@@ -12,7 +12,7 @@ import hashlib
 import tomllib
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import jax
 import numpy as np
@@ -99,6 +99,30 @@ def _jsonable(value: object) -> object:
     if hasattr(value, "value") and type(value).__module__ == "enum":
         return value.value
     return value
+
+
+ProgressCallback = Callable[[Mapping[str, object]], None]
+
+
+def _progress(
+    callback: ProgressCallback | None,
+    *,
+    phase: str,
+    status: str,
+    current_unit: str,
+    **fields: object,
+) -> None:
+    """Emit a phase event without inventing work or ETA information."""
+    if callback is None:
+        return
+    callback(
+        {
+            "phase": phase,
+            "status": status,
+            "current_unit": current_unit,
+            **fields,
+        }
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -323,7 +347,8 @@ def bootstrap_prior_demand(
     root: str | Path,
     *,
     resume: bool = False,
-    progress: Callable[[dict[str, object]], None] | None = None,
+    settings: CaseSettings | None = None,
+    progress: ProgressCallback | None = None,
 ) -> dict[str, object]:
     """Generate the scenario prior through a resumable expansion checkpoint.
 
@@ -332,16 +357,66 @@ def bootstrap_prior_demand(
     validated.  Large cases therefore retain durable progress without holding
     the full OD--time expansion in memory.
     """
-    settings = CaseSettings.load(root)
+    if settings is None:
+        _progress(
+            progress,
+            phase="configuration_loading",
+            status="started",
+            current_unit="case.toml",
+        )
+        settings = CaseSettings.load(root)
+        _progress(
+            progress,
+            phase="configuration_loading",
+            status="completed",
+            current_unit="case.toml",
+        )
+    else:
+        _progress(
+            progress,
+            phase="configuration_loading",
+            status="completed",
+            current_unit="case.toml",
+        )
     if settings.scenario_demand is None:
         raise ValueError("config/case.toml must define scenario_demand for prior generation.")
 
+    _progress(
+        progress,
+        phase="scenario_loading",
+        status="started",
+        current_unit="scenario",
+    )
     scenario = Scenario.from_folder(
         settings.scenario,
         strict=True,
         allow_missing_demand=True,
     )
+    _progress(
+        progress,
+        phase="scenario_loading",
+        status="completed",
+        current_unit="scenario",
+    )
+    _progress(
+        progress,
+        phase="timetable_index_construction",
+        status="started",
+        current_unit="canonical_timetable_index",
+    )
     timetable_index = build_canonical_timetable_index(scenario)
+    _progress(
+        progress,
+        phase="timetable_index_construction",
+        status="completed",
+        current_unit="canonical_timetable_index",
+    )
+    _progress(
+        progress,
+        phase="candidate_universe_construction",
+        status="started",
+        current_unit="candidate_od_pairs",
+    )
     universe = generate_candidate_od_pairs(
         scenario,
         source=settings.od_universe_source,
@@ -351,6 +426,20 @@ def bootstrap_prior_demand(
         connectivity_policy=settings.connectivity_policy,
         od_pairs_path=settings.od_pairs_file,
         timetable_index=timetable_index,
+    )
+    _progress(
+        progress,
+        phase="candidate_universe_construction",
+        status="completed",
+        current_unit="candidate_od_pairs",
+        completed_units=universe.pair_count,
+        total_units=universe.pair_count,
+    )
+    _progress(
+        progress,
+        phase="fingerprint_construction",
+        status="started",
+        current_unit="scenario_fingerprints",
     )
     scenario_fp = fingerprint_scenario(scenario)
     time_bins_fp = _time_bin_fingerprint(scenario)
@@ -376,6 +465,12 @@ def bootstrap_prior_demand(
     ).hexdigest()
     expansion_fp = expansion_contract_fingerprint(
         universe, scenario.time_bins, expansion_config
+    )
+    _progress(
+        progress,
+        phase="fingerprint_construction",
+        status="completed",
+        current_unit="expansion_fingerprint",
     )
     checkpoint = settings.results / "checkpoints/prior_demand" / expansion_fp
 
@@ -570,29 +665,91 @@ def _features(
     )
 
 
-def load_context(root: str | Path) -> CaseContext:
-    settings = CaseSettings.load(root)
+def load_context(
+    root: str | Path,
+    *,
+    settings: CaseSettings | None = None,
+    progress: ProgressCallback | None = None,
+) -> CaseContext:
+    """Build the case context while exposing coarse initialization phases."""
+    if settings is None:
+        _progress(
+            progress,
+            phase="configuration_loading",
+            status="started",
+            current_unit="case.toml",
+        )
+        settings = CaseSettings.load(root)
+        _progress(
+            progress,
+            phase="configuration_loading",
+            status="completed",
+            current_unit="case.toml",
+        )
+    else:
+        _progress(
+            progress,
+            phase="configuration_loading",
+            status="completed",
+            current_unit="case.toml",
+        )
+
+    _progress(progress, phase="scenario_loading", status="started", current_unit="scenario")
     scenario = Scenario.from_folder(
         settings.scenario,
         strict=True,
         demand_file=settings.scenario_demand,
     )
+    _progress(progress, phase="scenario_loading", status="completed", current_unit="scenario")
+
+    _progress(
+        progress,
+        phase="timetable_index_construction",
+        status="started",
+        current_unit="canonical_timetable_index",
+    )
     timetable_index = build_canonical_timetable_index(scenario)
+    _progress(
+        progress,
+        phase="timetable_index_construction",
+        status="completed",
+        current_unit="canonical_timetable_index",
+    )
+
+    _progress(progress, phase="fixed_demand_loading", status="started", current_unit="fixed_demand")
     generated_fixed = settings.results / "structural_zeros/fixed_demand.csv"
     fixed_path = generated_fixed if generated_fixed.is_file() else settings.fixed_demand
     fixed = read_fixed_demand_csv(fixed_path, scenario=scenario)
+    _progress(progress, phase="fixed_demand_loading", status="completed", current_unit="fixed_demand")
+
+    _progress(progress, phase="od_layout_construction", status="started", current_unit="od_layout")
     layout = build_od_parameter_layout(scenario=scenario, fixed_demand=fixed)
+    _progress(progress, phase="od_layout_construction", status="completed", current_unit="od_layout")
+    _progress(progress, phase="compact_layout_construction", status="started", current_unit="compact_od_layout")
     compact = build_compact_od_assignment_layout(parameter_layout=layout)
+    _progress(progress, phase="compact_layout_construction", status="completed", current_unit="compact_od_layout")
+
+    _progress(progress, phase="assignment_preparation", status="started", current_unit="assignment")
     assignment = prepare_assignment(
         scenario=scenario,
         config=AssignmentConfig(),
         timetable_index=timetable_index,
     )
     inputs = build_assignment_inputs(artifacts=assignment, compact_layout=compact)
+    _progress(progress, phase="assignment_preparation", status="completed", current_unit="assignment")
+    _progress(progress, phase="assignment_id_construction", status="started", current_unit="assignment_ids")
     id_manager = AssignmentIDManager.build(scenario=scenario, graph=assignment.graph)
+    _progress(progress, phase="assignment_id_construction", status="completed", current_unit="assignment_ids")
+
+    _progress(progress, phase="measurement_mapping", status="started", current_unit="measurements")
     table = read_measurements_csv(settings.measurements)
     mapping = build_mapping_spec_strict(id_manager=id_manager, table=table)
+    _progress(progress, phase="measurement_mapping", status="completed", current_unit="measurements")
+    _progress(progress, phase="canonical_index_construction", status="started", current_unit="canonical_index")
     canonical = _canonical_index(scenario, layout, table)
+    _progress(progress, phase="canonical_index_construction", status="completed", current_unit="canonical_index")
+
+    _progress(progress, phase="identity_construction", status="started", current_unit="artifact_identity")
     identity = build_scheduled_reference_artifact_identity(
         inputs=inputs,
         spec=mapping.spec,
@@ -603,6 +760,8 @@ def load_context(root: str | Path) -> CaseContext:
         feasibility_fingerprint="assignment-config-default-v1",
         coefficient_policy_fingerprint="exact-float32-v1",
     )
+    _progress(progress, phase="identity_construction", status="completed", current_unit="artifact_identity")
+    _progress(progress, phase="feature_construction", status="started", current_unit="gravity_features")
     features = _features(
         scenario,
         layout,
@@ -610,6 +769,8 @@ def load_context(root: str | Path) -> CaseContext:
         timetable_index=timetable_index,
         journey_time_scale=float(settings.model.get("journey_time_scale", 30.0)),
     )
+    _progress(progress, phase="feature_construction", status="completed", current_unit="gravity_features")
+    _progress(progress, phase="context_initialization", status="completed", current_unit="context")
     return CaseContext(
         settings, scenario, timetable_index, assignment, id_manager, table,
         mapping, layout, compact, canonical, features, identity
