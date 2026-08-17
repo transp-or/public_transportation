@@ -76,6 +76,11 @@ case_studies/<case_name>/                 # case-owned example root
     └── validation/
 ```
 
+The `results/` tree shown here is a logical layout. For a medium or large JED
+case it must be materialized at the explicit absolute scratch path described
+in **Large outputs, scratch storage, and archival**, not inside the Git working
+tree.
+
 The public template supplies `adapter.py`, `run_case.py`, the three example
 TOML files, and scheduler wrappers. It intentionally does **not** supply
 `pyproject.toml` or `uv.lock`: the case owner must create those files, pin an
@@ -118,7 +123,420 @@ copied template is not scientifically ready until the case owner has supplied
 the data, units, service-day convention, time-bin policy, frozen-demand policy,
 and model assumptions.
 
+## Large outputs, scratch storage, and archival
+
+Read this section before starting every potentially long phase. The repository
+is the home for source code, configuration, `pyproject.toml`, `uv.lock`, and
+small manifests or status reports. JED scratch is the working home for large
+generated data: checkpoints, generated OD/time inputs, exclusion and audit
+tables, routing and preparation artifacts, linear-operator blocks, logs, and
+intermediate files. Large generated outputs must not be committed to GitHub.
+
+### Configure one persistent scratch results root
+
+For a JED case, set the results root to an explicit absolute path in the
+case-owned TOML configuration. Do not put shell variables such as
+`$RESULTS_ROOT` in TOML; replace `<username>` with the actual account name:
+
+```toml
+results = "/scratch/<username>/tpg-medium-network/results"
+scenario_demand = "/scratch/<username>/tpg-medium-network/results/inputs/scenario/prior_demand.csv"
+```
+
+The second line is important for the generated OD/time prior: the network
+scenario files remain source inputs in the case-study repository, while the
+generated prior is a scratch output. If a different generated-input filename
+is chosen, set `scenario_demand` to that absolute path. Also replace the
+relative paths in `config/structural_zeros.toml` with absolute paths, for
+example:
+
+```toml
+[scenario]
+folder = "/home/<username>/github/public_transport_TPG/case_studies/medium_network/inputs/scenario"
+demand_file = "/scratch/<username>/tpg-medium-network/results/inputs/scenario/prior_demand.csv"
+
+[output]
+folder = "/scratch/<username>/tpg-medium-network/results/structural_zeros"
+```
+
+Every generated output path must be derived from this same results root. All
+stages must reuse exactly the same absolute results root, input fingerprints,
+and identity fingerprints. A resumed job must never silently create a second
+results tree. In the remainder of this document, a logical path such as
+`results/audit/` means the corresponding directory below this concrete
+`$RESULTS_ROOT`; commands for JED must use the absolute root rather than a
+repository-relative `results/` directory. Python API snippets later in this
+document use `Path("results/...")` only as logical example notation; a case
+driver must derive those paths from its configured `settings.results` (which
+is `$RESULTS_ROOT` for JED).
+
+Prepare the scratch tree before submitting any long stage. Run this from the
+login node or an interactive JED shell:
+
+```bash
+CASE_ROOT=/home/<username>/github/public_transport_TPG/case_studies/medium_network
+SCRATCH_CASE=/scratch/<username>/tpg-medium-network
+RESULTS_ROOT="$SCRATCH_CASE/results"
+
+cd "$CASE_ROOT"
+
+mkdir -p "$RESULTS_ROOT"/{
+audit,
+artifacts,
+checkpoints,
+fits,
+logs,
+manifests,
+preflight,
+structural_zeros,
+time_discretization,
+validation
+}
+
+df -h "$SCRATCH_CASE"
+```
+
+Scratch is temporary working storage, not an archive. Before deleting it or
+allowing it to expire, copy the required results to persistent project storage
+or another approved archive location. Keep the source code, TOML files,
+`pyproject.toml`, `uv.lock`, and small provenance/status files in the case
+repository; keep large generated files on scratch until they have been
+archived.
+
+### Scratch contracts and Slurm submissions
+
+The following examples assume `CASE_ROOT` and `RESULTS_ROOT` are set as above
+and are run from the case-study root. The explicit `--output` and `--error`
+arguments are intentional: the template wrappers currently contain relative
+`#SBATCH` output directives, so these arguments place scheduler logs under the
+configured scratch root. Each job uses the existing case script and does not
+introduce a new package command-line option.
+
+#### Time-bin recommendation (Stage 0.1)
+
+This diagnostic has no template batch wrapper. Submit the documented module
+command directly when its input profile is large:
+
+```bash
+cd "$CASE_ROOT"
+JOB_ID=$(
+  sbatch --parsable \
+    --chdir="$CASE_ROOT" \
+    --output="$RESULTS_ROOT/logs/time-discretization-%j.out" \
+    --error="$RESULTS_ROOT/logs/time-discretization-%j.err" \
+    --wrap="uv run --frozen python -m public_transportation.preprocessing.time_discretization \
+      --measurements inputs/measurements.csv \
+      --base-resolution-minutes 5 --min-bin-minutes 10 --max-bin-minutes 60 \
+      --max-bins 24 --output-json $RESULTS_ROOT/time_discretization/recommendation.json"
+)
+echo "Submitted job: $JOB_ID"
+squeue -j "$JOB_ID"
+```
+
+The output is `"$RESULTS_ROOT/time_discretization/"`; progress is the Slurm
+stdout log above, there is no checkpoint in the current diagnostic, and the
+completion record is `recommendation.json` with `status = "ok"` and a valid
+recommendation. Resume by rerunning the same command after an interruption;
+review or archive the previous recommendation first. Adopt bins only after
+the JSON recommendation and its source checksum have been reviewed.
+
+#### Candidate OD/time expansion and prior bootstrap (Stage 0.2)
+
+```bash
+cd "$CASE_ROOT"
+JOB_ID=$(
+  sbatch --parsable \
+    --output="$RESULTS_ROOT/logs/bootstrap-prior-%j.out" \
+    --error="$RESULTS_ROOT/logs/bootstrap-prior-%j.err" \
+    scripts/00_bootstrap_prior.sbatch
+)
+
+echo "Submitted job: $JOB_ID"
+squeue -j "$JOB_ID"
+```
+
+The expected output is the identity-specific
+`"$RESULTS_ROOT/checkpoints/prior_demand/<fingerprint>/"` directory, the
+configured scratch `scenario_demand` CSV, `"$RESULTS_ROOT/audit/"`, and the
+`bootstrap-prior` manifest/log. The JSONL progress log is
+`"$RESULTS_ROOT/logs/bootstrap-prior.jsonl"`; the checkpoint progress record
+is `.../progress.json`; the durable completion manifest is
+`"$RESULTS_ROOT/manifests/bootstrap-prior.json"`. Resume only after the job
+has exited, with the same results root and the same checkpoint:
+
+```bash
+uv run --frozen python run_case.py bootstrap-prior --resume
+```
+
+Submit the next phase only when the manifest reports `"status": "completed"`,
+the checkpoint is complete, the configured prior CSV exists, and its audit and
+fingerprints match.
+
+#### Strict input and mapping audit (Stage 1)
+
+```bash
+cd "$CASE_ROOT"
+JOB_ID=$(
+  sbatch --parsable \
+    --output="$RESULTS_ROOT/logs/check-%j.out" \
+    --error="$RESULTS_ROOT/logs/check-%j.err" \
+    scripts/00_check.sbatch
+)
+
+echo "Submitted job: $JOB_ID"
+squeue -j "$JOB_ID"
+```
+
+The audit writes its generated reports and input checksums under
+`"$RESULTS_ROOT/audit/"`, the durable manifest
+`"$RESULTS_ROOT/manifests/check.json"`, and the JSONL progress log
+`"$RESULTS_ROOT/logs/check.jsonl"` (plus the Slurm log). The current check
+stage has no resumable computation checkpoint; its checkpoint location is
+`"$RESULTS_ROOT/checkpoints/"` only for any case-specific auxiliary state.
+After an interruption, rerun the same script with the same results root. Do
+not continue until the check manifest reports `"status": "completed"` and
+all scenario, timetable, measurement, and assignment fingerprints are
+present and mutually consistent.
+
+#### Structural-zero processing (Stage 2)
+
+```bash
+cd "$CASE_ROOT"
+JOB_ID=$(
+  sbatch --parsable \
+    --output="$RESULTS_ROOT/logs/structural-zeros-%j.out" \
+    --error="$RESULTS_ROOT/logs/structural-zeros-%j.err" \
+    scripts/10_structural_zeros.sbatch
+)
+
+echo "Submitted job: $JOB_ID"
+squeue -j "$JOB_ID"
+```
+
+Outputs are under `"$RESULTS_ROOT/structural_zeros/"`; progress is
+`"$RESULTS_ROOT/logs/structural-zeros.jsonl"` plus the Slurm log; the current
+service exposes no structural-zero checkpoint, so the checkpoint location is
+`"$RESULTS_ROOT/checkpoints/"` only for any case-specific auxiliary state. The
+completion manifest is `"$RESULTS_ROOT/manifests/structural-zeros.json"` and
+the generated fingerprints and reconciliation outputs must be present. There
+is no documented `--resume` option for this service: after an interruption,
+wait for the process to exit and rerun the same script with the same results
+root. Continue only when the manifest is completed and all structural-zero
+outputs and fingerprints are valid.
+
+#### Preparation and routing construction (Stage 3)
+
+The `prepare` job includes direct-scheduled routing construction. Its large
+outputs are the linear-operator blocks and routing checkpoints:
+
+```bash
+cd "$CASE_ROOT"
+JOB_ID=$(
+  sbatch --parsable \
+    --output="$RESULTS_ROOT/logs/prepare-%j.out" \
+    --error="$RESULTS_ROOT/logs/prepare-%j.err" \
+    scripts/20_prepare.sbatch
+)
+
+echo "Submitted job: $JOB_ID"
+squeue -j "$JOB_ID"
+```
+
+Outputs are `"$RESULTS_ROOT/artifacts/<identity>/"` and
+`"$RESULTS_ROOT/checkpoints/<identity>/"`; progress is
+`"$RESULTS_ROOT/logs/prepare.jsonl"` plus the Slurm log. The durable manifest
+is `"$RESULTS_ROOT/manifests/prepare.json"` and the artifact manifest must
+report complete with matching block and fixed-offset hashes. Rerun the same
+`prepare` command after interruption: matching preparation checkpoints are
+reused by the current activation path; there is no separate undocumented
+resume switch. Continue only when the complete artifact and routing checkpoint
+share the expected identity fingerprint.
+
+#### Bounded preflight (Stage 4)
+
+```bash
+cd "$CASE_ROOT"
+JOB_ID=$(
+  sbatch --parsable \
+    --output="$RESULTS_ROOT/logs/preflight-%j.out" \
+    --error="$RESULTS_ROOT/logs/preflight-%j.err" \
+    scripts/30_preflight.sbatch
+)
+
+echo "Submitted job: $JOB_ID"
+squeue -j "$JOB_ID"
+```
+
+Outputs are the generated `"$RESULTS_ROOT/preflight/"` summary when the
+driver writes one, the existing artifact/checkpoint roots under
+`"$RESULTS_ROOT/"`, and `"$RESULTS_ROOT/manifests/preflight.json"`.
+Progress is `"$RESULTS_ROOT/logs/preflight.jsonl"` plus the Slurm log. The
+template preflight does not create a new checkpoint; any support-preflight
+checkpoint used by a case driver must be below `"$RESULTS_ROOT/checkpoints/"`
+and recorded in the manifest. Resume by rerunning the same script against the
+unchanged roots. Continue only when `completed_phase` is
+`recommendation` and the reported timings, memory, and gradient checks are
+finite and acceptable.
+
+#### Warm benchmark (Stage 5)
+
+```bash
+cd "$CASE_ROOT"
+JOB_ID=$(
+  sbatch --parsable \
+    --output="$RESULTS_ROOT/logs/benchmark-%j.out" \
+    --error="$RESULTS_ROOT/logs/benchmark-%j.err" \
+    scripts/40_benchmark.sbatch
+)
+
+echo "Submitted job: $JOB_ID"
+squeue -j "$JOB_ID"
+```
+
+Outputs are the generated benchmark summary under
+`"$RESULTS_ROOT/preflight/"` (if configured), the durable
+`"$RESULTS_ROOT/manifests/benchmark.json"`, and
+`"$RESULTS_ROOT/logs/benchmark.jsonl"`; no new checkpoint is created by the
+template benchmark. Resume by rerunning the same script with the same
+operator, results root, and fingerprints. Continue only when all warm timings
+are finite and derivative-strategy agreement satisfies the declared tolerance.
+
+#### MAP/gravity estimation (Stage 6)
+
+```bash
+cd "$CASE_ROOT"
+JOB_ID=$(
+  sbatch --parsable \
+    --output="$RESULTS_ROOT/logs/fit-%j.out" \
+    --error="$RESULTS_ROOT/logs/fit-%j.err" \
+    scripts/50_fit.sbatch
+)
+
+echo "Submitted job: $JOB_ID"
+squeue -j "$JOB_ID"
+```
+
+Outputs are `"$RESULTS_ROOT/fits/"`, the fit checkpoint
+`"$RESULTS_ROOT/checkpoints/gravity.json"`, the durable manifest
+`"$RESULTS_ROOT/manifests/fit.json"`, and the JSONL progress log
+`"$RESULTS_ROOT/logs/fit.jsonl"` (plus the Slurm log). Resume a clean
+time-budget stop with the same scratch root and checkpoint directory:
+
+```bash
+cd "$CASE_ROOT"
+uv run --frozen python run_case.py fit --resume
+```
+
+Submit validation only after the fit manifest and result identify the same
+operator/model fingerprints and the fit status is an allowed completed or
+diagnostic status. A time-budget stop is resumable, not an accepted fit.
+
+#### Reconstruction and validation (Stage 7)
+
+```bash
+cd "$CASE_ROOT"
+JOB_ID=$(
+  sbatch --parsable \
+    --output="$RESULTS_ROOT/logs/validate-%j.out" \
+    --error="$RESULTS_ROOT/logs/validate-%j.err" \
+    scripts/60_validate.sbatch
+)
+
+echo "Submitted job: $JOB_ID"
+squeue -j "$JOB_ID"
+```
+
+Outputs are `"$RESULTS_ROOT/validation/"`, the durable
+`"$RESULTS_ROOT/manifests/validate.json"`, and
+`"$RESULTS_ROOT/logs/validate.jsonl"`; no separate validation checkpoint is
+created by the template. Resume by rerunning the same script after checking
+that the fit and operator roots are unchanged. The final gate is an identity
+match and an explicit `acceptance = "accepted"` for a converged successful fit
+(otherwise the result remains diagnostic-only).
+
+### Monitor Slurm and JSON progress together
+
+For any submitted long job, use both the scheduler and persistent files:
+
+```bash
+squeue -j "$JOB_ID"
+
+tail -f "$RESULTS_ROOT/logs/bootstrap-prior-$JOB_ID.out"
+
+find "$RESULTS_ROOT/checkpoints" \
+  -name progress.json \
+  -print \
+  -exec tail -n 1 {} \;
+```
+
+Substitute the stage name for jobs other than bootstrap. Where available, a
+JSON progress record reports completed and total units, elapsed time, recent
+processing rate, estimated remaining time, estimated completion time, current
+phase, checkpoint location, memory usage, and terminal status. The current
+expansion API records `eta_seconds` and rates; an estimated wall-clock
+completion timestamp is not guaranteed when the underlying operation cannot
+provide one. Treat the first ETA as provisional and trust it more only after
+completed chunks accumulate. A log is not completion: verify the manifest,
+expected files, checksums, and fingerprints.
+
+### Verify the completion manifest before continuing
+
+For each phase, inspect the durable manifest before submitting its dependent
+job. For example:
+
+```bash
+jq . "$RESULTS_ROOT/manifests/bootstrap-prior.json"
+```
+
+The next stage may be submitted only when the manifest reports
+`"status": "completed"` and the expected output files and identity
+fingerprints are present. For `preflight`, also require
+`completed_phase = recommendation`; for `fit`, inspect the optimizer status
+and `success` separately; for `validate`, inspect the acceptance field.
+
+### Current path/interface limitation
+
+The current template has relative defaults in `config/case.toml`,
+`config/structural_zeros.toml`, and the `#SBATCH --output/--error` directives.
+They are suitable for a local case tree, not for the absolute scratch policy
+above. The configuration accepts absolute paths, so the case owner must edit
+those TOML values before a JED run. The explicit `sbatch --output/--error`
+arguments above override the wrapper log defaults. `scripts/submit_chain.sh`
+does not accept a scratch results root and should not be used unchanged for
+this policy; submit the jobs individually (or update that wrapper in the
+case-owned repository). This is a template/interface issue, not a scientific
+workflow change.
+
+### Archive scratch results
+
+Before scratch cleanup or expiry, archive the required outputs:
+
+```bash
+ARCHIVE_ROOT=/scratch/<username>/tpg-medium-network-archives
+mkdir -p "$ARCHIVE_ROOT"
+
+tar -C "$SCRATCH_CASE" \
+  -cf "$ARCHIVE_ROOT/tpg-medium-network-results.tar" \
+  results
+
+tar -tf "$ARCHIVE_ROOT/tpg-medium-network-results.tar" >/dev/null
+```
+
+Move the archive itself to persistent project storage or another approved
+location; an archive left only on expiring scratch is not preservation. Copy
+back into the case-study repository the small provenance needed to reproduce
+or audit the run: stage manifests, package/configuration/model fingerprints,
+input and output checksums, completion/status summaries, the selected time-bin
+recommendation and decision, and the final fit/validation summaries. Keep
+large checkpoints, generated OD/time tables, exclusion/audit tables, routing
+artifacts, operator blocks, logs, and intermediate files in the archive rather
+than committing them to GitHub.
+
 ### 0.1 Determine time bins from the count data before the audit
+
+Before starting this potentially long diagnostic, read **Large outputs, scratch
+storage, and archival** and prepare the JED results root if the case is not a
+small local pilot.
 
 For a new case, do not choose time-bin edges only because they are convenient.
 The public package includes a preparation diagnostic that profiles the finest
@@ -133,7 +551,7 @@ Run it from the case-study root, replacing the example paths and budgets with
 the case owner's decisions:
 
 ```bash
-mkdir -p results/time_discretization
+mkdir -p "$RESULTS_ROOT/time_discretization"
 uv run --frozen python -m public_transportation.preprocessing.time_discretization \
   --measurements inputs/measurements.csv \
   --base-resolution-minutes 5 \
@@ -142,7 +560,7 @@ uv run --frozen python -m public_transportation.preprocessing.time_discretizatio
   --max-bins 24 \
   --num-od-pairs <retained_pair_count> \
   --max-od-cells <approved_od_cell_budget> \
-  --output-json results/time_discretization/recommendation.json
+  --output-json "$RESULTS_ROOT/time_discretization/recommendation.json"
 ```
 
 The measurement path and all numeric options in that command are **case-owned
@@ -170,9 +588,9 @@ that an existing scenario file is not overwritten accidentally:
 
 ```bash
 uv run --frozen python -m public_transportation.preprocessing.materialize_time_bins \
-  --recommendation-json results/time_discretization/recommendation.json \
+  --recommendation-json "$RESULTS_ROOT/time_discretization/recommendation.json" \
   --candidate recommendation \
-  --output results/time_discretization/time_bins.reviewed.csv
+  --output "$RESULTS_ROOT/time_discretization/time_bins.reviewed.csv"
 ```
 
 `results/time_discretization/time_bins.reviewed.csv` is a **generated review
@@ -188,6 +606,10 @@ skip the recommendation only after recording that decision and the existing
 bin-file checksum.
 
 ### 0.2 Generate the candidate OD universe and prior demand
+
+Before starting this potentially long expansion, read **Large outputs, scratch
+storage, and archival**. Medium and large cases should use the JED submission,
+persistent checkpoint, and monitoring procedure there.
 
 The scenario demand file is not an unexplained pre-existing case-owner input.
 After the final time bins have been reviewed and adopted, this stage generates
@@ -285,6 +707,12 @@ status, package revision, output path, and output checksum. The stage manifest
 is successful only with `status = "completed"` and the final CSV plus audit
 present. `interrupted`, `failed`, and `deadline_stopped` are terminal
 non-success statuses; no downstream stage may start for them.
+
+Here `inputs/scenario/prior_demand.csv` is the logical template name. Under the
+scratch policy, the actual file is the absolute `scenario_demand` path in
+`config/case.toml` (for example,
+`$RESULTS_ROOT/inputs/scenario/prior_demand.csv` after shell expansion); later
+stages must consume that same configured path.
 
 Run the stage from the case-study root:
 
@@ -507,6 +935,10 @@ result and cache roots, never in a temporary directory.
 
 ## 6. Stage 1 — strict input and mapping audit
 
+Before starting this potentially long audit on a full network, read **Large
+outputs, scratch storage, and archival** and use the same configured results
+root as the preceding stages.
+
 **Stage contract.** Inputs are the **required-convention** scenario files
 (`inputs/scenario/metadata.json`, `stops.csv`, `lines.csv`, `time_bins.csv`,
 the generated `prior_demand.csv`, and, for a scheduled case, `trips.csv` and
@@ -554,6 +986,10 @@ inconsistent service-day conventions. Save the audit and all input checksums
 under `results/audit/`.
 
 ## 7. Stage 2 — structural zeros and fixed demand
+
+Before submitting this potentially long topology and reconciliation phase,
+read **Large outputs, scratch storage, and archival** and verify the scratch
+capacity and output-root configuration.
 
 **Stage contract.** Inputs are the **required-convention**
 `config/structural_zeros.toml`, the **generated** scenario prior demand
@@ -612,6 +1048,10 @@ Before proceeding, verify:
   scenario.
 
 ## 8. Stage 3 — compact OD layout and direct-scheduled preparation
+
+Before submitting preparation and routing construction, read **Large outputs,
+scratch storage, and archival**. This phase can create the largest operator
+blocks and checkpoints in the case.
 
 **Stage contract.** Inputs are the **generated** structural-zero
 `results/structural_zeros/fixed_demand.csv` (or a reviewed **case-owned
@@ -700,6 +1140,10 @@ is never published as complete until all blocks validate.
 
 ## 9. Stage 4 — bounded preflight
 
+Before submitting preflight, read **Large outputs, scratch storage, and
+archival** and confirm that it will reuse the completed preparation artifact
+and the same results root.
+
 **Stage contract.** Inputs are the **generated** complete preparation artifact
 and matching routing checkpoint, the **case-owned** `config/model.toml`, and
 the **case-owned example** initial raw-parameter values. Outputs are the
@@ -742,6 +1186,10 @@ fingerprints, budgets, and persistent checkpoint directory. A complete result
 has `status == "completed"` and `result.complete is True`.
 
 ## 10. Stage 5 — warm benchmark
+
+Before submitting the warm benchmark, read **Large outputs, scratch storage,
+and archival** and confirm that benchmark outputs and logs remain under the
+same results root.
 
 **Stage contract.** Inputs are the same **generated** operator/artifact and
 problem used by the intended fit, the **case-owned** model specification and
@@ -826,6 +1274,10 @@ provisional; it becomes more reliable after completed units accumulate.
 
 ## 12. Stage 6 — initial MAP/gravity fit
 
+Before submitting estimation, read **Large outputs, scratch storage, and
+archival**. Fit checkpoints, logs, and results must remain on the same scratch
+root for any resume.
+
 **Stage contract.** Inputs are the **generated** complete operator artifact,
 matching preflight and benchmark manifests, the **case-owned** model and
 optimizer settings in `config/model.toml`, and a persistent checkpoint root
@@ -873,6 +1325,10 @@ results/logs/<fit-id>.progress.jsonl
 
 ## 13. Stage 7 — diagnostics, reconstruction, and validation
 
+Before submitting reconstruction and validation, read **Large outputs, scratch
+storage, and archival** and confirm that the accepted fit and operator
+fingerprints are available under the same results root.
+
 **Stage contract.** Inputs are the **generated** accepted fit result, the
 matching operator/artifact and fingerprints, the **required-convention**
 scenario/timetable, and the **case-owned example** observation CSV. Outputs
@@ -914,16 +1370,26 @@ policy.
 
 ## 15. Jed scheduling and restartable long runs
 
+Read **Large outputs, scratch storage, and archival** before scheduling. It
+defines the absolute results root, per-phase submissions, monitoring, and
+archive policy used for medium and large cases.
+
 Use separate jobs for preparation, preflight, benchmark, and fit. Keep each job
 below the scheduler wall-time limit and preserve checkpoint/artifact roots on
 persistent storage.
 
-A tested dependency chain is provided by the public template. After copying it
-into the private case and reviewing the resource requests:
+A tested dependency chain is provided by the public template. Its dependency
+ordering is useful as a reference, but its wrappers contain repository-relative
+log directives. Do not invoke that chain unchanged for the absolute scratch
+policy. After copying it into the private case and reviewing the resource
+requests, submit each phase with the explicit `--output` and `--error` paths
+shown in **Large outputs, scratch storage, and archival**, or update a
+case-owned wrapper to provide those paths:
 
 ```bash
-mkdir -p results/logs results/manifests results/checkpoints results/artifacts
-bash scripts/submit_chain.sh
+mkdir -p "$RESULTS_ROOT"/{logs,manifests,checkpoints,artifacts}
+# Do not run scripts/submit_chain.sh unchanged on JED: its #SBATCH log paths
+# are relative to the case repository. Use the per-phase submissions above.
 ```
 
 The template submits `00_bootstrap_prior.sbatch`, `00_check.sbatch`,
@@ -931,9 +1397,9 @@ The template submits `00_bootstrap_prior.sbatch`, `00_check.sbatch`,
 `20_prepare.sbatch`, `30_preflight.sbatch`, `40_benchmark.sbatch`,
 `50_fit.sbatch`, and `60_validate.sbatch` with `afterok` dependencies. Each
 wrapper uses `SLURM_SUBMIT_DIR`, the frozen `uv` environment, explicit CPU,
-memory, and wall-time requests, and persistent output/error paths. Copy the
-wrappers rather than inventing a second stage order; adjust resources only
-after the warm benchmark justifies the change.
+memory, and wall-time requests, and (when overridden as above) persistent
+output/error paths. Copy the wrappers rather than inventing a second stage
+order; adjust resources only after the warm benchmark justifies the change.
 
 `00_bootstrap_prior.sbatch` is intentionally a long-run job: its example
 requests 24 hours, 8 CPUs, and 32 GB of memory. Review those requests against
@@ -942,12 +1408,16 @@ checkpoint and JSONL log must be on persistent case storage, never in a node
 temporary directory. Monitor them while the job runs:
 
 ```bash
-sbatch scripts/00_bootstrap_prior.sbatch
-tail -f results/logs/bootstrap-prior-<job-id>.out
-tail -f results/logs/bootstrap-prior.jsonl
-cat results/manifests/bootstrap-prior.json
-cat results/checkpoints/prior_demand/<expansion-contract-fingerprint>/manifest.json
-cat results/checkpoints/prior_demand/<expansion-contract-fingerprint>/progress.json
+JOB_ID=$(sbatch --parsable \
+  --output="$RESULTS_ROOT/logs/bootstrap-prior-%j.out" \
+  --error="$RESULTS_ROOT/logs/bootstrap-prior-%j.err" \
+  scripts/00_bootstrap_prior.sbatch)
+echo "Submitted job: $JOB_ID"
+tail -f "$RESULTS_ROOT/logs/bootstrap-prior-$JOB_ID.out"
+tail -f "$RESULTS_ROOT/logs/bootstrap-prior.jsonl"
+cat "$RESULTS_ROOT/manifests/bootstrap-prior.json"
+cat "$RESULTS_ROOT/checkpoints/prior_demand/<expansion-contract-fingerprint>/manifest.json"
+cat "$RESULTS_ROOT/checkpoints/prior_demand/<expansion-contract-fingerprint>/progress.json"
 ```
 
 If the job reaches a wall-time limit or is interrupted, classify the terminal
@@ -958,8 +1428,8 @@ finished and released its lock:
 
 ```bash
 sbatch --dependency=afterany:<bootstrap-job-id> \
-  --output=results/logs/bootstrap-prior-resume-%j.out \
-  --error=results/logs/bootstrap-prior-resume-%j.err \
+  --output="$RESULTS_ROOT/logs/bootstrap-prior-resume-%j.out" \
+  --error="$RESULTS_ROOT/logs/bootstrap-prior-resume-%j.err" \
   --wrap='cd "$SLURM_SUBMIT_DIR" && uv run --frozen python run_case.py bootstrap-prior --resume'
 ```
 
@@ -985,15 +1455,15 @@ uv run --frozen python run_case.py fit --resume
 Slurm wrappers should write stdout and stderr to persistent files:
 
 ```text
-results/logs/<stage>-<job-id>.out
-results/logs/<stage>-<job-id>.err
+"$RESULTS_ROOT/logs/<stage>-<job-id>.out"
+"$RESULTS_ROOT/logs/<stage>-<job-id>.err"
 ```
 
 Monitor with:
 
 ```bash
-tail -f results/logs/<stage>-<job-id>.out
-tail -f results/logs/<stage>-<job-id>.err
+tail -f "$RESULTS_ROOT/logs/<stage>-<job-id>.out"
+tail -f "$RESULTS_ROOT/logs/<stage>-<job-id>.err"
 ```
 
 A clean scheduler stop is acceptable only when the durable checkpoint or
