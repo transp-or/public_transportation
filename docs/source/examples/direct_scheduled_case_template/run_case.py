@@ -280,6 +280,11 @@ def _base(context: CaseContext, stage: str) -> dict[str, object]:
         "binding_fingerprint": context.canonical_index.binding_fingerprint,
         "mapping_fingerprint": context.mapping.info.fingerprint,
         "artifact_identity_fingerprint": context.identity.fingerprint,
+        # These identify the exact fixed-demand file used to build the
+        # context, rather than merely the configured fallback path.
+        "fixed_demand": str(context.fixed_demand_path),
+        "fixed_demand_source": context.fixed_demand_source,
+        "fixed_demand_sha256": context.fixed_demand_sha256,
     }
 
 
@@ -337,7 +342,6 @@ def check(root: Path) -> None:
         payload = _base(context, "check") | {
             "scenario": str(context.settings.scenario),
             "measurements": str(context.settings.measurements),
-            "fixed_demand": str(context.settings.fixed_demand),
             "num_physical_od_cells": context.parameter_layout.num_od_total,
             "num_free_od_cells": context.compact_layout.num_free,
             "num_fixed_positive_cells": context.compact_layout.num_fixed_positive,

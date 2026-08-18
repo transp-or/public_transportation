@@ -73,6 +73,7 @@ from .construction_control import (
     ConstructionProgressReporter,
     ConstructionTermination,
     deadline_stop,
+    estimate_completed_unit_eta,
 )
 
 DirectTemporalProgressCallback = Callable[[dict[str, object]], None]
@@ -1239,11 +1240,28 @@ def activate_direct_scheduled_temporal_operator(
         )
 
         def routing_progress(event: FixedRoutingShardProgress) -> None:
+            eta = estimate_completed_unit_eta(
+                (),
+                completed_units=event.completed_shards,
+                total_units=event.total_shards,
+                parallelism=max(1, event.admitted_worker_count),
+            )
+            if event.eta_confidence != "unavailable":
+                eta_confidence = event.eta_confidence
+                predicted_remaining = event.estimated_remaining_seconds
+                completion_at = event.estimated_completion_at_utc
+                eta_reason = event.eta_reason
+            else:
+                eta_confidence = eta.eta_confidence
+                predicted_remaining = eta.predicted_remaining_seconds
+                completion_at = eta.estimated_completion_at_utc
+                eta_reason = eta.eta_reason
             reporter.emit(
                 phase=ConstructionPhase.ROUTING_PREPARATION,
                 status=event.status,
                 force=event.phase in {
                     "planning_cache_scan",
+                    "planning",
                     "terminal",
                     "shard_persistence",
                     "shard_persisted",
@@ -1263,7 +1281,10 @@ def activate_direct_scheduled_temporal_operator(
                     else f"routing-shard-{event.shard_index:06d}"
                 ),
                 recent_unit_seconds=event.recent_shard_seconds,
-                predicted_remaining_seconds=event.estimated_remaining_seconds,
+                predicted_remaining_seconds=predicted_remaining,
+                eta_confidence=eta_confidence,
+                estimated_completion_at_utc=completion_at,
+                eta_reason=eta_reason,
                 checkpoint_location=str(routing_directory),
                 cache_hits=event.cache_hits,
                 cache_misses=event.cache_misses,
@@ -1282,6 +1303,7 @@ def activate_direct_scheduled_temporal_operator(
                         event.buffered_shards + event.active_workers,
                         effective_routing_config.resident_shard_limit,
                     ),
+                    "eta_reason": eta_reason,
                 },
             )
 
@@ -1334,20 +1356,30 @@ def activate_direct_scheduled_temporal_operator(
                 f"{routing_result.status}"
             )
     elif routing is None:
-        reporter.emit(
-            phase=ConstructionPhase.ROUTING_PREPARATION,
-            status="started",
-            force=True,
-            predicted_remaining_seconds=predicted_routing_seconds,
-            cache_hits=0,
-            cache_misses=1,
-        )
         routing_started = control.clock()
-        routing = (
-            bounded_routing_factory(control)
-            if bounded_routing_factory is not None
-            else routing_factory()
-        )
+        with reporter.heartbeat_scope(
+            current_unit="routing_factory",
+            details={
+                "routing_phase": "routing_factory",
+                "eta_reason": "opaque routing factory has no shard callback",
+            },
+        ):
+            reporter.emit(
+                phase=ConstructionPhase.ROUTING_PREPARATION,
+                status="started",
+                force=True,
+                predicted_remaining_seconds=None,
+                eta_confidence="unavailable",
+                eta_reason="opaque routing factory has no shard callback",
+                cache_hits=0,
+                cache_misses=1,
+                details={"routing_phase": "routing_factory"},
+            )
+            routing = (
+                bounded_routing_factory(control)
+                if bounded_routing_factory is not None
+                else routing_factory()
+            )
         routing_seconds = max(0.0, control.clock() - routing_started)
         _save_routing_checkpoint(
             checkpoint_directory=checkpoint_directory,

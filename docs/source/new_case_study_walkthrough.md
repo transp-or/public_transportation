@@ -1050,6 +1050,17 @@ manifest and JSONL log under `results/manifests/` and `results/logs/`. The
 template uses these exact output filenames; a different driver must preserve
 their meaning and record any renamed paths in its manifest.
 
+The `fixed_demand` entry in `config/case.toml` is only the configured fallback
+path. Once structural-zero preprocessing has produced
+`results/structural_zeros/fixed_demand.csv`, that generated file is the
+effective fixed-demand input for later stages and takes precedence over the
+fallback. The adapter must report the exact resolved file that it passes to
+`read_fixed_demand_csv`, together with `fixed_demand_source` (either
+`generated_structural_zeros` or `case_config_fallback`) and
+`fixed_demand_sha256`. Preserve the resolved absolute path, source
+classification, and checksum in the stage manifest, artifact/provenance
+metadata, and case results; do not infer provenance from the configured path.
+
 Topology-driven structural-zero preprocessing is TOML-driven. A
 structural-zero TOML file can be passed to the public service:
 
@@ -1118,6 +1129,11 @@ names are current template conventions; the identity is generated, never
 handwritten. Retain the measurement fingerprint, support-preflight report,
 removed-row identifiers, and owner decision with the case results; the fit
 report must state whether any rows were excluded and why.
+
+The `prepare` context must use the same resolved fixed-demand path and checksum
+reported by `check`; generated structural-zero output continues to take
+precedence when present. A mismatch between the manifest and the file actually
+loaded is a provenance failure and stops the case.
 
 The current estimator uses a compact layout. Free cells are parameters; frozen
 zero cells are absent from the assignment representation; frozen positive cells
@@ -1334,6 +1350,27 @@ total units, elapsed and remaining time, current unit, cache counters, and
 checkpoint location when available. Estimator events report iteration,
 objective, gradient norm, elapsed time, and checkpoint state. An early ETA is
 provisional; it becomes more reliable after completed units accumulate.
+
+For the potentially long `routing_preparation` phase, the first event reports
+the actual planned destination-group and shard totals (never a hard-coded
+placeholder). Subsequent JSONL records are throttled heartbeats for planning,
+cache scanning, JAX tracing/lowering/compilation, batch preparation,
+synchronization, shard construction, and checkpoint persistence. `completed_units`
+counts only shards whose output is persisted and recorded in the durable
+manifest; reusable shards found on restart are included in that initial count.
+`current_unit` identifies the current shard or subphase. When enough completed
+shard timings exist, `predicted_remaining_seconds`,
+`estimated_completion_at_utc`, and `eta_confidence` are emitted. The confidence
+is deliberately `unavailable` (with an `eta_reason`) until observations are
+sufficient; heterogeneous shard times may produce `low` or `medium` confidence.
+The routing fields are `completed_units`, `total_units`, `current_unit`,
+`recent_unit_seconds`, `predicted_remaining_seconds`, `eta_confidence`,
+`estimated_completion_at_utc`, and `eta_reason`; the subphase is carried in
+`routing_phase`.
+An opaque `routing_factory()` has no shard callback, so it emits regular
+subphase heartbeats with a null ETA rather than inventing progress. These
+records are observational and do not alter routing decisions, numerical
+results, parallelism, or artifact fingerprints.
 
 ## 12. Stage 6 — initial MAP/gravity fit
 
@@ -1896,7 +1933,11 @@ activate_direct_scheduled_temporal_operator(
 `AssignmentArtifactIdentity` (canonical-index, network, timetable,
 temporal-discretization, route-choice, departure-choice, feasibility,
 measurement-mapping, coefficient-policy fingerprints, numeric dtype, and
-schema version). The result contains a `decision`, an optional `operator`, an
+schema version). Set `progress_interval_seconds` to the
+desired heartbeat interval. The same interval is used for sharded
+routing-preparation heartbeats when `routing_preparation_config` is supplied;
+it controls reporting only and does not change shard construction or its
+identity. The result contains a `decision`, an optional `operator`, an
 optional construction record, and an optional termination record. A complete
 operator has a persisted artifact manifest with `complete: true`, matching
 identity/provenance, dimensions, nonzero count, block list, and fixed-offset
@@ -2097,9 +2138,9 @@ by the stage and must be fingerprinted before a later stage consumes it.
 | count recommendation | **Example:** `inputs/measurements.csv`; **example settings:** resolution, horizon, `num_od_pairs`, and `max_od_cells` passed to `time_discretization` | `results/time_discretization/recommendation.json`; retain the input checksum and selected candidate | JSON `status = "ok"` and a valid `recommendation`; `blocked` is a stop condition | no; rerun after a deliberate input/policy change |
 | bin materialization | **Generated:** reviewed recommendation JSON; **example output:** `results/time_discretization/time_bins.reviewed.csv` | reviewed three-column CSV; later, the **convention** scenario input `inputs/scenario/time_bins.csv` after explicit adoption | materializer succeeds and the selected candidate is valid; scenario `time_bins.csv` is not replaced implicitly | no |
 | `bootstrap-prior` | **Convention:** approved `inputs/scenario/time_bins.csv`; **example:** network and explicit policy/resource values in `config/case.toml`; no demand file is required yet | `results/checkpoints/prior_demand/<expansion-contract-fingerprint>/manifest.json`, immutable `chunk-*.jsonl`, `progress.json`; `inputs/scenario/prior_demand.csv`; `results/audit/prior_demand_generation.json`; `results/manifests/bootstrap-prior.json`; `results/logs/bootstrap-prior.jsonl` | manifest and stage summary `status = "completed"`; checkpoint is complete, audit exists, and output checksum is present. `interrupted`, `failed`, and `deadline_stopped` stop the chain | yes, only with `bootstrap-prior --resume` and matching identity; a fresh run refuses an existing checkpoint |
-| `check` | **Convention:** `config/case.toml`, `config/structural_zeros.toml`, `config/model.toml`; **generated:** `inputs/scenario/prior_demand.csv` and its audit; **example:** other paths selected by those files under `inputs/` | `results/manifests/check.json`, `results/logs/check.jsonl`, `results/audit/feasibility_support.json`, `results/audit/feasibility_support_cells.jsonl`, and audit fingerprints | manifest `status = "completed"`, support audit `status = "completed"`, zero unsupported free/bootstrap-only cells, all fingerprints present | no |
+| `check` | **Convention:** `config/case.toml`, `config/structural_zeros.toml`, `config/model.toml`; **generated:** `inputs/scenario/prior_demand.csv` and its audit; **example:** other paths selected by those files under `inputs/` | `results/manifests/check.json` (including resolved `fixed_demand`, `fixed_demand_source`, and `fixed_demand_sha256`), `results/logs/check.jsonl`, `results/audit/feasibility_support.json`, `results/audit/feasibility_support_cells.jsonl`, and audit fingerprints | manifest `status = "completed"`, support audit `status = "completed"`, zero unsupported free/bootstrap-only cells, all fingerprints present | no |
 | `structural-zeros` | **Convention:** `config/structural_zeros.toml`; **generated:** scenario prior demand; **example:** existing fixed-demand path selected by it | `results/structural_zeros/fixed_demand.csv`, `results/structural_zeros/structural_zero_audit.csv`, `results/structural_zeros/structural_zero_summary.json`, `results/structural_zeros/fingerprints.json`, `results/structural_zeros/resolved_config.toml`, `results/manifests/structural-zeros.json`, `results/logs/structural-zeros.jsonl` | service returns without exception; summary and fingerprints exist | safe to rerun with the same roots |
-| `prepare` | **Generated:** structural-zero fixed demand (or **example:** reviewed fixed-demand file when the stage is disabled); **convention:** scenario/timetable and measurement contracts; **example:** resource limits in TOML | `results/artifacts/<identity>/manifest.json`, `blocks/block-*.npz`, `fixed_measurement_offset.npy`; `results/checkpoints/<identity>/`; stage manifest/log | artifact `complete = true`; routing `status = "completed"` | yes, only from a matching checkpoint |
+| `prepare` | **Generated:** resolved structural-zero fixed demand (or **example:** reviewed fallback fixed-demand file when the stage is disabled); **convention:** scenario/timetable and measurement contracts; **example:** resource limits in TOML | `results/artifacts/<identity>/manifest.json`, `blocks/block-*.npz`, `fixed_measurement_offset.npy`; `results/checkpoints/<identity>/`; stage manifest/log with resolved fixed-demand path, source, and checksum | artifact `complete = true`; routing `status = "completed"`; fixed-demand provenance matches the file actually loaded | yes, only from a matching checkpoint |
 | `preflight` | **Generated:** complete preparation artifact; **example:** model settings and initial raw parameters | `results/manifests/preflight.json`, `results/logs/preflight.jsonl`, and optional **example** copy under `results/preflight/` | `completed_phase = recommendation` | no |
 | `benchmark` | **Generated:** the exact artifact/problem used for the fit and preflight recommendation; **example:** benchmark repetitions and tolerances | `results/manifests/benchmark.json`, `results/logs/benchmark.jsonl`, and optional **example** benchmark JSON under `results/preflight/` | finite timings and gradient agreement within the declared tolerance | no |
 | `fit` | **Generated:** complete artifact, preflight, benchmark; **convention:** `results/checkpoints/`; **example:** model/optimizer settings and fit ID | `results/manifests/fit.json`, `results/fits/result.json` (or `.npz`), identity-bound checkpoint, `results/logs/fit.jsonl` | optimizer status is explicit; `success` must be checked separately from stage completion | yes for a valid time-budget checkpoint |

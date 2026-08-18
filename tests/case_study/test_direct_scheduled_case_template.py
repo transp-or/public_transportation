@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import runpy
 import shutil
@@ -10,6 +11,66 @@ from pathlib import Path
 import pytest
 
 from public_transportation.preprocessing import ODTimeExpansionInterrupted
+
+
+def _fixed_demand_provenance_case(
+    tmp_path: Path, *, generated_values: tuple[int, int] | None
+) -> Path:
+    repository = Path(__file__).parents[2]
+    template = repository / "docs/source/examples/direct_scheduled_case_template"
+    example = repository / "docs/source/examples/simple_example_02"
+    case = tmp_path / "case"
+    shutil.copytree(template, case)
+    shutil.copytree(example / "data", case / "inputs/scenario")
+    shutil.copy(example / "data/fixed_demand.csv", case / "inputs/fixed_demand.csv")
+    shutil.copy(
+        example / "pre_processing/results/measurements_boarding_alighting.csv",
+        case / "inputs/measurements.csv",
+    )
+    case_config = case / "config/case.toml"
+    case_config.write_text(
+        case_config.read_text(encoding="utf-8").replace(
+            "REPLACE_WITH_PUBLIC_TRANSPORTATION_COMMIT",
+            "fixed-demand-provenance-test-revision",
+        ),
+        encoding="utf-8",
+    )
+    if generated_values is not None:
+        generated = case / "results/structural_zeros/fixed_demand.csv"
+        generated.parent.mkdir(parents=True, exist_ok=True)
+        generated.write_text(
+            "origin_stop_id,dest_stop_id,time_bin_id,fixed_flow\n"
+            f"A,H,t0,{generated_values[0]}\n"
+            f"A,H,t1,{generated_values[1]}\n",
+            encoding="utf-8",
+        )
+    return case
+
+
+def _load_context_and_check_manifest(
+    case: Path,
+) -> tuple[object, dict[str, object], dict[str, Path]]:
+    """Load the template driver while capturing the exact fixed path read."""
+    sys.path.insert(0, str(case))
+    try:
+        namespace = runpy.run_path(str(case / "run_case.py"), run_name="provenance_test")
+        adapter_globals = namespace["load_context"].__globals__
+        original_reader = adapter_globals["read_fixed_demand_csv"]
+        observed: dict[str, Path] = {}
+
+        def capture_reader(path: Path, *, scenario: object) -> object:
+            observed["path"] = Path(path)
+            return original_reader(path, scenario=scenario)
+
+        adapter_globals["read_fixed_demand_csv"] = capture_reader
+        context = namespace["load_context"](case)
+        namespace["check"](case)
+    finally:
+        sys.path.remove(str(case))
+    manifest = json.loads(
+        (case / "results/manifests/check.json").read_text(encoding="utf-8")
+    )
+    return context, manifest, observed
 
 
 def test_direct_scheduled_template_complete_public_fixture(tmp_path: Path) -> None:
@@ -226,6 +287,40 @@ def test_stage_progress_heartbeats_do_not_fabricate_work_or_eta(tmp_path: Path) 
     assert all(event["estimated_remaining_seconds"] is None for event in heartbeats)
     assert all(event["eta_confidence"] == "unavailable" for event in heartbeats)
     assert events[-1]["status"] == "completed"
+
+
+def test_check_reports_generated_fixed_demand_provenance(tmp_path: Path) -> None:
+    case = _fixed_demand_provenance_case(tmp_path, generated_values=(19, 43))
+    context, manifest, observed = _load_context_and_check_manifest(case)
+    generated = (case / "results/structural_zeros/fixed_demand.csv").resolve()
+    expected_sha256 = hashlib.sha256(generated.read_bytes()).hexdigest()
+
+    assert observed["path"] == generated
+    assert context.fixed_demand_path == generated
+    assert context.fixed_demand_source == "generated_structural_zeros"
+    assert context.fixed_demand_sha256 == expected_sha256
+    assert sorted(context.parameter_layout.fixed_od_values) == [19.0, 43.0]
+    assert manifest["fixed_demand"] == str(generated)
+    assert manifest["fixed_demand_source"] == "generated_structural_zeros"
+    assert manifest["fixed_demand_sha256"] == expected_sha256
+
+
+def test_check_reports_configured_fixed_demand_fallback_provenance(
+    tmp_path: Path,
+) -> None:
+    case = _fixed_demand_provenance_case(tmp_path, generated_values=None)
+    context, manifest, observed = _load_context_and_check_manifest(case)
+    fallback = (case / "inputs/fixed_demand.csv").resolve()
+    expected_sha256 = hashlib.sha256(fallback.read_bytes()).hexdigest()
+
+    assert observed["path"] == fallback
+    assert context.fixed_demand_path == fallback
+    assert context.fixed_demand_source == "case_config_fallback"
+    assert context.fixed_demand_sha256 == expected_sha256
+    assert sorted(context.parameter_layout.fixed_od_values) == [18.0, 42.0]
+    assert manifest["fixed_demand"] == str(fallback)
+    assert manifest["fixed_demand_source"] == "case_config_fallback"
+    assert manifest["fixed_demand_sha256"] == expected_sha256
 
 
 def test_check_failure_writes_terminal_progress_and_manifest(tmp_path: Path) -> None:

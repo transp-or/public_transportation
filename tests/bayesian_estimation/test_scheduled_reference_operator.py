@@ -1026,6 +1026,16 @@ def test_activation_stops_and_resumes_persistent_sharded_routing(
     assert stopped.termination.checkpoint_reusable
     assert routing_calls == []
     json.dumps(stopped_events)
+    stopped_routing_events = [
+        event
+        for event in stopped_events
+        if event["phase"] == "routing_preparation"
+    ]
+    assert stopped_routing_events[0]["routing_phase"] == "planning"
+    assert stopped_routing_events[0]["completed_units"] == 0
+    assert stopped_routing_events[0]["total_units"] > 0
+    assert stopped_routing_events[0]["total_destination_groups"] > 0
+    assert stopped_routing_events[0]["eta_confidence"] == "unavailable"
     routing_subphases = {
         event.get("routing_phase")
         for event in stopped_events
@@ -1062,6 +1072,9 @@ def test_activation_stops_and_resumes_persistent_sharded_routing(
     ]
     assert routing_events
     assert any(int(event["cache_hits"] or 0) >= 1 for event in routing_events)
+    assert routing_events[0]["routing_phase"] == "planning"
+    assert routing_events[0]["completed_units"] >= 1
+    assert routing_events[0]["total_units"] == stopped_routing_events[0]["total_units"]
     assert routing_calls == []
 
     dense = prepare_direct_scheduled_temporal_operator(

@@ -460,7 +460,9 @@ def test_parallel_detailed_profile_is_complete_ordered_and_cache_safe(
     assert [event.shard_index for event in persisted] == list(
         range(result.routing.num_shards)
     )
-    assert len(events) <= 3 * result.routing.num_shards + 2
+    # The progress contract now includes one planning event and explicit
+    # tracing/lowering/compilation phase observations before shard events.
+    assert len(events) <= 3 * result.routing.num_shards + 10
 
     cached_events = []
     cached = prepare_fixed_routing_sharded(
@@ -473,6 +475,7 @@ def test_parallel_detailed_profile_is_complete_ordered_and_cache_safe(
     assert cached.cache_misses == 0
     assert cached.shard_diagnostics == ()
     assert [event.phase for event in cached_events] == [
+        "planning",
         "planning_cache_scan",
         "terminal",
     ]

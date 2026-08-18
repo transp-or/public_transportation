@@ -305,6 +305,9 @@ class CaseSettings:
 @dataclass(frozen=True, slots=True)
 class CaseContext:
     settings: CaseSettings
+    fixed_demand_path: Path
+    fixed_demand_source: str
+    fixed_demand_sha256: str
     scenario: Scenario
     timetable_index: Any
     assignment: Any
@@ -324,6 +327,18 @@ def _sha256_file(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _resolve_fixed_demand(settings: CaseSettings) -> tuple[Path, str, str]:
+    """Resolve and fingerprint the fixed-demand file used by the context."""
+    generated = (settings.results / "structural_zeros/fixed_demand.csv").resolve()
+    if generated.is_file():
+        path = generated
+        source = "generated_structural_zeros"
+    else:
+        path = settings.fixed_demand.resolve()
+        source = "case_config_fallback"
+    return path, source, _sha256_file(path)
 
 
 def _time_bin_fingerprint(scenario: Scenario) -> str:
@@ -950,10 +965,17 @@ def load_context(
     )
 
     _progress(progress, phase="fixed_demand_loading", status="started", current_unit="fixed_demand")
-    generated_fixed = settings.results / "structural_zeros/fixed_demand.csv"
-    fixed_path = generated_fixed if generated_fixed.is_file() else settings.fixed_demand
+    fixed_path, fixed_source, fixed_sha256 = _resolve_fixed_demand(settings)
     fixed = read_fixed_demand_csv(fixed_path, scenario=scenario)
-    _progress(progress, phase="fixed_demand_loading", status="completed", current_unit="fixed_demand")
+    _progress(
+        progress,
+        phase="fixed_demand_loading",
+        status="completed",
+        current_unit="fixed_demand",
+        fixed_demand_path=str(fixed_path),
+        fixed_demand_source=fixed_source,
+        fixed_demand_sha256=fixed_sha256,
+    )
 
     _progress(progress, phase="od_layout_construction", status="started", current_unit="od_layout")
     layout = build_od_parameter_layout(scenario=scenario, fixed_demand=fixed)
@@ -1013,8 +1035,21 @@ def load_context(
     _progress(progress, phase="feature_construction", status="completed", current_unit="gravity_features")
     _progress(progress, phase="context_initialization", status="completed", current_unit="context")
     return CaseContext(
-        settings, scenario, timetable_index, assignment, id_manager, table,
-        mapping, layout, compact, canonical, features, identity
+        settings=settings,
+        fixed_demand_path=fixed_path,
+        fixed_demand_source=fixed_source,
+        fixed_demand_sha256=fixed_sha256,
+        scenario=scenario,
+        timetable_index=timetable_index,
+        assignment=assignment,
+        id_manager=id_manager,
+        measurements=table,
+        mapping=mapping,
+        parameter_layout=layout,
+        compact_layout=compact,
+        canonical_index=canonical,
+        features=features,
+        identity=identity,
     )
 
 

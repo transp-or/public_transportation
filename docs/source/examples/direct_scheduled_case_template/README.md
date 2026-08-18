@@ -41,8 +41,13 @@ columns `method_id` (string), `measurement_type` (`boarding` or `alighting`),
 and optional `trip_id` and `line_id` strings. The fixed-demand CSV has
 `origin_stop_id,dest_stop_id,time_bin_id,fixed_flow`; blank `fixed_flow` means
 zero. Every fixed key must exist in the scenario demand table.
-The template expects `fixed_demand.csv` to exist; when no cells are frozen,
-provide the header row and no data rows.
+The `fixed_demand` value in `config/case.toml` is the case-configured fallback
+file. The template expects that fallback to exist; when no cells are frozen,
+provide the header row and no data rows. After structural-zero preprocessing,
+`results/structural_zeros/fixed_demand.csv` takes precedence whenever it
+exists. The adapter records the resolved file actually loaded, its source
+classification (`generated_structural_zeros` or `case_config_fallback`), and
+its SHA-256 checksum in every context-backed stage manifest.
 
 `config/case.toml` selects the input and persistent output roots and declares
 the candidate-universe, timetable-feasibility, and prior-generation policies:
@@ -309,6 +314,27 @@ OD-layout, or package identity differs. Do not mix result roots between cases.
 After `structural-zeros`, the generated
 `results/structural_zeros/fixed_demand.csv` becomes the authoritative fixed
 demand for later stages; review its audit and fingerprint before continuing.
+The `check` manifest and preparation-related summaries report the resolved
+absolute path, source classification, and checksum of that file—not merely the
+fallback path from `config/case.toml`. Retain these values with the artifact
+identity and case results for reproducibility.
+
+### Routing-preparation progress
+
+The first `routing_preparation` JSONL event reports the actual number of
+destination groups and routing shards planned. Later records are throttled
+heartbeats for planning, cache scanning, JAX tracing/lowering/compilation,
+batch preparation, synchronization, shard construction, and checkpoint
+persistence. `completed_units` means persisted or reusable shards only, so a
+resumed run starts with its durable completed count. `current_unit` identifies
+the active shard or subphase. An ETA is emitted only after enough completed
+shard timings are available; otherwise `predicted_remaining_seconds` and
+`estimated_completion_at_utc` are `null`, `eta_confidence` is
+`"unavailable"`, and `eta_reason` explains why. Heterogeneous shard times can
+lower the confidence to `"low"` or `"medium"`. An opaque `routing_factory()`
+cannot expose shard progress and therefore reports regular heartbeats with an
+unavailable ETA. These records are observational: they do not change routing,
+parallelism, numerical values, or artifact fingerprints.
 
 ## Scheduler scripts
 
