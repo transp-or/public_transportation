@@ -336,6 +336,32 @@ cannot expose shard progress and therefore reports regular heartbeats with an
 unavailable ETA. These records are observational: they do not change routing,
 parallelism, numerical values, or artifact fingerprints.
 
+When an adapter supplies `routing_preparation_config`, configure both
+reporting controls explicitly when desired:
+
+```python
+FixedRoutingPreparationConfig(
+    progress_interval_seconds=5.0,
+    progress_interval_groups=8,
+)
+```
+
+`progress_interval_seconds` is the minimum wall-clock interval for heartbeats,
+including long indivisible planning, compilation, synchronization, checkpoint,
+and finalization subphases. `progress_interval_groups` controls sampling at
+completed destination-group boundaries. They are independent and are never
+converted into one another; when both are supplied, repeated work-progress
+events honor both constraints. Lifecycle transitions remain visible
+immediately. Older adapters that pass only `progress_interval_seconds` remain
+compatible, and a caller that omits either setting receives its default
+(`1.0` second or `8` groups). Changing either setting cannot change routing
+values, shard contents, checkpoint identities, scheduling, memory layout, or
+artifact fingerprints. Monitor the durable stream with:
+
+```bash
+tail -f results/logs/prepare.jsonl
+```
+
 ## Scheduler scripts
 
 The `scripts/*.sbatch` files are examples only. Review the requested memory,

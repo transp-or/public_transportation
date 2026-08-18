@@ -35,6 +35,33 @@ Phases include cache validation, routing preparation, support discovery,
 planning, shard validation and construction, temporal-block assembly,
 validation, persistence, and completion.
 
+Routing preparation accepts two independent progress controls:
+
+```python
+routing_config = FixedRoutingPreparationConfig(
+    progress_interval_seconds=5.0,
+    progress_interval_groups=8,
+)
+```
+
+`progress_interval_seconds` is the minimum wall-clock interval between
+heartbeat/progress observations, including long indivisible planning, cache
+scan, compilation, synchronization, batch-execution, checkpoint, and
+finalization subphases. `progress_interval_groups` samples progress at
+completed destination-group (routing-unit) boundaries. The settings are not
+interchangeable: seconds are not converted to groups and groups are not
+converted to seconds. When both are supplied, a repeated work-progress event
+is emitted only when both its wall-clock and completed-group constraints are
+met; lifecycle transitions and terminal records remain visible immediately.
+When only one is supplied, the other keeps its default (`1.0` second or `8`
+groups). A reliable ETA is still unavailable until enough completed units have
+been observed. These controls affect reporting only and never routing values,
+shard contents, checkpoints, scheduling, memory layout, or artifact
+fingerprints.
+
+Older callers that provide only `progress_interval_seconds` remain supported;
+new callers may additionally provide `progress_interval_groups`.
+
 ## Resume and checkpoint identity
 
 Prepared routing batches, each completed destination group's origin-specific
@@ -157,6 +184,8 @@ routing_config = FixedRoutingPreparationConfig(
     construction_workers=1,
     resident_shard_limit=1,
     dispatch_safety_margin_seconds=120.0,
+    progress_interval_seconds=5.0,
+    progress_interval_groups=8,
 )
 ```
 

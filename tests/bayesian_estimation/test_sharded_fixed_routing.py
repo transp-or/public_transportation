@@ -12,6 +12,8 @@ from public_transportation.inference.sharded_fixed_routing import (
     FixedRoutingShard,
     FixedRoutingShardCacheError,
     FixedRoutingShardDescriptor,
+    FixedRoutingShardProgress,
+    _RoutingProgressHeartbeat,
     build_sharded_fixed_routing_inputs,
     load_fixed_routing_shard,
     materialize_sharded_fixed_routing_dense,
@@ -41,6 +43,96 @@ def _inputs() -> AssignmentInputs:
         group_od_index_padded=jnp.array([[0], [1], [2]], dtype=jnp.int32),
         group_od_mask=jnp.ones((3, 1), dtype=bool),
     )
+
+
+def _progress_event(*, completed_groups: int, phase: str = "shard_persisted"):
+    return FixedRoutingShardProgress(
+        phase=phase,
+        status="completed",
+        completed_groups=completed_groups,
+        total_groups=16,
+        completed_shards=completed_groups,
+        total_shards=16,
+        shard_index=None,
+        cache_hits=0,
+        cache_misses=16,
+        elapsed_seconds=0.0,
+        recent_shard_seconds=None,
+        estimated_remaining_seconds=None,
+        peak_rss_bytes=None,
+        retained_cache_bytes=0,
+        deadline_remaining_seconds=None,
+    )
+
+
+def test_progress_intervals_are_independent_and_serializable():
+    seconds_only = FixedRoutingPreparationConfig(progress_interval_seconds=5.0)
+    groups_only = FixedRoutingPreparationConfig(progress_interval_groups=3)
+    both = FixedRoutingPreparationConfig(
+        progress_interval_seconds=2.5,
+        progress_interval_groups=6,
+    )
+
+    assert seconds_only.progress_interval_seconds == 5.0
+    assert seconds_only.progress_interval_groups == 8
+    assert groups_only.progress_interval_seconds == 1.0
+    assert groups_only.progress_interval_groups == 3
+    assert both.progress_configuration() == {
+        "progress_interval_seconds": 2.5,
+        "progress_interval_groups": 6,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("progress_interval_seconds", 0.0, "positive and finite"),
+        ("progress_interval_seconds", float("nan"), "positive and finite"),
+        ("progress_interval_seconds", float("inf"), "positive and finite"),
+        ("progress_interval_groups", 0, "positive integer"),
+        ("progress_interval_groups", -1, "positive integer"),
+        ("progress_interval_groups", 1.5, "positive integer"),
+        ("progress_interval_groups", True, "positive integer"),
+    ],
+)
+def test_progress_interval_validation_names_field(field, value, message):
+    with pytest.raises(ValueError, match=field):
+        FixedRoutingPreparationConfig(**{field: value})
+    with pytest.raises(ValueError, match=message):
+        FixedRoutingPreparationConfig(**{field: value})
+
+
+def test_group_progress_requires_group_boundary_and_wall_clock_interval():
+    now = [0.0]
+    events = []
+    heartbeat = _RoutingProgressHeartbeat(
+        events.append,
+        _progress_event(completed_groups=0),
+        interval_seconds=5.0,
+        interval_groups=2,
+        clock=lambda: now[0],
+    )
+
+    heartbeat.emit(_progress_event(completed_groups=1))
+    assert events == []
+    now[0] = 5.0
+    heartbeat.emit(_progress_event(completed_groups=1))
+    assert events == []
+    heartbeat.emit(_progress_event(completed_groups=2))
+    assert len(events) == 1
+    assert events[0].completed_groups == 2
+
+    now[0] = 6.0
+    heartbeat.emit(_progress_event(completed_groups=4))
+    assert len(events) == 1
+    now[0] = 10.0
+    heartbeat.emit(_progress_event(completed_groups=4))
+    assert len(events) == 2
+    assert events[-1].completed_groups == 4
+
+    heartbeat.emit(_progress_event(completed_groups=4, phase="terminal"))
+    assert len(events) == 3
+    heartbeat.close()
 
 
 def test_sharded_metadata_is_stable_and_contains_no_routing_payload(tmp_path):

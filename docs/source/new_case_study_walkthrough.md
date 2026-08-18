@@ -1372,6 +1372,31 @@ subphase heartbeats with a null ETA rather than inventing progress. These
 records are observational and do not alter routing decisions, numerical
 results, parallelism, or artifact fingerprints.
 
+The two routing progress controls are independent. Set
+`progress_interval_seconds` for the minimum wall-clock heartbeat interval and
+`progress_interval_groups` for sampling at completed destination-group
+boundaries:
+
+```python
+FixedRoutingPreparationConfig(
+    progress_interval_seconds=5.0,
+    progress_interval_groups=8,
+)
+```
+
+They are not interchangeable and are not converted into one another. When
+both are supplied, repeated work-progress events honor both constraints;
+lifecycle transitions and terminal records remain visible immediately. A
+caller that provides only one uses the default for the other. Changing either
+setting affects reporting only, never routing values, shard contents,
+checkpoint identities, scheduling, memory layout, or artifact fingerprints.
+ETA values remain unavailable until enough completed units exist for a reliable
+estimate. Monitor the durable stream with:
+
+```bash
+tail -f "$RESULTS_ROOT/logs/prepare.jsonl"
+```
+
 ## 12. Stage 6 — initial MAP/gravity fit
 
 Before submitting estimation, read **Large outputs, scratch storage, and
@@ -1933,15 +1958,36 @@ activate_direct_scheduled_temporal_operator(
 `AssignmentArtifactIdentity` (canonical-index, network, timetable,
 temporal-discretization, route-choice, departure-choice, feasibility,
 measurement-mapping, coefficient-policy fingerprints, numeric dtype, and
-schema version). Set `progress_interval_seconds` to the
-desired heartbeat interval. The same interval is used for sharded
-routing-preparation heartbeats when `routing_preparation_config` is supplied;
-it controls reporting only and does not change shard construction or its
-identity. The result contains a `decision`, an optional `operator`, an
+schema version). Set `progress_interval_seconds` to the desired wall-clock
+heartbeat interval. When `routing_preparation_config` is supplied, set its
+independent `progress_interval_seconds` and `progress_interval_groups` values,
+for example:
+
+```python
+FixedRoutingPreparationConfig(
+    progress_interval_seconds=5.0,
+    progress_interval_groups=8,
+)
+```
+
+Seconds control wall-clock heartbeats; groups control progress sampling at
+completed destination-group boundaries. They are not interchangeable and are
+not converted into one another. When both are set, repeated work-progress
+events honor both constraints; lifecycle transitions remain visible
+immediately. These are reporting-only settings and do not change shard
+construction, numerical values, checkpoint identities, scheduling, or
+artifact fingerprints. ETA values remain unavailable until enough completed
+units exist for a reliable estimate. The result contains a `decision`, an
+optional `operator`, an
 optional construction record, and an optional termination record. A complete
 operator has a persisted artifact manifest with `complete: true`, matching
 identity/provenance, dimensions, nonzero count, block list, and fixed-offset
 hash. A deadline termination is resumable; it is not a completed operator.
+
+Migration note: private adapters from older package revisions that pass only
+`progress_interval_seconds=...` remain supported. They may add
+`progress_interval_groups=...` after updating the public package; changing
+either reporting value does not invalidate compatible numerical artifacts.
 
 The template's `adapter.activate` is a minimal executable example of this
 assembly. It uses persistent `results/checkpoints/` and `results/artifacts/`

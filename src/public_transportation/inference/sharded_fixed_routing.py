@@ -11,6 +11,7 @@ import threading
 import uuid
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
+from numbers import Integral
 from pathlib import Path
 from time import perf_counter, process_time
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal
@@ -77,7 +78,15 @@ class FixedRoutingShardDescriptor:
 
 @dataclass(frozen=True, slots=True)
 class FixedRoutingPreparationConfig:
-    """Resource ceilings controlling deterministic routing-shard preparation."""
+    """Resource and reporting settings for deterministic routing preparation.
+
+    ``progress_interval_seconds`` is a wall-clock throttle for heartbeat and
+    progress events.  ``progress_interval_groups`` is a work-unit sampling
+    interval: a progress event is eligible when this many destination groups
+    have completed.  The settings are independent; neither is converted into
+    the other, and both constraints are honored when both are configured.
+    They are reporting-only and do not participate in routing identities.
+    """
 
     maximum_groups_per_shard: int = 8
     maximum_retained_bytes_per_shard: int = 256 * 1024 * 1024
@@ -106,7 +115,6 @@ class FixedRoutingPreparationConfig:
             "maximum_groups_per_shard": self.maximum_groups_per_shard,
             "maximum_retained_bytes_per_shard": self.maximum_retained_bytes_per_shard,
             "maximum_temporary_bytes": self.maximum_temporary_bytes,
-            "progress_interval_groups": self.progress_interval_groups,
             "construction_workers": self.construction_workers,
             "threads_per_worker": self.threads_per_worker,
             "resident_shard_limit": self.resident_shard_limit,
@@ -115,17 +123,32 @@ class FixedRoutingPreparationConfig:
         for name, value in positive.items():
             if value <= 0:
                 raise ValueError(f"{name} must be positive.")
+        if isinstance(self.progress_interval_groups, bool) or not isinstance(
+            self.progress_interval_groups, Integral
+        ):
+            raise ValueError(
+                "progress_interval_groups must be a positive integer."
+            )
+        if self.progress_interval_groups <= 0:
+            raise ValueError("progress_interval_groups must be a positive integer.")
+        object.__setattr__(
+            self, "progress_interval_groups", int(self.progress_interval_groups)
+        )
         for name in ("maximum_process_rss_bytes", "maximum_cache_bytes"):
             value = getattr(self, name)
             if value is not None and value <= 0:
                 raise ValueError(f"{name} must be positive when provided.")
         if self.maximum_elapsed_seconds is not None and self.maximum_elapsed_seconds <= 0:
             raise ValueError("maximum_elapsed_seconds must be positive when provided.")
-        if (
-            not np.isfinite(self.progress_interval_seconds)
-            or self.progress_interval_seconds <= 0.0
-        ):
+        try:
+            progress_seconds = float(self.progress_interval_seconds)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "progress_interval_seconds must be positive and finite."
+            ) from error
+        if not math.isfinite(progress_seconds) or progress_seconds <= 0.0:
             raise ValueError("progress_interval_seconds must be positive and finite.")
+        object.__setattr__(self, "progress_interval_seconds", progress_seconds)
         if self.dispatch_safety_margin_seconds < 0.0:
             raise ValueError("dispatch_safety_margin_seconds must be nonnegative.")
         if (
@@ -154,6 +177,14 @@ class FixedRoutingPreparationConfig:
                 "jax_compilation_cache_directory",
                 Path(self.jax_compilation_cache_directory),
             )
+
+    def progress_configuration(self) -> dict[str, float | int]:
+        """Return deterministic, reporting-only progress configuration."""
+
+        return {
+            "progress_interval_seconds": float(self.progress_interval_seconds),
+            "progress_interval_groups": int(self.progress_interval_groups),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -970,6 +1001,7 @@ def _write_manifest(
     status: str,
     elapsed_seconds: float,
     durable: bool,
+    config: FixedRoutingPreparationConfig,
     shard_durations: dict[int, float] | None = None,
 ) -> None:
     canonical_completed = sorted(set(completed))
@@ -1003,6 +1035,10 @@ def _write_manifest(
             "next_shard_position": next_position,
             "elapsed_seconds": elapsed_seconds,
             "status": status,
+            # Reporting controls are persisted for reproducibility of the
+            # progress log, but are deliberately absent from all scientific
+            # and checkpoint identity fingerprints.
+            **config.progress_configuration(),
             "shard_durations": {
                 str(index): seconds
                 for index, seconds in sorted((shard_durations or {}).items())
@@ -1060,33 +1096,71 @@ def _manifest_completed_shards(
 
 
 class _RoutingProgressHeartbeat:
-    """Throttle progress observations during long opaque routing subphases."""
+    """Throttle routing progress by wall time and completed groups.
+
+    Lifecycle transitions (phase changes and terminal events) are emitted
+    immediately so a durable log cannot hide a state transition.  Repeated
+    work-progress events are emitted only after the wall-clock interval and a
+    completed-group boundary are both satisfied.  The heartbeat thread still
+    emits the latest state at the wall-clock interval while an indivisible
+    operation is running.
+    """
 
     def __init__(
         self,
         callback: ProgressCallback,
         initial: FixedRoutingShardProgress,
         interval_seconds: float,
+        interval_groups: int,
+        clock: Callable[[], float] = perf_counter,
     ) -> None:
         self._callback = callback
         self._latest = initial
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._interval = max(0.01, float(interval_seconds))
+        self._group_interval = int(interval_groups)
+        self._clock = clock
+        self._last_emitted_at = self._clock()
+        self._last_emitted_phase = initial.phase
+        self._next_group_boundary = (
+            (initial.completed_groups // self._group_interval) + 1
+        ) * self._group_interval
         self._thread: threading.Thread | None = None
 
     def emit(self, event: FixedRoutingShardProgress) -> None:
+        should_emit = False
+        now = self._clock()
         with self._lock:
             self._latest = event
-        self._callback(event)
+            phase_changed = event.phase != self._last_emitted_phase
+            terminal = event.phase in {"terminal", "preparation"} or event.status in {
+                "interrupted",
+                "failed",
+                "deadline_reached",
+                "memory_budget_reached",
+                "batch_failed",
+            }
+            time_ready = now - self._last_emitted_at >= self._interval
+            group_ready = event.completed_groups >= self._next_group_boundary
+            should_emit = phase_changed or terminal or (time_ready and group_ready)
+            if should_emit:
+                self._mark_emitted(event, now)
+        if should_emit:
+            self._callback(event)
+
+    def _mark_emitted(self, event: FixedRoutingShardProgress, now: float) -> None:
+        self._last_emitted_at = now
+        self._last_emitted_phase = event.phase
+        while event.completed_groups >= self._next_group_boundary:
+            self._next_group_boundary += self._group_interval
 
     def start(self) -> None:
         def run() -> None:
             while not self._stop.wait(self._interval):
                 with self._lock:
                     event = self._latest
-                self._callback(
-                    replace(
+                    heartbeat = replace(
                         event,
                         status="running",
                         eta_confidence=(
@@ -1099,7 +1173,8 @@ class _RoutingProgressHeartbeat:
                             or "heartbeat before another shard was persisted"
                         ),
                     )
-                )
+                    self._mark_emitted(heartbeat, self._clock())
+                self._callback(heartbeat)
 
         self._thread = threading.Thread(
             target=run, name="fixed-routing-progress-heartbeat", daemon=True
@@ -1248,6 +1323,7 @@ def _prepare_fixed_routing_sharded_threads(
             status="completed",
             elapsed_seconds=elapsed,
             durable=config.durable_progress,
+            config=config,
         )
         if progress is not None and planning_event is not None:
             progress(replace(planning_event, phase="terminal"))
@@ -1337,6 +1413,7 @@ def _prepare_fixed_routing_sharded_threads(
             status="memory_budget_reached",
             elapsed_seconds=elapsed,
             durable=config.durable_progress,
+            config=config,
         )
         if progress is not None and planning_event is not None:
             progress(replace(planning_event, phase="terminal"))
@@ -1491,6 +1568,7 @@ def _prepare_fixed_routing_sharded_threads(
             status="deadline_reached",
             elapsed_seconds=elapsed,
             durable=config.durable_progress,
+            config=config,
         )
         emit_progress(
             phase="terminal",
@@ -1879,6 +1957,7 @@ def _prepare_fixed_routing_sharded_threads(
                         status=status,
                         elapsed_seconds=clock() - started,
                         durable=config.durable_progress,
+                        config=config,
                     )
                     emit_progress(
                         phase="terminal",
@@ -1927,6 +2006,7 @@ def _prepare_fixed_routing_sharded_threads(
                     status="in_progress",
                     elapsed_seconds=clock() - started,
                     durable=config.durable_progress,
+                    config=config,
                     shard_durations=shard_duration_map,
                 )
                 manifest_seconds = clock() - phase_started
@@ -1959,6 +2039,7 @@ def _prepare_fixed_routing_sharded_threads(
         status=status,
         elapsed_seconds=elapsed,
         durable=config.durable_progress,
+        config=config,
     )
     emit_progress(
         phase="terminal",
@@ -2283,6 +2364,7 @@ def _prepare_fixed_routing_sharded_batched(
                 status=status,
                 elapsed_seconds=clock() - started,
                 durable=config.durable_progress,
+                config=config,
                 shard_durations=durations,
             )
             raise
@@ -2330,6 +2412,7 @@ def _prepare_fixed_routing_sharded_batched(
                 status="in_progress",
                 elapsed_seconds=clock() - started,
                 durable=config.durable_progress,
+                config=config,
                 shard_durations=durations,
             )
             emit(
@@ -2382,6 +2465,7 @@ def _prepare_fixed_routing_sharded_batched(
         status=status,
         elapsed_seconds=elapsed,
         durable=config.durable_progress,
+        config=config,
         shard_durations=durations,
     )
     emit(phase="terminal")
@@ -2530,7 +2614,11 @@ def prepare_fixed_routing_sharded(
         )
         progress(initial)
         heartbeat = _RoutingProgressHeartbeat(
-            progress, initial, config.progress_interval_seconds
+            progress,
+            initial,
+            config.progress_interval_seconds,
+            config.progress_interval_groups,
+            clock=clock,
         )
         heartbeat.start()
         branch_progress = heartbeat.emit
@@ -2772,6 +2860,7 @@ def prepare_fixed_routing_sharded(
             status="in_progress",
             elapsed_seconds=clock() - started,
             durable=config.durable_progress,
+            config=config,
             shard_durations=shard_duration_map,
         )
         manifest_persistence_seconds = clock() - phase_started
@@ -2861,7 +2950,14 @@ def prepare_fixed_routing_sharded(
             break
 
     elapsed = clock() - started
-    _write_manifest(routing=routing, completed=completed, status=status, elapsed_seconds=elapsed, durable=config.durable_progress)
+    _write_manifest(
+        routing=routing,
+        completed=completed,
+        status=status,
+        elapsed_seconds=elapsed,
+        durable=config.durable_progress,
+        config=config,
+    )
     emit("preparation", status, None, None)
     if heartbeat is not None:
         heartbeat.close()

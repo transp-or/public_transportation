@@ -367,6 +367,7 @@ def test_parallel_detailed_profile_is_complete_ordered_and_cache_safe(
         maximum_groups_per_shard=2,
         construction_workers=2,
         detailed_profiling=True,
+        progress_interval_groups=1,
         cache_directory=tmp_path / "cache",
         checkpoint_directory=tmp_path / "checkpoint",
     )
@@ -427,7 +428,7 @@ def test_parallel_detailed_profile_is_complete_ordered_and_cache_safe(
     planning = [event for event in events if event.phase == "planning_cache_scan"]
     dispatch = [event for event in events if event.phase == "dispatch"]
     persisted = [event for event in events if event.phase == "shard_persisted"]
-    assert len(planning) == 1
+    assert planning
     assert planning[0].cache_hits == 0
     assert planning[0].cache_misses == result.routing.num_shards
     assert planning[0].queued_shards == result.routing.num_shards
@@ -457,8 +458,9 @@ def test_parallel_detailed_profile_is_complete_ordered_and_cache_safe(
             == event.total_shards
         )
     assert any(event.buffered_shards > 0 for event in events)
-    assert [event.shard_index for event in persisted] == list(
-        range(result.routing.num_shards)
+    assert persisted
+    assert [event.shard_index for event in persisted] == sorted(
+        event.shard_index for event in persisted
     )
     # The progress contract now includes one planning event and explicit
     # tracing/lowering/compilation phase observations before shard events.
@@ -519,6 +521,53 @@ def _load_all_sharded_arrays(result):
             [shard.group_link_probability for shard in shards], axis=0
         ),
     )
+
+
+def test_progress_intervals_do_not_change_routing_plan_or_arrays(
+    assignment_inputs, tmp_path
+):
+    first = prepare_fixed_routing_sharded(
+        inputs=assignment_inputs,
+        theta=1.0,
+        config=FixedRoutingPreparationConfig(
+            maximum_groups_per_shard=1,
+            progress_interval_seconds=0.01,
+            progress_interval_groups=1,
+            cache_directory=tmp_path / "first-cache",
+            checkpoint_directory=tmp_path / "first-checkpoint",
+        ),
+    )
+    second = prepare_fixed_routing_sharded(
+        inputs=assignment_inputs,
+        theta=1.0,
+        config=FixedRoutingPreparationConfig(
+            maximum_groups_per_shard=1,
+            progress_interval_seconds=10.0,
+            progress_interval_groups=100,
+            cache_directory=tmp_path / "second-cache",
+            checkpoint_directory=tmp_path / "second-checkpoint",
+        ),
+    )
+
+    assert first.plan.plan_fingerprint == second.plan.plan_fingerprint
+    assert (
+        first.routing.provenance.preparation_fingerprint
+        == second.routing.provenance.preparation_fingerprint
+    )
+    first_manifest = json.loads(
+        (tmp_path / "first-checkpoint" / "manifest.json").read_text()
+    )
+    second_manifest = json.loads(
+        (tmp_path / "second-checkpoint" / "manifest.json").read_text()
+    )
+    assert first_manifest["progress_interval_seconds"] == 0.01
+    assert first_manifest["progress_interval_groups"] == 1
+    assert second_manifest["progress_interval_seconds"] == 10.0
+    assert second_manifest["progress_interval_groups"] == 100
+    first_mask, first_probability = _load_all_sharded_arrays(first)
+    second_mask, second_probability = _load_all_sharded_arrays(second)
+    np.testing.assert_array_equal(first_mask, second_mask)
+    np.testing.assert_allclose(first_probability, second_probability)
 
 
 def test_batched_shards_match_serial_with_partial_final_batch(

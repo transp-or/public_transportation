@@ -992,6 +992,7 @@ def test_activation_stops_and_resumes_persistent_sharded_routing(
         maximum_groups_per_shard=1,
         maximum_retained_bytes_per_shard=8 * 1024 * 1024,
         maximum_temporary_bytes=64 * 1024 * 1024,
+        progress_interval_groups=1,
         checkpoint_directory=tmp_path / "ignored-checkpoint",
         cache_directory=tmp_path / "ignored-cache",
         dispatch_safety_margin_seconds=0.0,
