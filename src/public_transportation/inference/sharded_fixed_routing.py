@@ -586,6 +586,21 @@ class FixedRoutingShardProgress:
     eta_confidence: str = "unavailable"
     estimated_completion_at_utc: str | None = None
     eta_reason: str | None = None
+    phase_elapsed_seconds: float | None = None
+    eta_lower_seconds: float | None = None
+    eta_upper_seconds: float | None = None
+    completed_weight: float | None = None
+    total_weight: float | None = None
+    weighted_fraction: float | None = None
+    work_stack: tuple[dict[str, object], ...] = ()
+    active_units: tuple[str, ...] = ()
+    checkpoint_location: str | None = None
+    checkpoint_reusable: bool | None = None
+    job_elapsed_seconds: float | None = None
+    predicted_job_remaining_seconds: float | None = None
+    job_eta_confidence: str = "unavailable"
+    job_eta_reason: str | None = None
+    estimated_job_completion_at_utc: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1131,6 +1146,7 @@ class _RoutingProgressHeartbeat:
     def emit(self, event: FixedRoutingShardProgress) -> None:
         should_emit = False
         now = self._clock()
+        event = self._with_hierarchy(event)
         with self._lock:
             self._latest = event
             phase_changed = event.phase != self._last_emitted_phase
@@ -1149,6 +1165,55 @@ class _RoutingProgressHeartbeat:
         if should_emit:
             self._callback(event)
 
+    @staticmethod
+    def _with_hierarchy(event: FixedRoutingShardProgress) -> FixedRoutingShardProgress:
+        """Add descriptive nested units while preserving legacy flat fields."""
+
+        if event.work_stack:
+            return event
+        active = event.active_units or tuple(
+            f"routing-shard-{index:06d}" for index in event.current_shard_indices
+        )
+        return replace(
+            event,
+            work_stack=(
+                {
+                    "name": "destination_groups",
+                    "completed_units": event.completed_groups,
+                    "total_units": event.total_groups,
+                    "current_unit": active[0] if active else None,
+                    "status": event.status,
+                },
+                {
+                    "name": "routing_shards",
+                    "completed_units": event.completed_shards,
+                    "total_units": event.total_shards,
+                    "current_unit": active[0] if active else None,
+                    "status": event.status,
+                },
+            ),
+            active_units=active,
+            completed_weight=(
+                event.completed_weight
+                if event.completed_weight is not None
+                else float(event.completed_groups)
+            ),
+            total_weight=(
+                event.total_weight
+                if event.total_weight is not None
+                else float(event.total_groups)
+            ),
+            weighted_fraction=(
+                event.weighted_fraction
+                if event.weighted_fraction is not None
+                else (
+                    event.completed_groups / event.total_groups
+                    if event.total_groups > 0
+                    else None
+                )
+            ),
+        )
+
     def _mark_emitted(self, event: FixedRoutingShardProgress, now: float) -> None:
         self._last_emitted_at = now
         self._last_emitted_phase = event.phase
@@ -1159,7 +1224,7 @@ class _RoutingProgressHeartbeat:
         def run() -> None:
             while not self._stop.wait(self._interval):
                 with self._lock:
-                    event = self._latest
+                    event = self._with_hierarchy(self._latest)
                     heartbeat = replace(
                         event,
                         status="running",

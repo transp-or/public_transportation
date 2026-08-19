@@ -61,6 +61,37 @@ class BlockProgressEvent:
     selected_block_cache_misses: int = 0
     block_solve_seconds: float = 0.0
     checkpoint_seconds: float = 0.0
+    phase: str = "block_coordinate_sweep"
+    phase_elapsed_seconds: float | None = None
+    completed_units: int | None = None
+    total_units: int | None = None
+    predicted_remaining_seconds: float | None = None
+    eta_confidence: str = "unavailable"
+    eta_reason: str | None = None
+    estimated_completion_at_utc: str | None = None
+    work_stack: tuple[dict[str, object], ...] = ()
+    active_units: tuple[str, ...] = ()
+    queued_units: int | None = None
+    active_workers: int | None = None
+    requested_workers: int | None = None
+    completed_weight: float | None = None
+    total_weight: float | None = None
+    weighted_fraction: float | None = None
+    checkpoint_location: str | None = None
+    checkpoint_reusable: bool | None = None
+    reused_units: int | None = None
+    rebuilt_units: int | None = None
+    next_resumable_position: str | None = None
+    job_elapsed_seconds: float | None = None
+    eta_lower_seconds: float | None = None
+    eta_upper_seconds: float | None = None
+    predicted_job_remaining_seconds: float | None = None
+    job_eta_confidence: str = "unavailable"
+    job_eta_reason: str | None = None
+    estimated_job_completion_at_utc: str | None = None
+    deadline_remaining_seconds: float | None = None
+    deadline_margin_seconds: float | None = None
+    will_finish_before_deadline: bool | None = None
 
     def __post_init__(self) -> None:
         if self.sweep < 0:

@@ -18,6 +18,26 @@ class StructuralZeroProgress:
     total: int
     elapsed_seconds: float
     message: str | None = None
+    phase_elapsed_seconds: float | None = None
+    work_stack: tuple[dict[str, object], ...] = ()
+    active_units: tuple[str, ...] = ()
+    queued_units: int | None = None
+    active_workers: int | None = None
+    requested_workers: int | None = None
+    completed_weight: float | None = None
+    total_weight: float | None = None
+    eta_lower_seconds: float | None = None
+    eta_upper_seconds: float | None = None
+    checkpoint_location: str | None = None
+    checkpoint_reusable: bool | None = None
+    reused_units: int | None = None
+    rebuilt_units: int | None = None
+    next_resumable_position: str | None = None
+    job_elapsed_seconds: float | None = None
+    predicted_job_remaining_seconds: float | None = None
+    job_eta_confidence: str = "unavailable"
+    job_eta_reason: str | None = None
+    estimated_job_completion_at_utc: str | None = None
 
     def __post_init__(self) -> None:
         if not self.phase:
@@ -26,6 +46,22 @@ class StructuralZeroProgress:
             raise ValueError("progress counts must satisfy 0 <= completed <= total.")
         if self.elapsed_seconds < 0:
             raise ValueError("elapsed_seconds must be non-negative.")
+        if self.phase_elapsed_seconds is not None and self.phase_elapsed_seconds < 0:
+            raise ValueError("phase_elapsed_seconds must be non-negative.")
+        for name, value in (
+            ("completed_weight", self.completed_weight),
+            ("total_weight", self.total_weight),
+        ):
+            if value is not None and (
+                not math.isfinite(float(value)) or float(value) < 0.0
+            ):
+                raise ValueError(f"{name} must be finite and non-negative.")
+        if (
+            self.completed_weight is not None
+            and self.total_weight is not None
+            and self.completed_weight > self.total_weight
+        ):
+            raise ValueError("completed_weight must not exceed total_weight.")
 
     @property
     def throughput_units_per_second(self) -> float | None:
@@ -57,6 +93,18 @@ class StructuralZeroProgress:
             return "medium"
         return "high"
 
+    @property
+    def weighted_fraction(self) -> float | None:
+        if self.completed_weight is None or self.total_weight in (None, 0.0):
+            return None
+        return self.completed_weight / self.total_weight
+
+    @property
+    def throughput_weight_per_second(self) -> float | None:
+        if self.completed_weight is None or self.elapsed_seconds <= 0.0:
+            return None
+        return self.completed_weight / self.elapsed_seconds
+
 
 StructuralZeroProgressCallback = Callable[[StructuralZeroProgress], None]
 
@@ -71,11 +119,22 @@ class ProgressEmitter:
         phase: str,
         total: int,
         message: str | None = None,
+        work_name: str | None = None,
+        total_weight: float | None = None,
+        progress_interval_seconds: float = 10.0,
     ) -> None:
         self.progress = progress
         self.phase = phase
         self.total = total
         self.message = message
+        self.work_name = work_name or phase
+        self.total_weight = total_weight
+        if (
+            not math.isfinite(float(progress_interval_seconds))
+            or progress_interval_seconds <= 0.0
+        ):
+            raise ValueError("progress_interval_seconds must be positive and finite.")
+        self.progress_interval_seconds = float(progress_interval_seconds)
         self.started = perf_counter()
         self.last_completed = -1
         self.last_emitted_at = self.started
@@ -91,7 +150,7 @@ class ProgressEmitter:
         if (
             completed == self.total
             or completed - self.last_completed >= self.count_interval
-            or now - self.last_emitted_at >= 10.0
+            or now - self.last_emitted_at >= self.progress_interval_seconds
         ):
             self._emit(completed, now)
 
@@ -111,7 +170,59 @@ class ProgressEmitter:
                 completed=completed,
                 total=self.total,
                 elapsed_seconds=now - self.started,
+                job_elapsed_seconds=now - self.started,
+                predicted_job_remaining_seconds=(
+                    (self.total - completed)
+                    / (completed / max(now - self.started, 1.0e-12))
+                    if completed > 0 and completed < self.total
+                    else (0.0 if completed == self.total else None)
+                ),
+                job_eta_confidence=(
+                    "high"
+                    if completed >= 10
+                    else ("medium" if completed >= 3 else "unavailable")
+                ),
+                job_eta_reason=(
+                    None
+                    if completed > 0
+                    else "no completed units are available"
+                ),
                 message=self.message,
+                phase_elapsed_seconds=now - self.started,
+                work_stack=(
+                    {
+                        "name": self.work_name,
+                        "completed_units": completed,
+                        "total_units": self.total,
+                        "current_unit": f"{self.work_name}-{completed:06d}",
+                        "completed_weight": (
+                            None
+                            if self.total_weight is None
+                            else float(self.total_weight) * completed / max(self.total, 1)
+                        ),
+                        "total_weight": self.total_weight,
+                        "status": "completed" if completed == self.total else "running",
+                    },
+                ),
+                active_units=(
+                    () if completed >= self.total else (f"{self.work_name}-{completed:06d}",)
+                ),
+                eta_lower_seconds=(
+                    None
+                    if completed == 0
+                    else ((self.total - completed) / (completed / max(now - self.started, 1.0e-12)))
+                ),
+                eta_upper_seconds=(
+                    None
+                    if completed == 0
+                    else ((self.total - completed) / (completed / max(now - self.started, 1.0e-12)))
+                ),
+                completed_weight=(
+                    None
+                    if self.total_weight is None
+                    else float(self.total_weight) * completed / max(self.total, 1)
+                ),
+                total_weight=self.total_weight,
             )
         )
         self.last_completed = completed

@@ -35,6 +35,59 @@ Phases include cache validation, routing preparation, support discovery,
 planning, shard validation and construction, temporal-block assembly,
 validation, persistence, and completion.
 
+### Hierarchical progress and ETA semantics
+
+The flat fields above remain the compatibility contract.  Newer reporters add
+the following observational fields without changing the schema version:
+
+- `job_elapsed_seconds` and `phase_elapsed_seconds` distinguish the complete
+  job clock from the clock for the current phase; `phase` changes reset only
+  the latter;
+- `work_stack` is an outer-to-inner list of named units.  Each entry may carry
+  `completed_units`, `total_units`, `current_unit`, and optional weighted
+  counts.  Nested counts are not added together: use the deepest active unit
+  for local progress and the explicit weighted fields for a job-level view;
+- `active_units`, `queued_units`, `active_workers`, and `requested_workers`
+  describe scheduling state without claiming that queued work is complete;
+- `current_unit_elapsed_seconds` and
+  `current_unit_predicted_remaining_seconds` describe an in-flight unit and
+  remain separate from completed-unit ETA;
+- `completed_weight`, `total_weight`, `weighted_fraction`, and throughput
+  fields are available when units have materially different costs;
+- `eta_lower_seconds`/`eta_upper_seconds`, `eta_confidence`, and
+  `eta_reason` expose uncertainty.  Estimates use only completed, persisted
+  units; the first estimate is provisional and may remain unavailable for an
+  opaque operation;
+- `predicted_job_remaining_seconds` and
+  `estimated_job_completion_at_utc` are emitted only when the current phase
+  estimate and all declared future-phase durations are known;
+- `checkpoint_reusable`, `next_resumable_position`, `reused_units`, and
+  `rebuilt_units` make restart state explicit.  `deadline_margin_seconds` and
+  `will_finish_before_deadline` are conservative and remain null when either
+  ETA or deadline is unknown.
+
+An indivisible planning, compilation, or synchronization call may therefore
+emit a heartbeat with a current work name but no completed-unit ETA.  This is
+intentional: the reporter must never invent precision for a callback that does
+not expose progress.  All of these fields are reporting metadata only and are
+excluded from numerical identities, checkpoints, and artifact fingerprints.
+
+Callers that know a phase schedule may provide reporting hints without changing
+the scientific run:
+
+```python
+reporter.set_phase_plan({
+    "planning": 30.0,
+    "routing_preparation": 900.0,
+    "temporal_block_assembly": 120.0,
+})
+with reporter.work_scope("routing_shards", total_units=num_shards):
+    ...
+```
+
+An omitted or opaque phase keeps the job-level ETA unavailable; the plan is
+never treated as a scientific assumption.
+
 Routing preparation accepts two independent progress controls:
 
 ```python
@@ -61,6 +114,85 @@ fingerprints.
 
 Older callers that provide only `progress_interval_seconds` remain supported;
 new callers may additionally provide `progress_interval_groups`.
+
+### Profiling support discovery before changing the worker plan
+
+Support discovery is a different workload from routing preparation and from
+the later numerical measurement-shard construction.  The three worker plans
+must therefore be measured and configured independently.  In
+`ShardedConstructionConfig`, `support_workers` controls the destination-group
+support pool and `workers` controls numerical shard construction.  If
+`support_workers` is omitted it inherits `workers` for compatibility; it is
+never inferred from `FixedRoutingPreparationConfig.construction_workers`.
+Changing either value is execution metadata only and does not enter the
+scientific support or artifact fingerprint.
+
+For a case-owned benchmark, enable the optional profile recorder and write it
+below the same isolated results root as the run:
+
+```toml
+# config/model.toml
+support_workers = 2
+shard_construction_workers = 1
+support_progress_interval_seconds = 5.0
+profile_support_discovery = true
+```
+
+The generic direct-scheduled template writes
+`results/audit/support_discovery_profile.json`.  Each completed destination
+group records selected/free OD cells, measurement count, origin-chunk count,
+reachability time, projection time, checkpoint time, total time, cache reuse,
+worker identity, and peak RSS when available.  Aggregate fields include
+completed groups, cache hits/misses, weighted cell throughput, component
+timings, worker IDs, and elapsed wall time.  Profiling is observational: it
+does not materialize a second support set, alter scheduling, or change any
+numerical artifact.
+
+The profile also reports deterministic representative small/median/large group
+IDs.  A pilot benchmark may use those IDs only with an explicitly isolated
+pilot input or case-owned adapter (the public helper is
+`run_support_discovery_pilot`); the normal production call must still
+evaluate every group.  Compare profiles from the same scientific identity
+with `compare_support_profiles` and record CPU allocation, memory, JAX
+backend, input/config fingerprints, and cache state alongside the JSON.  Do
+not compare a cold run with a resumed run as if they were the same workload.
+
+Support progress is hierarchical.  During a long group, throttled heartbeat
+events expose `destination_groups` as the outer unit and `origin_chunks` as
+the inner unit, together with active/queued group IDs, worker ID, checkpoint
+location, weighted throughput, and ETA bounds.  The first group may still have
+an unavailable ETA because no completed group duration exists; after completed
+groups accumulate, the estimate is based on persisted group timings.  These
+records remain durable reporting metadata and are excluded from all numerical
+identities.
+
+For a controlled worker matrix, use `benchmark_support_discovery` with a
+case-owned operation factory. The factory receives the worker count, an
+isolated artifact root, an isolated checkpoint root, and the timing callback:
+
+```python
+benchmark = benchmark_support_discovery(
+    operation_factory,
+    worker_counts=(1, 2, 4, 8),
+    output_root=case_results / "benchmarks/support-workers",
+    metadata={
+        "scenario_fingerprint": scenario_fingerprint,
+        "configuration_fingerprint": configuration_fingerprint,
+        "cpu_allocation": 8,
+        "memory_bytes": 32 * 1024**3,
+        "jax_backend": "cpu",
+    },
+)
+```
+
+The summary contains wall time, groups/second, weighted OD-cell throughput,
+CPU seconds/utilization (when `cpu_allocation` is provided), peak RSS,
+effective parallelism, and speedup against the one-worker record.  The
+per-worker profile files remain under separate
+`workers-XX/artifacts` and `workers-XX/checkpoints` directories.  A pilot
+profile can be projected with `project_support_duration`, but its interval is
+explicitly low/medium confidence for heterogeneous group costs and must not
+be presented as a guaranteed full-run ETA.
 
 ## Resume and checkpoint identity
 

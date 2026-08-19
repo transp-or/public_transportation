@@ -20,6 +20,9 @@ from public_transportation.inference.block_coordinate._canonical import fingerpr
 from public_transportation.inference.compact_od_assignment_layout import (
     CompactODAssignmentLayout,
 )
+from public_transportation.inference.construction_control import (
+    estimate_completed_unit_eta,
+)
 
 from .objective import (
     GravityGradientStrategy,
@@ -93,6 +96,37 @@ class GravityEstimatorProgress:
     gradient_inf_norm: float
     elapsed_seconds: float
     checkpoint_written: bool
+    phase: str = "optimizer_iterations"
+    phase_elapsed_seconds: float | None = None
+    completed_units: int | None = None
+    total_units: int | None = None
+    predicted_remaining_seconds: float | None = None
+    eta_confidence: str = "unavailable"
+    eta_reason: str | None = None
+    estimated_completion_at_utc: str | None = None
+    work_stack: tuple[dict[str, object], ...] = ()
+    active_units: tuple[str, ...] = ()
+    queued_units: int | None = None
+    active_workers: int | None = None
+    requested_workers: int | None = None
+    completed_weight: float | None = None
+    total_weight: float | None = None
+    weighted_fraction: float | None = None
+    checkpoint_location: str | None = None
+    checkpoint_reusable: bool | None = None
+    reused_units: int | None = None
+    rebuilt_units: int | None = None
+    next_resumable_position: str | None = None
+    deadline_remaining_seconds: float | None = None
+    deadline_margin_seconds: float | None = None
+    will_finish_before_deadline: bool | None = None
+    job_elapsed_seconds: float | None = None
+    eta_lower_seconds: float | None = None
+    eta_upper_seconds: float | None = None
+    predicted_job_remaining_seconds: float | None = None
+    job_eta_confidence: str = "unavailable"
+    job_eta_reason: str | None = None
+    estimated_job_completion_at_utc: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -424,6 +458,8 @@ def estimate_gravity_model(
     valid_evaluation: GravityObjectiveEvaluation | None = None
     valid_gradient = np.zeros_like(raw_numpy)
     deadline_phase: str | None = None
+    iteration_durations: list[float] = []
+    last_iteration_at = started
 
     def evaluate(value: np.ndarray) -> tuple[float, np.ndarray]:
         nonlocal latest_raw, latest_evaluation, latest_gradient
@@ -458,12 +494,16 @@ def estimate_gravity_model(
 
     def callback(value: np.ndarray) -> None:
         nonlocal completed_iterations, valid_raw, valid_evaluation, valid_gradient
+        nonlocal last_iteration_at
         completed_iterations += 1
         valid_raw = np.asarray(value, dtype=np.float64).copy()
         if np.array_equal(latest_raw, valid_raw):
             valid_evaluation = latest_evaluation
             valid_gradient = latest_gradient.copy()
-        elapsed = resumed_elapsed + clock() - started
+        now = clock()
+        elapsed = resumed_elapsed + now - started
+        iteration_durations.append(max(0.0, now - last_iteration_at))
+        last_iteration_at = now
         if checkpoint is not None:
             _write_checkpoint(
                 checkpoint,
@@ -477,6 +517,12 @@ def estimate_gravity_model(
             and completed_iterations % execution.progress_interval == 0
         ):
             assert latest_evaluation is not None
+            eta = estimate_completed_unit_eta(
+                iteration_durations,
+                completed_units=completed_iterations,
+                total_units=config.maximum_iterations,
+                elapsed_seconds=max(0.0, elapsed),
+            )
             progress(
                 GravityEstimatorProgress(
                     completed_iterations,
@@ -484,6 +530,61 @@ def estimate_gravity_model(
                     float(np.max(np.abs(latest_gradient), initial=0.0)),
                     elapsed,
                     checkpoint is not None,
+                    completed_units=completed_iterations,
+                    total_units=config.maximum_iterations,
+                    predicted_remaining_seconds=eta.predicted_remaining_seconds,
+                    eta_confidence=eta.eta_confidence,
+                    eta_reason=eta.eta_reason,
+                    estimated_completion_at_utc=eta.estimated_completion_at_utc,
+                    work_stack=(
+                        {
+                            "name": "optimizer_iterations",
+                            "completed_units": completed_iterations,
+                            "total_units": config.maximum_iterations,
+                            "current_unit": f"iteration-{completed_iterations:06d}",
+                            "status": "running",
+                        },
+                    ),
+                    active_units=(f"iteration-{completed_iterations:06d}",),
+                    requested_workers=1,
+                    completed_weight=float(completed_iterations),
+                    total_weight=float(config.maximum_iterations),
+                    weighted_fraction=(
+                        completed_iterations / config.maximum_iterations
+                    ),
+                    checkpoint_location=(None if checkpoint is None else str(checkpoint)),
+                    checkpoint_reusable=checkpoint is not None,
+                    reused_units=(completed_iterations if resumed else 0),
+                    rebuilt_units=(0 if resumed else completed_iterations),
+                    next_resumable_position=(
+                        f"iteration-{completed_iterations + 1:06d}"
+                        if completed_iterations < config.maximum_iterations
+                        else None
+                    ),
+                    deadline_remaining_seconds=(
+                        None
+                        if deadline is None
+                        else max(0.0, deadline - now)
+                    ),
+                    deadline_margin_seconds=(
+                        None
+                        if deadline is None or eta.predicted_remaining_seconds is None
+                        else max(0.0, deadline - now)
+                        - eta.predicted_remaining_seconds
+                    ),
+                    will_finish_before_deadline=(
+                        None
+                        if deadline is None or eta.predicted_remaining_seconds is None
+                        else eta.predicted_remaining_seconds
+                        <= max(0.0, deadline - now)
+                    ),
+                    job_elapsed_seconds=elapsed,
+                    eta_lower_seconds=eta.eta_lower_seconds,
+                    eta_upper_seconds=eta.eta_upper_seconds,
+                    predicted_job_remaining_seconds=eta.predicted_remaining_seconds,
+                    job_eta_confidence=eta.eta_confidence,
+                    job_eta_reason=eta.eta_reason,
+                    estimated_job_completion_at_utc=eta.estimated_completion_at_utc,
                 )
             )
         if deadline is not None and clock() >= deadline:

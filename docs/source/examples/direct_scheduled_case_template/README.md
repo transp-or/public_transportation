@@ -362,6 +362,72 @@ artifact fingerprints. Monitor the durable stream with:
 tail -f results/logs/prepare.jsonl
 ```
 
+### Profiling support discovery and separating worker pools
+
+Support discovery, routing preparation, and numerical measurement-shard
+construction are separate workloads. Configure support and shard workers
+independently in `config/model.toml`; the conservative template defaults are:
+
+```toml
+support_workers = 1
+shard_construction_workers = 1
+support_progress_interval_seconds = 5.0
+profile_support_discovery = false
+```
+
+`support_workers` controls the destination-group topology-support pool, while
+`shard_construction_workers` controls the later numerical shard pool. Neither
+is inferred from the routing-preparation worker count. If a lower-level
+`ShardedConstructionConfig` is created without `support_workers`, it inherits
+`workers` for backward compatibility. Worker counts are reporting/execution
+settings, not scientific identity; changing them must leave support sets,
+values, checkpoints, and fingerprints unchanged.
+
+Before raising concurrency on a large case, set `profile_support_discovery =
+true` and run in an isolated results root. The adapter writes the durable
+diagnostic `results/audit/support_discovery_profile.json`. It contains one
+record per completed destination group (selected/free OD cells, measurements,
+origin chunks, reachability/projection/checkpoint/total seconds, cache reuse,
+worker ID, and peak RSS), plus aggregate rates, component timings, cache
+counts, and representative small/median/large group IDs. Keep the profile
+with the input/configuration/timetable fingerprints and the CPU/memory/JAX
+allocation used for the run.
+
+The representative IDs are a diagnostic selection only. A pilot run must use
+an explicitly isolated, case-owned pilot input; the production support call
+must still cover every destination group. Compare cold runs with cold runs and
+resumed runs with resumed runs. A first-group ETA may be unavailable; after
+completed groups accumulate, progress events report robust ETA bounds, weighted
+throughput, active/queued groups, inner origin-chunk progress, checkpoint
+location, and worker identity. These diagnostics never alter the calculation
+or its artifact identity.
+
+For a worker-count matrix, a case-owned benchmark may call the public
+`benchmark_support_discovery` helper. It creates separate
+`workers-XX/artifacts` and `workers-XX/checkpoints` roots and writes a summary
+with wall time, throughput, CPU seconds, peak RSS, effective parallelism, and
+speedup. A pilot projection is diagnostic only and must not be used as a
+production completion guarantee.
+
+### Hierarchical progress records
+
+Progress events retain the flat fields used by older adapters and may also
+include `job_elapsed_seconds`, `phase_elapsed_seconds`, and a
+`work_stack` (outer-to-inner units). `active_units`, `queued_units`,
+`active_workers`, and `requested_workers` describe scheduler state. When group
+costs differ, `completed_weight`, `total_weight`, and `weighted_fraction`
+provide the meaningful aggregate fraction; nested unit counts must not be
+summed. ETA records include lower/upper bounds, `eta_confidence`, and
+`eta_reason`. Job-level ETA is reported only when the current phase estimate
+and declared future-phase durations are known.
+
+Restart metadata (`checkpoint_location`, `checkpoint_reusable`,
+`next_resumable_position`, `reused_units`, and `rebuilt_units`) identifies what
+can be reused after interruption. An opaque planning or compilation call still
+produces a heartbeat, but its ETA is explicitly unavailable. These fields are
+observational and do not participate in numerical identities or artifact
+fingerprints.
+
 ## Scheduler scripts
 
 The `scripts/*.sbatch` files are examples only. Review the requested memory,

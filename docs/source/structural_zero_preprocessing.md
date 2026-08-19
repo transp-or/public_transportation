@@ -221,6 +221,13 @@ contains `phase`, `completed`, `total`, `elapsed_seconds`, and an optional
 `render_outputs`, `write_outputs`, and `complete`; small auxiliary rendering
 phases identify fixed-demand and summary preparation.
 
+The same events expose `phase_elapsed_seconds`, a `work_stack` with the active
+loop, active/queued units and workers, optional weighted progress, ETA bounds
+and confidence, and restart/checkpoint metadata when the caller supplies it.
+Nested counts are descriptive and must not be added together. ETA is based only
+on completed loop items; before enough observations exist it remains explicitly
+unavailable.
+
 ```python
 from public_transportation.preprocessing import (
     run_structural_zero_preprocessing,

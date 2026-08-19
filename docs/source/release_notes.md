@@ -53,6 +53,23 @@
 
 ## Unreleased
 
+- Added a generic hierarchical progress contract for long-running phases. Flat
+  progress fields remain backward compatible while reporters can now expose
+  nested work stacks, active/queued units and workers, weighted progress,
+  robust ETA intervals and confidence, phase/job clocks, checkpoint reuse and
+  deadline margins. The contract is integrated into scheduled routing, gravity
+  and block-coordinate estimation, and structural-zero preprocessing. These
+  fields are reporting metadata only and do not alter numerical identities or
+  artifact fingerprints.
+
+- Separated support-discovery workers from numerical shard-construction workers
+  while preserving the legacy default (`support_workers` inherits `workers`).
+  Added per-destination-group timing records, worker/cache/memory diagnostics,
+  nested destination-group/origin-chunk progress and weighted ETA reporting,
+  and an isolated JSON profile/pilot utility. Profiling is observational and
+  cannot change support sets, numerical values, checkpoints, scheduling, or
+  computational fingerprints.
+
 - Documented the 2026-08-05 full-network stochastic-gravity validation. The
   sequential streaming evaluator reduced internal peak RSS from 98.67 GiB
   exact to about 8.5 GiB, validating its memory bound. Uniform persisted-shard

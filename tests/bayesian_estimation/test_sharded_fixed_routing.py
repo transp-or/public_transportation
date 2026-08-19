@@ -241,6 +241,27 @@ def test_planner_enforces_group_and_byte_ceilings_deterministically(tmp_path):
     assert first.plan_fingerprint == repeated.plan_fingerprint
 
 
+def test_progress_intervals_do_not_change_plan_identity(tmp_path):
+    inputs = _inputs()
+    first = plan_fixed_routing_shards(
+        inputs=inputs,
+        config=FixedRoutingPreparationConfig(
+            progress_interval_seconds=1.0,
+            progress_interval_groups=8,
+            cache_directory=tmp_path / "first",
+        ),
+    )
+    changed = plan_fixed_routing_shards(
+        inputs=inputs,
+        config=FixedRoutingPreparationConfig(
+            progress_interval_seconds=30.0,
+            progress_interval_groups=2,
+            cache_directory=tmp_path / "second",
+        ),
+    )
+    assert first.plan_fingerprint == changed.plan_fingerprint
+
+
 def test_planner_rejects_when_one_group_exceeds_either_budget(tmp_path):
     inputs = _inputs()
     with pytest.raises(ValueError, match="retained-byte"):

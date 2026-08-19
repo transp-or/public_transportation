@@ -69,6 +69,7 @@ from public_transportation.inference.sharded_sparse_operator import (
 from public_transportation.inference.construction_control import (
     ConstructionDeadline,
     ConstructionDeadlineStop,
+    ConstructionProgressReporter,
 )
 from public_transportation.inference.sharded_fixed_routing import (
     FixedRoutingPreparationConfig,
@@ -1492,6 +1493,51 @@ def test_origin_support_is_deterministic_across_chunk_sizes(all_free_operator):
     assert first.fingerprint == second.fingerprint
     np.testing.assert_array_equal(
         first.free_support.toarray(), second.free_support.toarray()
+    )
+
+
+def test_origin_support_reports_nested_origin_chunk_progress(all_free_operator):
+    inputs, routing, spec, _ = all_free_operator
+    num_od = int(inputs.od_origin_node.shape[0])
+    layout = ODParameterLayout(
+        num_od_total=num_od,
+        od_keys=tuple((f"o{i}", "d", "t") for i in range(num_od)),
+        free_od_indices=tuple(range(num_od)),
+        fixed_od_indices=(),
+        fixed_od_values=(),
+        free_baseline_values=tuple(1.0 for _ in range(num_od)),
+        fixed_zero_indices=(),
+        fixed_positive_indices=(),
+    )
+    compact = build_compact_od_assignment_layout(parameter_layout=layout)
+    events: list[dict[str, object]] = []
+    reporter = ConstructionProgressReporter(
+        ConstructionDeadline.unlimited(), events.append, minimum_interval_seconds=0.0
+    )
+    analyze_fixed_routing_origin_support(
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        compact_layout=compact,
+        config=OriginSupportConfig(origin_chunk_size=1),
+        reporter=reporter,
+    )
+    nested = [
+        event
+        for event in events
+        if event.get("work_stack")
+        and any(
+            item.get("name") == "origin_chunks" for item in event["work_stack"]
+        )
+    ]
+    assert nested
+    assert isinstance(nested[0]["inner_work"], dict)
+    assert nested[0]["inner_work"]["name"] == "origin_chunks"
+    assert any(
+        item["completed_units"] < item["total_units"]
+        for event in nested
+        for item in event["work_stack"]
+        if item["name"] == "origin_chunks"
     )
 
 

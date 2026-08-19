@@ -143,6 +143,22 @@ from .fixed_routing_measurement_operator import (  # noqa: F401
     save_fixed_routing_measurement_operator,
     validate_fixed_routing_measurement_operator,
 )
+from .support_discovery_profile import (  # noqa: F401
+    SUPPORT_DISCOVERY_PROFILE_SCHEMA_VERSION,
+    SupportDiscoveryProfileRecorder,
+    build_support_discovery_profile,
+    compare_support_profiles,
+    profile_support_discovery,
+    representative_support_groups,
+    run_support_discovery_pilot,
+    write_support_discovery_profile,
+)
+from .support_discovery_benchmark import (  # noqa: F401
+    SupportBenchmarkRecord,
+    SupportBenchmarkResult,
+    benchmark_support_discovery,
+    project_support_duration,
+)
 from .fixed_routing_matrix_free_operator import (  # noqa: F401
     MatrixFreePreparationDeadlineError,
     MatrixFreePreparationDiagnostics,
@@ -279,11 +295,14 @@ from .construction_control import (  # noqa: F401
     CONSTRUCTION_EVENT_SCHEMA_VERSION,
     ConstructionDeadline,
     ConstructionDeadlineStop,
+    ConstructionETA,
     ConstructionPhase,
     ConstructionProgressReporter,
     ConstructionTerminalStatus,
     ConstructionTermination,
+    ProgressWorkUnit,
     deadline_stop,
+    estimate_completed_unit_eta,
     termination_payload,
 )
 from .fixed_routing_linear_backend import (  # noqa: F401
@@ -317,6 +336,9 @@ from .fixed_routing_sharded_selection import (  # noqa: F401
 )
 from .fixed_routing_origin_support import (  # noqa: F401
     GroupOriginSupportSummary,
+    GroupSupportInnerProgressCallback,
+    GroupSupportTiming,
+    GroupSupportTimingCallback,
     OriginSpecificMeasurementSupport,
     OriginSupportConfig,
     OriginSupportMetrics,

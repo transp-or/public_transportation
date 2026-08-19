@@ -12,6 +12,7 @@ import hashlib
 import tomllib
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Callable, Mapping
 
 import jax
@@ -40,6 +41,11 @@ from public_transportation.inference.direct_scheduled_temporal_builder import (
 )
 from public_transportation.inference.fixed_routing_sharded_builder import (
     ShardedConstructionConfig,
+)
+from public_transportation.inference.support_discovery_profile import (
+    SupportDiscoveryProfileRecorder,
+    build_support_discovery_profile,
+    write_support_discovery_profile,
 )
 from public_transportation.inference.gravity import (
     GravityGradientStrategy,
@@ -1066,11 +1072,29 @@ def activate(
         od_chunk_size=int(settings.model.get("od_chunk_size", 16)),
         measurement_block_size=int(settings.model.get("measurement_block_size", 64)),
         worker_memory_budget_bytes=int(settings.model.get("worker_memory_budget_bytes", 256_000_000)),
+        workers=int(
+            settings.model.get(
+                "shard_construction_workers",
+                settings.model.get("workers", 1),
+            )
+        ),
+        support_workers=int(
+            settings.model.get(
+                "support_workers",
+                settings.model.get("workers", 1),
+            )
+        ),
         target_nonzeros_per_storage_shard=int(settings.model.get("target_nonzeros_per_storage_shard", 20_000)),
         maximum_nonzeros_per_storage_shard=int(settings.model.get("maximum_nonzeros_per_storage_shard", 100_000)),
         manifest_checkpoint_shards=int(settings.model.get("manifest_checkpoint_shards", 1)),
+        progress_interval_seconds=float(
+            settings.model.get("support_progress_interval_seconds", 1.0)
+        ),
     )
-    return activate_direct_scheduled_temporal_operator(
+    profile_enabled = bool(settings.model.get("profile_support_discovery", False))
+    recorder = SupportDiscoveryProfileRecorder.create() if profile_enabled else None
+    profile_started = perf_counter()
+    activated = activate_direct_scheduled_temporal_operator(
         mode="direct",
         expected_evaluations=settings.expected_evaluations,
         construction_seconds=None,
@@ -1093,7 +1117,25 @@ def activate(
         time_budget_seconds=settings.construction_time_budget_seconds,
         safety_margin_seconds=settings.safety_margin_seconds,
         measurement_info=context.mapping.info,
+        support_timing_callback=recorder,
     )
+    if recorder is not None:
+        profile = build_support_discovery_profile(
+            recorder.records(),
+            metadata={
+                "package_revision": settings.package_revision,
+                "assignment_fingerprint": str(context.id_manager.fingerprint),
+                "od_layout_fingerprint": context.parameter_layout.fingerprint,
+                "support_workers_requested": config.support_workers,
+                "shard_construction_workers_requested": config.workers,
+                "results_root": str(settings.results),
+            },
+            elapsed_seconds=perf_counter() - profile_started,
+        )
+        write_support_discovery_profile(
+            settings.results / "audit/support_discovery_profile.json", profile
+        )
+    return activated
 
 
 def gravity_problem(context: CaseContext, operator: object) -> tuple[GravityObjectiveProblem, GravityParameterLayout]:

@@ -6,12 +6,13 @@ import hashlib
 import json
 import math
 import os
+import sys
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass
 from pathlib import Path
 import tempfile
 import threading
-from time import perf_counter
+from time import perf_counter, process_time
 from typing import Callable
 
 import jax
@@ -30,6 +31,7 @@ from .construction_control import (
     ConstructionPhase,
     ConstructionProgressReporter,
     deadline_stop,
+    estimate_completed_unit_eta,
 )
 from .compact_od_assignment_layout import CompactODAssignmentLayout
 from .fixed_routing_measurement_operator import FixedRoutingMeasurementOperator
@@ -41,6 +43,18 @@ from .sharded_fixed_routing import (
 )
 
 ORIGIN_SUPPORT_GROUP_SCHEMA_VERSION = 1
+
+
+def _current_peak_rss_bytes() -> int | None:
+    """Return process peak RSS for profiling, when available."""
+
+    try:
+        import resource
+
+        value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except (ImportError, OSError, ValueError):
+        return None
+    return value if sys.platform == "darwin" else value * 1024
 
 @dataclass(frozen=True, slots=True)
 class OriginSupportConfig:
@@ -86,6 +100,36 @@ class GroupOriginSupportSummary:
         return 1.0 - self.origin_specific_entries / self.group_level_candidate_entries
 
 
+@dataclass(frozen=True, slots=True)
+class GroupSupportTiming:
+    """Operational timing for one completed destination support group.
+
+    This record is deliberately separate from ``GroupOriginSupportSummary``:
+    timings are non-deterministic and must never enter support fingerprints or
+    numerical checkpoint identities.
+    """
+
+    group: int
+    selected_od_cells: int
+    free_od_cells: int
+    measurement_count: int
+    origin_chunks: int
+    reachability_seconds: float
+    projection_seconds: float
+    checkpoint_seconds: float
+    total_seconds: float
+    cached: bool
+    cpu_seconds: float | None = None
+    worker_id: str | None = None
+    peak_rss_bytes: int | None = None
+
+
+GroupSupportTimingCallback = Callable[[GroupSupportTiming], None]
+GroupSupportInnerProgressCallback = Callable[
+    [int, int, int, float, str | None], None
+]
+
+
 # The callback receives one complete destination-group result.  Keeping this
 # hook at group granularity lets callers consume support incrementally without
 # retaining the global origin-by-measurement sparse matrices.
@@ -119,6 +163,8 @@ class _GroupSupportResult:
     reachability_seconds: float
     projection_seconds: float
     elapsed_seconds: float
+    cpu_seconds: float
+    worker_id: str | None = None
 
 
 def _compute_group_support_result(
@@ -143,9 +189,11 @@ def _compute_group_support_result(
     routing_for_group: Callable[[int], tuple[np.ndarray, np.ndarray]],
     reachability_kernel=None,
     graph_arrays: tuple[jax.Array, ...] | None = None,
+    inner_progress_callback: GroupSupportInnerProgressCallback | None = None,
 ) -> _GroupSupportResult:
     """Compute one support group without checkpoint or progress side effects."""
     started = perf_counter()
+    cpu_started = process_time()
     active_indices = group_indices[group][group_masks[group]]
     active_indices = active_indices[selected[active_indices]].astype(
         np.int64, copy=False
@@ -163,7 +211,10 @@ def _compute_group_support_result(
     group_fixed_rows_parts: list[np.ndarray] = []
     group_fixed_column_parts: list[np.ndarray] = []
     reachability_seconds = projection_seconds = 0.0
-    for first in range(0, active_indices.size, origin_chunk_size):
+    total_origin_chunks = max(1, math.ceil(active_indices.size / origin_chunk_size))
+    for chunk_number, first in enumerate(
+        range(0, active_indices.size, origin_chunk_size), start=1
+    ):
         chunk = active_indices[first : first + origin_chunk_size]
         reach_started = perf_counter()
         if reachability_kernel is None:
@@ -208,6 +259,14 @@ def _compute_group_support_result(
                     np.full(rows.size, fixed, dtype=np.int64)
                 )
         projection_seconds += perf_counter() - projection_started
+        if inner_progress_callback is not None:
+            inner_progress_callback(
+                group,
+                chunk_number,
+                total_origin_chunks,
+                perf_counter() - started,
+                threading.current_thread().name,
+            )
     summary = GroupOriginSupportSummary(
         group=group,
         selected_od_cells=int(active_indices.size),
@@ -245,6 +304,8 @@ def _compute_group_support_result(
         reachability_seconds=reachability_seconds,
         projection_seconds=projection_seconds,
         elapsed_seconds=perf_counter() - started,
+        cpu_seconds=max(0.0, process_time() - cpu_started),
+        worker_id=threading.current_thread().name,
     )
 
 
@@ -258,6 +319,7 @@ def _analyze_parallel_support(
     deadline: ConstructionDeadline | None,
     reporter: ConstructionProgressReporter | None,
     group_callback: GroupSupportCallback | None,
+    timing_callback: GroupSupportTimingCallback | None,
     total_start: float,
     estimated_peak: int,
     num_measurements: int,
@@ -365,12 +427,101 @@ def _analyze_parallel_support(
     summaries: list[GroupOriginSupportSummary] = []
     reachability_seconds = projection_seconds = 0.0
     total_origin_specific = total_group_bound = 0
+    group_weights = tuple(
+        int(np.count_nonzero(selected[group_indices[group][group_masks[group]]]))
+        for group in range(num_groups)
+    )
+    total_group_weight = float(sum(group_weights))
+    completed_group_weight = 0.0
+    support_cache_hits = 0
+    support_cache_misses = 0
 
     def predicted_group_seconds() -> float | None:
         return (
             None
             if not recent_group_seconds
             else float(np.mean(recent_group_seconds[-3:]))
+        )
+
+    def report_inner_progress(
+        group: int,
+        completed_chunks: int,
+        total_chunks: int,
+        elapsed_seconds: float,
+        worker_id: str | None,
+    ) -> None:
+        """Emit throttled origin-chunk heartbeats from a running worker."""
+
+        if reporter is None:
+            return
+        eta = estimate_completed_unit_eta(
+            recent_group_seconds,
+            completed_units=len(summaries),
+            total_units=num_groups,
+            parallelism=admitted_workers,
+            completed_weight=completed_group_weight,
+            total_weight=total_group_weight,
+            elapsed_seconds=perf_counter() - total_start,
+        )
+        reporter.emit(
+            phase=ConstructionPhase.SUPPORT_DISCOVERY,
+            status="running",
+            completed_units=len(summaries),
+            total_units=num_groups,
+            current_unit=f"group-{group:06d}/origin-chunk-{completed_chunks:06d}",
+            current_unit_elapsed_seconds=elapsed_seconds,
+            current_unit_predicted_remaining_seconds=None,
+            predicted_remaining_seconds=eta.predicted_remaining_seconds,
+            eta_confidence=eta.eta_confidence,
+            estimated_completion_at_utc=eta.estimated_completion_at_utc,
+            eta_reason=eta.eta_reason,
+            eta_lower_seconds=eta.eta_lower_seconds,
+            eta_upper_seconds=eta.eta_upper_seconds,
+            completed_weight=completed_group_weight,
+            total_weight=total_group_weight,
+            throughput_units_per_second=eta.throughput_units_per_second,
+            throughput_weight_per_second=eta.throughput_weight_per_second,
+            work_stack=(
+                {
+                    "name": "destination_groups",
+                    "completed_units": len(summaries),
+                    "total_units": num_groups,
+                    "current_unit": f"group-{group:06d}",
+                    "status": "running",
+                },
+                {
+                    "name": "origin_chunks",
+                    "completed_units": completed_chunks,
+                    "total_units": total_chunks,
+                    "current_unit": (
+                        f"group-{group:06d}/origin-chunk-{completed_chunks:06d}"
+                    ),
+                    "status": "running",
+                },
+            ),
+            inner_work={
+                "name": "origin_chunks",
+                "completed_units": completed_chunks,
+                "total_units": total_chunks,
+                "current_unit": (
+                    f"group-{group:06d}/origin-chunk-{completed_chunks:06d}"
+                ),
+            },
+            active_units=tuple(f"group-{item:06d}" for item in sorted(pending)),
+            queued_units=max(0, len(missing) - next_missing),
+            queued_unit_ids=tuple(
+                f"group-{item:06d}" for item in missing[next_missing:]
+            ),
+            active_workers=len(pending),
+            requested_workers=config.workers,
+            checkpoint_reusable=bool(summaries),
+            checkpoint_location=(
+                None if checkpoint_root is None else str(checkpoint_root)
+            ),
+            details={
+                "support_workers_requested": config.workers,
+                "support_worker_id": worker_id,
+            },
         )
 
     def submit_available(executor: ThreadPoolExecutor) -> None:
@@ -416,6 +567,7 @@ def _analyze_parallel_support(
                 routing_for_group=worker_routing_for_group,
                 reachability_kernel=reachability_kernel,
                 graph_arrays=graph_arrays,
+                inner_progress_callback=report_inner_progress,
             )
             next_missing += 1
 
@@ -451,6 +603,7 @@ def _analyze_parallel_support(
                     reachability_seconds=0.0,
                     projection_seconds=0.0,
                     elapsed_seconds=0.0,
+                    cpu_seconds=0.0,
                 )
             else:
                 future = pending.pop(group)
@@ -484,7 +637,9 @@ def _analyze_parallel_support(
                     raise RuntimeError(
                         f"support worker failed for group-{group:06d}"
                     ) from error
+            checkpoint_seconds = 0.0
             if not is_cached and checkpoint_root is not None:
+                checkpoint_started = perf_counter()
                 _save_group_checkpoint(
                     directory=checkpoint_root,
                     group=group,
@@ -494,6 +649,31 @@ def _analyze_parallel_support(
                     free_columns=result.free_columns,
                     fixed_rows=result.fixed_rows,
                     fixed_columns=result.fixed_columns,
+                )
+                checkpoint_seconds = perf_counter() - checkpoint_started
+            if timing_callback is not None:
+                timing_callback(
+                    GroupSupportTiming(
+                        group=group,
+                        selected_od_cells=result.summary.selected_od_cells,
+                        free_od_cells=result.summary.free_od_cells,
+                        measurement_count=result.summary.group_measurements,
+                        origin_chunks=max(
+                            1,
+                            math.ceil(
+                                result.summary.selected_od_cells
+                                / max(1, config.origin_chunk_size)
+                            ),
+                        ),
+                        reachability_seconds=result.reachability_seconds,
+                        projection_seconds=result.projection_seconds,
+                        checkpoint_seconds=checkpoint_seconds,
+                        total_seconds=result.elapsed_seconds + checkpoint_seconds,
+                        cached=is_cached,
+                        cpu_seconds=result.cpu_seconds,
+                        worker_id=result.worker_id,
+                        peak_rss_bytes=_current_peak_rss_bytes(),
+                    )
                 )
             if config.materialize:
                 free_rows.append(result.free_rows)
@@ -514,10 +694,24 @@ def _analyze_parallel_support(
             summaries.append(result.summary)
             total_origin_specific += result.summary.origin_specific_entries
             total_group_bound += result.summary.group_level_candidate_entries
+            completed_group_weight += float(group_weights[group])
+            if is_cached:
+                support_cache_hits += 1
+            else:
+                support_cache_misses += 1
             reachability_seconds += result.reachability_seconds
             projection_seconds += result.projection_seconds
             recent_group_seconds.append(result.elapsed_seconds)
             if reporter is not None:
+                eta = estimate_completed_unit_eta(
+                    recent_group_seconds,
+                    completed_units=len(summaries),
+                    total_units=num_groups,
+                    parallelism=admitted_workers,
+                    completed_weight=completed_group_weight,
+                    total_weight=total_group_weight,
+                    elapsed_seconds=perf_counter() - total_start,
+                )
                 reporter.emit(
                     phase=ConstructionPhase.SUPPORT_DISCOVERY,
                     status="running",
@@ -526,22 +720,88 @@ def _analyze_parallel_support(
                     total_units=num_groups,
                     current_unit=f"group-{group:06d}",
                     recent_unit_seconds=result.elapsed_seconds,
-                    predicted_remaining_seconds=(
-                        (predicted_group_seconds() or 0.0) * (num_groups - group - 1)
+                    predicted_remaining_seconds=eta.predicted_remaining_seconds,
+                    eta_confidence=eta.eta_confidence,
+                    estimated_completion_at_utc=eta.estimated_completion_at_utc,
+                    eta_reason=eta.eta_reason,
+                    eta_lower_seconds=eta.eta_lower_seconds,
+                    eta_upper_seconds=eta.eta_upper_seconds,
+                    completed_weight=completed_group_weight,
+                    total_weight=total_group_weight,
+                    throughput_units_per_second=eta.throughput_units_per_second,
+                    throughput_weight_per_second=eta.throughput_weight_per_second,
+                    work_stack=(
+                        {
+                            "name": "destination_groups",
+                            "completed_units": len(summaries),
+                            "total_units": num_groups,
+                            "current_unit": f"group-{group:06d}",
+                            "status": "running",
+                        },
+                        {
+                            "name": "origin_chunks",
+                            "completed_units": max(
+                                1,
+                                math.ceil(
+                                    result.summary.selected_od_cells
+                                    / max(1, config.origin_chunk_size)
+                                ),
+                            ),
+                            "total_units": max(
+                                1,
+                                math.ceil(
+                                    result.summary.selected_od_cells
+                                    / max(1, config.origin_chunk_size)
+                                ),
+                            ),
+                            "current_unit": f"group-{group:06d}/origin-chunks",
+                            "status": "completed",
+                        },
                     ),
+                    active_units=tuple(
+                        f"group-{pending_group:06d}"
+                        for pending_group, future in pending.items()
+                        if not future.done()
+                    ),
+                    queued_units=max(0, len(missing) - next_missing),
+                    queued_unit_ids=tuple(
+                        f"group-{pending_group:06d}"
+                        for pending_group in missing[next_missing:]
+                    ),
+                    active_workers=sum(
+                        not future.done() for future in pending.values()
+                    ),
+                    requested_workers=config.workers,
+                    reused_units=support_cache_hits,
+                    rebuilt_units=support_cache_misses,
+                    checkpoint_reusable=True,
                     checkpoint_location=str(checkpoint_root),
                     cache_hits=int(is_cached),
                     cache_misses=int(not is_cached),
                     details={
-                        "requested_workers": config.workers,
-                        "admitted_workers": admitted_workers,
-                        "active_workers": sum(
-                            not future.done() for future in pending.values()
-                        ),
+                        "support_workers_requested": config.workers,
+                        "support_workers_admitted": admitted_workers,
                         "queued_groups": len(missing) - next_missing,
                         "buffered_groups": sum(
                             future.done() for future in pending.values()
                         ),
+                        "inner_work": {
+                            "name": "origin_chunks",
+                            "completed_units": max(
+                                1,
+                                math.ceil(
+                                    result.summary.selected_od_cells
+                                    / max(1, config.origin_chunk_size)
+                                ),
+                            ),
+                            "total_units": max(
+                                1,
+                                math.ceil(
+                                    result.summary.selected_od_cells
+                                    / max(1, config.origin_chunk_size)
+                                ),
+                            ),
+                        },
                     },
                 )
             submit_available(executor)
@@ -849,6 +1109,7 @@ def analyze_fixed_routing_origin_support(
     deadline: ConstructionDeadline | None = None,
     reporter: ConstructionProgressReporter | None = None,
     group_callback: GroupSupportCallback | None = None,
+    timing_callback: GroupSupportTimingCallback | None = None,
 ) -> OriginSpecificMeasurementSupport:
     """Discover support without evaluating passenger-flow values."""
     config = OriginSupportConfig() if config is None else config
@@ -944,7 +1205,7 @@ def analyze_fixed_routing_origin_support(
     summaries: list[GroupOriginSupportSummary] = []
     reachability_seconds = projection_seconds = 0.0
     total_start = perf_counter()
-    if config.workers > 1:
+    if int(config.workers) > 1:
         support_kernel = _make_support_reachability_kernel(
             chunk_size=config.origin_chunk_size,
             num_nodes=num_nodes,
@@ -973,6 +1234,7 @@ def analyze_fixed_routing_origin_support(
             deadline=deadline,
             reporter=reporter,
             group_callback=group_callback,
+            timing_callback=timing_callback,
             total_start=total_start,
             estimated_peak=estimated_peak,
             num_measurements=num_measurements,
@@ -998,6 +1260,14 @@ def analyze_fixed_routing_origin_support(
         )
     total_origin_specific = total_group_bound = 0
     recent_group_seconds: list[float] = []
+    group_weights = tuple(
+        int(np.count_nonzero(selected[group_indices[group][group_masks[group]]]))
+        for group in range(int(inputs.group_dest_node.shape[0]))
+    )
+    total_group_weight = float(sum(group_weights))
+    completed_group_weight = 0.0
+    support_cache_hits = 0
+    support_cache_misses = 0
     for group in range(int(inputs.group_dest_node.shape[0])):
         predicted_group = (
             float(np.mean(recent_group_seconds[-3:]))
@@ -1075,7 +1345,46 @@ def analyze_fixed_routing_origin_support(
             total_origin_specific += summary.origin_specific_entries
             total_group_bound += summary.group_level_candidate_entries
             recent_group_seconds.append(0.0)
+            completed_group_weight += float(group_weights[group])
+            support_cache_hits += 1
+            if timing_callback is not None:
+                timing_callback(
+                    GroupSupportTiming(
+                        group=group,
+                        selected_od_cells=summary.selected_od_cells,
+                        free_od_cells=summary.free_od_cells,
+                        measurement_count=summary.group_measurements,
+                        origin_chunks=max(
+                            1,
+                            math.ceil(
+                                summary.selected_od_cells
+                                / max(1, config.origin_chunk_size)
+                            ),
+                        ),
+                        reachability_seconds=0.0,
+                        projection_seconds=0.0,
+                        checkpoint_seconds=0.0,
+                        total_seconds=0.0,
+                        cached=True,
+                        cpu_seconds=0.0,
+                        worker_id=threading.current_thread().name,
+                        peak_rss_bytes=_current_peak_rss_bytes(),
+                    )
+                )
             if reporter is not None:
+                eta = estimate_completed_unit_eta(
+                    recent_group_seconds,
+                    completed_units=len(summaries),
+                    total_units=int(inputs.group_dest_node.shape[0]),
+                    parallelism=1,
+                    completed_weight=completed_group_weight,
+                    total_weight=total_group_weight,
+                    elapsed_seconds=perf_counter() - total_start,
+                )
+                chunk_count = max(
+                    1,
+                    math.ceil(summary.selected_od_cells / max(1, config.origin_chunk_size)),
+                )
                 reporter.emit(
                     phase=ConstructionPhase.SUPPORT_DISCOVERY,
                     status="running",
@@ -1084,6 +1393,43 @@ def analyze_fixed_routing_origin_support(
                     total_units=int(inputs.group_dest_node.shape[0]),
                     current_unit=f"group-{group:06d}",
                     recent_unit_seconds=0.0,
+                    predicted_remaining_seconds=eta.predicted_remaining_seconds,
+                    eta_confidence=eta.eta_confidence,
+                    estimated_completion_at_utc=eta.estimated_completion_at_utc,
+                    eta_reason=eta.eta_reason,
+                    eta_lower_seconds=eta.eta_lower_seconds,
+                    eta_upper_seconds=eta.eta_upper_seconds,
+                    completed_weight=completed_group_weight,
+                    total_weight=total_group_weight,
+                    throughput_units_per_second=eta.throughput_units_per_second,
+                    throughput_weight_per_second=eta.throughput_weight_per_second,
+                    work_stack=(
+                        {
+                            "name": "destination_groups",
+                            "completed_units": len(summaries),
+                            "total_units": int(inputs.group_dest_node.shape[0]),
+                            "current_unit": f"group-{group:06d}",
+                            "status": "running",
+                        },
+                        {
+                            "name": "origin_chunks",
+                            "completed_units": chunk_count,
+                            "total_units": chunk_count,
+                            "current_unit": f"group-{group:06d}/origin-chunks",
+                            "status": "cached",
+                        },
+                    ),
+                    inner_work={
+                        "name": "origin_chunks",
+                        "completed_units": chunk_count,
+                        "total_units": chunk_count,
+                        "current_unit": f"group-{group:06d}/origin-chunks",
+                    },
+                    active_workers=0,
+                    requested_workers=1,
+                    reused_units=support_cache_hits,
+                    rebuilt_units=support_cache_misses,
+                    checkpoint_reusable=True,
                     checkpoint_location=str(checkpoint_root),
                     cache_hits=1,
                     cache_misses=0,
@@ -1097,7 +1443,15 @@ def analyze_fixed_routing_origin_support(
         group_free_column_parts: list[np.ndarray] = []
         group_fixed_rows_parts: list[np.ndarray] = []
         group_fixed_column_parts: list[np.ndarray] = []
-        for first in range(0, active_indices.size, config.origin_chunk_size):
+        group_reachability_before = reachability_seconds
+        group_projection_before = projection_seconds
+        group_cpu_before = process_time()
+        total_origin_chunks = max(
+            1, math.ceil(active_indices.size / config.origin_chunk_size)
+        )
+        for chunk_number, first in enumerate(
+            range(0, active_indices.size, config.origin_chunk_size), start=1
+        ):
             if deadline is not None and deadline.expired:
                 raise deadline_stop(
                     deadline,
@@ -1143,6 +1497,79 @@ def analyze_fixed_routing_origin_support(
                         np.full(rows.size, fixed, dtype=np.int64)
                     )
             projection_seconds += perf_counter() - start
+            if reporter is not None:
+                eta = estimate_completed_unit_eta(
+                    recent_group_seconds,
+                    completed_units=group,
+                    total_units=int(inputs.group_dest_node.shape[0]),
+                    parallelism=1,
+                    completed_weight=completed_group_weight,
+                    total_weight=total_group_weight,
+                    elapsed_seconds=perf_counter() - total_start,
+                )
+                reporter.emit(
+                    phase=ConstructionPhase.SUPPORT_DISCOVERY,
+                    status="running",
+                    completed_units=group,
+                    total_units=int(inputs.group_dest_node.shape[0]),
+                    current_unit=(
+                        f"group-{group:06d}/origin-chunk-{chunk_number:06d}"
+                    ),
+                    current_unit_elapsed_seconds=(
+                        perf_counter() - group_started
+                    ),
+                    predicted_remaining_seconds=eta.predicted_remaining_seconds,
+                    eta_confidence=eta.eta_confidence,
+                    estimated_completion_at_utc=eta.estimated_completion_at_utc,
+                    eta_reason=eta.eta_reason,
+                    eta_lower_seconds=eta.eta_lower_seconds,
+                    eta_upper_seconds=eta.eta_upper_seconds,
+                    completed_weight=completed_group_weight,
+                    total_weight=total_group_weight,
+                    throughput_units_per_second=eta.throughput_units_per_second,
+                    throughput_weight_per_second=eta.throughput_weight_per_second,
+                    work_stack=(
+                        {
+                            "name": "destination_groups",
+                            "completed_units": group,
+                            "total_units": int(inputs.group_dest_node.shape[0]),
+                            "current_unit": f"group-{group:06d}",
+                            "status": "running",
+                        },
+                        {
+                            "name": "origin_chunks",
+                            "completed_units": chunk_number,
+                            "total_units": total_origin_chunks,
+                            "current_unit": (
+                                f"group-{group:06d}/origin-chunk-{chunk_number:06d}"
+                            ),
+                            "status": "running",
+                        },
+                    ),
+                    inner_work={
+                        "name": "origin_chunks",
+                        "completed_units": chunk_number,
+                        "total_units": total_origin_chunks,
+                        "current_unit": (
+                            f"group-{group:06d}/origin-chunk-{chunk_number:06d}"
+                        ),
+                    },
+                    active_units=(f"group-{group:06d}",),
+                    queued_units=max(
+                        0,
+                        int(inputs.group_dest_node.shape[0]) - group - 1,
+                    ),
+                    active_workers=1,
+                    requested_workers=1,
+                    checkpoint_reusable=group > 0,
+                    checkpoint_location=(
+                        None if checkpoint_root is None else str(checkpoint_root)
+                    ),
+                    details={
+                        "support_workers_requested": 1,
+                        "support_worker_id": threading.current_thread().name,
+                    },
+                )
         total_origin_specific += group_entries
         total_group_bound += group_bound
         summary = GroupOriginSupportSummary(
@@ -1174,7 +1601,9 @@ def analyze_fixed_routing_origin_support(
             if group_fixed_column_parts
             else np.empty(0, dtype=np.int64)
         )
+        checkpoint_seconds = 0.0
         if checkpoint_root is not None:
+            checkpoint_started = perf_counter()
             _save_group_checkpoint(
                 directory=checkpoint_root,
                 group=group,
@@ -1185,6 +1614,7 @@ def analyze_fixed_routing_origin_support(
                 fixed_rows=group_fixed_rows,
                 fixed_columns=group_fixed_columns,
             )
+            checkpoint_seconds = perf_counter() - checkpoint_started
         if group_callback is not None:
             group_callback(
                 group,
@@ -1204,7 +1634,50 @@ def analyze_fixed_routing_origin_support(
         summaries.append(summary)
         now = deadline.clock() if deadline is not None else perf_counter()
         recent_group_seconds.append(max(0.0, now - group_started))
+        completed_group_weight += float(group_weights[group])
+        support_cache_misses += 1
+        if timing_callback is not None:
+            timing_callback(
+                GroupSupportTiming(
+                    group=group,
+                    selected_od_cells=summary.selected_od_cells,
+                    free_od_cells=summary.free_od_cells,
+                    measurement_count=summary.group_measurements,
+                    origin_chunks=max(
+                        1,
+                        math.ceil(
+                            summary.selected_od_cells
+                            / max(1, config.origin_chunk_size)
+                        ),
+                    ),
+                    reachability_seconds=(
+                        reachability_seconds - group_reachability_before
+                    ),
+                    projection_seconds=(
+                        projection_seconds - group_projection_before
+                    ),
+                    checkpoint_seconds=checkpoint_seconds,
+                    total_seconds=recent_group_seconds[-1] + checkpoint_seconds,
+                    cached=False,
+                    cpu_seconds=max(0.0, process_time() - group_cpu_before),
+                    worker_id=threading.current_thread().name,
+                    peak_rss_bytes=_current_peak_rss_bytes(),
+                )
+            )
         if reporter is not None:
+            eta = estimate_completed_unit_eta(
+                recent_group_seconds,
+                completed_units=len(summaries),
+                total_units=int(inputs.group_dest_node.shape[0]),
+                parallelism=1,
+                completed_weight=completed_group_weight,
+                total_weight=total_group_weight,
+                elapsed_seconds=perf_counter() - total_start,
+            )
+            chunk_count = max(
+                1,
+                math.ceil(summary.selected_od_cells / max(1, config.origin_chunk_size)),
+            )
             reporter.emit(
                 phase=ConstructionPhase.SUPPORT_DISCOVERY,
                 status="running",
@@ -1213,10 +1686,43 @@ def analyze_fixed_routing_origin_support(
                 total_units=int(inputs.group_dest_node.shape[0]),
                 current_unit=f"group-{group:06d}",
                 recent_unit_seconds=recent_group_seconds[-1],
-                predicted_remaining_seconds=(
-                    recent_group_seconds[-1]
-                    * (int(inputs.group_dest_node.shape[0]) - group - 1)
+                predicted_remaining_seconds=eta.predicted_remaining_seconds,
+                eta_confidence=eta.eta_confidence,
+                estimated_completion_at_utc=eta.estimated_completion_at_utc,
+                eta_reason=eta.eta_reason,
+                eta_lower_seconds=eta.eta_lower_seconds,
+                eta_upper_seconds=eta.eta_upper_seconds,
+                completed_weight=completed_group_weight,
+                total_weight=total_group_weight,
+                throughput_units_per_second=eta.throughput_units_per_second,
+                throughput_weight_per_second=eta.throughput_weight_per_second,
+                work_stack=(
+                    {
+                        "name": "destination_groups",
+                        "completed_units": len(summaries),
+                        "total_units": int(inputs.group_dest_node.shape[0]),
+                        "current_unit": f"group-{group:06d}",
+                        "status": "running",
+                    },
+                    {
+                        "name": "origin_chunks",
+                        "completed_units": chunk_count,
+                        "total_units": chunk_count,
+                        "current_unit": f"group-{group:06d}/origin-chunks",
+                        "status": "completed",
+                    },
                 ),
+                inner_work={
+                    "name": "origin_chunks",
+                    "completed_units": chunk_count,
+                    "total_units": chunk_count,
+                    "current_unit": f"group-{group:06d}/origin-chunks",
+                },
+                active_workers=0,
+                requested_workers=1,
+                reused_units=support_cache_hits,
+                rebuilt_units=support_cache_misses,
+                checkpoint_reusable=True,
                 checkpoint_location=str(checkpoint_root),
                 cache_hits=0,
                 cache_misses=1,

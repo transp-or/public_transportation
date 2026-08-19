@@ -35,6 +35,7 @@ from .fixed_routing_measurement_operator import (
     measurement_mapping_fingerprint,
 )
 from .fixed_routing_sharded_builder import (
+    GroupSupportTimingCallback,
     ShardedConstructionConfig,
     ShardedConstructionResult,
     prepare_sharded_fixed_routing_measurement_operator,
@@ -821,6 +822,7 @@ def prepare_direct_scheduled_temporal_operator(
     progress: DirectTemporalProgressCallback | None = None,
     deadline: ConstructionDeadline | None = None,
     reporter: ConstructionProgressReporter | None = None,
+    support_timing_callback: GroupSupportTimingCallback | None = None,
     measurement_info: MappingInfo | None = None,
     fixed_zero_reasons_by_full_index: Mapping[int, str] | None = None,
 ) -> DirectScheduledTemporalConstructionResult:
@@ -918,6 +920,7 @@ def prepare_direct_scheduled_temporal_operator(
             "assignment_contract_schema_version": identity.schema_version,
         },
         positive_boarding_preflight=preflight,
+        support_timing_callback=support_timing_callback,
     )
     predicted_finalization = (
         source.total_seconds / max(1, source.plan.num_shards)
@@ -1027,6 +1030,7 @@ def activate_direct_scheduled_temporal_operator(
     od_layout_fingerprint: str,
     config: ShardedConstructionConfig | None = None,
     progress: DirectTemporalProgressCallback | None = None,
+    support_timing_callback: GroupSupportTimingCallback | None = None,
     deadline: ConstructionDeadline | None = None,
     time_budget_seconds: float | None = None,
     safety_margin_seconds: float = 0.0,
@@ -1245,6 +1249,7 @@ def activate_direct_scheduled_temporal_operator(
                 completed_units=event.completed_shards,
                 total_units=event.total_shards,
                 parallelism=max(1, event.admitted_worker_count),
+                elapsed_seconds=event.elapsed_seconds,
             )
             if event.eta_confidence != "unavailable":
                 eta_confidence = event.eta_confidence
@@ -1289,6 +1294,48 @@ def activate_direct_scheduled_temporal_operator(
                 cache_hits=event.cache_hits,
                 cache_misses=event.cache_misses,
                 peak_resident_memory_bytes=event.peak_rss_bytes,
+                work_stack=[
+                    {
+                        "name": "destination_groups",
+                        "completed_units": event.completed_groups,
+                        "total_units": event.total_groups,
+                        "current_unit": (
+                            None
+                            if event.shard_index is None
+                            else f"destination-group-shard-{event.shard_index:06d}"
+                        ),
+                        "status": event.status,
+                    },
+                    {
+                        "name": "routing_shards",
+                        "completed_units": event.completed_shards,
+                        "total_units": event.total_shards,
+                        "current_unit": (
+                            None
+                            if event.shard_index is None
+                            else f"routing-shard-{event.shard_index:06d}"
+                        ),
+                        "status": event.status,
+                    },
+                ],
+                active_units=[
+                    f"routing-shard-{index:06d}"
+                    for index in event.current_shard_indices
+                ],
+                queued_units=event.queued_shards,
+                active_workers=event.active_workers,
+                requested_workers=effective_routing_config.construction_workers,
+                current_unit_elapsed_seconds=event.recent_shard_seconds,
+                current_unit_predicted_remaining_seconds=(
+                    event.predicted_next_shard_seconds
+                ),
+                completed_weight=float(event.completed_groups),
+                total_weight=float(event.total_groups),
+                eta_lower_seconds=getattr(event, "eta_lower_seconds", None),
+                eta_upper_seconds=getattr(event, "eta_upper_seconds", None),
+                reused_units=event.cache_hits,
+                rebuilt_units=event.cache_misses,
+                checkpoint_reusable=event.status in {"completed", "cache_reused"},
                 details={
                     "routing_phase": event.phase,
                     "routing_status": event.status,
@@ -1433,6 +1480,7 @@ def activate_direct_scheduled_temporal_operator(
             progress=progress,
             deadline=control,
             reporter=reporter,
+            support_timing_callback=support_timing_callback,
             measurement_info=measurement_info,
             fixed_zero_reasons_by_full_index=fixed_zero_reasons_by_full_index,
         )

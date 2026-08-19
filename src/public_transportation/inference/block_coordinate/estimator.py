@@ -8,6 +8,7 @@ import math
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from time import perf_counter
 from typing import cast
 
@@ -790,6 +791,80 @@ class BlockCoordinateMAPEstimator:
                     selected_block_cache_misses=self._selected_cache_misses,
                     block_solve_seconds=solve_seconds,
                     checkpoint_seconds=checkpoint_seconds,
+                    phase_elapsed_seconds=elapsed_now,
+                    completed_units=schedule_position,
+                    total_units=len(schedule),
+                    predicted_remaining_seconds=remaining,
+                    eta_confidence=(
+                        "unavailable"
+                        if remaining is None
+                        else ("high" if schedule_position >= 3 else "low")
+                    ),
+                    eta_reason=(
+                        None
+                        if remaining is not None
+                        else "no completed schedule position is available"
+                    ),
+                    work_stack=(
+                        {
+                            "name": "block_coordinate_schedule",
+                            "completed_units": schedule_position,
+                            "total_units": len(schedule),
+                            "current_unit": batch_label,
+                            "status": "running",
+                        },
+                    ),
+                    active_units=(batch_label,),
+                    queued_units=max(0, len(schedule) - schedule_position),
+                    requested_workers=1,
+                    completed_weight=float(schedule_position),
+                    total_weight=float(len(schedule)),
+                    weighted_fraction=(
+                        schedule_position / max(len(schedule), 1)
+                    ),
+                    checkpoint_reusable=checkpoint_committed,
+                    next_resumable_position=(
+                        None
+                        if schedule_position >= len(schedule)
+                        else f"schedule-{schedule_position:06d}"
+                    ),
+                    job_elapsed_seconds=elapsed_now,
+                    eta_lower_seconds=remaining,
+                    eta_upper_seconds=remaining,
+                    predicted_job_remaining_seconds=remaining,
+                    job_eta_confidence=(
+                        "unavailable"
+                        if remaining is None
+                        else ("high" if schedule_position >= 3 else "low")
+                    ),
+                    job_eta_reason=(
+                        None
+                        if remaining is not None
+                        else "no completed schedule position is available"
+                    ),
+                    estimated_job_completion_at_utc=(
+                        None
+                        if remaining is None
+                        else (
+                            datetime.now(timezone.utc)
+                            + timedelta(seconds=max(0.0, remaining))
+                        ).isoformat().replace("+00:00", "Z")
+                    ),
+                    deadline_remaining_seconds=(
+                        None
+                        if self.absolute_deadline is None
+                        else max(0.0, self.absolute_deadline - self.clock())
+                    ),
+                    deadline_margin_seconds=(
+                        None
+                        if self.absolute_deadline is None or remaining is None
+                        else max(0.0, self.absolute_deadline - self.clock()) - remaining
+                    ),
+                    will_finish_before_deadline=(
+                        None
+                        if self.absolute_deadline is None or remaining is None
+                        else remaining <= max(0.0, self.absolute_deadline - self.clock())
+                    ),
                 )
                 if self.logger is not None:
                     self.logger.info(event.to_json_line().rstrip())

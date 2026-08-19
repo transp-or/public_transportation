@@ -14,6 +14,13 @@ destination_ridge = 1.0
 od_chunk_size = 16
 measurement_block_size = 64
 worker_memory_budget_bytes = 256000000
+# Support discovery and numerical shard construction are separate worker
+# pools.  Keep both at one until a case-owned benchmark justifies raising them.
+support_workers = 1
+shard_construction_workers = 1
+support_progress_interval_seconds = 5.0
+# Diagnostic only: write results/audit/support_discovery_profile.json.
+profile_support_discovery = false
 target_nonzeros_per_storage_shard = 20000
 maximum_nonzeros_per_storage_shard = 100000
 manifest_checkpoint_shards = 1

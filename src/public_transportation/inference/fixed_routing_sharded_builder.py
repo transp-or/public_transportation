@@ -32,6 +32,7 @@ from .fixed_routing_measurement_operator import (
     measurement_mapping_fingerprint,
 )
 from .fixed_routing_origin_support import (
+    GroupSupportTimingCallback,
     OriginSupportConfig,
     analyze_fixed_routing_origin_support,
 )
@@ -143,6 +144,7 @@ class ShardedConstructionConfig:
     zero_tolerance: float = 0.0
     compressed_shards: bool = False
     workers: int = 1
+    support_workers: int | None = None
     origin_support_chunk_size: int = 64
     max_materialized_support_entries: int = 125_000_000
     support_discovery_mode: Literal["compact", "reference"] = "compact"
@@ -178,8 +180,22 @@ class ShardedConstructionConfig:
             )
         if not math.isfinite(self.zero_tolerance) or self.zero_tolerance < 0:
             raise ValueError("zero_tolerance must be finite and non-negative.")
-        if self.workers <= 0:
+        if (
+            isinstance(self.workers, bool)
+            or not isinstance(self.workers, (int, np.integer))
+            or self.workers <= 0
+        ):
             raise ValueError("workers must be positive.")
+        if self.support_workers is not None and (
+            isinstance(self.support_workers, bool)
+            or not isinstance(self.support_workers, (int, np.integer))
+            or self.support_workers <= 0
+        ):
+            raise ValueError(
+                "support_workers must be a positive integer when provided."
+            )
+        if self.support_workers is None:
+            object.__setattr__(self, "support_workers", int(self.workers))
         if self.maximum_resident_shards <= 0:
             raise ValueError("maximum_resident_shards must be positive.")
         if (
@@ -206,10 +222,28 @@ class ShardedConstructionConfig:
                 self.maximum_sparse_calls_per_product,
                 self.manifest_checkpoint_shards,
                 self.maximum_construction_dispatches,
-            )
+        )
             <= 0
         ):
             raise ValueError("operational shard limits must be positive.")
+
+    def execution_configuration(self) -> dict[str, object]:
+        """Return explicit worker-pool settings for reports and manifests.
+
+        ``workers`` remains the legacy shard-construction worker setting.
+        ``support_workers`` is independently configurable and defaults to the
+        legacy value for compatibility; it is never inferred from routing
+        preparation workers.
+        """
+
+        return {
+            "support_workers_requested": int(self.support_workers),
+            "shard_construction_workers_requested": int(self.workers),
+            "threads_per_worker": 1,
+            "support_execution_strategy": "thread_pool",
+            "shard_construction_execution_strategy": "thread_pool",
+            "maximum_resident_shards": int(self.maximum_resident_shards),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -900,6 +934,7 @@ def _discover_support(
     checkpoint_provenance_hash: str | None = None,
     deadline: ConstructionDeadline | None = None,
     reporter: ConstructionProgressReporter | None = None,
+    timing_callback: GroupSupportTimingCallback | None = None,
 ) -> _Support:
     num_active = int(inputs.od_origin_node.shape[0])
     free_column = np.full(num_active, -1, np.int64)
@@ -962,12 +997,13 @@ def _discover_support(
             worker_memory_budget_bytes=config.worker_memory_budget_bytes,
             materialize=config.support_discovery_mode == "reference",
             max_materialized_entries=config.max_materialized_support_entries,
-            workers=config.workers,
+            workers=int(config.support_workers),
         ),
         checkpoint_directory=checkpoint_directory,
         checkpoint_provenance_hash=checkpoint_provenance_hash,
         deadline=deadline,
         reporter=reporter,
+        timing_callback=timing_callback,
         group_callback=(
             None
             if config.support_discovery_mode == "reference"
@@ -1184,6 +1220,7 @@ def plan_sharded_fixed_routing_operator(
     compact_layout: CompactODAssignmentLayout,
     config: ShardedConstructionConfig | None = None,
     discovered_support: _Support | None = None,
+    support_timing_callback: GroupSupportTimingCallback | None = None,
 ) -> tuple[ShardedConstructionPlan, _Support]:
     """Discover structural support and reject unsafe kernels before lowering."""
     config = ShardedConstructionConfig() if config is None else config
@@ -1200,6 +1237,7 @@ def plan_sharded_fixed_routing_operator(
             spec=spec,
             compact_layout=compact_layout,
             config=config,
+            timing_callback=support_timing_callback,
         )
         if discovered_support is None
         else discovered_support
@@ -1394,6 +1432,7 @@ def _manifest(
         plan_summary=plan_summary,
         execution_provenance={
             "workers": config.workers,
+            **config.execution_configuration(),
             "od_chunk_size": config.od_chunk_size,
             "measurement_block_size": config.measurement_block_size,
             "origin_support_chunk_size": config.origin_support_chunk_size,
@@ -1873,6 +1912,7 @@ def prepare_sharded_fixed_routing_measurement_operator(
     reporter: ConstructionProgressReporter | None = None,
     scientific_identity: dict[str, object] | None = None,
     positive_boarding_preflight: PositiveBoardingPreflightContext | None = None,
+    support_timing_callback: GroupSupportTimingCallback | None = None,
 ) -> ShardedConstructionResult:
     """Build missing/invalid shards and atomically advance a resumable manifest."""
     config = ShardedConstructionConfig() if config is None else config
@@ -2131,6 +2171,7 @@ def prepare_sharded_fixed_routing_measurement_operator(
             checkpoint_provenance_hash=support_provenance_hash,
             deadline=control,
             reporter=events,
+            timing_callback=support_timing_callback,
         )
         _save_support_checkpoint(
             directory, support, provenance_hash=support_provenance_hash
@@ -2217,6 +2258,7 @@ def prepare_sharded_fixed_routing_measurement_operator(
             compact_layout=compact_layout,
             config=config,
             discovered_support=support,
+            support_timing_callback=support_timing_callback,
         )
     if not support.construction_metadata:
         support = replace(

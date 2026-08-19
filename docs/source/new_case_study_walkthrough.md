@@ -479,6 +479,65 @@ provide one. Treat the first ETA as provisional and trust it more only after
 completed chunks accumulate. A log is not completion: verify the manifest,
 expected files, checksums, and fingerprints.
 
+Progress records also preserve a compatibility-friendly hierarchy. The flat
+`elapsed_seconds` is the job clock and `phase_elapsed_seconds` is reset when
+the current phase changes. `work_stack` lists outer-to-inner units;
+`active_units`, `queued_units`, `active_workers`, and `requested_workers`
+describe scheduling state. Do not add nested counts together. For unequal-cost
+units, use `completed_weight`, `total_weight`, and `weighted_fraction`.
+`eta_lower_seconds`, `eta_upper_seconds`, `eta_confidence`, and `eta_reason`
+make uncertainty explicit. `predicted_job_remaining_seconds` is emitted only
+when the current phase and all declared future phases have usable estimates.
+Checkpoint fields (`checkpoint_reusable`, `next_resumable_position`,
+`reused_units`, and `rebuilt_units`) state exactly what a resumed run can
+reuse. Opaque planning, compilation, or synchronization calls still emit
+heartbeats, but their ETA remains unavailable rather than being guessed. These
+fields are reporting metadata and never change numerical results or artifact
+fingerprints.
+
+### Profile support discovery before increasing concurrency
+
+Support discovery is distinct from routing preparation and from numerical
+measurement-shard construction. Configure their worker pools independently in
+`config/model.toml`:
+
+```toml
+support_workers = 1
+shard_construction_workers = 1
+support_progress_interval_seconds = 5.0
+profile_support_discovery = false
+```
+
+`support_workers` controls destination-group topology support; it is not
+automatically coupled to routing-preparation workers. The lower-level
+`ShardedConstructionConfig` keeps backward compatibility by defaulting
+`support_workers` to `workers` when omitted. These settings are execution and
+reporting metadata, not scientific identity. A support-worker experiment must
+therefore reproduce the same support set, numerical values, checkpoints, and
+fingerprints.
+
+For a cold, isolated benchmark, set `profile_support_discovery = true`. The
+generic direct-scheduled template writes
+`results/audit/support_discovery_profile.json` with one record per completed
+destination group: selected/free OD cells, measurement count, origin-chunk
+count, reachability/projection/checkpoint/total seconds, cache reuse, worker
+ID, and peak RSS when available. The aggregate records rates, component
+timings, cache hits/misses, worker IDs, and deterministic representative
+small/median/large group IDs. Retain the profile with the package revision,
+all input/configuration/timetable fingerprints, CPU/memory/JAX allocation, and
+the exact cache state. Compare cold runs only with cold runs and resumed runs
+only with resumed runs.
+
+The representative IDs are diagnostic guidance for a case-owned pilot input;
+they do not authorize a partial production support set. The normal production
+run must evaluate every destination group. During a long group, nested
+progress events report the outer `destination_groups` unit and inner
+`origin_chunks`, plus active/queued group IDs, worker identity, checkpoint
+location, weighted throughput, and ETA bounds. An ETA may remain unavailable
+for the first group because no completed group duration exists; it becomes
+more useful after persisted group timings accumulate. Profiling and progress
+are observational and cannot change the calculation or its artifact identity.
+
 ### Verify the completion manifest before continuing
 
 For each phase, inspect the durable manifest before submitting its dependent

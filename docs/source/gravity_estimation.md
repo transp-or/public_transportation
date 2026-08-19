@@ -665,6 +665,14 @@ theta, batching, residency, estimator policy, JAX devices and relevant thread
 environment. Progress records are append-only, timestamped, flushed and
 optionally `fsync`-committed. Resume with the same manifest and configuration.
 
+Estimator progress retains the flat iteration/objective fields and adds the
+common hierarchical contract: `job_elapsed_seconds`, `phase_elapsed_seconds`,
+`work_stack`, active/queued units and workers, weighted progress, ETA bounds and
+confidence, plus checkpoint reuse and next-resumable-iteration metadata. ETA is
+based only on completed optimizer iterations; it is intentionally unavailable
+while an objective/gradient evaluation is opaque or while too few iterations
+have completed. These reporting fields do not enter the model fingerprint.
+
 The committed public Geneva integration exercises the complete direct-scheduled
 gravity workflow on 96 free cells, 15,128 full-layout cells, and 8,967
 boarding/alighting measurements. Scheduled path metrics and synthetic prior demand
