@@ -343,7 +343,9 @@ from .fixed_routing_origin_support import (  # noqa: F401
     OriginSupportConfig,
     OriginSupportMetrics,
     OriginSupportValidation,
+    SupportReuseDiagnostics,
     analyze_fixed_routing_origin_support,
+    diagnose_fixed_routing_support_reuse,
     validate_origin_support_against_operator,
 )
 from .sharded_sparse_operator import (  # noqa: F401

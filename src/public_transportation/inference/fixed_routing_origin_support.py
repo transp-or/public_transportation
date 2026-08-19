@@ -84,6 +84,35 @@ class OriginSupportConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class SupportReuseDiagnostics:
+    """Cost diagnostics for exact support-reuse opportunities.
+
+    The estimates count origin-chunk reachability evaluations.  They are not
+    execution results and do not enter support fingerprints or checkpoint
+    identities.  ``estimated_shared_origin_chunks`` assumes that groups with
+    the same structural link mask share one traversal over their union of
+    origin nodes.
+    """
+
+    total_groups: int
+    groups_with_selected_cells: int
+    selected_od_cells: int
+    current_origin_chunks: int
+    unique_structural_masks: int
+    reused_structural_masks: int
+    groups_in_reused_structural_masks: int
+    sum_group_unique_origin_nodes: int
+    unique_origin_nodes_across_groups: int
+    estimated_deduplicated_separate_origin_chunks: int
+    estimated_shared_origin_chunks: int
+    origin_cell_deduplication_ratio: float
+    structural_mask_reuse_ratio: float
+    estimated_deduplicated_work_reduction_ratio: float
+    estimated_shared_work_reduction_ratio: float
+    elapsed_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
 class GroupOriginSupportSummary:
     group: int
     selected_od_cells: int
@@ -1035,6 +1064,171 @@ def _load_group_checkpoint(
         arrays["free_columns"],
         arrays["fixed_rows"],
         arrays["fixed_columns"],
+    )
+
+
+def diagnose_fixed_routing_support_reuse(
+    *,
+    inputs: AssignmentInputs,
+    routing: FixedRoutingInputs | ShardedFixedRoutingInputs,
+    compact_layout: CompactODAssignmentLayout,
+    origin_chunk_size: int = 64,
+    probability_tolerance: float = 0.0,
+) -> SupportReuseDiagnostics:
+    """Estimate exact support-reuse opportunities without running support.
+
+    Structural support depends on the Boolean enabled-link mask and the graph
+    origin node, not on the positive routing probabilities themselves.  This
+    diagnostic therefore identifies groups that can share exact reachability
+    work and estimates the effect of deduplicating repeated origin nodes.
+    It deliberately performs no support traversal and has no effect on the
+    numerical construction path.
+    """
+
+    if origin_chunk_size <= 0:
+        raise ValueError("origin_chunk_size must be positive.")
+    if (
+        not math.isfinite(probability_tolerance)
+        or probability_tolerance < 0.0
+    ):
+        raise ValueError("probability_tolerance must be finite and non-negative.")
+    if isinstance(routing, ShardedFixedRoutingInputs):
+        validate_sharded_fixed_routing_compatibility(inputs=inputs, routing=routing)
+    else:
+        validate_fixed_routing_compatibility(inputs=inputs, routing=routing)
+    if compact_layout.num_active != int(inputs.od_origin_node.shape[0]):
+        raise ValueError("compact layout and assignment active dimensions differ.")
+
+    started = perf_counter()
+    group_indices = np.asarray(inputs.group_od_index_padded)
+    group_masks = np.asarray(inputs.group_od_mask, dtype=bool)
+    origins_by_active = np.asarray(inputs.od_origin_node, dtype=np.int64)
+    active_selected = np.zeros(origins_by_active.shape[0], dtype=bool)
+    active_selected[
+        np.asarray(compact_layout.free_compact_indices, dtype=np.int64)
+    ] = True
+    fixed_indices = np.asarray(compact_layout.fixed_compact_indices, dtype=np.int64)
+    fixed_values = np.asarray(compact_layout.fixed_compact_values)
+    positive_fixed = fixed_indices[fixed_values > 0.0]
+    active_selected[positive_fixed] = True
+
+    dense_probability = (
+        None
+        if isinstance(routing, ShardedFixedRoutingInputs)
+        else np.asarray(routing.group_link_probability)
+    )
+    dense_effective = (
+        None
+        if isinstance(routing, ShardedFixedRoutingInputs)
+        else np.asarray(routing.effective_group_link_mask, dtype=bool)
+    )
+    resident_descriptor = None
+    resident_shard = None
+
+    def routing_for_group(group: int) -> tuple[np.ndarray, np.ndarray]:
+        nonlocal resident_descriptor, resident_shard
+        if not isinstance(routing, ShardedFixedRoutingInputs):
+            assert dense_probability is not None and dense_effective is not None
+            return dense_probability[group], dense_effective[group]
+        descriptor = fixed_routing_descriptor_for_group(routing, group)
+        if resident_descriptor != descriptor:
+            resident_shard = load_fixed_routing_shard(
+                routing=routing,
+                descriptor=descriptor,
+            )
+            resident_descriptor = descriptor
+        assert resident_shard is not None
+        local = group - descriptor.group_start
+        return (
+            resident_shard.group_link_probability[local],
+            resident_shard.effective_group_link_mask[local],
+        )
+
+    # A mask key is a digest rather than the full mask, so the diagnostic does
+    # not retain one copy of every group's link mask.
+    mask_origins: dict[str, list[np.ndarray]] = {}
+    mask_group_counts: dict[str, int] = {}
+    total_selected = 0
+    current_chunks = 0
+    deduplicated_chunks = 0
+    group_unique_origins = 0
+    all_origins: list[np.ndarray] = []
+    groups_with_cells = 0
+
+    for group in range(int(inputs.group_dest_node.shape[0])):
+        active_indices = group_indices[group][group_masks[group]]
+        active_indices = active_indices[active_selected[active_indices]].astype(
+            np.int64,
+            copy=False,
+        )
+        if active_indices.size == 0:
+            continue
+        group_probability, group_effective = routing_for_group(group)
+        enabled = np.asarray(group_effective, dtype=bool) & (
+            np.asarray(group_probability) > probability_tolerance
+        )
+        packed = np.packbits(enabled, bitorder="little")
+        digest = hashlib.sha256()
+        digest.update(np.asarray([enabled.size], dtype=np.int64).tobytes())
+        digest.update(packed.tobytes())
+        key = digest.hexdigest()
+        origin_nodes = np.unique(origins_by_active[active_indices])
+        mask_origins.setdefault(key, []).append(origin_nodes)
+        mask_group_counts[key] = mask_group_counts.get(key, 0) + 1
+        all_origins.append(origin_nodes)
+        groups_with_cells += 1
+        total_selected += int(active_indices.size)
+        current_chunks += max(1, math.ceil(active_indices.size / origin_chunk_size))
+        deduplicated_chunks += max(1, math.ceil(origin_nodes.size / origin_chunk_size))
+        group_unique_origins += int(origin_nodes.size)
+
+    unique_masks = len(mask_origins)
+    reused_masks = sum(count > 1 for count in mask_group_counts.values())
+    groups_in_reused_masks = sum(
+        count for count in mask_group_counts.values() if count > 1
+    )
+    shared_chunks = 0
+    for origins in mask_origins.values():
+        union = np.unique(np.concatenate(origins)) if origins else np.empty(0, np.int64)
+        shared_chunks += max(1, math.ceil(union.size / origin_chunk_size))
+    unique_all = (
+        int(np.unique(np.concatenate(all_origins)).size)
+        if all_origins
+        else 0
+    )
+
+    def reduction(numerator: int, denominator: int) -> float:
+        return 0.0 if denominator <= 0 else max(0.0, 1.0 - numerator / denominator)
+
+    return SupportReuseDiagnostics(
+        total_groups=int(inputs.group_dest_node.shape[0]),
+        groups_with_selected_cells=groups_with_cells,
+        selected_od_cells=total_selected,
+        current_origin_chunks=current_chunks,
+        unique_structural_masks=unique_masks,
+        reused_structural_masks=reused_masks,
+        groups_in_reused_structural_masks=groups_in_reused_masks,
+        sum_group_unique_origin_nodes=group_unique_origins,
+        unique_origin_nodes_across_groups=unique_all,
+        estimated_deduplicated_separate_origin_chunks=deduplicated_chunks,
+        estimated_shared_origin_chunks=shared_chunks,
+        origin_cell_deduplication_ratio=reduction(
+            group_unique_origins,
+            total_selected,
+        ),
+        structural_mask_reuse_ratio=reduction(
+            unique_masks,
+            groups_with_cells,
+        ),
+        estimated_deduplicated_work_reduction_ratio=reduction(
+            deduplicated_chunks,
+            current_chunks,
+        ),
+        estimated_shared_work_reduction_ratio=reduction(
+            shared_chunks,
+            current_chunks,
+        ),
+        elapsed_seconds=perf_counter() - started,
     )
 
 

@@ -58,6 +58,7 @@ from public_transportation.inference.fixed_routing_sharded_builder import (
 from public_transportation.inference.fixed_routing_origin_support import (
     OriginSupportConfig,
     analyze_fixed_routing_origin_support,
+    diagnose_fixed_routing_support_reuse,
     validate_origin_support_against_operator,
 )
 from public_transportation.inference.sharded_sparse_operator import (
@@ -1494,6 +1495,37 @@ def test_origin_support_is_deterministic_across_chunk_sizes(all_free_operator):
     np.testing.assert_array_equal(
         first.free_support.toarray(), second.free_support.toarray()
     )
+
+
+def test_support_reuse_diagnostics_are_noninvasive(all_free_operator):
+    inputs, routing, _, _ = all_free_operator
+    num_od = int(inputs.od_origin_node.shape[0])
+    layout = ODParameterLayout(
+        num_od_total=num_od,
+        od_keys=tuple((f"o{i}", "d", "t") for i in range(num_od)),
+        free_od_indices=tuple(range(num_od)),
+        fixed_od_indices=(),
+        fixed_od_values=(),
+        free_baseline_values=tuple(1.0 for _ in range(num_od)),
+        fixed_zero_indices=(),
+        fixed_positive_indices=(),
+    )
+    compact = build_compact_od_assignment_layout(parameter_layout=layout)
+    diagnostics = diagnose_fixed_routing_support_reuse(
+        inputs=inputs,
+        routing=routing,
+        compact_layout=compact,
+        origin_chunk_size=3,
+    )
+    assert diagnostics.total_groups == int(inputs.group_dest_node.shape[0])
+    assert diagnostics.selected_od_cells == num_od
+    assert diagnostics.unique_structural_masks <= diagnostics.groups_with_selected_cells
+    assert (
+        diagnostics.estimated_shared_origin_chunks
+        <= diagnostics.current_origin_chunks
+    )
+    assert 0.0 <= diagnostics.origin_cell_deduplication_ratio <= 1.0
+    assert 0.0 <= diagnostics.structural_mask_reuse_ratio <= 1.0
 
 
 def test_origin_support_reports_nested_origin_chunk_progress(all_free_operator):
