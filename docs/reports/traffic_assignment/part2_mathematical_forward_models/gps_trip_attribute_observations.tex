@@ -1,0 +1,255 @@
+\section{Optional GPS-Derived Trip-Attribute Observations}
+\label{sec:gps-trip-attribute-observations}
+
+Boarding and alighting counts are the primary observations in this model.  A
+case study may also have a sample of complete passenger journeys reconstructed
+from GPS data.  Such a sample provides information about the distribution of
+journey attributes, but it is not, by itself, an additional OD table or a
+calibrated demand count.  It can therefore be included as an optional,
+auxiliary observation model without changing the count-assignment model.
+
+\subsection{Data description}
+
+One row in the auxiliary data represents one reconstructed public-transport
+journey, from its first boarding to its final alighting.  A representative
+schema contains the following fields:
+
+\begin{description}
+  \item[\texttt{departure\_hour}] the local clock hour of the first boarding,
+    obtained by taking the floor of the first-boarding timestamp;
+  \item[\texttt{travel\_time}] the sum of the in-vehicle travel times of the
+    journey's legs, measured in seconds;
+  \item[\texttt{airline\_distance}] the origin--destination air-line distance,
+    measured in metres.  The geometric points and distance formula must be
+    declared by the case study;
+  \item[\texttt{traveled\_stops}] the number of stops traversed by the
+    journey;
+  \item[\texttt{transfers}] the number of changes of vehicle.
+\end{description}
+
+For the current case study, the GPS sample covers 52 weekdays between
+3~October and 23~December~2022 under reported normal-traffic conditions.  It
+has no sampling or expansion weights, and it is not assumed to represent the
+absolute number of journeys in each departure hour.  Its intended information
+content is the shape of the trip-time and transfer distributions.  Multiple
+rows can come from the same individual.  Moreover, the APC observations are
+exhaustive, so GPS journeys recorded on 22~November~2022 also occur in the APC
+data for that day.  The two sources must therefore not be treated as fully
+independent replicate samples.
+
+The absence of GPS records in the 02:00--03:00 hours is a service fact rather
+than missing data: no vehicle operates in that interval.  The 03:00--04:00
+interval has only very sparse service and should not be assigned its own
+distribution without a documented pooling rule.  The row count is version
+dependent and is recorded by the data audit together with the file checksum,
+rather than being a fixed mathematical constant in this report.
+
+The current journey reconstruction removes trips whose initial, transfer, or
+final stops cannot be deduced; merges consecutive legs using the same line and
+direction when the intervening transfer time is below 120 seconds; and slices
+records that incorrectly merge a same-line opposite-direction return or a
+transfer longer than 20 minutes.  An overnight journey with an implausibly
+long duration and zero-distance records with zero traversed stops are treated
+as invalid.  Other long journeys and zero-distance journeys with non-zero
+stops require a documented case-owner decision because they may be distinct
+journeys merged by the reconstruction algorithm.  Every such decision belongs
+in the data-cleaning audit, not in the likelihood definition.
+
+In particular, the trip time in this schema is not door-to-door journey time:
+it excludes access walking, egress walking, initial waiting, and transfer
+waiting unless an explicitly extended data contract supplies those quantities.
+The routing representation used by the model must compute the same quantity.
+Adding waiting time to the GPS field without adding the corresponding quantity
+to the route attributes would create a systematic measurement mismatch.
+
+The file may also contain exact timestamps, origin and destination identifiers,
+line or trip identifiers, or visited-stop sequences.  These richer fields are
+useful for validation and can support a more detailed observation model, but
+the aggregate formulation below does not require them.  If those identifiers
+are unavailable, the GPS data constrain aggregate journey attributes only; they
+cannot identify individual OD cells.
+
+\subsection{Data contract and assumptions}
+
+The optional data term is valid only after a case-specific data audit.  The
+following assumptions must be stated and checked:
+
+\begin{enumerate}
+  \item The units, time zone, journey boundaries, stop definition, transfer
+    definition, and distance definition agree with the corresponding quantities
+    produced by the fixed-routing model.
+  \item The sample is interpreted as information about the distribution of
+    journey attributes within a declared departure-time stratum, not as an
+    estimate of the absolute passenger volume in that stratum.  Sampling weights
+    are used if they exist; otherwise the likelihood must not treat the raw row
+    count as a calibrated demand total.
+  \item Repeated journeys by the same person, and overlap with an exhaustive
+    APC data set, are recorded.  The GPS rows are therefore not automatically
+    conditionally independent of one another or of the count observations.
+    Clustering, an effective sample size, or an explicit likelihood tempering
+    factor is required when the term is used for estimation.
+  \item Departure-time strata are chosen with enough observations to support a
+    stable distribution.  A separate distribution for every clock hour is not
+    required.  Hours with no service contribute no GPS likelihood term, and a
+    sparse hour may be pooled with neighbouring hours under a documented rule.
+  \item Invalid or ambiguous journeys are removed only under a documented
+    data-owner rule.  The original file, the cleaning rule, the removed-row
+    identifiers, and the resulting checksum are retained.  An observed GPS bin
+    with no modelled route support is a path-attribute or data-contract failure,
+    not an observed zero that may be discarded silently.
+\end{enumerate}
+
+Because GPS coverage can vary by person, day, line, or time of day, the
+assumption that the sample is representative must be treated as a modelling
+choice and tested.  A distributional term should be omitted, or used only for
+diagnostics, when that assumption cannot be defended.
+
+\subsection{Attribute-response construction}
+
+Let $j$ index the free OD--time cells and let $x_j(\theta)$ be the demand
+generated by the selected demand model.  The existing count response is
+\begin{equation}
+  \boldsymbol{\mu}_{\mathrm{count}}(\theta)
+  =\rho\bigl(A\boldsymbol{x}(\theta)+\boldsymbol{c}\bigr),
+\end{equation}
+where $A$ is the fixed-routing measurement operator and $\boldsymbol{c}$ is
+the contribution of fixed positive demand.
+
+For the GPS data, let $s$ index a declared departure-time stratum and let
+$b$ index a bin of one attribute or of a declared joint attribute vector (for
+example, in-vehicle travel-time bins crossed with transfer counts).  Define
+$B_{sb,j}$ as the route-share-weighted probability that demand cell $j$
+produces an assigned journey in stratum $s$ and bin $b$.  The predicted GPS
+mass is
+\begin{equation}
+  \nu_{sb}(\theta)
+  =\sum_j B_{sb,j}x_j(\theta)+\nu^{\mathrm{fixed}}_{sb}.
+  \label{eq:gps-attribute-mass}
+\end{equation}
+The fixed-demand term is included for the same reason as the fixed count
+offset.  Conditional on stratum $s$, the predicted attribute distribution is
+\begin{equation}
+  p_{sb}(\theta)
+  =\frac{\nu_{sb}(\theta)}{\sum_{b'}\nu_{sb'}(\theta)}.
+  \label{eq:gps-attribute-probability}
+\end{equation}
+The operator $B$ is a second view of the same fixed routes; it does not create
+new route choices or alter $A$.
+
+In the public implementation, the route-level contributions are represented
+by a \texttt{GravityRouteShare} for each free OD--time cell and each assigned
+route.  The corresponding
+\texttt{GravityAttributeResponseOperator} stores the resulting category
+contributions either as a small dense reference matrix or as contiguous
+category shards.  Its fixed-demand offset is kept separately, and its
+forward/adjoint products have the same compact free-OD dimension as the count
+operator.  The attribute-response artifact has its own provenance fingerprint
+so that changing attribute bins invalidates $B$ without rebuilding $A$.
+Support is checked before the likelihood is evaluated: a positive observed
+count in a category with no free-route or fixed-demand support is a strict
+preflight failure, whereas a zero count in such a category is not silently
+interpreted as a route observation.
+
+\subsection{Optional GPS likelihood and MAP objective}
+
+Let $n_{sb}$ be the observed GPS histogram and
+$N_s=\sum_b n_{sb}$.  If the sample is treated as a representative sample
+within each stratum, the basic auxiliary likelihood is
+\begin{equation}
+  \boldsymbol{n}_s\mid\theta
+  \sim \operatorname{Multinomial}
+       \bigl(N_s,\boldsymbol{p}_s(\theta)\bigr).
+  \label{eq:gps-multinomial}
+\end{equation}
+
+The multinomial form is selected because the GPS file supplies a sample of
+completed journeys but no expansion weights or known capture rate.  Conditional
+on $N_s$, it uses the information that is actually identified---the relative
+frequency of journey attributes within a stratum---without interpreting the
+number of GPS records as an absolute passenger volume.  A Poisson likelihood on
+$n_{sb}$ would require a calibrated exposure or sampling rate; without one it
+would incorrectly add a second, arbitrary production measurement to the
+exhaustive APC counts.
+
+The ordinary multinomial nevertheless treats all rows as independent.  That is
+not credible here because several rows may come from one individual, the sample
+covers multiple days, journey reconstruction is uncertain, and some GPS
+journeys overlap the APC observations.  When a cluster or uncertainty estimate
+is available, a Dirichlet--multinomial model is preferred:
+\begin{equation}
+  \boldsymbol{n}_s\mid\theta
+  \sim \operatorname{DirichletMultinomial}
+       \bigl(N_s,\kappa_s\boldsymbol{p}_s(\theta)\bigr),
+  \label{eq:gps-dirichlet-multinomial}
+\end{equation}
+where the concentration $\kappa_s$ controls the extra-multinomial variation.
+Large concentration approaches the ordinary multinomial; smaller concentration
+represents the loss of information caused by clustering and reconstruction or
+day-to-day variation.  An equivalent practical route is to use a
+cluster-adjusted effective sample size, but the adjustment must be documented.
+
+If neither a cluster estimate nor an effective sample size is available, a
+tempered multinomial log-likelihood is a conservative composite-likelihood
+approximation:
+\begin{equation}
+  \ell_{\mathrm{GPS,weighted}}(\theta)
+  =\lambda_{\mathrm{GPS}}\ell_{\mathrm{GPS}}(\theta),
+  \qquad 0\leq\lambda_{\mathrm{GPS}}\leq 1.
+  \label{eq:gps-tempered-likelihood}
+\end{equation}
+The tempering factor prevents the unweighted GPS sample from overwhelming the
+primary APC evidence and acknowledges the cross-source dependence.  It is not
+mathematically equivalent to a Dirichlet--multinomial distribution and must be
+reported as a modelling choice.  A Dirichlet--multinomial concentration or an
+effective sample size and a tempering factor should not both be used to reduce
+the same evidence unless their separate roles are explicitly justified.
+
+The implementation in
+\path{public_transportation.inference.gravity.likelihoods} applies these
+models to the route-response masses after normalization separately within
+each declared stratum.  It treats a supplied effective sample size as the
+Dirichlet concentration in the current aggregate contract, and reports this
+choice as part of the uncertainty metadata.  The multinomial,
+Dirichlet--multinomial, and tempered forms are mutually exclusive
+declarations; the tempering factor is not silently applied on top of a
+Dirichlet--multinomial concentration.  All three functions are
+JAX-differentiable and the zero-tempering limit contributes exactly zero.  The
+count-only gravity objective remains unchanged when no auxiliary channel is
+enabled.
+
+With the existing count log-likelihood and prior penalty, the optional MAP
+objective is
+\begin{equation}
+  \mathcal{J}_{\mathrm{MAP}}(\theta)
+  =-\ell_{\mathrm{count}}(\theta)
+   -\lambda_{\mathrm{GPS}}\ell_{\mathrm{GPS}}(\theta)
+   +\mathcal{R}(\theta).
+  \label{eq:gps-augmented-map}
+\end{equation}
+Setting $\lambda_{\mathrm{GPS}}=0$ recovers the existing count-only model.
+The GPS term is therefore an optional source of information, not a replacement
+for the boarding/alighting likelihood.  In ML estimation $\mathcal{R}$ is
+omitted; in MAP estimation it contains the declared prior or regularization.
+
+The implementation connects these terms through
+\path{public_transportation.inference.gravity.aggregate_channel}.  One
+validated histogram becomes one optional observation channel.  The gravity
+objective retains the APC contribution and each auxiliary contribution
+separately, then sums them before adding the regularization term.  Both the
+batched-forward and adjoint gradients propagate the auxiliary derivative
+through the same free-OD demand vector.  With an empty channel bundle, the
+objective, gradients, model fingerprint, and checkpoints retain the existing
+count-only behavior.
+
+The aggregate GPS sample can constrain shared gravity parameters that change
+the mix of short and long journeys or the number of transfers.  Without
+origin--destination identifiers, however, it cannot supply independent
+information for every OD cell.  Its influence must be reported separately from
+the count likelihood and assessed through sensitivity to the departure-time
+strata, attribute bins, effective sample size, and
+$\lambda_{\mathrm{GPS}}$.
+
+If the auxiliary file is unavailable, fails the data contract, or is judged
+non-representative, equations~\eqref{eq:gps-attribute-mass}--\eqref{eq:gps-augmented-map}
+are simply omitted and the existing count-based estimation procedure is
+unchanged.

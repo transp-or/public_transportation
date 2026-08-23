@@ -114,8 +114,12 @@ def build_gravity_run_manifest(
         if mask is not None and mask.shape != calibration.shape:
             raise ValueError(f"{name}_measurement_mask must match observations.")
     if unsupported is not None and bool(jax.numpy.any(unsupported & calibration)):
-        raise ValueError("unsupported measurement rows must be excluded from calibration.")
-    artifact_fingerprint = getattr(operator, "artifact_fingerprint", None) or fingerprint(
+        raise ValueError(
+            "unsupported measurement rows must be excluded from calibration."
+        )
+    artifact_fingerprint = getattr(
+        operator, "artifact_fingerprint", None
+    ) or fingerprint(
         {
             "schema_version": 1,
             "assignment": operator.assignment_fingerprint,
@@ -128,7 +132,7 @@ def build_gravity_run_manifest(
         }
     )
     specification = problem.parameter_layout.specification
-    return {
+    manifest: dict[str, object] = {
         "schema_version": GRAVITY_RUN_MANIFEST_SCHEMA_VERSION,
         "created_at_utc": _utc_now(),
         "repository_revision": str(repository_revision),
@@ -162,9 +166,7 @@ def build_gravity_run_manifest(
                 "total": None if holdout is None else int(holdout.size),
             },
             "unsupported": {
-                "excluded": None
-                if unsupported is None
-                else int(unsupported.sum()),
+                "excluded": None if unsupported is None else int(unsupported.sum()),
                 "total": None if unsupported is None else int(unsupported.size),
             },
         },
@@ -226,15 +228,21 @@ def build_gravity_run_manifest(
         "preflight": _json_value(preflight),
         "extra": _json_value({} if extra is None else extra),
     }
+    if problem.auxiliary_observations.enabled:
+        manifest["auxiliary_observations"] = _json_value(
+            problem.auxiliary_observations.to_dict()
+        )
+    return manifest
 
 
 def write_gravity_run_manifest(path: Path, manifest: Mapping[str, object]) -> None:
     """Atomically publish a run manifest without exposing a partial file."""
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    rendered = json.dumps(
-        _json_value(manifest), indent=2, sort_keys=True, ensure_ascii=True
-    ) + "\n"
+    rendered = (
+        json.dumps(_json_value(manifest), indent=2, sort_keys=True, ensure_ascii=True)
+        + "\n"
+    )
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
     )

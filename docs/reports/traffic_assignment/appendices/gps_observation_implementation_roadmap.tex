@@ -1,0 +1,246 @@
+\section{Implementation Roadmap for Optional GPS Observations}
+\label{sec:gps-observation-implementation-roadmap}
+
+The mathematical contract for the optional GPS observation channel is given in
+Section~\ref{sec:gps-trip-attribute-observations}.  The following phases record
+the proposed implementation order.  A phase is marked implemented only after
+its code, tests, and documentation have been reviewed; the remaining phases
+are explicitly marked \emph{Not implemented}.  The absence of an auxiliary
+data file must remain a supported
+configuration throughout: an empty observation bundle must reproduce the
+current count-only objective, gradients, fingerprints, checkpoints, and
+reports.
+
+\subsection{Phase 0: Aggregate data contract}
+\label{sec:gps-implementation-phase-0}
+\textbf{Status: Not implemented.}
+
+Define the privacy-safe data product that can be prepared locally by the data
+provider.  The minimum product is a versioned histogram of in-vehicle travel
+time and transfer-count bins, optionally stratified into overall, morning-peak,
+off-peak, and evening-peak periods.  Its metadata must contain units, bin
+boundaries, stratum definitions, collection period, valid and excluded journey
+counts, cleaning reasons, APC-overlap policy, and a file checksum.  It must also
+provide either a Dirichlet concentration, an effective sample size, or an
+explicit statement that only a tempered multinomial is justified.  Exact GPS
+traces and personal identifiers are outside the package contract.
+
+The phase is complete only when a small aggregate fixture and its metadata have
+been approved.  The fixture must include at least one sparse stratum, one
+excluded-data record, and the no-service-hour convention.
+
+\subsection{Phase 1: Generic optional observation interface}
+\label{sec:gps-implementation-phase-1}
+\textbf{Status: Implemented (generic interface; 2026-08-20).}
+
+Introduce a generic gravity observation-channel abstraction.  A channel exposes
+its observed aggregate data, a prediction from gravity demand, a JAX-compatible
+likelihood contribution, a stable data fingerprint, and a serializable report
+breakdown.  The gravity objective accepts a tuple of channels, defaulting to an
+empty tuple.  The existing APC count likelihood remains the primary built-in
+channel and is not rewritten as a GPS-specific special case.
+
+The public implementation is provided by
+\path{public_transportation.inference.gravity.observations}.  It validates
+channel names, kinds, fingerprints, report mappings, and the free-OD dimension
+at objective construction.  An empty bundle is normalized as the default and
+does not alter the count-only objective or its model fingerprint; an enabled
+bundle contributes its channel identities to the model fingerprint.  No
+provider-specific data loader, trip-attribute response operator, or auxiliary
+likelihood is enabled by this phase.
+
+The required regression test is exact count-only equivalence: constructing the
+objective without channels must preserve the current scalar objective,
+gradient, model fingerprint, checkpoint identity, and result fields.
+
+\subsection{Phase 2: Aggregate loader and validation}
+\label{sec:gps-implementation-phase-2}
+\textbf{Status: Implemented (loader and validation; 2026-08-20).}
+
+Add a loader for the provider's aggregate histogram and metadata.  Validation
+must reject duplicate bins, negative or non-integral counts, inconsistent
+stratum totals, overlapping or incomplete bin definitions, invalid units,
+missing checksums, and unsupported likelihood settings.  An absent optional
+file must be interpreted as ``no auxiliary observations''; an explicitly
+enabled but missing or invalid file must fail before expensive operator
+construction.
+
+The validator must write a compact audit containing the source fingerprint,
+valid and excluded counts, stratum totals, bin definitions, overlap policy, and
+uncertainty metadata.  Tests must cover both the absent-data path and malformed
+aggregate inputs.
+
+The public implementation is
+\path{public_transportation.inference.gravity.aggregate}.  It accepts a
+versioned JSON document containing one or more numeric histograms.  Each
+histogram declares its attribute, unit, finite support, contiguous closed-open
+bin boundaries, and named strata.  Stratum counts may be supplied as an array
+in bin order or as an object keyed by bin label; in both cases the declared
+total must equal the sum of non-negative integer counts.  The document also
+requires collection and cleaning metadata, an APC-overlap policy, an
+uncertainty declaration (multinomial, Dirichlet--multinomial with a
+concentration/effective sample size, or tempered multinomial), and a semantic
+SHA-256 content checksum.  The loader records the actual file checksum and a
+path-independent aggregate fingerprint in its audit.
+
+When the optional channel is disabled, the loader returns no observation and
+records an ``absent`` audit without reading the file.  When it is enabled, a
+missing or invalid file raises before routing or operator construction and
+records a ``rejected`` audit.  A valid file records a ``validated`` audit with
+the source path, both checksums, histogram and stratum summaries, metadata, and
+uncertainty settings.  This phase does not yet build the route-response
+operator or add the aggregate likelihood; those are deferred to Phases 3--5.
+
+\subsection{Phase 3: Trip-attribute response operator}
+\label{sec:gps-implementation-phase-3}
+\textbf{Status: Implemented (reference and sharded response operator; 2026-08-20).}
+
+Extend routing preparation only when the auxiliary channel is enabled.  For
+each free OD--time cell, persist route-share-weighted contributions to the
+declared attribute bins and departure strata.  The result is the operator
+$B$ in equation~\eqref{eq:gps-attribute-mass}, together with its fixed-demand
+offset.  It must use the same route choices, compact OD layout, timetable
+identity, and feasibility contract as the APC operator $A$.
+
+The implementation must not infer a distribution by binning only the mean
+journey-time feature when several assigned paths exist.  It must preserve the
+path-share distribution, using a compact or sharded matrix-free representation
+for large layouts.  Attribute-response artifacts receive a separate
+fingerprint; changing GPS bins must not rebuild $A$.
+
+Tests must compare forward and adjoint products on a small multi-route fixture,
+include fixed positive demand, and verify that unsupported observed bins stop
+preflight with a clear audit.
+
+The public reference implementation is
+\path{public_transportation.inference.gravity.attribute_operator}.  A
+\texttt{GravityRouteShare} records the stratum, attribute-bin label, and
+probability assigned to one route for one free OD--time cell.  The constructor
+adds all route shares belonging to a category, so a cell with several routes
+retains its categorical distribution rather than being represented by a mean
+journey attribute.  The resulting
+\texttt{GravityAttributeResponseOperator} exposes JAX-compatible forward and
+adjoint products and a fixed-demand attribute offset.  It can store one dense
+matrix for small fixtures or contiguous category shards for large artifacts;
+the sharded products do not concatenate the complete response matrix merely
+to apply it.  Every artifact records the compact OD, assignment, graph,
+timetable, and feasibility fingerprints and has an identity separate from
+the APC operator.  The optional \texttt{save}/\texttt{load} artifact path
+verifies this identity on reload.
+
+The function \texttt{validate\_aggregate\_support} is the strict Phase-3
+support audit.  It compares positive aggregate counts with categories that
+have nonzero route support, returns a machine-readable report, and raises
+\texttt{GravityAttributeSupportError} for a positive unsupported bin.  Zero
+counts in a category with no route support are not treated as observations.
+This is a preflight contract: no auxiliary likelihood or expensive estimator
+work is started after the audit fails.  Integration with the case-study
+routing-preparation adapter and the aggregate likelihood remains in Phases 4
+and 5.
+
+\subsection{Phase 4: Distribution likelihoods and uncertainty}
+\label{sec:gps-implementation-phase-4}
+\textbf{Status: Implemented (aggregate likelihood functions; 2026-08-20).}
+
+Implement the aggregate likelihoods as independent channel components:
+
+\begin{enumerate}
+  \item ordinary multinomial for a representative independent sample;
+  \item Dirichlet--multinomial when clustering, reconstruction uncertainty, or
+    day-to-day variation can be summarized by a concentration parameter or
+    effective sample size;
+  \item a clearly named tempered multinomial composite likelihood when no
+    uncertainty estimate is available.
+\end{enumerate}
+
+The Dirichlet--multinomial and tempering parameters must not be silently
+combined to downweight the same evidence twice.  Tests must cover the
+multinomial limit at large concentration, overdispersion at smaller
+concentration, the zero-weight limit, finite-difference gradients, and
+normalization within each stratum.
+
+The public implementation is
+\path{public_transportation.inference.gravity.likelihoods}.  It normalizes
+predicted masses independently within every declared stratum and evaluates
+all histograms as separate contributions.  The Phase-2
+\texttt{effective\_sample\_size} is interpreted as the Dirichlet concentration
+for this first implementation; this is a declared approximation, not an
+assumption that the raw GPS row count is an exposure.  A zero-mass stratum
+with zero observed count contributes zero, while a positive observed count in
+an unsupported stratum must have been stopped by the Phase-3 support audit.
+The tempered form multiplies only the ordinary multinomial log likelihood.
+It is rejected when a concentration or effective sample size is supplied, so
+the same uncertainty is not downweighted twice.  The functions return JAX
+arrays and support automatic differentiation; they do not yet modify the
+count-only gravity objective (Phase 5).
+
+\subsection{Phase 5: Objective, estimator, and provenance integration}
+\label{sec:gps-implementation-phase-5}
+\textbf{Status: Implemented (objective, gradients, estimator provenance; 2026-08-20).}
+
+Add the channel contributions to the existing gravity objective and both
+gradient strategies without changing the count-only path.  The objective
+breakdown must report, separately, the APC log-likelihood, each auxiliary
+log-likelihood, the tempering or concentration settings, the prior penalty,
+and the total MAP objective.  The result and checkpoint metadata must include
+auxiliary data fingerprints and channel specifications only when a channel is
+enabled.
+
+Changing or adding an auxiliary data source must invalidate the corresponding
+fit checkpoint.  With no source enabled, old checkpoints and model identities
+must remain compatible.  Tests must verify objective composition, adjoint and
+batched-forward agreement, resume rejection after a source change, and exact
+backward compatibility when the channel tuple is empty.
+
+The concrete bridge is
+\path{public_transportation.inference.gravity.aggregate_channel}.
+It creates one Phase-1 observation channel per validated histogram, adds the
+fixed-demand attribute offset to its prediction, and invokes the Phase-4
+likelihood.  \texttt{GravityObjectiveEvaluation} now retains the APC
+log-likelihood, total auxiliary log-likelihood, and per-channel contributions;
+the total data likelihood and MAP objective are their explicit sums.  Both
+the batched-forward and adjoint gradient strategies include the auxiliary
+chain rule through the demand vector, while the empty bundle follows the
+previous count-only path.
+
+Estimator results, run manifests, and enabled-channel checkpoints retain the
+aggregate/channel reports and fingerprints.  Disabled channels are omitted
+from these records.  The model fingerprint includes the channel identity, so
+changing aggregate content, uncertainty settings, route-response artifacts,
+or bins rejects a resume with a fingerprint mismatch.  Existing count-only
+checkpoints remain compatible because their identity and serialized shape are
+unchanged.
+
+\subsection{Phase 6: Case configuration, adapter, and reporting}
+\label{sec:gps-implementation-phase-6}
+\textbf{Status: Not implemented.}
+
+Add an optional TOML contract, preferably in
+\path{config/auxiliary_observations.toml}, that declares sources, paths,
+strata, bins, likelihood family, concentration or effective sample size, and
+tempering.  The generic adapter must expose a documented hook for constructing
+channels while retaining the existing case-owned responsibility for data
+preparation.
+
+The check and preflight stages must report whether auxiliary data are absent,
+validated, or rejected.  Fit reports must retain the aggregate input checksum,
+cleaning audit, APC-overlap decision, effective sample size or concentration,
+and every channel's likelihood contribution.  The template must remain usable
+without the optional configuration file.
+
+\subsection{Phase 7: Case-study pilot and sensitivity analysis}
+\label{sec:gps-implementation-phase-7}
+\textbf{Status: Not implemented.}
+
+Run the first pilot on a small or reduced case before the full network.  Compare
+the count-only fit with the GPS-augmented fit using one overall distribution
+and the approved broad strata.  Vary the Dirichlet concentration or effective
+sample size, the tempering factor when used, bin boundaries, and the treatment
+of the 22~November overlap.  Report APC fit, GPS distribution fit, parameter
+changes, runtime, and sensitivity.
+
+The GPS term may be promoted to the full case only if it improves or stabilizes
+the declared diagnostics without creating unsupported-bin failures or allowing
+the auxiliary sample to dominate the exhaustive APC evidence.  If the data
+provider cannot supply a defensible aggregate product, this phase remains
+disabled and the existing count-only MAP workflow is the valid result.

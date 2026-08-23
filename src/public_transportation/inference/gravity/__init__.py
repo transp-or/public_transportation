@@ -103,6 +103,36 @@ from .objective import (
     predict_gravity_measurements,
 )
 from .operator import GravityMeasurementOperator
+from .aggregate import (
+    GRAVITY_AGGREGATE_SCHEMA_VERSION,
+    SUPPORTED_AGGREGATE_LIKELIHOODS,
+    SUPPORTED_AGGREGATE_UNITS,
+    GravityAggregateBin,
+    GravityAggregateHistogram,
+    GravityAggregateObservation,
+    GravityAggregateStratum,
+    GravityAggregateUncertainty,
+    load_gravity_aggregate,
+)
+from .attribute_operator import (
+    GravityAttributeResponseOperator,
+    GravityAttributeResponseProvenance,
+    GravityAttributeSupportError,
+    GravityRouteShare,
+    validate_aggregate_support,
+)
+from .likelihoods import (
+    GravityAggregateLikelihoodEvaluation,
+    aggregate_histogram_log_likelihood,
+    evaluate_gravity_aggregate_likelihood,
+    gravity_aggregate_log_likelihood,
+    normalize_aggregate_masses,
+)
+from .aggregate_channel import (
+    GravityAggregateObservationChannel,
+    build_gravity_aggregate_observation_bundle,
+)
+from .observations import GravityObservationBundle, GravityObservationChannel
 from .operations import (
     GRAVITY_PROGRESS_SCHEMA_VERSION,
     GRAVITY_RUN_MANIFEST_SCHEMA_VERSION,

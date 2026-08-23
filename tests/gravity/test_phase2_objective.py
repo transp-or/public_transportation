@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Mapping
 
 import jax
 import jax.numpy as jnp
@@ -9,6 +10,9 @@ import pytest
 from jax.experimental import sparse as jsparse
 from scipy.special import gammaln, xlogy
 
+from public_transportation.inference.compact_od_assignment_layout import (
+    CompactODAssignmentLayout,
+)
 from public_transportation.inference.fixed_routing_measurement_operator import (
     FixedRoutingMeasurementOperator,
     MeasurementOperatorMetrics,
@@ -22,8 +26,10 @@ from public_transportation.inference.gravity import (
     GravityParameterLayout,
     evaluate_gravity_objective,
     gravity_value_and_gradient,
+    GravityObservationBundle,
     predict_gravity_measurements,
 )
+from public_transportation.inference.gravity.estimator import gravity_model_fingerprint
 
 
 def features(dtype=np.float64) -> GravityFeatures:
@@ -279,3 +285,102 @@ def test_value_and_gradient_routes_once_with_protocol_only_operator(
             recording.transpose_calls,
             recording.matmat_calls,
         ) == expected
+
+
+class _FakeObservationChannel:
+    name = "gps_trip_attributes"
+    kind = "trip_attribute_distribution"
+    observed = {"counts": (6, 4)}
+    fingerprint = "gps-fixture-v1"
+
+    def validate(self, *, num_free_od: int, dtype: np.dtype) -> None:
+        assert num_free_od == 4
+        assert dtype == np.dtype("float64")
+
+    def predict(self, demand: jax.Array) -> jax.Array:
+        return jnp.sum(demand).reshape(1)
+
+    def log_likelihood(
+        self, *, prediction: jax.Array, raw_parameters: jax.Array
+    ) -> jax.Array:
+        del raw_parameters
+        return -jnp.sum(prediction**2)
+
+    def report(self) -> Mapping[str, object]:
+        return {"observed_bins": 2, "sample_size": 10}
+
+
+def _compact_layout() -> CompactODAssignmentLayout:
+    return CompactODAssignmentLayout(
+        num_od_total=4,
+        active_full_indices=(0, 1, 2, 3),
+        removed_zero_full_indices=(),
+        full_to_compact=(0, 1, 2, 3),
+        free_full_indices=(0, 1, 2, 3),
+        free_compact_indices=(0, 1, 2, 3),
+        free_baseline_values=(1.0, 1.0, 1.0, 1.0),
+        fixed_compact_indices=(),
+        fixed_compact_values=(),
+    )
+
+
+def test_empty_observation_bundle_is_a_count_only_noop():
+    with jax.enable_x64():
+        implicit = problem(likelihood=GravityLikelihood.POISSON)
+        explicit = replace(
+            implicit, auxiliary_observations=GravityObservationBundle.empty()
+        )
+        raw = np.asarray((0.2, -0.1, 1.0))
+        implicit_evaluation, implicit_gradient = gravity_value_and_gradient(
+            raw, problem=implicit, strategy=GravityGradientStrategy.ADJOINT
+        )
+        explicit_evaluation, explicit_gradient = gravity_value_and_gradient(
+            raw, problem=explicit, strategy=GravityGradientStrategy.ADJOINT
+        )
+        assert not implicit.auxiliary_observations.enabled
+        assert not explicit.auxiliary_observations.enabled
+        np.testing.assert_allclose(
+            implicit_evaluation.objective, explicit_evaluation.objective
+        )
+        np.testing.assert_allclose(implicit_gradient, explicit_gradient)
+
+
+def test_empty_bundle_does_not_change_gravity_model_fingerprint():
+    implicit = problem()
+    explicit = replace(
+        implicit, auxiliary_observations=GravityObservationBundle.empty()
+    )
+    assert gravity_model_fingerprint(implicit, _compact_layout()) == (
+        gravity_model_fingerprint(explicit, _compact_layout())
+    )
+
+
+def test_enabled_bundle_has_stable_identity_and_serializable_report():
+    channel = _FakeObservationChannel()
+    bundle = GravityObservationBundle(channels=(channel,))
+    assert bundle.enabled
+    assert bundle.fingerprint
+    assert bundle.to_dict()["channels"] == [
+        {
+            "name": "gps_trip_attributes",
+            "kind": "trip_attribute_distribution",
+            "fingerprint": "gps-fixture-v1",
+            "report": {"observed_bins": 2, "sample_size": 10},
+        }
+    ]
+    item = replace(problem(), auxiliary_observations=bundle)
+    assert gravity_model_fingerprint(item, _compact_layout()) != (
+        gravity_model_fingerprint(problem(), _compact_layout())
+    )
+
+
+def test_bundle_rejects_duplicate_or_invalid_channel_metadata():
+    channel = _FakeObservationChannel()
+    with pytest.raises(ValueError, match="names must be unique"):
+        GravityObservationBundle(channels=(channel, channel))
+
+    class _InvalidChannel(_FakeObservationChannel):
+        name = ""
+
+    with pytest.raises(ValueError, match="name must be a non-empty string"):
+        GravityObservationBundle(channels=(_InvalidChannel(),))

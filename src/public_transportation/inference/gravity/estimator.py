@@ -162,6 +162,10 @@ class GravityEstimationResult:
     excluded_measurements: int = 0
     time_discretization: dict[str, object] | None = None
     destination_attractiveness_provenance: str | None = None
+    count_log_likelihood: float = 0.0
+    auxiliary_log_likelihood: float = 0.0
+    auxiliary_channel_log_likelihoods: tuple[float, ...] = ()
+    auxiliary_observations: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != GRAVITY_RESULT_SCHEMA_VERSION:
@@ -178,33 +182,40 @@ class GravityEstimationResult:
             value = np.array(getattr(self, name), copy=True)
             value.setflags(write=False)
             object.__setattr__(self, name, value)
-        if self.parameter_names and len(self.parameter_names) != self.raw_parameters.size:
-            raise ValueError("gravity result parameter names do not match the estimates.")
+        if (
+            self.parameter_names
+            and len(self.parameter_names) != self.raw_parameters.size
+        ):
+            raise ValueError(
+                "gravity result parameter names do not match the estimates."
+            )
 
 
 def gravity_model_fingerprint(
     problem: GravityObjectiveProblem, compact_layout: CompactODAssignmentLayout
 ) -> str:
     operator = problem.operator
-    return fingerprint(
-        {
-            "schema_version": 1,
-            "features": problem.features.fingerprint,
-            "specification": problem.parameter_layout.specification.to_dict(),
-            "parameter_layout": problem.parameter_layout.fingerprint,
-            "compact_layout": compact_layout.fingerprint,
-            "assignment": operator.assignment_fingerprint,
-            "graph": operator.graph_fingerprint,
-            "mapping": operator.mapping_fingerprint,
-            "routing_theta": operator.theta,
-            "operator_dtype": str(operator.dtype),
-            "likelihood": problem.likelihood.value,
-            "rho": problem.rho,
-            "mean_floor": problem.mean_floor,
-            "observations": problem.observations,
-            "calibration_mask": problem.calibration_mask,
-        }
-    )
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "features": problem.features.fingerprint,
+        "specification": problem.parameter_layout.specification.to_dict(),
+        "parameter_layout": problem.parameter_layout.fingerprint,
+        "compact_layout": compact_layout.fingerprint,
+        "assignment": operator.assignment_fingerprint,
+        "graph": operator.graph_fingerprint,
+        "mapping": operator.mapping_fingerprint,
+        "routing_theta": operator.theta,
+        "operator_dtype": str(operator.dtype),
+        "likelihood": problem.likelihood.value,
+        "rho": problem.rho,
+        "mean_floor": problem.mean_floor,
+        "observations": problem.observations,
+        "calibration_mask": problem.calibration_mask,
+    }
+    observations = problem.auxiliary_observations
+    if observations is not None and observations.enabled:
+        payload["auxiliary_observations"] = observations.identity_payload()
+    return fingerprint(payload)
 
 
 def _atomic_checkpoint(path: Path, payload: dict[str, object]) -> None:
@@ -232,17 +243,18 @@ def _write_checkpoint(
     raw_parameters: np.ndarray,
     iterations: int,
     elapsed_seconds: float,
+    auxiliary_observations: dict[str, object] | None = None,
 ) -> None:
-    _atomic_checkpoint(
-        path,
-        {
-            "schema_version": GRAVITY_CHECKPOINT_SCHEMA_VERSION,
-            "model_fingerprint": model_fingerprint,
-            "raw_parameters": raw_parameters.tolist(),
-            "iterations": iterations,
-            "elapsed_seconds": elapsed_seconds,
-        },
-    )
+    payload: dict[str, object] = {
+        "schema_version": GRAVITY_CHECKPOINT_SCHEMA_VERSION,
+        "model_fingerprint": model_fingerprint,
+        "raw_parameters": raw_parameters.tolist(),
+        "iterations": iterations,
+        "elapsed_seconds": elapsed_seconds,
+    }
+    if auxiliary_observations is not None:
+        payload["auxiliary_observations"] = auxiliary_observations
+    _atomic_checkpoint(path, payload)
 
 
 def _load_checkpoint(
@@ -284,7 +296,7 @@ def _compile_strategy(
     lowering = clock() - started
     try:
         lowered_bytes = len(lowered.as_text().encode("utf-8"))
-    except (AttributeError, TypeError, ValueError):
+    except AttributeError, TypeError, ValueError:
         lowered_bytes = None
     started = clock()
     compiled = lowered.compile()
@@ -410,6 +422,11 @@ def estimate_gravity_model(
     if execution.jax_compilation_cache_directory is not None:
         configure_jax_compilation_cache(execution.jax_compilation_cache_directory)
     model_fingerprint = gravity_model_fingerprint(problem, compact_layout)
+    auxiliary_metadata = (
+        None
+        if not problem.auxiliary_observations.enabled
+        else problem.auxiliary_observations.to_dict()
+    )
     started = clock()
     checkpoint = execution.checkpoint_path
     resumed_elapsed = 0.0
@@ -440,6 +457,7 @@ def estimate_gravity_model(
                 raw_parameters=raw_numpy,
                 iterations=0,
                 elapsed_seconds=0.0,
+                auxiliary_observations=auxiliary_metadata,
             )
     deadline = (
         None
@@ -511,6 +529,7 @@ def estimate_gravity_model(
                 raw_parameters=np.asarray(value),
                 iterations=completed_iterations,
                 elapsed_seconds=elapsed,
+                auxiliary_observations=auxiliary_metadata,
             )
         if (
             progress is not None
@@ -552,7 +571,9 @@ def estimate_gravity_model(
                     weighted_fraction=(
                         completed_iterations / config.maximum_iterations
                     ),
-                    checkpoint_location=(None if checkpoint is None else str(checkpoint)),
+                    checkpoint_location=(
+                        None if checkpoint is None else str(checkpoint)
+                    ),
                     checkpoint_reusable=checkpoint is not None,
                     reused_units=(completed_iterations if resumed else 0),
                     rebuilt_units=(0 if resumed else completed_iterations),
@@ -562,21 +583,17 @@ def estimate_gravity_model(
                         else None
                     ),
                     deadline_remaining_seconds=(
-                        None
-                        if deadline is None
-                        else max(0.0, deadline - now)
+                        None if deadline is None else max(0.0, deadline - now)
                     ),
                     deadline_margin_seconds=(
                         None
                         if deadline is None or eta.predicted_remaining_seconds is None
-                        else max(0.0, deadline - now)
-                        - eta.predicted_remaining_seconds
+                        else max(0.0, deadline - now) - eta.predicted_remaining_seconds
                     ),
                     will_finish_before_deadline=(
                         None
                         if deadline is None or eta.predicted_remaining_seconds is None
-                        else eta.predicted_remaining_seconds
-                        <= max(0.0, deadline - now)
+                        else eta.predicted_remaining_seconds <= max(0.0, deadline - now)
                     ),
                     job_elapsed_seconds=elapsed,
                     eta_lower_seconds=eta.eta_lower_seconds,
@@ -705,12 +722,17 @@ def estimate_gravity_model(
         {
             "units": problem.parameter_layout.specification.time.units,
             "interpretation": problem.parameter_layout.specification.time.interpretation,
-            "bin_labels": list(
-                problem.parameter_layout.specification.time.bin_labels
-            ),
+            "bin_labels": list(problem.parameter_layout.specification.time.bin_labels),
             "smooth_basis_name": problem.parameter_layout.specification.time.smooth_basis_name,
         },
         problem.parameter_layout.specification.component(
             "destination_attractiveness"
         ).source,
+        count_log_likelihood=float(latest_evaluation.count_log_likelihood),
+        auxiliary_log_likelihood=float(latest_evaluation.auxiliary_log_likelihood),
+        auxiliary_channel_log_likelihoods=tuple(
+            float(value)
+            for value in latest_evaluation.auxiliary_channel_log_likelihoods
+        ),
+        auxiliary_observations=auxiliary_metadata,
     )

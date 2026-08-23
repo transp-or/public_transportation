@@ -18,6 +18,7 @@ from public_transportation.measurement.likelihood_jax import (
 from .demand import generate_gravity_demand
 from .features import GravityFeatures
 from .operator import GravityMeasurementOperator
+from .observations import GravityObservationBundle
 from .parameters import GravityParameterLayout, validate_gravity_relaxation_features
 from .specification import GravityEffectScope
 
@@ -42,13 +43,31 @@ class GravityObjectiveProblem:
     rho: float = 1.0
     calibration_mask: np.ndarray | None = None
     mean_floor: float = 1.0e-9
+    auxiliary_observations: GravityObservationBundle | None = None
 
     def __post_init__(self) -> None:
+        observations_bundle = (
+            GravityObservationBundle.empty()
+            if self.auxiliary_observations is None
+            else self.auxiliary_observations
+        )
+        if not isinstance(observations_bundle, GravityObservationBundle):
+            raise TypeError(
+                "auxiliary_observations must be a GravityObservationBundle or None."
+            )
+        observations_bundle.validate(
+            num_free_od=int(self.operator.num_free_od),
+            dtype=np.dtype(getattr(self.operator, "dtype", np.float64)),
+        )
+        object.__setattr__(self, "auxiliary_observations", observations_bundle)
         validate_gravity_relaxation_features(
             self.features, self.parameter_layout.specification
         )
         specification = self.parameter_layout.specification
-        if specification.components and specification.likelihood.family != self.likelihood.value:
+        if (
+            specification.components
+            and specification.likelihood.family != self.likelihood.value
+        ):
             raise ValueError(
                 "objective likelihood does not match the declarative model specification."
             )
@@ -65,10 +84,14 @@ class GravityObjectiveProblem:
                         "calibration-mask policy 'all_measurements' cannot exclude rows."
                     )
         waiting = specification.component("waiting_time")
-        if waiting.scope not in (
-            GravityEffectScope.NONE,
-            GravityEffectScope.FIXED,
-        ) and self.features.initial_waiting_time is None:
+        if (
+            waiting.scope
+            not in (
+                GravityEffectScope.NONE,
+                GravityEffectScope.FIXED,
+            )
+            and self.features.initial_waiting_time is None
+        ):
             raise ValueError(
                 "initial_waiting_time is required by the active waiting-time component."
             )
@@ -130,6 +153,9 @@ class GravityObjectiveEvaluation(NamedTuple):
     demand: jax.Array
     calibration_measurements: jax.Array
     excluded_measurements: jax.Array
+    count_log_likelihood: jax.Array = 0.0
+    auxiliary_log_likelihood: jax.Array = 0.0
+    auxiliary_channel_log_likelihoods: tuple[jax.Array, ...] = ()
 
 
 def predict_gravity_measurements(
@@ -162,14 +188,11 @@ def _evaluation_from_mean(
     demand: jax.Array,
     problem: GravityObjectiveProblem,
 ) -> GravityObjectiveEvaluation:
-    observations = jnp.asarray(problem.observations, dtype=mean.dtype)
-    mask = jnp.asarray(problem.calibration_mask)
-    if problem.likelihood is GravityLikelihood.POISSON:
-        contributions = poisson_logpmf(observations, mean)
-    else:
-        dispersion = problem.parameter_layout.transform(raw).dispersion
-        contributions = negbinom_logpmf_mu_r(observations, mean, dispersion)
-    data_log_likelihood = jnp.sum(jnp.where(mask, contributions, 0))
+    count_log_likelihood = _count_log_likelihood(mean, raw, problem)
+    auxiliary_log_likelihood, auxiliary_channel_log_likelihoods = (
+        _auxiliary_log_likelihood(raw, demand, problem)
+    )
+    data_log_likelihood = count_log_likelihood + auxiliary_log_likelihood
     regularization = problem.parameter_layout.regularization(raw)
     return GravityObjectiveEvaluation(
         objective=-data_log_likelihood + regularization,
@@ -179,7 +202,41 @@ def _evaluation_from_mean(
         demand=demand,
         calibration_measurements=jnp.asarray(problem.calibration_measurements),
         excluded_measurements=jnp.asarray(problem.excluded_measurements),
+        count_log_likelihood=count_log_likelihood,
+        auxiliary_log_likelihood=auxiliary_log_likelihood,
+        auxiliary_channel_log_likelihoods=auxiliary_channel_log_likelihoods,
     )
+
+
+def _count_log_likelihood(
+    mean: jax.Array, raw: jax.Array, problem: GravityObjectiveProblem
+) -> jax.Array:
+    observations = jnp.asarray(problem.observations, dtype=mean.dtype)
+    mask = jnp.asarray(problem.calibration_mask)
+    if problem.likelihood is GravityLikelihood.POISSON:
+        contributions = poisson_logpmf(observations, mean)
+    else:
+        dispersion = problem.parameter_layout.transform(raw).dispersion
+        contributions = negbinom_logpmf_mu_r(observations, mean, dispersion)
+    return jnp.sum(jnp.where(mask, contributions, 0))
+
+
+def _auxiliary_log_likelihood(
+    raw: jax.Array,
+    demand: jax.Array,
+    problem: GravityObjectiveProblem,
+) -> tuple[jax.Array, tuple[jax.Array, ...]]:
+    channels = problem.auxiliary_observations.channels
+    if not channels:
+        return jnp.asarray(0.0, dtype=demand.dtype), ()
+    contributions = tuple(
+        channel.log_likelihood(
+            prediction=channel.predict(demand),
+            raw_parameters=raw,
+        )
+        for channel in channels
+    )
+    return jnp.sum(jnp.stack(contributions)), contributions
 
 
 def _objective_scalar(raw: jax.Array, problem: GravityObjectiveProblem) -> jax.Array:
@@ -207,17 +264,33 @@ def gravity_value_and_gradient_batched_forward(
     mean = jnp.maximum(mean_unfloored, problem.mean_floor)
     active_mean = (mean_unfloored > problem.mean_floor).astype(mean.dtype)
     mean_jacobian = (
-        active_mean[:, None]
-        * rho
-        * problem.operator.jax_matmat(demand_jacobian)
+        active_mean[:, None] * rho * problem.operator.jax_matmat(demand_jacobian)
     )
-    mean_gradient = jax.grad(lambda value: _objective_from_mean(value, raw, problem))(
-        mean
-    )
-    direct_gradient = jax.grad(
-        lambda parameters: _objective_from_mean(mean, parameters, problem)
-    )(raw)
-    gradient = mean_jacobian.T @ mean_gradient + direct_gradient
+    if problem.auxiliary_observations.enabled:
+        mean_gradient = jax.grad(
+            lambda value: _objective_from_mean_and_demand(value, raw, demand, problem)
+        )(mean)
+        demand_gradient = jax.grad(
+            lambda value: _objective_from_mean_and_demand(mean, raw, value, problem)
+        )(demand)
+        direct_gradient = jax.grad(
+            lambda parameters: _objective_from_mean_and_demand(
+                mean, parameters, demand, problem
+            )
+        )(raw)
+        gradient = (
+            mean_jacobian.T @ mean_gradient
+            + demand_jacobian.T @ demand_gradient
+            + direct_gradient
+        )
+    else:
+        mean_gradient = jax.grad(
+            lambda value: _objective_from_mean(value, raw, problem)
+        )(mean)
+        direct_gradient = jax.grad(
+            lambda parameters: _objective_from_mean(mean, parameters, problem)
+        )(raw)
+        gradient = mean_jacobian.T @ mean_gradient + direct_gradient
     return _evaluation_from_mean(
         raw, mean=mean, demand=demand, problem=problem
     ), gradient
@@ -226,14 +299,23 @@ def gravity_value_and_gradient_batched_forward(
 def _objective_from_mean(
     mean: jax.Array, raw: jax.Array, problem: GravityObjectiveProblem
 ) -> jax.Array:
-    observations = jnp.asarray(problem.observations, dtype=mean.dtype)
-    mask = jnp.asarray(problem.calibration_mask)
-    if problem.likelihood is GravityLikelihood.POISSON:
-        contributions = poisson_logpmf(observations, mean)
-    else:
-        dispersion = problem.parameter_layout.transform(raw).dispersion
-        contributions = negbinom_logpmf_mu_r(observations, mean, dispersion)
-    return -jnp.sum(jnp.where(mask, contributions, 0)) + problem.parameter_layout.regularization(raw)
+    return -_count_log_likelihood(
+        mean, raw, problem
+    ) + problem.parameter_layout.regularization(raw)
+
+
+def _objective_from_mean_and_demand(
+    mean: jax.Array,
+    raw: jax.Array,
+    demand: jax.Array,
+    problem: GravityObjectiveProblem,
+) -> jax.Array:
+    auxiliary, _ = _auxiliary_log_likelihood(raw, demand, problem)
+    return (
+        -_count_log_likelihood(mean, raw, problem)
+        - auxiliary
+        + problem.parameter_layout.regularization(raw)
+    )
 
 
 def gravity_value_and_gradient_adjoint(
@@ -254,17 +336,32 @@ def gravity_value_and_gradient_adjoint(
     rho = jnp.asarray(problem.rho, dtype=demand.dtype)
     mean_unfloored = rho * (problem.operator.jax_matvec(demand) + offset)
     mean = jnp.maximum(mean_unfloored, problem.mean_floor)
-    mean_gradient = jax.grad(lambda value: _objective_from_mean(value, raw, problem))(
-        mean
-    )
+    if problem.auxiliary_observations.enabled:
+        mean_gradient = jax.grad(
+            lambda value: _objective_from_mean_and_demand(value, raw, demand, problem)
+        )(mean)
+        demand_gradient = jax.grad(
+            lambda value: _objective_from_mean_and_demand(mean, raw, value, problem)
+        )(demand)
+        direct_gradient = jax.grad(
+            lambda parameters: _objective_from_mean_and_demand(
+                mean, parameters, demand, problem
+            )
+        )(raw)
+    else:
+        mean_gradient = jax.grad(
+            lambda value: _objective_from_mean(value, raw, problem)
+        )(mean)
+        demand_gradient = jnp.zeros_like(demand)
+        direct_gradient = jax.grad(
+            lambda parameters: _objective_from_mean(mean, parameters, problem)
+        )(raw)
     active_mean = (mean_unfloored > problem.mean_floor).astype(mean.dtype)
-    demand_cotangent = rho * problem.operator.jax_rmatvec(
-        active_mean * mean_gradient
+    demand_cotangent = (
+        rho * problem.operator.jax_rmatvec(active_mean * mean_gradient)
+        + demand_gradient
     )
     demand_gradient = demand_pullback(demand_cotangent)[0]
-    direct_gradient = jax.grad(
-        lambda parameters: _objective_from_mean(mean, parameters, problem)
-    )(raw)
     return _evaluation_from_mean(
         raw, mean=mean, demand=demand, problem=problem
     ), demand_gradient + direct_gradient
