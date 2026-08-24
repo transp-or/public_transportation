@@ -627,6 +627,51 @@ unchanged roots. Continue only when `completed_phase` is
 `recommendation` and the reported timings, memory, and gradient checks are
 finite and acceptable.
 
+If `preflight` reaches the scheduler time limit, preserve the completed
+preparation artifact and rerun only `preflight` against the unchanged results
+root. Preflight does not create a preparation checkpoint and does not rebuild
+the operator. Request a longer wall time and verify the final manifest again:
+
+```bash
+sbatch --parsable \
+  --time=12:00:00 \
+  --cpus-per-task=8 \
+  --mem=32G \
+  --job-name=preflight-long \
+  --output="$RESULTS_ROOT/logs/preflight-%j.out" \
+  --error="$RESULTS_ROOT/logs/preflight-%j.err" \
+  scripts/30_preflight.sbatch
+```
+
+Inspect the durable result from the case-study root:
+
+```bash
+jq . "$RESULTS_ROOT/manifests/preflight.json"
+```
+
+It must report `completed_phase = "recommendation"`. Do not rerun
+`prepare` merely because `preflight` timed out.
+
+##### Poisson and dispersion consistency
+
+Poisson likelihood has no dispersion parameter and must not estimate one.
+Negative-binomial likelihood requires a global or fixed dispersion setting. If
+the case uses Poisson, the adapter's model specification must explicitly set:
+
+```python
+dispersion_scope=GravityEffectScope.NONE
+```
+
+The error
+
+```text
+Poisson likelihood cannot estimate an unused dispersion parameter.
+```
+
+is a model-specification error, not an out-of-memory failure and not a
+checkpoint-compatibility failure. Fix the case-owned adapter/model
+specification, then rerun `preflight`; do not rerun `prepare`.
+
 #### Warm benchmark (Stage 5)
 
 ```bash
@@ -849,7 +894,10 @@ maximum_construction_dispatches = 3_000_000
 and therefore influence dispatch count. Larger values may reduce dispatch
 overhead, but they can increase memory required by each worker. These values
 must be selected from the observed plan and the available allocation; do not
-copy them blindly to another case.
+copy them blindly to another case. Increasing
+`shard_construction_workers` may improve parallel shard construction, but it is
+distinct from routing workers and does not necessarily accelerate serial
+assembly, manifest writing, synchronization, or finalization phases.
 
 Routing preparation has a separate worker setting. For example:
 
