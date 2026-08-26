@@ -36,6 +36,7 @@ from public_transportation.inference.direct_scheduled_temporal_builder import (
 from public_transportation.inference.construction_control import (
     ConstructionDeadline,
     ConstructionPhase,
+    ConstructionProgressReporter,
 )
 from public_transportation.inference.fixed_routing_measurement_operator import (
     prepare_fixed_routing_measurement_operator,
@@ -362,6 +363,78 @@ def test_temporal_block_artifact_reuses_and_rejects_incompatibility(
         )
 
 
+def test_temporal_block_cache_validation_reports_throttled_progress(
+    artifacts, tmp_path
+):
+    inputs = build_assignment_inputs(artifacts=artifacts)
+    layout = _layout(int(inputs.od_origin_node.shape[0]), fixed_positive=False)
+    reference = _scheduled_operator(
+        inputs=inputs,
+        spec=_spec(inputs.graph.num_links),
+        index=_canonical_index(layout),
+    )
+    operator, _ = reuse_or_build_temporal_block_operator(
+        cache_root=tmp_path, reference=reference
+    )
+    directory = temporal_block_cache_path(tmp_path, reference.identity)
+    manifest_before = (directory / "manifest.json").read_bytes()
+
+    events: list[dict[str, object]] = []
+    reporter = ConstructionProgressReporter(
+        ConstructionDeadline.unlimited(),
+        events.append,
+        minimum_interval_seconds=0.0,
+    )
+    loaded = load_temporal_block_operator(
+        directory,
+        expected_identity=reference.identity,
+        expected_canonical_index=reference.canonical_index,
+        reporter=reporter,
+    )
+
+    cache_events = [
+        event
+        for event in events
+        if event["phase"] == ConstructionPhase.CACHE_VALIDATION.value
+    ]
+    load_events = [
+        event
+        for event in cache_events
+        if event.get("cache_validation_stage") == "temporal_block_load"
+    ]
+    assert load_events
+    total_blocks = len(operator.blocks)
+    assert load_events[0]["completed_units"] == 0
+    assert load_events[0]["total_units"] == total_blocks
+    counts = [int(event["completed_units"]) for event in load_events]
+    assert counts == sorted(counts)
+    assert counts[-1] == total_blocks
+    assert load_events[-1]["status"] == "completed"
+    assert loaded.identity.fingerprint == operator.identity.fingerprint
+    assert (directory / "manifest.json").read_bytes() == manifest_before
+
+    throttled_events: list[dict[str, object]] = []
+    throttled_reporter = ConstructionProgressReporter(
+        ConstructionDeadline.unlimited(clock=lambda: 0.0),
+        throttled_events.append,
+        minimum_interval_seconds=10.0,
+        clock=lambda: 0.0,
+    )
+    load_temporal_block_operator(
+        directory,
+        expected_identity=reference.identity,
+        expected_canonical_index=reference.canonical_index,
+        reporter=throttled_reporter,
+    )
+    throttled_cache_events = [
+        event
+        for event in throttled_events
+        if event["phase"] == ConstructionPhase.CACHE_VALIDATION.value
+    ]
+    assert len(throttled_cache_events) == 2
+    assert throttled_cache_events[-1]["completed_units"] == total_blocks
+
+
 def test_temporal_block_artifact_rejects_corrupt_payload(artifacts, tmp_path):
     inputs = build_assignment_inputs(artifacts=artifacts)
     layout = _layout(int(inputs.od_origin_node.shape[0]), fixed_positive=False)
@@ -498,7 +571,14 @@ def test_direct_resumable_builder_matches_reference_and_reuses_artifact(
         od_layout_fingerprint=layout.fingerprint,
         config=_direct_config(),
     )
+    cached_progress: list[dict[str, object]] = []
+    cached_reporter = ConstructionProgressReporter(
+        ConstructionDeadline.unlimited(),
+        cached_progress.append,
+        minimum_interval_seconds=0.0,
+    )
     second = prepare_direct_scheduled_temporal_operator(
+        reporter=cached_reporter,
         checkpoint_root=tmp_path / "unused-checkpoints",
         artifact_root=tmp_path / "artifacts",
         inputs=inputs,
@@ -535,7 +615,30 @@ def test_direct_resumable_builder_matches_reference_and_reuses_artifact(
     assert not first.temporal_artifact_reused
     assert second.temporal_artifact_reused
     assert second.source is None
-    np.testing.assert_array_equal(second.operator.matvec(demand), first.operator.matvec(demand))
+    cached_load_events = [
+        event
+        for event in cached_progress
+        if event.get("cache_validation_stage") == "temporal_block_load"
+    ]
+    assert cached_load_events
+    assert (
+        cached_load_events[-1]["completed_units"]
+        == cached_load_events[-1]["total_units"]
+    )
+    cached_support_events = [
+        event
+        for event in cached_progress
+        if event.get("cache_validation_stage") == "realized_operator_support"
+    ]
+    assert cached_support_events
+    assert cached_support_events[-1]["status"] == "completed"
+    assert (
+        cached_support_events[-1]["completed_units"]
+        == cached_support_events[-1]["total_units"]
+    )
+    np.testing.assert_array_equal(
+        second.operator.matvec(demand), first.operator.matvec(demand)
+    )
 
 
 def test_direct_builder_resumes_after_interruption(artifacts, tmp_path):
@@ -740,7 +843,9 @@ def test_direct_activation_builds_then_fresh_call_reuses_without_routing(
     assert len(routing_calls) == 1
     assert built.construction is not None
 
+    activation_events: list[dict[str, object]] = []
     reused = activate_direct_scheduled_temporal_operator(
+        progress=activation_events.append,
         mode="auto",
         expected_evaluations=0,
         construction_seconds=None,
@@ -752,6 +857,27 @@ def test_direct_activation_builds_then_fresh_call_reuses_without_routing(
     assert reused.decision.cache_reused
     assert reused.construction is None
     assert len(routing_calls) == 1
+    activation_load_events = [
+        event
+        for event in activation_events
+        if event.get("cache_validation_stage") == "temporal_block_load"
+    ]
+    assert activation_load_events
+    assert (
+        activation_load_events[-1]["completed_units"]
+        == activation_load_events[-1]["total_units"]
+    )
+    activation_support_events = [
+        event
+        for event in activation_events
+        if event.get("cache_validation_stage") == "realized_operator_support"
+    ]
+    assert activation_support_events
+    assert activation_support_events[-1]["status"] == "completed"
+    assert (
+        activation_support_events[-1]["completed_units"]
+        == activation_support_events[-1]["total_units"]
+    )
     vector = jnp.ones(reused.operator.num_free_od, dtype=jnp.float32)
     matrix = jnp.stack((vector, 2.0 * vector), axis=1)
     np.testing.assert_allclose(

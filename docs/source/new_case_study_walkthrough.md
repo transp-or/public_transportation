@@ -1962,6 +1962,53 @@ estimate. Monitor the durable stream with:
 tail -f "$RESULTS_ROOT/logs/prepare.jsonl"
 ```
 
+### Cache validation for large temporal artifacts
+
+The `cache_validation` phase may itself take several hours when a prepared
+case contains many temporal operator blocks. This phase validates the artifact
+manifest, reads and checks each persisted block, and then scans the realized
+operator for positive-boarding support. It is therefore normal for the job to
+remain in cache validation after routing preparation and operator construction
+have finished.
+
+Monitor the durable progress stream for `completed_units/total_units`,
+`current_unit`, and (when the driver exposes it) the nested `work_stack`:
+
+```bash
+tail -f "$RESULTS_ROOT/logs/prepare.jsonl"
+
+find "$RESULTS_ROOT/checkpoints" \
+  -name progress.json \
+  -print \
+  -exec tail -n 1 {} \;
+```
+
+Temporal-block loading reports `phase=cache_validation`,
+`cache_validation_stage=temporal_block_load`, and a total equal to the number
+of blocks in the artifact manifest. The completed count increases only after a
+block has been read and its payload and content hash validated. The subsequent
+`cache_validation_stage=realized_operator_support` events report progress
+while the loaded blocks are scanned for supported measurement rows. These
+events use the existing throttling policy, so a large number of blocks does
+not imply one output line per block.
+
+Heartbeats show that the process is alive, but they do not by themselves
+provide an ETA. Before stopping a job, check scheduler state and resource use:
+
+```bash
+squeue -j "$JOB_ID"
+sacct -j "$JOB_ID" --format=JobID,State,Elapsed,MaxRSS
+```
+
+If a job reaches its wall-time limit during cache validation, a completed
+artifact is not invalidated. Wait for the process to exit, preserve the same
+case root, package revision, input fingerprints, and results root, and rerun
+the same stage with a longer allocation. The cache is revalidated against the
+unchanged identity; do not delete the artifact or create a new results root.
+Continue only after the stage manifest reports successful completion and the
+identity-specific artifact manifest remains complete with valid block and
+fixed-offset hashes.
+
 ## 12. Stage 6 — initial MAP/gravity fit
 
 Before submitting estimation, read **Large outputs, scratch storage, and

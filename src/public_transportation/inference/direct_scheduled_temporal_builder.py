@@ -577,11 +577,27 @@ def _validate_cached_positive_boarding_support(
     context: PositiveBoardingPreflightContext,
     reporter: ConstructionProgressReporter,
 ) -> None:
-    supported = {
-        int(row)
-        for block in operator.blocks
-        for row in np.unique(block.row_indices)
-    }
+    total_blocks = len(operator.blocks)
+    reporter.emit(
+        phase=ConstructionPhase.CACHE_VALIDATION,
+        status="running",
+        force=True,
+        completed_units=0,
+        total_units=total_blocks,
+        current_unit=("block-000000.npz" if total_blocks else None),
+        details={"cache_validation_stage": "realized_operator_support"},
+    )
+    supported: set[int] = set()
+    for block_position, block in enumerate(operator.blocks):
+        supported.update(int(row) for row in np.unique(block.row_indices))
+        reporter.emit(
+            phase=ConstructionPhase.CACHE_VALIDATION,
+            status="running",
+            completed_units=block_position + 1,
+            total_units=total_blocks,
+            current_unit=f"block-{block_position:06d}.npz",
+            details={"cache_validation_stage": "realized_operator_support"},
+        )
     supported.update(
         int(row) for row in np.flatnonzero(operator.fixed_measurement_offset != 0.0)
     )
@@ -594,6 +610,14 @@ def _validate_cached_positive_boarding_support(
         fixed_zero_reasons_by_full_index=context.fixed_zero_reasons_by_full_index,
     )
     enforce_positive_boarding_support(report, report_path=context.report_path)
+    reporter.emit(
+        phase=ConstructionPhase.CACHE_VALIDATION,
+        status="completed",
+        force=True,
+        completed_units=total_blocks,
+        total_units=total_blocks,
+        details={"cache_validation_stage": "realized_operator_support"},
+    )
     reporter.emit(
         phase=ConstructionPhase.MEASUREMENT_SUPPORT_PREFLIGHT,
         status="completed",
@@ -864,6 +888,7 @@ def prepare_direct_scheduled_temporal_operator(
                 artifact_directory,
                 expected_identity=identity,
                 expected_canonical_index=canonical_index,
+                reporter=events,
             )
         except (AssignmentCompatibilityError, ValueError, KeyError, OSError):
             quarantine = artifact_directory.with_name(
@@ -1126,6 +1151,7 @@ def activate_direct_scheduled_temporal_operator(
                 artifact_directory,
                 expected_identity=identity,
                 expected_canonical_index=canonical_index,
+                reporter=reporter,
             )
         except (AssignmentCompatibilityError, ValueError, KeyError, OSError):
             cached = None

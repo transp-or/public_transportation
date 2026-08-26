@@ -208,8 +208,13 @@ def load_temporal_block_operator(
     *,
     expected_identity: AssignmentArtifactIdentity,
     expected_canonical_index: CanonicalAssignmentIndex,
+    reporter: ConstructionProgressReporter | None = None,
 ) -> TemporalBlockAssignmentOperator:
-    """Validate every identity and payload before accepting an artifact."""
+    """Validate every identity and payload before accepting an artifact.
+
+    When supplied, ``reporter`` receives throttled cache-validation progress;
+    omitting it preserves the original silent loading behavior.
+    """
     source = Path(directory)
     try:
         manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
@@ -219,6 +224,8 @@ def load_temporal_block_operator(
         raise ValueError("temporal block artifact schema is incompatible.")
     if manifest.get("complete") is not True:
         raise ValueError("temporal block artifact is incomplete.")
+    block_items = manifest.get("blocks", [])
+    total_blocks = len(block_items) if isinstance(block_items, list) else 0
     try:
         actual_identity = AssignmentArtifactIdentity(**manifest["identity"])
     except (KeyError, TypeError, ValueError) as error:
@@ -237,8 +244,24 @@ def load_temporal_block_operator(
         raise AssignmentCompatibilityError(
             "temporal block canonical binding is incompatible."
         )
+    if reporter is not None:
+        first_filename = (
+            block_items[0].get("filename")
+            if total_blocks and isinstance(block_items[0], dict)
+            else None
+        )
+        reporter.emit(
+            phase=ConstructionPhase.CACHE_VALIDATION,
+            status="running",
+            force=True,
+            completed_units=0,
+            total_units=total_blocks,
+            current_unit=first_filename,
+            checkpoint_location=str(source),
+            details={"cache_validation_stage": "temporal_block_load"},
+        )
     blocks = []
-    for item in manifest.get("blocks", []):
+    for block_position, item in enumerate(block_items):
         try:
             with np.load(source / "blocks" / item["filename"], allow_pickle=False) as data:
                 rows = data["row_indices"]
@@ -259,6 +282,16 @@ def load_temporal_block_operator(
         if block.nonzero_entries != item.get("nonzero_entries"):
             raise ValueError("temporal block nonzero count is invalid.")
         blocks.append(block)
+        if reporter is not None:
+            reporter.emit(
+                phase=ConstructionPhase.CACHE_VALIDATION,
+                status="running",
+                completed_units=block_position + 1,
+                total_units=total_blocks,
+                current_unit=item.get("filename"),
+                checkpoint_location=str(source),
+                details={"cache_validation_stage": "temporal_block_load"},
+            )
     diagnostics = TemporalBlockConstructionDiagnostics(**manifest["diagnostics"])
     if sum(block.nonzero_entries for block in blocks) != manifest.get("nonzero_entries"):
         raise ValueError("temporal block aggregate nonzero count is invalid.")
@@ -268,13 +301,24 @@ def load_temporal_block_operator(
         raise ValueError("fixed measurement offset is missing or corrupt.") from error
     if _array_content_hash(offset) != manifest.get("fixed_measurement_offset_hash"):
         raise ValueError("fixed measurement offset content hash is invalid.")
-    return TemporalBlockAssignmentOperator(
+    operator = TemporalBlockAssignmentOperator(
         canonical_index=actual_index,
         identity=actual_identity,
         blocks=tuple(blocks),
         fixed_measurement_offset=offset,
         diagnostics=diagnostics,
     )
+    if reporter is not None:
+        reporter.emit(
+            phase=ConstructionPhase.CACHE_VALIDATION,
+            status="completed",
+            force=True,
+            completed_units=total_blocks,
+            total_units=total_blocks,
+            checkpoint_location=str(source),
+            details={"cache_validation_stage": "temporal_block_load"},
+        )
+    return operator
 
 
 def reuse_or_build_temporal_block_operator(
