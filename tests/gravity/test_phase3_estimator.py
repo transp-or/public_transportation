@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+
+import public_transportation.inference.gravity.estimator as estimator_module
 
 from public_transportation.inference.compact_od_assignment_layout import (
     CompactODAssignmentLayout,
@@ -101,6 +104,53 @@ def setup_problem():
         GravityLikelihood.POISSON,
     )
     return problem, layout, true_raw
+
+
+def test_optimizer_maxls_is_configurable_and_validated():
+    config = GravityEstimatorConfig(optimizer_maxls=100)
+    assert config.optimizer_maxls == 100
+
+    with pytest.raises(ValueError, match="optimizer_maxls must be positive"):
+        GravityEstimatorConfig(optimizer_maxls=0)
+
+
+def test_optimizer_maxls_is_passed_to_lbfgsb(monkeypatch):
+    with jax.enable_x64():
+        problem, layout, _ = setup_problem()
+        captured: dict[str, object] = {}
+
+        def fake_minimize(fun, x0, *, method, jac, callback, options):
+            captured.update(
+                method=method,
+                jac=jac,
+                options=options,
+            )
+            fun(np.asarray(x0, dtype=float))
+            return SimpleNamespace(
+                x=np.asarray(x0, dtype=float),
+                success=True,
+                message="stub optimizer",
+            )
+
+        monkeypatch.setattr(estimator_module, "minimize", fake_minimize)
+        result = estimate_gravity_model(
+            problem=problem,
+            compact_layout=layout,
+            initial_raw_parameters=np.zeros(3),
+            config=GravityEstimatorConfig(
+                maximum_iterations=4,
+                optimizer_maxls=100,
+            ),
+            execution=GravityExecutionPolicy(gradient_strategy="adjoint"),
+        )
+
+    assert result.success
+    assert captured["method"] == "L-BFGS-B"
+    assert captured["jac"] is True
+    options = captured["options"]
+    assert isinstance(options, dict)
+    assert options["maxls"] == 100
+    assert options["maxiter"] == 4
 
 
 def test_minimal_estimator_recovers_impedance_and_complete_od_layout(tmp_path):
@@ -313,7 +363,7 @@ def test_public_preflight_stops_at_boundaries_and_recommends_measured_strategy()
 def test_run_manifest_and_progress_log_are_durable_and_serializable(tmp_path):
     with jax.enable_x64():
         problem, layout, _ = setup_problem()
-    config = GravityEstimatorConfig(maximum_iterations=7)
+    config = GravityEstimatorConfig(maximum_iterations=7, optimizer_maxls=100)
     execution = GravityExecutionPolicy(
         gradient_strategy="adjoint",
         checkpoint_path=tmp_path / "checkpoint.json",
@@ -332,6 +382,7 @@ def test_run_manifest_and_progress_log_are_durable_and_serializable(tmp_path):
     loaded = json.loads(manifest_path.read_text())
     assert loaded["repository_revision"] == "test-revision"
     assert loaded["model_fingerprint"] == manifest["model_fingerprint"]
+    assert loaded["estimator_config"]["optimizer_maxls"] == 100
     assert loaded["execution"]["checkpoint_path"] == str(
         execution.checkpoint_path
     )

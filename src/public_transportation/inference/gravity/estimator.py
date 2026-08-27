@@ -40,12 +40,15 @@ class GravityEstimatorConfig:
     maximum_iterations: int = 100
     gradient_tolerance: float = 1.0e-6
     objective_tolerance: float = 1.0e-9
+    optimizer_maxls: int = 20
 
     def __post_init__(self) -> None:
         if self.maximum_iterations <= 0:
             raise ValueError("maximum_iterations must be positive.")
         if self.gradient_tolerance <= 0 or self.objective_tolerance <= 0:
             raise ValueError("optimizer tolerances must be positive.")
+        if self.optimizer_maxls <= 0:
+            raise ValueError("optimizer_maxls must be positive.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -643,6 +646,7 @@ def estimate_gravity_model(
                         "maxiter": remaining,
                         "gtol": config.gradient_tolerance,
                         "ftol": config.objective_tolerance,
+                        "maxls": config.optimizer_maxls,
                     },
                 )
             except _DeadlineStop as stop:
