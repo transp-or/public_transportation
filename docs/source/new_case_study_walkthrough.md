@@ -2200,8 +2200,25 @@ template these are `results/manifests/fit.json`,
 fit-id directory but must preserve the same completion/status semantics.
 
 The recommended production fit is the smallest declared gravity model with
-MAP regularization or prior structure, after a short Poisson diagnostic fit.
-The case driver must create a `GravityEstimatorConfig` and
+MAP regularization or prior structure. A short diagnostic fit is intended only
+to verify the objective, gradients, checkpointing, and execution path. It is
+not a production estimate. The production fit must use a substantially larger
+iteration limit and may be accepted only when the optimizer reports
+convergence.
+
+`maximum_iterations` is an upper bound, not evidence that the optimizer
+converged. Ten iterations may be used for a smoke test or debugging run only;
+ten iterations are not sufficient for production estimation and must not
+support substantive scientific conclusions. For the medium-network case, the
+case-owned production configuration uses:
+
+```toml
+maximum_iterations = 1000
+```
+
+This is a case-specific production setting, not a universal package default.
+The optimizer may converge earlier when its declared tolerances are met. The
+case driver must create a `GravityEstimatorConfig` and
 `GravityExecutionPolicy` with:
 
 - an explicit iteration limit;
@@ -2219,6 +2236,66 @@ The estimator returns `GravityEstimationResult`. Interpret the status as:
 | `iteration_limit` | valid result at the configured limit, not evidence of convergence |
 | `stopped_by_time_budget` | clean resumable stop; do not call it complete |
 | numerical/other failure | diagnose before changing the model |
+
+Before accepting or submitting a validation job, inspect the durable fit
+manifest:
+
+```bash
+jq '{
+  stage_status: .status,
+  fit_status: .result.status,
+  success: .result.success,
+  iterations: .result.iterations,
+  objective: .result.objective
+}' "$RESULTS_ROOT/manifests/fit.json"
+```
+
+`stage_status = "completed"` means only that the driver finished. An accepted
+fit requires `fit_status = "converged"` together with `success = true`.
+`fit_status = "iteration_limit"` means that the optimizer stopped at its
+upper bound without convergence. `fit_status = "stopped_by_time_budget"`
+means that a resumable checkpoint was written, but the fit is not accepted.
+Either nonconverged status must be labelled `diagnostic_only` in downstream
+reports.
+
+If the optimizer reaches the iteration limit, increase `maximum_iterations`
+in `config/model.toml`, preserve the existing gravity checkpoint, and resume:
+
+```bash
+# Increase maximum_iterations in config/model.toml, then:
+uv run --frozen python run_case.py fit --resume
+```
+
+Changing only `maximum_iterations` does not require rerunning `prepare`,
+`preflight`, or `benchmark`, provided the scientific model, operator, data,
+and identity fingerprints remain unchanged. A Slurm wrapper that runs only
+
+```bash
+uv run --frozen python run_case.py fit
+```
+
+starts a fresh fit; it does not resume the checkpoint. A continuation job must
+invoke `uv run --frozen python run_case.py fit --resume` explicitly and must
+reuse the same results root and checkpoint path.
+
+During the fit, monitor:
+
+```bash
+tail -f "$RESULTS_ROOT/logs/fit.jsonl"
+```
+
+The `gravity_fit` progress records should report the intended `total_units`
+(the configured iteration limit). The progress reaches that limit only when
+convergence has not occurred earlier. The final validation gate is:
+
+```text
+fit status = converged
+success = true
+acceptance = accepted
+```
+
+An iteration-limited result can still be useful for debugging and diagnostics,
+but it must not be presented as the final estimated model.
 
 Checkpoints are identity-bound. Resume only with the same scientific model,
 OD layout, routing, mapping, observations, and checkpoint identity. A changed
