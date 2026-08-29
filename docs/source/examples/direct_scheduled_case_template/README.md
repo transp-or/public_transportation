@@ -277,7 +277,12 @@ the case environment before running `check`.
 raw optimizer coordinates (before positive transformations), while
 `gradient_strategy`, likelihood, ridge strength, tolerances, wall-time, JAX
 cache, and shard/memory limits are execution/model choices that the case owner
-must review.
+must review. The estimator also supports `scaled_gradient_tolerance`,
+`typical_objective_scale`, optional scalar or per-parameter
+`typical_parameter_scales`, and `optimizer_maxls`. The scaled-gradient values
+use Dennis--Schnabel parameter/objective scaling; SciPy success is accepted
+only when the scaled-gradient tolerance is met. These are case-owned settings
+and should be recorded with the fit manifest.
 
 ## Commands
 

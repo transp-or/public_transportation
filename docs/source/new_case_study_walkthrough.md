@@ -2214,6 +2214,11 @@ case-owned production configuration uses:
 
 ```toml
 maximum_iterations = 1000
+# The values below are case-specific convergence diagnostics.
+scaled_gradient_tolerance = 1.0e-4
+typical_objective_scale = 1.0
+# Optionally provide one scale per fitted parameter.
+# typical_parameter_scales = [1.0, 1.0, 1.0]
 ```
 
 This is a case-specific production setting, not a universal package default.
@@ -2236,6 +2241,25 @@ The estimator returns `GravityEstimationResult`. Interpret the status as:
 | `iteration_limit` | valid result at the configured limit, not evidence of convergence |
 | `stopped_by_time_budget` | clean resumable stop; do not call it complete |
 | numerical/other failure | diagnose before changing the model |
+
+The estimator certifies `converged` only when SciPy reports success **and** the
+Dennis--Schnabel scaled-gradient infinity norm is no larger than
+`scaled_gradient_tolerance`. The norm is computed per parameter as
+
+```text
+abs(gradient_i) * max(abs(parameter_i), typical_parameter_scale_i)
+/ max(abs(objective), typical_objective_scale)
+```
+
+`typical_parameter_scales` may be one scalar or one positive value per
+parameter. The result and fit progress report the raw and scaled gradient
+norms, the scale settings, and SciPy's termination message. A relative-
+objective termination with a large scaled gradient is therefore not an
+accepted fit, even when SciPy's success flag is true. The final diagnostics also
+record objective/gradient dtypes, `np.spacing(objective)`, the reduction between
+the last accepted iterates, and whether `objective_tolerance` is below the
+available floating-point resolution. Do not silently treat a float32 result as
+float64; use these fields to decide whether tighter tolerances are meaningful.
 
 Before accepting or submitting a validation job, inspect the durable fit
 manifest:

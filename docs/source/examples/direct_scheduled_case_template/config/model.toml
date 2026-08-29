@@ -3,6 +3,11 @@ gradient_strategy = "auto"
 maximum_iterations = 100
 gradient_tolerance = 1.0e-6
 objective_tolerance = 1.0e-9
+optimizer_maxls = 20
+scaled_gradient_tolerance = 1.0e-4
+typical_objective_scale = 1.0
+# Optional: provide one positive scale per gravity parameter.
+# typical_parameter_scales = [1.0, 1.0, 1.0]
 wall_time_seconds = 0.0
 progress_interval = 1
 journey_time_scale = 30.0

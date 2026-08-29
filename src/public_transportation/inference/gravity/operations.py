@@ -21,6 +21,7 @@ from public_transportation.inference.compact_od_assignment_layout import (
 )
 
 from .estimator import (
+    GravityEstimationResult,
     GravityExecutionPolicy,
     GravityEstimatorConfig,
     gravity_model_fingerprint,
@@ -28,7 +29,7 @@ from .estimator import (
 from .objective import GravityObjectiveProblem
 from public_transportation.inference.block_coordinate._canonical import fingerprint
 
-GRAVITY_RUN_MANIFEST_SCHEMA_VERSION = 2
+GRAVITY_RUN_MANIFEST_SCHEMA_VERSION = 3
 GRAVITY_PROGRESS_SCHEMA_VERSION = 1
 
 
@@ -86,6 +87,7 @@ def build_gravity_run_manifest(
     estimator_config: GravityEstimatorConfig,
     execution: GravityExecutionPolicy,
     repository_revision: str,
+    result: GravityEstimationResult | None = None,
     preflight: object | None = None,
     holdout_mask: object | None = None,
     unsupported_measurement_mask: object | None = None,
@@ -215,6 +217,38 @@ def build_gravity_run_manifest(
         },
         "estimator_config": _json_value(estimator_config),
         "execution": _json_value(execution),
+        "convergence_diagnostics": {
+            "objective": None if result is None else result.objective,
+            "gradient_inf_norm": (
+                None if result is None else result.gradient_inf_norm
+            ),
+            "scaled_gradient_inf_norm": (
+                None if result is None else result.scaled_gradient_inf_norm
+            ),
+            "scaled_gradient_tolerance": estimator_config.scaled_gradient_tolerance,
+            "typical_objective_scale": estimator_config.typical_objective_scale,
+            "typical_parameter_scales": _json_value(
+                result.typical_parameter_scales
+                if result is not None
+                else estimator_config.typical_parameter_scales
+            ),
+            "objective_dtype": None if result is None else result.objective_dtype,
+            "gradient_dtype": None if result is None else result.gradient_dtype,
+            "objective_spacing": (
+                None if result is None else result.objective_spacing
+            ),
+            "objective_reduction": (
+                None if result is None else result.objective_reduction
+            ),
+            "objective_tolerance_below_precision": (
+                None
+                if result is None
+                else result.objective_tolerance_below_precision
+            ),
+            "termination_message": None if result is None else result.message,
+            "status": None if result is None else result.status,
+            "success": None if result is None else result.success,
+        },
         "jax": {
             "backend": jax.default_backend(),
             "devices": [str(device) for device in jax.devices()],

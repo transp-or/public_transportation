@@ -599,10 +599,23 @@ def fit(root: Path, resume: bool = False) -> None:
             progress_interval=int(model.get("progress_interval", 1)),
             jax_compilation_cache_directory=context.settings.results / "jax-cache",
         )
+        typical_scales = model.get("typical_parameter_scales")
+        if typical_scales is not None and not np.isscalar(typical_scales):
+            typical_scales = tuple(float(value) for value in typical_scales)
+        elif typical_scales is not None:
+            typical_scales = float(typical_scales)
         config = GravityEstimatorConfig(
             maximum_iterations=int(model.get("maximum_iterations", 100)),
             gradient_tolerance=float(model.get("gradient_tolerance", 1.0e-6)),
             objective_tolerance=float(model.get("objective_tolerance", 1.0e-9)),
+            optimizer_maxls=int(model.get("optimizer_maxls", 20)),
+            scaled_gradient_tolerance=float(
+                model.get("scaled_gradient_tolerance", 1.0e-4)
+            ),
+            typical_objective_scale=float(
+                model.get("typical_objective_scale", 1.0)
+            ),
+            typical_parameter_scales=typical_scales,
         )
         fit_started = perf_counter()
 
@@ -614,7 +627,11 @@ def fit(root: Path, resume: bool = False) -> None:
             remaining = None if rate is None else max(0.0, (total - iteration) / rate)
             progress({
                 "phase": "gravity_fit",
-                "status": "completed" if iteration >= total else "running",
+                "status": getattr(
+                    event,
+                    "status",
+                    "completed" if iteration >= total else "running",
+                ),
                 "completed_units": iteration,
                 "total_units": total,
                 "elapsed_seconds": elapsed,
@@ -625,6 +642,19 @@ def fit(root: Path, resume: bool = False) -> None:
                 "iteration": iteration,
                 "objective": float(getattr(event, "objective")),
                 "gradient_inf_norm": float(getattr(event, "gradient_inf_norm")),
+                "scaled_gradient_inf_norm": getattr(
+                    event, "scaled_gradient_inf_norm", None
+                ),
+                "scaled_gradient_tolerance": getattr(
+                    event, "scaled_gradient_tolerance", None
+                ),
+                "typical_objective_scale": getattr(
+                    event, "typical_objective_scale", None
+                ),
+                "typical_parameter_scales": getattr(
+                    event, "typical_parameter_scales", None
+                ),
+                "termination_message": getattr(event, "termination_message", None),
                 "checkpoint_written": bool(getattr(event, "checkpoint_written")),
                 "wall_clock_seconds": perf_counter() - fit_started,
             })

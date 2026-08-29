@@ -32,7 +32,94 @@ from .objective import (
 )
 
 GRAVITY_CHECKPOINT_SCHEMA_VERSION = 1
-GRAVITY_RESULT_SCHEMA_VERSION = 2
+GRAVITY_RESULT_SCHEMA_VERSION = 3
+
+
+def _validate_positive_finite_scale(name: str, value: object) -> float:
+    """Return one validated positive finite scale."""
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be finite and strictly positive.") from error
+    if not np.isfinite(numeric) or numeric <= 0.0:
+        raise ValueError(f"{name} must be finite and strictly positive.")
+    return numeric
+
+
+def _is_scalar_scale(value: object) -> bool:
+    """Return whether a scale is scalar, including a zero-dimensional array."""
+    if np.isscalar(value):
+        return True
+    try:
+        return np.asarray(value).ndim == 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _resolve_typical_parameter_scales(
+    parameter_count: int, scales: object | None
+) -> np.ndarray:
+    """Resolve per-parameter Dennis--Schnabel ``typx`` values."""
+    if scales is None:
+        return np.ones(parameter_count, dtype=np.float64)
+    if _is_scalar_scale(scales):
+        value = _validate_positive_finite_scale(
+            "typical_parameter_scales", scales
+        )
+        return np.full(parameter_count, value, dtype=np.float64)
+    try:
+        resolved = np.asarray(tuple(scales), dtype=np.float64)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "typical_parameter_scales must contain finite positive values."
+        ) from error
+    if resolved.shape != (parameter_count,):
+        raise ValueError(
+            "typical_parameter_scales must have one value per parameter."
+        )
+    if not np.all(np.isfinite(resolved)) or np.any(resolved <= 0.0):
+        raise ValueError(
+            "typical_parameter_scales must contain finite positive values."
+        )
+    return resolved
+
+
+def scaled_gradient_inf_norm(
+    parameters: object,
+    gradient: object,
+    objective: float,
+    *,
+    typical_objective_scale: float = 1.0,
+    typical_parameter_scales: object | None = None,
+) -> float:
+    """Compute the Dennis--Schnabel scaled-gradient infinity norm."""
+    parameter_array = np.asarray(parameters, dtype=np.float64)
+    gradient_array = np.asarray(gradient, dtype=np.float64)
+    if parameter_array.ndim != 1 or gradient_array.shape != parameter_array.shape:
+        raise ValueError("parameters and gradient must be one-dimensional and match.")
+    if not np.all(np.isfinite(parameter_array)) or not np.all(
+        np.isfinite(gradient_array)
+    ):
+        raise ValueError("parameters and gradient must contain finite values.")
+    typf = _validate_positive_finite_scale(
+        "typical_objective_scale", typical_objective_scale
+    )
+    typx = _resolve_typical_parameter_scales(
+        parameter_array.size, typical_parameter_scales
+    )
+    try:
+        objective_value = float(objective)
+    except (TypeError, ValueError) as error:
+        raise ValueError("objective must be finite.") from error
+    if not np.isfinite(objective_value):
+        raise ValueError("objective must be finite.")
+    denominator = max(abs(objective_value), typf)
+    components = (
+        np.abs(gradient_array)
+        * np.maximum(np.abs(parameter_array), typx)
+        / denominator
+    )
+    return float(np.max(components, initial=0.0))
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,14 +128,49 @@ class GravityEstimatorConfig:
     gradient_tolerance: float = 1.0e-6
     objective_tolerance: float = 1.0e-9
     optimizer_maxls: int = 20
+    scaled_gradient_tolerance: float = 1.0e-4
+    typical_objective_scale: float = 1.0
+    typical_parameter_scales: float | tuple[float, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.maximum_iterations <= 0:
             raise ValueError("maximum_iterations must be positive.")
-        if self.gradient_tolerance <= 0 or self.objective_tolerance <= 0:
-            raise ValueError("optimizer tolerances must be positive.")
+        for name in (
+            "gradient_tolerance",
+            "objective_tolerance",
+            "scaled_gradient_tolerance",
+            "typical_objective_scale",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _validate_positive_finite_scale(name, getattr(self, name)),
+            )
         if self.optimizer_maxls <= 0:
             raise ValueError("optimizer_maxls must be positive.")
+        if self.typical_parameter_scales is not None:
+            if _is_scalar_scale(self.typical_parameter_scales):
+                object.__setattr__(
+                    self,
+                    "typical_parameter_scales",
+                    _validate_positive_finite_scale(
+                        "typical_parameter_scales", self.typical_parameter_scales
+                    ),
+                )
+            else:
+                normalized = tuple(self.typical_parameter_scales)
+                if not normalized:
+                    raise ValueError(
+                        "typical_parameter_scales must contain finite positive values."
+                    )
+                validated = _resolve_typical_parameter_scales(
+                    len(normalized), normalized
+                )
+                object.__setattr__(
+                    self,
+                    "typical_parameter_scales",
+                    tuple(float(value) for value in validated),
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +221,12 @@ class GravityEstimatorProgress:
     gradient_inf_norm: float
     elapsed_seconds: float
     checkpoint_written: bool
+    scaled_gradient_inf_norm: float | None = None
+    scaled_gradient_tolerance: float | None = None
+    typical_objective_scale: float | None = None
+    typical_parameter_scales: float | tuple[float, ...] | None = None
+    status: str = "running"
+    termination_message: str | None = None
     phase: str = "optimizer_iterations"
     phase_elapsed_seconds: float | None = None
     completed_units: int | None = None
@@ -169,6 +297,16 @@ class GravityEstimationResult:
     auxiliary_log_likelihood: float = 0.0
     auxiliary_channel_log_likelihoods: tuple[float, ...] = ()
     auxiliary_observations: dict[str, object] | None = None
+    gradient_inf_norm: float | None = None
+    scaled_gradient_inf_norm: float | None = None
+    scaled_gradient_tolerance: float | None = None
+    typical_objective_scale: float | None = None
+    typical_parameter_scales: float | tuple[float, ...] | None = None
+    objective_dtype: str | None = None
+    gradient_dtype: str | None = None
+    objective_spacing: float | None = None
+    objective_reduction: float | None = None
+    objective_tolerance_below_precision: bool | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != GRAVITY_RESULT_SCHEMA_VERSION:
@@ -422,6 +560,12 @@ def estimate_gravity_model(
 ) -> GravityEstimationResult:
     """Estimate the minimal model and checkpoint only at valid iterate boundaries."""
     problem.features.validate_compact_layout(compact_layout)
+    typical_parameter_scales = _resolve_typical_parameter_scales(
+        problem.parameter_layout.size, config.typical_parameter_scales
+    )
+    typical_parameter_scales_tuple = tuple(
+        float(value) for value in typical_parameter_scales
+    )
     if execution.jax_compilation_cache_directory is not None:
         configure_jax_compilation_cache(execution.jax_compilation_cache_directory)
     model_fingerprint = gravity_model_fingerprint(problem, compact_layout)
@@ -480,11 +624,15 @@ def estimate_gravity_model(
     valid_gradient = np.zeros_like(raw_numpy)
     deadline_phase: str | None = None
     iteration_durations: list[float] = []
+    accepted_objectives: list[float] = []
+    latest_objective_dtype: str | None = None
+    latest_gradient_dtype: str | None = None
     last_iteration_at = started
 
     def evaluate(value: np.ndarray) -> tuple[float, np.ndarray]:
         nonlocal latest_raw, latest_evaluation, latest_gradient
         nonlocal valid_evaluation, valid_gradient
+        nonlocal latest_objective_dtype, latest_gradient_dtype
         if evaluation_deadline is not None and clock() >= evaluation_deadline:
             raise _DeadlineStop("before objective-and-gradient evaluation")
         if hasattr(problem.operator, "absolute_deadline"):
@@ -507,6 +655,8 @@ def estimate_gravity_model(
             raise
         latest_raw = np.asarray(value, dtype=np.float64).copy()
         latest_evaluation = evaluation
+        latest_objective_dtype = str(np.asarray(evaluation.objective).dtype)
+        latest_gradient_dtype = str(np.asarray(gradient).dtype)
         latest_gradient = np.asarray(gradient, dtype=np.float64)
         if np.array_equal(latest_raw, valid_raw):
             valid_evaluation = evaluation
@@ -525,6 +675,8 @@ def estimate_gravity_model(
         elapsed = resumed_elapsed + now - started
         iteration_durations.append(max(0.0, now - last_iteration_at))
         last_iteration_at = now
+        assert latest_evaluation is not None
+        accepted_objectives.append(float(latest_evaluation.objective))
         if checkpoint is not None:
             _write_checkpoint(
                 checkpoint,
@@ -538,7 +690,13 @@ def estimate_gravity_model(
             progress is not None
             and completed_iterations % execution.progress_interval == 0
         ):
-            assert latest_evaluation is not None
+            current_scaled_gradient = scaled_gradient_inf_norm(
+                latest_raw,
+                latest_gradient,
+                float(latest_evaluation.objective),
+                typical_objective_scale=config.typical_objective_scale,
+                typical_parameter_scales=typical_parameter_scales,
+            )
             eta = estimate_completed_unit_eta(
                 iteration_durations,
                 completed_units=completed_iterations,
@@ -552,6 +710,10 @@ def estimate_gravity_model(
                     float(np.max(np.abs(latest_gradient), initial=0.0)),
                     elapsed,
                     checkpoint is not None,
+                    scaled_gradient_inf_norm=current_scaled_gradient,
+                    scaled_gradient_tolerance=config.scaled_gradient_tolerance,
+                    typical_objective_scale=config.typical_objective_scale,
+                    typical_parameter_scales=typical_parameter_scales_tuple,
                     completed_units=completed_iterations,
                     total_units=config.maximum_iterations,
                     predicted_remaining_seconds=eta.predicted_remaining_seconds,
@@ -662,11 +824,83 @@ def estimate_gravity_model(
                 solver_raw = np.asarray(solver.x, dtype=np.float64)
                 if not np.array_equal(latest_raw, solver_raw):
                     evaluate(solver_raw)
+                    assert latest_evaluation is not None
+                    accepted_objectives.append(float(latest_evaluation.objective))
                 latest_raw = solver_raw
                 success = bool(solver.success)
                 status = "converged" if success else "iteration_limit"
                 message = str(solver.message)
     assert latest_evaluation is not None
+    objective_value = float(latest_evaluation.objective)
+    gradient_inf_norm = float(np.max(np.abs(latest_gradient), initial=0.0))
+    scaled_gradient = scaled_gradient_inf_norm(
+        latest_raw,
+        latest_gradient,
+        objective_value,
+        typical_objective_scale=config.typical_objective_scale,
+        typical_parameter_scales=typical_parameter_scales,
+    )
+    if status == "converged" and scaled_gradient > config.scaled_gradient_tolerance:
+        success = False
+        status = "iteration_limit"
+    objective_array = np.asarray(latest_evaluation.objective)
+    objective_spacing = float(
+        np.spacing(objective_array.dtype.type(objective_value))
+    )
+    objective_reduction = (
+        None
+        if len(accepted_objectives) < 2
+        else accepted_objectives[-2] - accepted_objectives[-1]
+    )
+    objective_tolerance_below_precision = config.objective_tolerance < abs(
+        objective_spacing
+    )
+    final_elapsed = resumed_elapsed + clock() - started
+    if progress is not None:
+        final_eta = estimate_completed_unit_eta(
+            iteration_durations,
+            completed_units=completed_iterations,
+            total_units=config.maximum_iterations,
+            elapsed_seconds=max(0.0, final_elapsed),
+        )
+        progress(
+            GravityEstimatorProgress(
+                iteration=completed_iterations,
+                objective=objective_value,
+                gradient_inf_norm=gradient_inf_norm,
+                elapsed_seconds=final_elapsed,
+                checkpoint_written=checkpoint is not None,
+                scaled_gradient_inf_norm=scaled_gradient,
+                scaled_gradient_tolerance=config.scaled_gradient_tolerance,
+                typical_objective_scale=config.typical_objective_scale,
+                typical_parameter_scales=typical_parameter_scales_tuple,
+                status=status,
+                termination_message=message,
+                completed_units=completed_iterations,
+                total_units=config.maximum_iterations,
+                predicted_remaining_seconds=final_eta.predicted_remaining_seconds,
+                eta_confidence=final_eta.eta_confidence,
+                eta_reason=final_eta.eta_reason,
+                estimated_completion_at_utc=final_eta.estimated_completion_at_utc,
+                work_stack=(
+                    {
+                        "name": "optimizer_iterations",
+                        "completed_units": completed_iterations,
+                        "total_units": config.maximum_iterations,
+                        "current_unit": (
+                            None
+                            if status == "converged"
+                            else f"iteration-{completed_iterations:06d}"
+                        ),
+                        "status": status,
+                    },
+                ),
+                checkpoint_location=None if checkpoint is None else str(checkpoint),
+                checkpoint_reusable=checkpoint is not None,
+                reused_units=(completed_iterations if resumed else 0),
+                rebuilt_units=(0 if resumed else completed_iterations),
+            )
+        )
     free_demand = np.asarray(latest_evaluation.demand)
     active = np.zeros(compact_layout.num_active, dtype=free_demand.dtype)
     active[np.asarray(compact_layout.free_compact_indices, dtype=np.int64)] = (
@@ -704,7 +938,7 @@ def estimate_gravity_model(
         active,
         full,
         np.asarray(latest_evaluation.measurement_mean),
-        float(latest_evaluation.objective),
+        objective_value,
         float(latest_evaluation.data_log_likelihood),
         latest_gradient,
         completed_iterations,
@@ -739,4 +973,18 @@ def estimate_gravity_model(
             for value in latest_evaluation.auxiliary_channel_log_likelihoods
         ),
         auxiliary_observations=auxiliary_metadata,
+        gradient_inf_norm=gradient_inf_norm,
+        scaled_gradient_inf_norm=scaled_gradient,
+        scaled_gradient_tolerance=config.scaled_gradient_tolerance,
+        typical_objective_scale=config.typical_objective_scale,
+        typical_parameter_scales=typical_parameter_scales_tuple,
+        objective_dtype=str(objective_array.dtype),
+        gradient_dtype=(
+            latest_gradient_dtype
+            if latest_gradient_dtype is not None
+            else str(np.asarray(latest_gradient).dtype)
+        ),
+        objective_spacing=objective_spacing,
+        objective_reduction=objective_reduction,
+        objective_tolerance_below_precision=objective_tolerance_below_precision,
     )

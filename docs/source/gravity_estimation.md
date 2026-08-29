@@ -144,7 +144,21 @@ time, transfer, and negative-binomial dispersion parameters; optimizer bounds
 are unnecessary.
 
 `GravityEstimatorConfig` contains statistical stopping controls: maximum total
-iterations, gradient tolerance, and objective tolerance.
+iterations, gradient tolerance, and objective tolerance. It also records the
+Dennis--Schnabel scaled-gradient audit. For parameter vector $x$, gradient
+$g$, typical parameter scales $\operatorname{typx}$, and typical objective scale
+$\operatorname{typf}$, the reported infinity norm is
+
+```text
+max_i |g_i| max(|x_i|, typx_i) / max(|objective|, typf).
+```
+
+`scaled_gradient_tolerance`, `typical_objective_scale`, and the optional scalar
+or per-parameter `typical_parameter_scales` are validated as finite positive
+values. SciPy's success flag is accepted only when this scaled norm also meets
+the configured tolerance. A relative-objective termination with a large
+scaled gradient is therefore reported as not converged, while the original
+optimizer termination message is retained.
 `GravityExecutionPolicy` separately controls the derivative strategy, bounded
 automatic-strategy threshold, wall-time allowance, progress interval,
 checkpoint path, and optional persistent JAX compilation-cache directory. The
@@ -182,7 +196,18 @@ The immutable result reports raw and physical parameters, free-cell demand,
 active compact demand including frozen-positive cells, the complete full-layout
 OD vector with structural zeros, measurement predictions, objective and
 likelihood, gradient, iterations, runtime, strategy diagnostics, checkpoint,
-and model fingerprint.
+and model fingerprint. It additionally records raw and scaled gradient norms,
+all scaling settings, objective and gradient dtypes, objective spacing, the
+reduction between the final accepted iterates, and whether the requested
+objective tolerance is below the available floating-point resolution. The same
+convergence diagnostics are included in the result-aware
+`convergence_diagnostics` section of `build_gravity_run_manifest`.
+
+The production estimator remains SciPy L-BFGS-B. An isolated optional pilot,
+`run_biogeme_tr_bfgs_pilot`, can compare Biogeme's TR-BFGS on a caller-supplied
+objective-and-gradient callback. Biogeme is imported lazily and is not part of
+the package's default dependencies; the pilot reports the same scaled-gradient
+and precision diagnostics and never changes the production estimator.
 
 Phase 3 does not implement spatial effects, model adequacy reporting, holdout
 validation, or relaxation recommendations.
