@@ -5,9 +5,11 @@ gradient_tolerance = 1.0e-6
 objective_tolerance = 1.0e-9
 optimizer_maxls = 20
 scaled_gradient_tolerance = 1.0e-4
+# These are required case-owned values, not production defaults. Replace them
+# after measuring the initial objective and inspecting the fitted parameter
+# units/count before running a scientific fit.
 typical_objective_scale = 1.0
-# Optional: provide one positive scale per gravity parameter.
-# typical_parameter_scales = [1.0, 1.0, 1.0]
+typical_parameter_scales = 1.0
 wall_time_seconds = 0.0
 progress_interval = 1
 journey_time_scale = 30.0

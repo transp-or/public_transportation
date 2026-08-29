@@ -48,6 +48,10 @@ class GravityBiogemePilotResult:
     objective_reduction: float | None
     objective_tolerance_below_precision: bool
     optimizer_messages: dict[str, object] = field(default_factory=dict)
+    initial_objective: float | None = None
+    typical_objective_scale_provenance: str | None = None
+    typical_parameter_scales_provenance: str | None = None
+    typical_objective_scale_selection: str | None = None
 
     def __post_init__(self) -> None:
         raw = np.array(self.raw_parameters, dtype=np.float64, copy=True)
@@ -154,6 +158,23 @@ def run_biogeme_tr_bfgs_pilot(
 
     objective = _BiogemeObjective(objective_and_gradient)
     objective.set_variables(initial)
+    initial_objective, _ = objective._evaluate()
+    typical_objective_scale_provenance = (
+        "configured fixed lower bound; verify against the initial objective"
+    )
+    typical_parameter_scales_provenance = (
+        "generic default unit scales"
+        if config.typical_parameter_scales is None
+        else (
+            "configured scalar expanded to every parameter"
+            if np.isscalar(config.typical_parameter_scales)
+            else "configured per-parameter vector"
+        )
+    )
+    typical_objective_scale_selection = (
+        "fixed case-specific typf; recommended rule is "
+        "max(abs(initial_objective), objective_floor)"
+    )
     started = perf_counter()
     optimization_result = bfgs_trust_region_for_biogeme(
         objective,
@@ -232,6 +253,10 @@ def run_biogeme_tr_bfgs_pilot(
         objective_tolerance_below_precision=config.objective_tolerance
         < abs(objective_spacing),
         optimizer_messages=messages,
+        initial_objective=initial_objective,
+        typical_objective_scale_provenance=typical_objective_scale_provenance,
+        typical_parameter_scales_provenance=typical_parameter_scales_provenance,
+        typical_objective_scale_selection=typical_objective_scale_selection,
     )
     if progress is not None:
         progress(
@@ -245,6 +270,16 @@ def run_biogeme_tr_bfgs_pilot(
                 scaled_gradient_tolerance=result.scaled_gradient_tolerance,
                 typical_objective_scale=result.typical_objective_scale,
                 typical_parameter_scales=result.typical_parameter_scales,
+                initial_objective=result.initial_objective,
+                typical_objective_scale_provenance=(
+                    result.typical_objective_scale_provenance
+                ),
+                typical_parameter_scales_provenance=(
+                    result.typical_parameter_scales_provenance
+                ),
+                typical_objective_scale_selection=(
+                    result.typical_objective_scale_selection
+                ),
                 status=result.status,
                 termination_message=result.message,
                 completed_units=iterations,

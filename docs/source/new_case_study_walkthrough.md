@@ -2216,14 +2216,17 @@ case-owned production configuration uses:
 maximum_iterations = 1000
 # The values below are case-specific convergence diagnostics.
 scaled_gradient_tolerance = 1.0e-4
-typical_objective_scale = 1.0
-# Optionally provide one scale per fitted parameter.
-# typical_parameter_scales = [1.0, 1.0, 1.0]
+# Measure the initial objective first, then store the selected fixed scale.
+typical_objective_scale = <measured_initial_objective_scale>
+# Exactly one natural-unit scale per raw fitted parameter.
+typical_parameter_scales = [<production_scale>, <destination_scale_1>, <destination_scale_2>]
 ```
 
 This is a case-specific production setting, not a universal package default.
 The optimizer may converge earlier when its declared tolerances are met. The
-case driver must create a `GravityEstimatorConfig` and
+angle-bracket values are placeholders for documentation and must be replaced
+with valid TOML numbers before running the case. The case driver must create a
+`GravityEstimatorConfig` and
 `GravityExecutionPolicy` with:
 
 - an explicit iteration limit;
@@ -2253,13 +2256,39 @@ abs(gradient_i) * max(abs(parameter_i), typical_parameter_scale_i)
 
 `typical_parameter_scales` may be one scalar or one positive value per
 parameter. The result and fit progress report the raw and scaled gradient
-norms, the scale settings, and SciPy's termination message. A relative-
+norms, the scale settings, the initial objective, scale-selection provenance,
+and SciPy's termination message. A relative-
 objective termination with a large scaled gradient is therefore not an
 accepted fit, even when SciPy's success flag is true. The final diagnostics also
 record objective/gradient dtypes, `np.spacing(objective)`, the reduction between
 the last accepted iterates, and whether `objective_tolerance` is below the
 available floating-point resolution. Do not silently treat a float32 result as
 float64; use these fields to decide whether tighter tolerances are meaningful.
+
+Before selecting the final scales, inspect the raw parameter names and blocks:
+
+```bash
+jq '.result | {parameter_names, parameter_blocks}' \
+  "$RESULTS_ROOT/manifests/fit.json"
+```
+
+For a fresh fit, record the objective at the initial raw vector and choose a
+fixed, documented `typf`, preferably
+`max(abs(initial_objective), objective_floor)`. The fit manifest records both
+the measured initial objective and the value/rule used for `typf`. Do not use
+the final objective to choose the scale. Choose each `typx` from the natural
+units or prior distribution of its parameter; do not substitute the final
+absolute parameter values, and do not confuse a prior standard deviation with
+a ridge precision. For a penalty `0.5 * lambda * x^2`, the corresponding
+standard deviation is `1 / sqrt(lambda)` unless the model defines the prior
+differently.
+
+Run a bounded scale-sensitivity diagnostic before the long fit, using `0.5x`,
+`1.0x`, and `2.0x` versions of both `typf` and `typx`. The final objective and
+parameters should be materially unchanged, and convergence classification
+should be interpreted together with the reported scaled-gradient value. A
+large classification change under these modest scale changes is not a robust
+convergence certificate.
 
 Before accepting or submitting a validation job, inspect the durable fit
 manifest:

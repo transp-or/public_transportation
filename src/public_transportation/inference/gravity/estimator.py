@@ -258,6 +258,10 @@ class GravityEstimatorProgress:
     job_eta_confidence: str = "unavailable"
     job_eta_reason: str | None = None
     estimated_job_completion_at_utc: str | None = None
+    initial_objective: float | None = None
+    typical_objective_scale_provenance: str | None = None
+    typical_parameter_scales_provenance: str | None = None
+    typical_objective_scale_selection: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -307,6 +311,10 @@ class GravityEstimationResult:
     objective_spacing: float | None = None
     objective_reduction: float | None = None
     objective_tolerance_below_precision: bool | None = None
+    initial_objective: float | None = None
+    typical_objective_scale_provenance: str | None = None
+    typical_parameter_scales_provenance: str | None = None
+    typical_objective_scale_selection: str | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != GRAVITY_RESULT_SCHEMA_VERSION:
@@ -625,14 +633,32 @@ def estimate_gravity_model(
     deadline_phase: str | None = None
     iteration_durations: list[float] = []
     accepted_objectives: list[float] = []
+    initial_objective: float | None = None
     latest_objective_dtype: str | None = None
     latest_gradient_dtype: str | None = None
+    typical_objective_scale_provenance = (
+        "configured fixed lower bound; verify against the initial objective"
+    )
+    typical_parameter_scales_provenance = (
+        "generic default unit scales"
+        if config.typical_parameter_scales is None
+        else (
+            "configured scalar expanded to every parameter"
+            if _is_scalar_scale(config.typical_parameter_scales)
+            else "configured per-parameter vector"
+        )
+    )
+    typical_objective_scale_selection = (
+        "fixed case-specific typf; recommended rule is "
+        "max(abs(initial_objective), objective_floor)"
+    )
     last_iteration_at = started
 
     def evaluate(value: np.ndarray) -> tuple[float, np.ndarray]:
         nonlocal latest_raw, latest_evaluation, latest_gradient
         nonlocal valid_evaluation, valid_gradient
         nonlocal latest_objective_dtype, latest_gradient_dtype
+        nonlocal initial_objective
         if evaluation_deadline is not None and clock() >= evaluation_deadline:
             raise _DeadlineStop("before objective-and-gradient evaluation")
         if hasattr(problem.operator, "absolute_deadline"):
@@ -655,6 +681,8 @@ def estimate_gravity_model(
             raise
         latest_raw = np.asarray(value, dtype=np.float64).copy()
         latest_evaluation = evaluation
+        if initial_objective is None:
+            initial_objective = float(evaluation.objective)
         latest_objective_dtype = str(np.asarray(evaluation.objective).dtype)
         latest_gradient_dtype = str(np.asarray(gradient).dtype)
         latest_gradient = np.asarray(gradient, dtype=np.float64)
@@ -714,6 +742,16 @@ def estimate_gravity_model(
                     scaled_gradient_tolerance=config.scaled_gradient_tolerance,
                     typical_objective_scale=config.typical_objective_scale,
                     typical_parameter_scales=typical_parameter_scales_tuple,
+                    initial_objective=initial_objective,
+                    typical_objective_scale_provenance=(
+                        typical_objective_scale_provenance
+                    ),
+                    typical_parameter_scales_provenance=(
+                        typical_parameter_scales_provenance
+                    ),
+                    typical_objective_scale_selection=(
+                        typical_objective_scale_selection
+                    ),
                     completed_units=completed_iterations,
                     total_units=config.maximum_iterations,
                     predicted_remaining_seconds=eta.predicted_remaining_seconds,
@@ -874,6 +912,10 @@ def estimate_gravity_model(
                 scaled_gradient_tolerance=config.scaled_gradient_tolerance,
                 typical_objective_scale=config.typical_objective_scale,
                 typical_parameter_scales=typical_parameter_scales_tuple,
+                initial_objective=initial_objective,
+                typical_objective_scale_provenance=typical_objective_scale_provenance,
+                typical_parameter_scales_provenance=typical_parameter_scales_provenance,
+                typical_objective_scale_selection=typical_objective_scale_selection,
                 status=status,
                 termination_message=message,
                 completed_units=completed_iterations,
@@ -987,4 +1029,8 @@ def estimate_gravity_model(
         objective_spacing=objective_spacing,
         objective_reduction=objective_reduction,
         objective_tolerance_below_precision=objective_tolerance_below_precision,
+        initial_objective=initial_objective,
+        typical_objective_scale_provenance=typical_objective_scale_provenance,
+        typical_parameter_scales_provenance=typical_parameter_scales_provenance,
+        typical_objective_scale_selection=typical_objective_scale_selection,
     )

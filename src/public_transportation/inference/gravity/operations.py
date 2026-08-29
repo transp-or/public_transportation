@@ -14,6 +14,7 @@ from threading import RLock
 from typing import Mapping
 
 import jax
+import numpy as np
 
 from public_transportation import __version__
 from public_transportation.inference.compact_od_assignment_layout import (
@@ -218,6 +219,9 @@ def build_gravity_run_manifest(
         "estimator_config": _json_value(estimator_config),
         "execution": _json_value(execution),
         "convergence_diagnostics": {
+            "initial_objective": (
+                None if result is None else result.initial_objective
+            ),
             "objective": None if result is None else result.objective,
             "gradient_inf_norm": (
                 None if result is None else result.gradient_inf_norm
@@ -231,6 +235,30 @@ def build_gravity_run_manifest(
                 result.typical_parameter_scales
                 if result is not None
                 else estimator_config.typical_parameter_scales
+            ),
+            "typical_objective_scale_provenance": (
+                "configured fixed lower bound; verify against the initial objective"
+                if result is None
+                else result.typical_objective_scale_provenance
+            ),
+            "typical_parameter_scales_provenance": (
+                (
+                    "generic default unit scales"
+                    if estimator_config.typical_parameter_scales is None
+                    else (
+                        "configured scalar expanded to every parameter"
+                        if np.isscalar(estimator_config.typical_parameter_scales)
+                        else "configured per-parameter vector"
+                    )
+                )
+                if result is None
+                else result.typical_parameter_scales_provenance
+            ),
+            "typical_objective_scale_selection": (
+                "fixed case-specific typf; recommended rule is "
+                "max(abs(initial_objective), objective_floor)"
+                if result is None
+                else result.typical_objective_scale_selection
             ),
             "objective_dtype": None if result is None else result.objective_dtype,
             "gradient_dtype": None if result is None else result.gradient_dtype,

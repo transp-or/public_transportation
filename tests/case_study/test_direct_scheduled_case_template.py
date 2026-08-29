@@ -171,6 +171,13 @@ def test_direct_scheduled_template_complete_public_fixture(tmp_path: Path) -> No
 
     fit = json.loads((manifests / "fit.json").read_text(encoding="utf-8"))
     assert fit["result"]["status"] == "iteration_limit"
+    assert fit["convergence_scaling"]["initial_objective"] == pytest.approx(
+        fit["result"]["initial_objective"]
+    )
+    assert fit["convergence_scaling"]["typical_objective_scale_provenance"] == (
+        "case_config"
+    )
+    assert fit["result"]["typical_parameter_scales"]
     assert json.loads((manifests / "validate.json").read_text(encoding="utf-8"))["acceptance"] == "diagnostic_only"
     prior_header = (case / "inputs/scenario/prior_demand.csv").read_text(encoding="utf-8").splitlines()[0]
     assert prior_header == "origin_stop_id,dest_stop_id,time_bin_id,flow"
@@ -189,6 +196,23 @@ def test_direct_scheduled_template_complete_public_fixture(tmp_path: Path) -> No
     support_cells = case / "results/audit/feasibility_support_cells.jsonl"
     assert support_audit["unsupported_cells_path"] == str(support_cells)
     assert support_cells.is_file()
+
+
+def test_direct_scheduled_template_requires_explicit_convergence_scales() -> None:
+    repository = Path(__file__).parents[2]
+    template = repository / "docs/source/examples/direct_scheduled_case_template"
+    namespace = runpy.run_path(
+        str(template / "run_case.py"), run_name="explicit_scale_requirement_test"
+    )
+    resolve_scales = namespace["_explicit_convergence_scales"]
+
+    with pytest.raises(ValueError, match="typical_objective_scale"):
+        resolve_scales({})
+    with pytest.raises(ValueError, match="typical_parameter_scales"):
+        resolve_scales({"typical_objective_scale": 10.0})
+    assert resolve_scales(
+        {"typical_objective_scale": 10.0, "typical_parameter_scales": 2.0}
+    ) == (10.0, 2.0)
 
 
 def test_check_writes_initial_progress_before_slow_context_loading(tmp_path: Path) -> None:

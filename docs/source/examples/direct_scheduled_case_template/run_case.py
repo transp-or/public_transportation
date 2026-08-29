@@ -530,6 +530,38 @@ def _operator_and_problem(
     return context, activated.operator, problem, parameters
 
 
+def _explicit_convergence_scales(
+    model: Mapping[str, object],
+) -> tuple[float, float | tuple[float, ...]]:
+    """Read case-owned convergence scales without applying library defaults."""
+    required = ("typical_objective_scale", "typical_parameter_scales")
+    missing = [name for name in required if name not in model]
+    if missing:
+        names = ", ".join(missing)
+        raise ValueError(
+            "config/model.toml must explicitly define "
+            f"{names}; case-study fits may not rely on generic convergence-scale defaults."
+        )
+    typf = float(model["typical_objective_scale"])
+    raw_typx = model["typical_parameter_scales"]
+    if raw_typx is None:
+        raise ValueError(
+            "config/model.toml typical_parameter_scales must be an explicit "
+            "positive scalar or one value per fitted parameter."
+        )
+    if np.isscalar(raw_typx):
+        typx: float | tuple[float, ...] = float(raw_typx)
+    else:
+        try:
+            typx = tuple(float(value) for value in raw_typx)  # type: ignore[arg-type]
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "config/model.toml typical_parameter_scales must be an explicit "
+                "positive scalar or one value per fitted parameter."
+            ) from error
+    return typf, typx
+
+
 def preflight(root: Path) -> None:
     settings, progress = _start_stage(root, "preflight")
     context: CaseContext | None = None
@@ -590,6 +622,10 @@ def fit(root: Path, resume: bool = False) -> None:
             root, "fit", settings, progress
         )
         model = context.settings.model
+        typical_objective_scale, typical_parameter_scales = (
+            _explicit_convergence_scales(model)
+        )
+        initial_parameters = initial_raw_parameters(parameters, model)
         checkpoint = context.settings.results / "checkpoints/gravity.json"
         wall = float(model.get("wall_time_seconds", 0.0))
         execution = GravityExecutionPolicy(
@@ -599,11 +635,6 @@ def fit(root: Path, resume: bool = False) -> None:
             progress_interval=int(model.get("progress_interval", 1)),
             jax_compilation_cache_directory=context.settings.results / "jax-cache",
         )
-        typical_scales = model.get("typical_parameter_scales")
-        if typical_scales is not None and not np.isscalar(typical_scales):
-            typical_scales = tuple(float(value) for value in typical_scales)
-        elif typical_scales is not None:
-            typical_scales = float(typical_scales)
         config = GravityEstimatorConfig(
             maximum_iterations=int(model.get("maximum_iterations", 100)),
             gradient_tolerance=float(model.get("gradient_tolerance", 1.0e-6)),
@@ -612,10 +643,8 @@ def fit(root: Path, resume: bool = False) -> None:
             scaled_gradient_tolerance=float(
                 model.get("scaled_gradient_tolerance", 1.0e-4)
             ),
-            typical_objective_scale=float(
-                model.get("typical_objective_scale", 1.0)
-            ),
-            typical_parameter_scales=typical_scales,
+            typical_objective_scale=typical_objective_scale,
+            typical_parameter_scales=typical_parameter_scales,
         )
         fit_started = perf_counter()
 
@@ -654,6 +683,16 @@ def fit(root: Path, resume: bool = False) -> None:
                 "typical_parameter_scales": getattr(
                     event, "typical_parameter_scales", None
                 ),
+                "initial_objective": getattr(event, "initial_objective", None),
+                "typical_objective_scale_provenance": getattr(
+                    event, "typical_objective_scale_provenance", None
+                ),
+                "typical_parameter_scales_provenance": getattr(
+                    event, "typical_parameter_scales_provenance", None
+                ),
+                "typical_objective_scale_selection": getattr(
+                    event, "typical_objective_scale_selection", None
+                ),
                 "termination_message": getattr(event, "termination_message", None),
                 "checkpoint_written": bool(getattr(event, "checkpoint_written")),
                 "wall_clock_seconds": perf_counter() - fit_started,
@@ -663,13 +702,26 @@ def fit(root: Path, resume: bool = False) -> None:
         result = estimate_gravity_model(
             problem=problem,
             compact_layout=context.compact_layout,
-            initial_raw_parameters=initial_raw_parameters(parameters, context.settings.model),
+            initial_raw_parameters=initial_parameters,
             config=config,
             execution=execution,
             resume=resume,
             progress=fit_progress,
         )
-        payload = _base(context, "fit") | {"result": _jsonable(result)}
+        payload = _base(context, "fit") | {
+            "result": _jsonable(result),
+            "convergence_scaling": {
+                "initial_objective": result.initial_objective,
+                "typical_objective_scale": config.typical_objective_scale,
+                "typical_parameter_scales": result.typical_parameter_scales,
+                "typical_objective_scale_provenance": "case_config",
+                "typical_parameter_scales_provenance": "case_config",
+                "typical_objective_scale_selection": (
+                    "fixed case-specific typf; selected from "
+                    "max(abs(initial_objective), objective_floor)"
+                ),
+            },
+        }
         write_json(progress.manifest_path, payload)
         write_json(context.settings.results / "fits/result.json", result)
         stage_status = "completed" if result.status in {

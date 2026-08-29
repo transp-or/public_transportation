@@ -159,6 +159,17 @@ values. SciPy's success flag is accepted only when this scaled norm also meets
 the configured tolerance. A relative-objective termination with a large
 scaled gradient is therefore reported as not converged, while the original
 optimizer termination message is retained.
+The library defaults (`typical_objective_scale = 1.0` and unit `typx`) are
+generic fallbacks for library callers, not evidence that those scales are
+appropriate for a case study. A case-study driver should require explicit
+case-owned values. `typf` is a lower bound in the denominator: when the
+objective is approximately $1.8\times10^6$, `typf = 1.0` is inactive. Measure
+the objective at the initial raw parameter vector and choose a fixed,
+documented value, preferably
+`max(abs(initial_objective), objective_floor)`; never derive it from the final
+objective. Choose `typx` from natural parameter units or prior scales and
+provide exactly one value per raw parameter unless one scalar genuinely applies
+to all parameters.
 `GravityExecutionPolicy` separately controls the derivative strategy, bounded
 automatic-strategy threshold, wall-time allowance, progress interval,
 checkpoint path, and optional persistent JAX compilation-cache directory. The
@@ -199,8 +210,10 @@ likelihood, gradient, iterations, runtime, strategy diagnostics, checkpoint,
 and model fingerprint. It additionally records raw and scaled gradient norms,
 all scaling settings, objective and gradient dtypes, objective spacing, the
 reduction between the final accepted iterates, and whether the requested
-objective tolerance is below the available floating-point resolution. The same
-convergence diagnostics are included in the result-aware
+objective tolerance is below the available floating-point resolution. It also
+records the initial objective, the resolved scale vector, and provenance/rule
+metadata describing how `typf` and `typx` were selected. The same convergence
+diagnostics are included in the result-aware
 `convergence_diagnostics` section of `build_gravity_run_manifest`.
 
 The production estimator remains SciPy L-BFGS-B. An isolated optional pilot,

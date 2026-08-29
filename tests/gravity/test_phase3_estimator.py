@@ -216,6 +216,22 @@ def test_scaled_gradient_configuration_rejects_invalid_scales(field, value):
         GravityEstimatorConfig(**{field: value})
 
 
+def test_estimator_rejects_typx_vector_with_wrong_parameter_count():
+    with jax.enable_x64():
+        problem, layout, _ = setup_problem()
+        with pytest.raises(ValueError, match="one value per parameter"):
+            estimate_gravity_model(
+                problem=problem,
+                compact_layout=layout,
+                initial_raw_parameters=np.zeros(3),
+                config=GravityEstimatorConfig(
+                    maximum_iterations=1,
+                    typical_parameter_scales=(1.0, 2.0),
+                ),
+                execution=GravityExecutionPolicy(gradient_strategy="adjoint"),
+            )
+
+
 def _run_with_patched_scaled_gradient(monkeypatch, value):
     with jax.enable_x64():
         problem, layout, _ = setup_problem()
@@ -316,6 +332,10 @@ def test_estimator_records_scaled_gradient_and_precision_diagnostics():
     assert result.objective_spacing == pytest.approx(
         float(np.spacing(np.float32(result.objective)))
     )
+    assert result.initial_objective is not None
+    assert result.typical_objective_scale_provenance
+    assert result.typical_parameter_scales_provenance
+    assert result.typical_objective_scale_selection
     assert result.objective_tolerance_below_precision is True
     assert result.objective_reduction is None or np.isfinite(
         result.objective_reduction
@@ -456,6 +476,9 @@ def test_optional_biogeme_tr_bfgs_pilot_uses_same_convergence_audit(monkeypatch)
     assert result.gradient_dtype == "float32"
     assert result.scaled_gradient_inf_norm == pytest.approx(2.0)
     assert result.message == "stub trust-region convergence"
+    assert result.initial_objective == pytest.approx(2.0)
+    assert result.typical_objective_scale_provenance
+    assert result.typical_parameter_scales_provenance
     assert progress and progress[-1].scaled_gradient_inf_norm == pytest.approx(2.0)
 
 
@@ -671,6 +694,9 @@ def test_run_manifest_and_progress_log_are_durable_and_serializable(tmp_path):
     assert loaded["estimator_config"]["optimizer_maxls"] == 100
     diagnostics = loaded["convergence_diagnostics"]
     assert diagnostics["objective"] == pytest.approx(result.objective)
+    assert diagnostics["initial_objective"] == pytest.approx(
+        result.initial_objective
+    )
     assert diagnostics["gradient_inf_norm"] == pytest.approx(
         result.gradient_inf_norm
     )
@@ -682,6 +708,12 @@ def test_run_manifest_and_progress_log_are_durable_and_serializable(tmp_path):
     assert diagnostics["typical_parameter_scales"] == [1.0, 1.0, 1.0]
     assert diagnostics["typical_objective_scale"] == pytest.approx(
         config.typical_objective_scale
+    )
+    assert diagnostics["typical_objective_scale_provenance"] == (
+        result.typical_objective_scale_provenance
+    )
+    assert diagnostics["typical_parameter_scales_provenance"] == (
+        result.typical_parameter_scales_provenance
     )
     assert diagnostics["scaled_gradient_tolerance"] == pytest.approx(
         config.scaled_gradient_tolerance

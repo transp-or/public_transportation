@@ -278,11 +278,26 @@ raw optimizer coordinates (before positive transformations), while
 `gradient_strategy`, likelihood, ridge strength, tolerances, wall-time, JAX
 cache, and shard/memory limits are execution/model choices that the case owner
 must review. The estimator also supports `scaled_gradient_tolerance`,
-`typical_objective_scale`, optional scalar or per-parameter
-`typical_parameter_scales`, and `optimizer_maxls`. The scaled-gradient values
-use Dennis--Schnabel parameter/objective scaling; SciPy success is accepted
-only when the scaled-gradient tolerance is met. These are case-owned settings
-and should be recorded with the fit manifest.
+`typical_objective_scale`, scalar or per-parameter `typical_parameter_scales`,
+and `optimizer_maxls`. The template contains syntactically valid illustrative
+values for `typical_objective_scale` and `typical_parameter_scales`; they are
+required case-owned inputs and must be replaced or justified before a
+scientific fit. The scaled-gradient values use Dennis--Schnabel
+parameter/objective scaling; SciPy success is accepted only when the
+scaled-gradient tolerance is met. These settings and their provenance should
+be recorded with the fit manifest.
+
+For a production case, first evaluate the objective at the exact initial raw
+parameter vector used by the fit. Choose and document a fixed objective scale
+using, for example,
+`typical_objective_scale = max(abs(initial_objective), objective_floor)`;
+do not choose it from the final fitted objective. A value of `1.0` is only
+appropriate when that documented scale is genuinely of order one. Inspect the
+parameter names and blocks before selecting `typical_parameter_scales`:
+provide exactly one positive value per raw parameter (or one scalar only when
+all parameters share the same natural scale), and do not use fitted absolute
+values as `typx`. The case driver does not supply generic fallbacks for these
+two fields; a missing field stops the fit with a configuration error.
 
 ## Commands
 
