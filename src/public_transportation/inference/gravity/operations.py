@@ -29,9 +29,30 @@ from .estimator import (
 )
 from .objective import GravityObjectiveProblem
 from public_transportation.inference.block_coordinate._canonical import fingerprint
+from public_transportation.inference.construction_control import (
+    normalize_progress_event,
+)
 
 GRAVITY_RUN_MANIFEST_SCHEMA_VERSION = 3
 GRAVITY_PROGRESS_SCHEMA_VERSION = 1
+
+
+def _append_progress_line(path: Path, rendered: str, *, durable: bool) -> None:
+    """Append one complete JSONL record with an atomic append operation."""
+
+    payload = rendered.encode("utf-8")
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError("progress append wrote no bytes")
+            offset += written
+        if durable:
+            os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _utc_now() -> str:
@@ -71,14 +92,14 @@ class GravityJSONLProgressSink:
             "recorded_at_utc": _utc_now(),
             "event_type": type(event).__name__,
             **({} if self.context is None else dict(self.context)),
-            "event": _json_value(event),
+            # Normalize only at the reporting boundary.  The event object and
+            # all numerical code remain untouched, while legacy event classes
+            # gain the common hierarchical fields in JSONL output.
+            "event": _json_value(normalize_progress_event(event)),
         }
         rendered = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
-        with self._lock, self.path.open("a", encoding="utf-8") as stream:
-            stream.write(rendered)
-            stream.flush()
-            if self.durable:
-                os.fsync(stream.fileno())
+        with self._lock:
+            _append_progress_line(self.path, rendered, durable=self.durable)
 
 
 def build_gravity_run_manifest(

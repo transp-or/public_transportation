@@ -170,7 +170,7 @@ def test_destination_profile_progress_is_complete_and_monotonic() -> None:
     assert materialization_events[-1].estimated_remaining_seconds == pytest.approx(0.0)
 
 
-def test_destination_progress_callback_exception_propagates() -> None:
+def test_destination_progress_callback_failure_is_observability_only() -> None:
     topology = build_structural_zero_topology(
         _scenario_with_transfer(), StructuralZeroAssignmentConfig()
     )
@@ -179,5 +179,6 @@ def test_destination_progress_callback_exception_propagates() -> None:
         if event.completed == 1:
             raise RuntimeError("stop requested")
 
-    with pytest.raises(RuntimeError, match="stop requested"):
-        compute_od_path_metrics(topology, progress=fail)
+    # A broken progress sink must not change the scientific calculation.
+    records = compute_od_path_metrics(topology, progress=fail)
+    assert len(records) == 9

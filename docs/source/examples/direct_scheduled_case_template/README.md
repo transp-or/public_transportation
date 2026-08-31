@@ -356,6 +356,14 @@ cannot expose shard progress and therefore reports regular heartbeats with an
 unavailable ETA. These records are observational: they do not change routing,
 parallelism, numerical values, or artifact fingerprints.
 
+Progress reporting is isolated from the calculation. Events produced by a
+construction worker are queued in memory and written by a background sink
+worker, so the computational worker does not wait for log I/O. Phase-boundary
+and terminal records drain the queue to preserve durable ordering. Omitting a
+callback disables reporting without changing the calculation, and a failed
+progress sink is retained as a diagnostic rather than changing a successful
+stage into a failure.
+
 When an adapter supplies `routing_preparation_config`, configure both
 reporting controls explicitly when desired:
 

@@ -256,7 +256,17 @@ def test_check_writes_initial_progress_before_slow_context_loading(tmp_path: Pat
     finally:
         sys.path.remove(str(case))
 
-    assert observed["first"] == {
+    first = observed["first"]
+    assert {
+        "current_unit": first["current_unit"],
+        "elapsed_seconds": first["elapsed_seconds"],
+        "estimated_remaining_seconds": first["estimated_remaining_seconds"],
+        "eta_confidence": first["eta_confidence"],
+        "phase": first["phase"],
+        "schema_version": first["schema_version"],
+        "stage": first["stage"],
+        "status": first["status"],
+    } == {
         "current_unit": "load_context",
         "elapsed_seconds": 0.0,
         "estimated_remaining_seconds": None,
@@ -266,6 +276,8 @@ def test_check_writes_initial_progress_before_slow_context_loading(tmp_path: Pat
         "stage": "check",
         "status": "started",
     }
+    assert first["work_stack"][0]["name"] == "initialization"
+    assert first["work_stack"][0]["current_unit"] == "load_context"
 
 
 def test_stage_progress_heartbeats_do_not_fabricate_work_or_eta(tmp_path: Path) -> None:

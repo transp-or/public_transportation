@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import tempfile
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -19,6 +20,7 @@ import numpy as np
 
 from public_transportation import __version__
 
+from ..construction_control import estimate_completed_unit_eta
 from .demand import generate_gravity_demand
 from .objective import (
     GravityObjectiveEvaluation,
@@ -313,6 +315,15 @@ class GravityFidelityProgress:
     anchor_used: bool
     deadline_remaining_seconds: float | None
     partial_result: bool
+    schema_version: int = 1
+    status: str = "running"
+    recent_unit_seconds: float | None = None
+    eta_confidence: str = "unavailable"
+    eta_reason: str | None = None
+    estimated_completion_at_utc: str | None = None
+    eta_lower_seconds: float | None = None
+    eta_upper_seconds: float | None = None
+    throughput_units_per_second: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -914,33 +925,63 @@ def gravity_value_and_gradient_progressive(
             "quality_groups": quality_groups_completed,
         }
 
+        phase_durations: dict[str, deque[float]] = {
+            "forward": deque(maxlen=32),
+            "reverse": deque(maxlen=32),
+        }
+
         def emit(phase: str, completed: int, *, partial: bool) -> None:
             if execution.progress is None:
                 return
             elapsed_now = max(0.0, perf_counter() - started)
-            rate = completed / elapsed_now if elapsed_now > 0.0 else 0.0
-            remaining = len(plan.selected_shard_ids) - completed
-            execution.progress(
-                GravityFidelityProgress(
-                    phase=phase,
-                    requested_effort_percent=fidelity.effort_percent,
-                    effective_effort_percent=plan.effective_effort_percent,
-                    selected_shards=len(plan.selected_shard_ids),
-                    completed_shards=completed,
-                    elapsed_seconds=elapsed_now,
-                    predicted_remaining_seconds=(
-                        None if rate <= 0.0 else remaining / rate
-                    ),
-                    quality_groups_completed=quality_groups_completed,
-                    anchor_used=anchor is not None,
-                    deadline_remaining_seconds=(
-                        None
-                        if execution.absolute_deadline is None
-                        else max(0.0, execution.absolute_deadline - perf_counter())
-                    ),
-                    partial_result=partial,
-                )
+            phase_name = "reverse" if phase.startswith("reverse") else "forward"
+            eta = estimate_completed_unit_eta(
+                phase_durations[phase_name],
+                completed_units=completed,
+                total_units=len(plan.selected_shard_ids),
+                parallelism=1,
+                elapsed_seconds=elapsed_now,
             )
+            status = "completed" if phase == "completed" else "running"
+            try:
+                execution.progress(
+                    GravityFidelityProgress(
+                        phase=phase,
+                        requested_effort_percent=fidelity.effort_percent,
+                        effective_effort_percent=plan.effective_effort_percent,
+                        selected_shards=len(plan.selected_shard_ids),
+                        completed_shards=completed,
+                        elapsed_seconds=elapsed_now,
+                        predicted_remaining_seconds=eta.predicted_remaining_seconds,
+                        quality_groups_completed=quality_groups_completed,
+                        anchor_used=anchor is not None,
+                        deadline_remaining_seconds=(
+                            None
+                            if execution.absolute_deadline is None
+                            else max(
+                                0.0,
+                                execution.absolute_deadline - perf_counter(),
+                            )
+                        ),
+                        partial_result=partial,
+                        status=status,
+                        recent_unit_seconds=(
+                            phase_durations[phase_name][-1]
+                            if phase_durations[phase_name]
+                            else None
+                        ),
+                        eta_confidence=eta.eta_confidence,
+                        eta_reason=eta.eta_reason,
+                        estimated_completion_at_utc=eta.estimated_completion_at_utc,
+                        eta_lower_seconds=eta.eta_lower_seconds,
+                        eta_upper_seconds=eta.eta_upper_seconds,
+                        throughput_units_per_second=eta.throughput_units_per_second,
+                    )
+                )
+            except OSError:
+                # Progress sinks are observability-only.  Preserve the
+                # scientific result when a durable log is unavailable.
+                return
 
         def interrupted(phase: str, completed: int) -> str | None:
             if (
@@ -1018,6 +1059,7 @@ def gravity_value_and_gradient_progressive(
         else:
             forward_start = len(forward_items)
         for item_index in range(forward_start, len(forward_items)):
+            shard_started = perf_counter() if execution.progress is not None else 0.0
             reason = interrupted("forward", completed_forward)
             if reason is not None:
                 save_checkpoint("forward")
@@ -1038,6 +1080,10 @@ def gravity_value_and_gradient_progressive(
             )
             represented |= np.asarray(contribution) != 0.0
             completed_forward += 1
+            if execution.progress is not None:
+                phase_durations["forward"].append(
+                    max(0.0, perf_counter() - shard_started)
+                )
             save_checkpoint("forward")
             emit("forward_shard_completed", completed_forward, partial=True)
         jax.block_until_ready(routed)
@@ -1073,6 +1119,7 @@ def gravity_value_and_gradient_progressive(
         emit("reverse_started", completed_reverse, partial=True)
         reverse_items = forward_items
         for item_index in range(completed_reverse, len(reverse_items)):
+            shard_started = perf_counter() if execution.progress is not None else 0.0
             reason = interrupted("reverse", completed_reverse)
             if reason is not None:
                 save_checkpoint(
@@ -1096,6 +1143,10 @@ def gravity_value_and_gradient_progressive(
                 + jnp.asarray(quality_groups_completed, dtype=demand.dtype) * weighted
             )
             completed_reverse += 1
+            if execution.progress is not None:
+                phase_durations["reverse"].append(
+                    max(0.0, perf_counter() - shard_started)
+                )
             save_checkpoint(
                 "reverse",
                 demand_cotangent_value=demand_cotangent,

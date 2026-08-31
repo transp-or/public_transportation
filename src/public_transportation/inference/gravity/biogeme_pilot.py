@@ -259,31 +259,36 @@ def run_biogeme_tr_bfgs_pilot(
         typical_objective_scale_selection=typical_objective_scale_selection,
     )
     if progress is not None:
-        progress(
-            GravityEstimatorProgress(
-                iteration=iterations,
-                objective=result.objective,
-                gradient_inf_norm=result.gradient_inf_norm,
-                elapsed_seconds=result.elapsed_seconds,
-                checkpoint_written=False,
-                scaled_gradient_inf_norm=result.scaled_gradient_inf_norm,
-                scaled_gradient_tolerance=result.scaled_gradient_tolerance,
-                typical_objective_scale=result.typical_objective_scale,
-                typical_parameter_scales=result.typical_parameter_scales,
-                initial_objective=result.initial_objective,
-                typical_objective_scale_provenance=(
-                    result.typical_objective_scale_provenance
-                ),
-                typical_parameter_scales_provenance=(
-                    result.typical_parameter_scales_provenance
-                ),
-                typical_objective_scale_selection=(
-                    result.typical_objective_scale_selection
-                ),
-                status=result.status,
-                termination_message=result.message,
-                completed_units=iterations,
-                total_units=config.maximum_iterations,
+        try:
+            progress(
+                GravityEstimatorProgress(
+                    iteration=iterations,
+                    objective=result.objective,
+                    gradient_inf_norm=result.gradient_inf_norm,
+                    elapsed_seconds=result.elapsed_seconds,
+                    checkpoint_written=False,
+                    scaled_gradient_inf_norm=result.scaled_gradient_inf_norm,
+                    scaled_gradient_tolerance=result.scaled_gradient_tolerance,
+                    typical_objective_scale=result.typical_objective_scale,
+                    typical_parameter_scales=result.typical_parameter_scales,
+                    initial_objective=result.initial_objective,
+                    typical_objective_scale_provenance=(
+                        result.typical_objective_scale_provenance
+                    ),
+                    typical_parameter_scales_provenance=(
+                        result.typical_parameter_scales_provenance
+                    ),
+                    typical_objective_scale_selection=(
+                        result.typical_objective_scale_selection
+                    ),
+                    status=result.status,
+                    termination_message=result.message,
+                    completed_units=iterations,
+                    total_units=config.maximum_iterations,
+                )
             )
-        )
+        except OSError:
+            # The optional pilot must retain its numerical result when a
+            # progress sink cannot be written.
+            pass
     return result

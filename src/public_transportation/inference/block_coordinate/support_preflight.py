@@ -9,6 +9,7 @@ import os
 import platform
 import resource
 import uuid
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
@@ -24,6 +25,9 @@ from public_transportation.inference.assignment_adapter import (
 )
 from public_transportation.inference.compact_od_assignment_layout import (
     CompactODAssignmentLayout,
+)
+from public_transportation.inference.construction_control import (
+    estimate_completed_unit_eta,
 )
 
 from ._canonical import canonical_json, fingerprint
@@ -238,6 +242,19 @@ class SupportPreflightProgress:
     current_invocation_elapsed_seconds: float = 0.0
     previous_invocations_elapsed_seconds: float = 0.0
     invocation_count: int = 1
+    schema_version: int = 1
+    status: str = "running"
+    completed_units: int | None = None
+    total_units: int | None = None
+    recent_unit_seconds: float | None = None
+    predicted_remaining_seconds: float | None = None
+    eta_confidence: str = "unavailable"
+    eta_reason: str | None = None
+    estimated_completion_at_utc: str | None = None
+    eta_lower_seconds: float | None = None
+    eta_upper_seconds: float | None = None
+    throughput_units_per_second: float | None = None
+    checkpoint_location: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -653,11 +670,61 @@ def run_support_preflight(
     num_nodes = int(graph.num_nodes)
     start = clock()
     last_checkpoint = start
+    recent_group_seconds: deque[float] = deque(maxlen=32)
     status = SupportPreflightStatus.COMPLETED
     reason = "selected destination groups completed"
     current_group: int | None = None
     stop_location = SupportPreflightStopLocation.COMPLETED
     stop_group_id: int | None = None
+
+    def emit_progress(
+        *,
+        current_group_id: int | None,
+        recent_unit_seconds: float | None,
+        force_status: SupportPreflightStatus | None = None,
+    ) -> None:
+        if progress_callback is None:
+            return
+        completed_groups = len(completed)
+        eta = estimate_completed_unit_eta(
+            recent_group_seconds,
+            completed_units=completed_groups,
+            total_units=len(selected_groups),
+            parallelism=config.construction_workers,
+            elapsed_seconds=max(0.0, clock() - start),
+        )
+        event_status = (status if force_status is None else force_status).value
+        event = SupportPreflightProgress(
+            completed_groups,
+            len(selected_groups),
+            sum(item.free_columns for item in destination_summaries),
+            elapsed_offset + max(0.0, clock() - start),
+            resource_observer(),
+            peak_rss,
+            retained_bytes,
+            current_group_id,
+            max(0.0, clock() - start),
+            elapsed_offset,
+            invocation_count,
+            status=event_status,
+            completed_units=completed_groups,
+            total_units=len(selected_groups),
+            recent_unit_seconds=recent_unit_seconds,
+            predicted_remaining_seconds=eta.predicted_remaining_seconds,
+            eta_confidence=eta.eta_confidence,
+            eta_reason=eta.eta_reason,
+            estimated_completion_at_utc=eta.estimated_completion_at_utc,
+            eta_lower_seconds=eta.eta_lower_seconds,
+            eta_upper_seconds=eta.eta_upper_seconds,
+            throughput_units_per_second=eta.throughput_units_per_second,
+            checkpoint_location=None if checkpoint is None else str(checkpoint),
+        )
+        try:
+            progress_callback(event)
+        except Exception:
+            # Progress is observability only; preserve support decisions when
+            # a consumer or log sink is unavailable.
+            return
 
     def build_result() -> SupportPreflightResult:
         invocation_elapsed = clock() - start
@@ -743,6 +810,7 @@ def run_support_preflight(
     final_result: SupportPreflightResult | None = None
     try:
         for current_group in pending:
+            group_start = clock()
             elapsed = clock() - start
             rss = resource_observer()
             peak_rss = max(peak_rss, rss)
@@ -777,7 +845,6 @@ def run_support_preflight(
                 destination_summaries.append(DestinationSupportSummary(current_group, int(free_counts[current_group]), sum(int(value) in positive_fixed for value in active), 0, 0, 0, 0.0, estimated_temporary, rss))
                 completed.append(current_group)
             else:
-                group_start = clock()
                 enabled_jax, cost = _routing_inputs_for_destination(
                     graph=graph,
                     base_link_cost=inputs.base_link_cost,
@@ -856,6 +923,7 @@ def run_support_preflight(
                 temporary_high = max(temporary_high, estimated_temporary)
                 del routing, enabled_jax, cost, enabled, probabilities, eligible, group_rows, patterns, block_rows, block_nnz
                 gc.collect()
+            recent_group_seconds.append(max(0.0, clock() - group_start))
             retained_bytes = len(canonical_json((destination_summaries, block_summaries)).encode("utf-8"))
             if retained_bytes > config.budget.maximum_retained_support_bytes:
                 status, reason = SupportPreflightStatus.STOPPED_RETAINED, "retained summary budget reached"
@@ -869,22 +937,10 @@ def run_support_preflight(
             if checkpoint is not None and (len(completed) % config.checkpoint_interval_groups == 0 or now - last_checkpoint >= config.checkpoint_interval_seconds):
                 persist()
                 last_checkpoint = now
-            if progress_callback is not None and len(completed) % config.progress_interval_groups == 0:
-                invocation_elapsed = now - start
-                progress_callback(
-                    SupportPreflightProgress(
-                        len(completed),
-                        len(selected_groups),
-                        sum(item.free_columns for item in destination_summaries),
-                        elapsed_offset + invocation_elapsed,
-                        resource_observer(),
-                        peak_rss,
-                        retained_bytes,
-                        current_group,
-                        invocation_elapsed,
-                        elapsed_offset,
-                        invocation_count,
-                    )
+            if len(completed) % config.progress_interval_groups == 0:
+                emit_progress(
+                    current_group_id=current_group,
+                    recent_unit_seconds=recent_group_seconds[-1] if recent_group_seconds else None,
                 )
     except KeyboardInterrupt:
         status, reason = SupportPreflightStatus.INTERRUPTED, "keyboard interrupt"
@@ -902,6 +958,12 @@ def run_support_preflight(
             SupportPreflightStatus.INTERRUPTED,
         }:
             final_result = persist()
+        if status is not SupportPreflightStatus.INTERRUPTED:
+            emit_progress(
+                current_group_id=stop_group_id,
+                recent_unit_seconds=recent_group_seconds[-1] if recent_group_seconds else None,
+                force_status=status,
+            )
     return build_result() if final_result is None else final_result
 
 

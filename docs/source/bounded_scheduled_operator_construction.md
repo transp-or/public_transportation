@@ -72,6 +72,13 @@ intentional: the reporter must never invent precision for a callback that does
 not expose progress.  All of these fields are reporting metadata only and are
 excluded from numerical identities, checkpoints, and artifact fingerprints.
 
+Telemetry delivery is isolated from construction.  Worker-origin callbacks
+queue their already-built event in memory and return without waiting for JSONL
+file I/O; the main phase-boundary emission drains the queue so durable records
+remain ordered.  If no callback is supplied, reporting is a no-op.  Sink
+exceptions are recorded as reporting diagnostics and never change a successful
+scientific result.
+
 Callers that know a phase schedule may provide reporting hints without changing
 the scientific run:
 

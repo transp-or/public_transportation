@@ -209,7 +209,7 @@ def test_audit_render_progress_ends_at_written_row_count(tmp_path: Path) -> None
     assert audit[-1].total == 2
 
 
-def test_callback_failure_during_render_preserves_existing_artifacts(
+def test_callback_failure_during_render_is_observability_only(
     tmp_path: Path,
 ) -> None:
     config = _config(tmp_path)
@@ -223,9 +223,8 @@ def test_callback_failure_during_render_preserves_existing_artifacts(
         if event.phase == "render_outputs" and event.completed == 1:
             raise RuntimeError("cancel rendering")
 
-    with pytest.raises(RuntimeError, match="cancel rendering"):
-        write_structural_zero_outputs(
-            analysis, _reconciliation(analysis), config, progress=fail
-        )
+    write_structural_zero_outputs(
+        analysis, _reconciliation(analysis), config, progress=fail
+    )
 
     assert original.audit.read_bytes() == before

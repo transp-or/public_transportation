@@ -7,8 +7,7 @@ import logging
 import math
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, field, replace
 from time import perf_counter
 from typing import cast
 
@@ -485,12 +484,28 @@ class BlockCoordinateMAPEstimator:
         sampled_block_norms: deque[float] = deque(
             maxlen=max(1, self.config.sampled_gradient_blocks)
         )
+        # ETA uses only a bounded history of completed batch durations.  A
+        # batch may contain several conflict-free blocks, so store its
+        # duration per completed schedule position.
+        unit_durations: deque[float] = deque(maxlen=32)
         if sampled_gradient.value is not None:
             sampled_block_norms.append(sampled_gradient.value)
         status: BlockCoordinateStatus | None = None
         message = ""
+        last_progress_event: BlockProgressEvent | None = None
         last_compact_elapsed = base_elapsed
         batch_size_at_position = _batch_size_by_position(batch_sizes)
+
+        def emit_progress(event: BlockProgressEvent) -> None:
+            if self.progress_callback is None:
+                return
+            try:
+                self.progress_callback(event)
+            except Exception:
+                # Progress is observability only.  Preserve control-flow
+                # exceptions such as KeyboardInterrupt and never turn a
+                # successful scientific update into a reporting failure.
+                return
 
         def elapsed() -> float:
             return base_elapsed + max(0.0, float(self.clock() - started))
@@ -558,6 +573,7 @@ class BlockCoordinateMAPEstimator:
                 batch = schedule[
                     schedule_position : schedule_position + planned_batch_size
                 ]
+                batch_started = self.clock()
                 objective_before_update = current_objective
                 solver_config = BlockSolverConfig(
                     maximum_iterations=self.config.block_solver_max_iterations,
@@ -755,12 +771,23 @@ class BlockCoordinateMAPEstimator:
                     checkpoint_committed = True
 
                 elapsed_now = elapsed()
-                remaining = (
-                    None
-                    if schedule_position == 0
-                    else (elapsed_now / schedule_position)
-                    * (len(schedule) - schedule_position)
+                batch_seconds = max(0.0, self.clock() - batch_started)
+                if batch_seconds > 0.0 and batch:
+                    unit_durations.extend(
+                        [batch_seconds / len(batch)] * len(batch)
+                    )
+                from public_transportation.inference.construction_control import (
+                    estimate_completed_unit_eta,
                 )
+
+                eta = estimate_completed_unit_eta(
+                    unit_durations,
+                    completed_units=schedule_position,
+                    total_units=len(schedule),
+                    parallelism=1,
+                    elapsed_seconds=max(0.0, elapsed_now),
+                )
+                remaining = eta.predicted_remaining_seconds
                 event = BlockProgressEvent(
                     sweep=completed_sweeps if completed_this_sweep else completed_sweeps + 1,
                     block_or_batch=batch_label,
@@ -795,16 +822,9 @@ class BlockCoordinateMAPEstimator:
                     completed_units=schedule_position,
                     total_units=len(schedule),
                     predicted_remaining_seconds=remaining,
-                    eta_confidence=(
-                        "unavailable"
-                        if remaining is None
-                        else ("high" if schedule_position >= 3 else "low")
-                    ),
-                    eta_reason=(
-                        None
-                        if remaining is not None
-                        else "no completed schedule position is available"
-                    ),
+                    eta_confidence=eta.eta_confidence,
+                    eta_reason=eta.eta_reason,
+                    estimated_completion_at_utc=eta.estimated_completion_at_utc,
                     work_stack=(
                         {
                             "name": "block_coordinate_schedule",
@@ -829,27 +849,12 @@ class BlockCoordinateMAPEstimator:
                         else f"schedule-{schedule_position:06d}"
                     ),
                     job_elapsed_seconds=elapsed_now,
-                    eta_lower_seconds=remaining,
-                    eta_upper_seconds=remaining,
+                    eta_lower_seconds=eta.eta_lower_seconds,
+                    eta_upper_seconds=eta.eta_upper_seconds,
                     predicted_job_remaining_seconds=remaining,
-                    job_eta_confidence=(
-                        "unavailable"
-                        if remaining is None
-                        else ("high" if schedule_position >= 3 else "low")
-                    ),
-                    job_eta_reason=(
-                        None
-                        if remaining is not None
-                        else "no completed schedule position is available"
-                    ),
-                    estimated_job_completion_at_utc=(
-                        None
-                        if remaining is None
-                        else (
-                            datetime.now(timezone.utc)
-                            + timedelta(seconds=max(0.0, remaining))
-                        ).isoformat().replace("+00:00", "Z")
-                    ),
+                    job_eta_confidence=eta.eta_confidence,
+                    job_eta_reason=eta.eta_reason,
+                    estimated_job_completion_at_utc=eta.estimated_completion_at_utc,
                     deadline_remaining_seconds=(
                         None
                         if self.absolute_deadline is None
@@ -866,10 +871,10 @@ class BlockCoordinateMAPEstimator:
                         else remaining <= max(0.0, self.absolute_deadline - self.clock())
                     ),
                 )
+                last_progress_event = event
                 if self.logger is not None:
                     self.logger.info(event.to_json_line().rstrip())
-                if self.progress_callback is not None:
-                    self.progress_callback(event)
+                emit_progress(event)
                 if self.stop_callback is not None and self.stop_callback(event):
                     status = "interrupted_with_approximate_solution"
                     message = "Stopped by the user callback after an atomic block or batch update."
@@ -952,6 +957,57 @@ class BlockCoordinateMAPEstimator:
 
         if status is None:  # pragma: no cover - defensive exhaustiveness
             raise RuntimeError("estimator stopped without a result status")
+        if last_progress_event is not None:
+            terminal_remaining = last_progress_event.predicted_remaining_seconds
+            terminal_current = last_progress_event.block_or_batch
+            if status == "converged":
+                terminal_remaining = 0.0
+                terminal_current = ""
+            terminal_stack = tuple(
+                {
+                    **stack,
+                    "status": str(status),
+                    "current_unit": (
+                        None if status == "converged" else stack.get("current_unit")
+                    ),
+                }
+                for stack in last_progress_event.work_stack
+            )
+            terminal_event = replace(
+                last_progress_event,
+                status=str(status),
+                block_or_batch=terminal_current or last_progress_event.block_or_batch,
+                estimated_remaining_sweep_seconds=terminal_remaining,
+                predicted_remaining_seconds=terminal_remaining,
+                eta_confidence=(
+                    "high" if status == "converged" else last_progress_event.eta_confidence
+                ),
+                eta_reason=(
+                    "all units completed"
+                    if status == "converged"
+                    else last_progress_event.eta_reason
+                ),
+                eta_lower_seconds=(
+                    0.0 if status == "converged" else last_progress_event.eta_lower_seconds
+                ),
+                eta_upper_seconds=(
+                    0.0 if status == "converged" else last_progress_event.eta_upper_seconds
+                ),
+                predicted_job_remaining_seconds=terminal_remaining,
+                job_eta_confidence=(
+                    "high" if status == "converged" else last_progress_event.job_eta_confidence
+                ),
+                job_eta_reason=(
+                    "all units completed"
+                    if status == "converged"
+                    else last_progress_event.job_eta_reason
+                ),
+                work_stack=terminal_stack,
+                active_units=() if status == "converged" else last_progress_event.active_units,
+            )
+            if self.logger is not None:
+                self.logger.info(terminal_event.to_json_line().rstrip())
+            emit_progress(terminal_event)
         if policy.final_exact_gradient and not invocation_deadline_reached():
             exact_gradient = DiagnosticValue(
                 exact_gradient_norm(incremental),

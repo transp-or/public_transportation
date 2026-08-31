@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 
 from public_transportation.inference.construction_control import (
     ConstructionDeadline,
     ConstructionPhase,
     ConstructionProgressReporter,
+    _finite_positive_samples,
     deadline_stop,
     estimate_completed_unit_eta,
+    normalize_progress_event,
 )
 
 
@@ -128,6 +133,123 @@ def test_eta_marks_heterogeneous_units_conservatively():
     )
     assert estimate.predicted_remaining_seconds is not None
     assert estimate.eta_confidence in {"low", "medium"}
+
+
+def test_eta_duration_samples_keep_only_a_bounded_recent_tail():
+    samples = _finite_positive_samples(
+        [1.0] * 10_000 + [2.0] * 32 + [float("nan"), -1.0, 0.0]
+    )
+    assert len(samples) == 32
+    assert samples == [2.0] * 32
+
+
+def test_reporting_sink_failure_does_not_fail_the_scientific_run():
+    def failing_sink(event):
+        raise OSError("log filesystem unavailable")
+
+    reporter = ConstructionProgressReporter(
+        ConstructionDeadline.unlimited(), failing_sink, minimum_interval_seconds=0.0
+    )
+    reporter.emit(
+        phase=ConstructionPhase.PLANNING,
+        status="running",
+        completed_units=1,
+        total_units=2,
+    )
+    assert reporter.reporting_failures == 1
+    assert reporter.last_reporting_error == "OSError: log filesystem unavailable"
+    assert reporter.last_event is not None
+    assert reporter.last_event["completed_units"] == 1
+
+
+def test_nonblocking_progress_does_not_wait_for_sink_io():
+    started = threading.Event()
+    release = threading.Event()
+    events = []
+
+    def blocking_sink(event):
+        started.set()
+        release.wait(timeout=2.0)
+        events.append(event)
+
+    reporter = ConstructionProgressReporter(
+        ConstructionDeadline.unlimited(), blocking_sink, minimum_interval_seconds=0.0
+    )
+    started_at = time.perf_counter()
+    reporter.emit_nonblocking(
+        phase=ConstructionPhase.SUPPORT_DISCOVERY,
+        status="running",
+        completed_units=1,
+        total_units=2,
+    )
+    assert time.perf_counter() - started_at < 0.5
+    assert started.wait(timeout=1.0)
+    release.set()
+    reporter.flush()
+    assert events and events[0]["completed_units"] == 1
+
+
+def test_nonblocking_progress_queue_is_bounded_and_drops_when_full():
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_sink(_event):
+        started.set()
+        release.wait(timeout=2.0)
+
+    reporter = ConstructionProgressReporter(
+        ConstructionDeadline.unlimited(), blocking_sink, minimum_interval_seconds=0.0
+    )
+    reporter.emit_nonblocking(
+        phase=ConstructionPhase.SUPPORT_DISCOVERY,
+        status="running",
+        force=True,
+        completed_units=0,
+        total_units=2,
+    )
+    assert started.wait(timeout=1.0)
+    pending = reporter._sink_queue
+    assert pending is not None
+    assert pending.maxsize > 0
+    for completed in range(pending.maxsize + 16):
+        reporter.emit_nonblocking(
+            phase=ConstructionPhase.SUPPORT_DISCOVERY,
+            status="running",
+            force=True,
+            completed_units=completed + 1,
+            total_units=pending.maxsize + 16,
+        )
+    assert reporter.reporting_failures > 0
+    release.set()
+    reporter.flush()
+
+
+def test_normalize_progress_event_preserves_legacy_fields_and_adds_hierarchy():
+    payload = normalize_progress_event(
+        {
+            "phase": "legacy_shards",
+            "completed_shards": 2,
+            "total_shards": 5,
+            "estimated_remaining_seconds": 3.5,
+        }
+    )
+
+    assert payload["completed_shards"] == 2
+    assert payload["total_shards"] == 5
+    assert payload["completed_units"] == 2
+    assert payload["total_units"] == 5
+    assert payload["predicted_remaining_seconds"] == 3.5
+    assert payload["status"] == "running"
+    assert payload["schema_version"] == 1
+    assert payload["work_stack"] == (
+        {
+            "name": "legacy_shards",
+            "completed_units": 2,
+            "total_units": 5,
+            "current_unit": None,
+            "status": "running",
+        },
+    )
 
 
 def test_opaque_heartbeat_reports_subphase_without_inventing_eta():

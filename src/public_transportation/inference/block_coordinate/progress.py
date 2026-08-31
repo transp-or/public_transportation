@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from ._canonical import canonical_json
+from ..construction_control import normalize_progress_event
 
 DiagnosticKind = Literal["exact", "sampled", "stale", "deferred", "unavailable"]
 
@@ -92,8 +93,17 @@ class BlockProgressEvent:
     deadline_remaining_seconds: float | None = None
     deadline_margin_seconds: float | None = None
     will_finish_before_deadline: bool | None = None
+    # Common progress metadata.  These additive fields make direct
+    # ``to_json_line`` consumers consistent with the hierarchical sink while
+    # preserving all historical constructor arguments.
+    schema_version: int = 1
+    status: str = "running"
 
     def __post_init__(self) -> None:
+        if self.schema_version <= 0:
+            raise ValueError("schema_version must be positive.")
+        if not self.status.strip():
+            raise ValueError("status must be nonempty.")
         if self.sweep < 0:
             raise ValueError("sweep must be non-negative.")
         if not self.block_or_batch.strip():
@@ -139,6 +149,18 @@ class BlockProgressEvent:
             )
         ):
             raise ValueError("work counts must be non-negative.")
+        if self.completed_units is None:
+            object.__setattr__(self, "completed_units", self.blocks_completed_in_sweep)
+        if self.total_units is None:
+            object.__setattr__(self, "total_units", self.total_blocks)
+        if self.predicted_remaining_seconds is None:
+            object.__setattr__(
+                self,
+                "predicted_remaining_seconds",
+                self.estimated_remaining_sweep_seconds,
+            )
+        if self.phase_elapsed_seconds is None:
+            object.__setattr__(self, "phase_elapsed_seconds", self.elapsed_seconds)
 
     def to_json_line(self) -> str:
-        return canonical_json(self) + "\n"
+        return canonical_json(normalize_progress_event(self)) + "\n"

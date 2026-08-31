@@ -220,6 +220,37 @@ def test_origin_period_feasibility_cache_matches_pairwise_search() -> None:
     assert indexed.fingerprint == reference.fingerprint
 
 
+def test_in_memory_time_expansion_reports_bounded_eta_progress() -> None:
+    scenario = _scenario()
+    universe = generate_candidate_od_pairs(
+        scenario,
+        source="network_ordered_pairs",
+        active_service_only=True,
+        connectivity_policy="directed_reachable",
+    )
+    events: list[dict[str, object]] = []
+    expansion = expand_candidate_od_time_cells(
+        universe,
+        [("morning", 8 * 3600, 9 * 3600), ("late", 9 * 3600, 10 * 3600)],
+        scenario=scenario,
+        progress=events.append,
+    )
+
+    cell_events = [
+        event for event in events if event.get("phase") == "expand_od_time_cells"
+    ]
+    assert cell_events
+    assert cell_events[0]["completed_units"] == 0
+    assert cell_events[-1]["completed_units"] == cell_events[-1]["total_units"]
+    assert cell_events[-1]["predicted_remaining_seconds"] == pytest.approx(0.0)
+    assert any(
+        event["completed_units"] > 0
+        and event["predicted_remaining_seconds"] is not None
+        for event in cell_events
+    )
+    assert expansion.cell_count + len(expansion.exclusions) == cell_events[-1]["total_units"]
+
+
 def test_all_ones_prior_is_neutral_and_external_pair_prior_repeats_per_bin(tmp_path: Path) -> None:
     universe = generate_candidate_od_pairs(
         _scenario(),

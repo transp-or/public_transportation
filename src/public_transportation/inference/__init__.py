@@ -269,6 +269,7 @@ from .assignment_contract import (  # noqa: F401
 )
 from .measurement_support_preflight import (  # noqa: F401
     POSITIVE_BOARDING_PREFLIGHT_SCHEMA_VERSION,
+    POSITIVE_BOARDING_SUPPORT_CACHE_SCHEMA_VERSION,
     PositiveBoardingPreflightContext,
     PositiveBoardingCauseSummary,
     PositiveBoardingSupportIssue,
@@ -278,6 +279,9 @@ from .measurement_support_preflight import (  # noqa: F401
     boarding_access_supported_measurement_rows,
     enforce_positive_boarding_support,
     format_positive_boarding_support_failure,
+    load_positive_boarding_support_cache,
+    read_positive_boarding_support_report,
+    write_positive_boarding_support_cache,
     write_positive_boarding_support_report,
 )
 from .scheduled_reference_operator import (  # noqa: F401
@@ -299,7 +303,12 @@ from .temporal_assignment_blocks import (  # noqa: F401
 )
 from .temporal_assignment_persistence import (  # noqa: F401
     TEMPORAL_BLOCK_ARTIFACT_SCHEMA_VERSION,
+    TEMPORAL_OPERATOR_CACHE_SCHEMA_VERSION,
+    TEMPORAL_OPERATOR_VALIDATOR_VERSION,
+    PREFLIGHT_ADOPTION_SCHEMA_VERSION,
+    adopt_completed_preflight,
     load_temporal_block_operator,
+    materialize_operator_cache_from_adopted_preflight,
     reuse_or_build_temporal_block_operator,
     save_temporal_block_operator,
     temporal_block_cache_path,
@@ -329,6 +338,7 @@ from .construction_control import (  # noqa: F401
     ProgressWorkUnit,
     deadline_stop,
     estimate_completed_unit_eta,
+    normalize_progress_event,
     termination_payload,
 )
 from .fixed_routing_linear_backend import (  # noqa: F401

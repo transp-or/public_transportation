@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
@@ -262,6 +263,7 @@ class GravityEstimatorProgress:
     typical_objective_scale_provenance: str | None = None
     typical_parameter_scales_provenance: str | None = None
     typical_objective_scale_selection: str | None = None
+    schema_version: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -631,7 +633,7 @@ def estimate_gravity_model(
     valid_evaluation: GravityObjectiveEvaluation | None = None
     valid_gradient = np.zeros_like(raw_numpy)
     deadline_phase: str | None = None
-    iteration_durations: list[float] = []
+    iteration_durations: deque[float] = deque(maxlen=32)
     accepted_objectives: list[float] = []
     initial_objective: float | None = None
     latest_objective_dtype: str | None = None
@@ -653,6 +655,16 @@ def estimate_gravity_model(
         "max(abs(initial_objective), objective_floor)"
     )
     last_iteration_at = started
+
+    def emit_progress(event: GravityEstimatorProgress) -> None:
+        if progress is None:
+            return
+        try:
+            progress(event)
+        except Exception:
+            # Progress is observability only.  Keep the optimizer and its
+            # checkpoint semantics unchanged if a sink is unavailable.
+            return
 
     def evaluate(value: np.ndarray) -> tuple[float, np.ndarray]:
         nonlocal latest_raw, latest_evaluation, latest_gradient
@@ -731,7 +743,7 @@ def estimate_gravity_model(
                 total_units=config.maximum_iterations,
                 elapsed_seconds=max(0.0, elapsed),
             )
-            progress(
+            emit_progress(
                 GravityEstimatorProgress(
                     completed_iterations,
                     float(latest_evaluation.objective),
@@ -901,7 +913,7 @@ def estimate_gravity_model(
             total_units=config.maximum_iterations,
             elapsed_seconds=max(0.0, final_elapsed),
         )
-        progress(
+        emit_progress(
             GravityEstimatorProgress(
                 iteration=completed_iterations,
                 objective=objective_value,

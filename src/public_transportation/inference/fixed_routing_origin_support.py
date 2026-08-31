@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 import hashlib
 import json
 import math
@@ -154,6 +155,24 @@ class GroupSupportTiming:
 
 
 GroupSupportTimingCallback = Callable[[GroupSupportTiming], None]
+
+
+def _emit_timing_callback(
+    callback: GroupSupportTimingCallback | None,
+    timing: GroupSupportTiming,
+) -> None:
+    """Deliver optional timing telemetry without affecting support analysis."""
+
+    if callback is None:
+        return
+    try:
+        callback(timing)
+    except Exception:
+        # Timing is observability only.  A failed consumer must not alter the
+        # routing/support result or interrupt worker coordination.
+        return
+
+
 GroupSupportInnerProgressCallback = Callable[
     [int, int, int, float, str | None], None
 ]
@@ -448,7 +467,7 @@ def _analyze_parallel_support(
     admitted_workers = min(config.workers, max(1, len(missing)))
     pending: dict[int, Future[_GroupSupportResult]] = {}
     next_missing = 0
-    recent_group_seconds: list[float] = []
+    recent_group_seconds: deque[float] = deque(maxlen=32)
     free_rows: list[np.ndarray] = []
     free_columns: list[np.ndarray] = []
     fixed_rows: list[np.ndarray] = []
@@ -469,7 +488,7 @@ def _analyze_parallel_support(
         return (
             None
             if not recent_group_seconds
-            else float(np.mean(recent_group_seconds[-3:]))
+            else float(np.mean(tuple(recent_group_seconds)[-3:]))
         )
 
     def report_inner_progress(
@@ -492,7 +511,7 @@ def _analyze_parallel_support(
             total_weight=total_group_weight,
             elapsed_seconds=perf_counter() - total_start,
         )
-        reporter.emit(
+        reporter.emit_nonblocking(
             phase=ConstructionPhase.SUPPORT_DISCOVERY,
             status="running",
             completed_units=len(summaries),
@@ -681,7 +700,8 @@ def _analyze_parallel_support(
                 )
                 checkpoint_seconds = perf_counter() - checkpoint_started
             if timing_callback is not None:
-                timing_callback(
+                _emit_timing_callback(
+                    timing_callback,
                     GroupSupportTiming(
                         group=group,
                         selected_od_cells=result.summary.selected_od_cells,
@@ -1453,7 +1473,7 @@ def analyze_fixed_routing_origin_support(
             graph_arrays=support_graph_arrays,
         )
     total_origin_specific = total_group_bound = 0
-    recent_group_seconds: list[float] = []
+    recent_group_seconds: deque[float] = deque(maxlen=32)
     group_weights = tuple(
         int(np.count_nonzero(selected[group_indices[group][group_masks[group]]]))
         for group in range(int(inputs.group_dest_node.shape[0]))
@@ -1464,7 +1484,7 @@ def analyze_fixed_routing_origin_support(
     support_cache_misses = 0
     for group in range(int(inputs.group_dest_node.shape[0])):
         predicted_group = (
-            float(np.mean(recent_group_seconds[-3:]))
+            float(np.mean(tuple(recent_group_seconds)[-3:]))
             if recent_group_seconds
             else None
         )
@@ -1542,7 +1562,8 @@ def analyze_fixed_routing_origin_support(
             completed_group_weight += float(group_weights[group])
             support_cache_hits += 1
             if timing_callback is not None:
-                timing_callback(
+                _emit_timing_callback(
+                    timing_callback,
                     GroupSupportTiming(
                         group=group,
                         selected_od_cells=summary.selected_od_cells,
@@ -1831,7 +1852,8 @@ def analyze_fixed_routing_origin_support(
         completed_group_weight += float(group_weights[group])
         support_cache_misses += 1
         if timing_callback is not None:
-            timing_callback(
+            _emit_timing_callback(
+                timing_callback,
                 GroupSupportTiming(
                     group=group,
                     selected_od_cells=summary.selected_od_cells,

@@ -581,6 +581,12 @@ def test_sharded_builder_matches_monolithic_and_resumes(all_free_operator, tmp_p
         measurement_block_size=2,
         worker_memory_budget_bytes=100_000_000,
     )
+    progress_events: list[dict[str, object]] = []
+    reporter = ConstructionProgressReporter(
+        ConstructionDeadline.unlimited(),
+        progress_events.append,
+        minimum_interval_seconds=0.0,
+    )
     built = prepare_sharded_fixed_routing_measurement_operator(
         directory=tmp_path,
         inputs=inputs,
@@ -590,8 +596,27 @@ def test_sharded_builder_matches_monolithic_and_resumes(all_free_operator, tmp_p
         assignment_fingerprint="sharded-public-example",
         od_layout_fingerprint=layout.fingerprint,
         config=config,
+        reporter=reporter,
     )
     assert built.manifest.complete
+    opaque_stages = [
+        event
+        for event in progress_events
+        if event.get("construction_stage") in {
+            "kernel_lowering",
+            "kernel_compilation",
+        }
+    ]
+    assert opaque_stages
+    assert {event["construction_stage"] for event in opaque_stages} == {
+        "kernel_lowering",
+        "kernel_compilation",
+    }
+    assert all(
+        event["predicted_remaining_seconds"] is None
+        and event["eta_confidence"] == "unavailable"
+        for event in opaque_stages
+    )
     assert (tmp_path / "manifest.json").stat().st_size <= (
         built.plan.estimated_manifest_bytes
     )

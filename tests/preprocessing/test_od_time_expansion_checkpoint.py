@@ -72,6 +72,26 @@ def test_checkpoint_emits_progress_and_completes_atomically(tmp_path: Path) -> N
     assert result.status == "completed"
     assert result.completed_chunks == result.total_chunks
     assert [event["status"] for event in events][0] == "started"
+    feasibility_events = [
+        event for event in events if event.get("phase") == "feasibility_precompute"
+    ]
+    assert feasibility_events
+    assert feasibility_events[0]["completed_units"] == 0
+    assert feasibility_events[-1]["completed_units"] == feasibility_events[-1]["total_units"]
+    assert any(
+        event["completed_units"] > 0
+        and event["predicted_remaining_seconds"] is not None
+        for event in feasibility_events
+    )
+    expansion_events = [
+        event for event in events if event.get("phase") == "od_time_expansion"
+    ]
+    assert expansion_events[0]["completed_units"] == 0
+    first_completed = next(
+        event for event in expansion_events if event["completed_units"] > 0
+    )
+    assert first_completed["predicted_remaining_seconds"] is not None
+    assert expansion_events[-1]["predicted_remaining_seconds"] == pytest.approx(0.0)
     assert events[-1]["status"] == "completed"
     assert events[-1]["checkpoint_reusable"] is False
     assert events[-1]["eta_seconds"] is None or events[-1]["eta_seconds"] >= 0
@@ -88,7 +108,13 @@ def test_sigint_preserves_completed_chunks_and_resume_is_semantically_identical(
     checkpoint = tmp_path / "interrupted"
 
     def interrupt(event: dict[str, object]) -> None:
-        if event.get("status") == "running":
+        # The expansion now also reports the checkpointed feasibility
+        # precompute.  Interrupt the original chunk loop to preserve the
+        # historical resume assertion below.
+        if (
+            event.get("phase") == "od_time_expansion"
+            and event.get("status") == "running"
+        ):
             raise KeyboardInterrupt
 
     with pytest.raises(ODTimeExpansionInterrupted):
@@ -187,12 +213,14 @@ def test_completed_checkpoint_materializes_exact_prior_schema(tmp_path: Path) ->
         checkpoint_directory=checkpoint,
     )
     output = tmp_path / "scenario" / "prior_demand.csv"
+    events: list[dict[str, object]] = []
     materialized = materialize_prior_demand_from_checkpoint(
         checkpoint,
         output,
         scenario=scenario,
         package_revision="test-revision",
         expansion_fingerprint=result.expansion_fingerprint,
+        progress=lambda event: events.append(dict(event)),
     )
     lines = output.read_text(encoding="utf-8").splitlines()
     assert lines[0] == "origin_stop_id,dest_stop_id,time_bin_id,flow"
@@ -200,6 +228,14 @@ def test_completed_checkpoint_materializes_exact_prior_schema(tmp_path: Path) ->
     assert materialized.cell_count == result.retained_cells
     assert materialized.output_sha256
     assert materialized.fingerprint
+    prior_events = [event for event in events if event["phase"] == "materialize_prior"]
+    assert prior_events[0]["completed_units"] == 0
+    assert prior_events[0]["predicted_remaining_seconds"] is None
+    assert prior_events[1]["completed_units"] == 1
+    assert prior_events[1]["predicted_remaining_seconds"] is not None
+    assert prior_events[-1]["completed_units"] == prior_events[-1]["total_units"]
+    assert prior_events[-1]["predicted_remaining_seconds"] == pytest.approx(0.0)
+    assert prior_events[-1]["eta_seconds"] == pytest.approx(0.0)
 
 
 def test_interrupted_checkpoint_resumes_before_materialization(tmp_path: Path) -> None:

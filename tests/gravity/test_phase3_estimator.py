@@ -752,6 +752,9 @@ def test_run_manifest_and_progress_log_are_durable_and_serializable(tmp_path):
     records = [json.loads(line) for line in progress_path.read_text().splitlines()]
     assert [record["event"]["iteration"] for record in records] == [1, 2]
     assert all(record["run_id"] == "test-run" for record in records)
+    assert records[0]["event"]["schema_version"] == 1
+    assert records[0]["event"]["completed_units"] == 1
+    assert records[0]["event"]["work_stack"][0]["name"] == "optimizer_iterations"
 
 
 def test_negative_binomial_synthetic_fit_recovers_all_minimal_parameters():

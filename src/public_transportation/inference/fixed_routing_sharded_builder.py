@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 import math
 import hashlib
 import json
@@ -59,6 +60,7 @@ from .construction_control import (
     ConstructionPhase,
     ConstructionProgressReporter,
     deadline_stop,
+    estimate_completed_unit_eta,
 )
 from .sharded_fixed_routing import (
     FixedRoutingShard,
@@ -70,6 +72,25 @@ from .sharded_fixed_routing import (
 )
 
 FixedRoutingSource = FixedRoutingInputs | ShardedFixedRoutingInputs
+
+
+def _emit_legacy_progress(
+    callback: Callable[[dict[str, object]], None] | None,
+    payload: dict[str, object],
+) -> None:
+    """Deliver the legacy telemetry hook without changing construction."""
+
+    if callback is None:
+        return
+    try:
+        callback(payload)
+    except OSError:
+        # A legacy callback is often a file/socket sink.  I/O failures are
+        # observability-only and must not invalidate an otherwise successful
+        # construction.  Other exceptions intentionally propagate: callers
+        # have historically used the callback as an explicit interruption
+        # hook, and swallowing those would break resumable construction.
+        return
 
 # Numerical shard contents are tied to the kernel algorithm.  This version is
 # deliberately separate from the support-checkpoint provenance: changing the
@@ -1928,6 +1949,7 @@ def prepare_sharded_fixed_routing_measurement_operator(
         if reporter is None
         else reporter
     )
+    reporting_enabled = events.sink is not None
     directory = Path(directory)
     total_start = perf_counter()
     if positive_boarding_preflight is not None:
@@ -2395,29 +2417,97 @@ def prepare_sharded_fixed_routing_measurement_operator(
     routing_reader = _RoutingBatchReader(routing)
     prototype_probability, prototype_effective = routing_reader.device(0)
     lowering_start = perf_counter()
-    reach_lowered = reach_kernel.lower(
-        dummy_origins,
-        dummy_valid,
-        prototype_probability,
-        prototype_effective,
-        *graph_arrays,
-    )
-    gather_lowered = gather_kernel.lower(
-        jnp.zeros(
-            (config.od_chunk_size, inputs.graph.num_nodes),
-            dtype=inputs.base_link_cost.dtype,
-        ),
-        prototype_probability,
-        prototype_effective,
-        dummy_links,
-        dummy_link_mask,
-        tail_device,
-    )
+    if reporting_enabled:
+        events.emit(
+            phase=ConstructionPhase.SHARD_CONSTRUCTION,
+            status="heartbeat",
+            force=True,
+            completed_units=len(completed),
+            total_units=plan.num_shards,
+            current_unit="operator_kernel_lowering",
+            checkpoint_location=str(directory),
+            details={"construction_stage": "kernel_lowering"},
+        )
+    with events.heartbeat_scope(
+        current_unit="operator_kernel_lowering",
+        completed_units=len(completed),
+        total_units=plan.num_shards,
+        phase=ConstructionPhase.SHARD_CONSTRUCTION,
+        heartbeat_status="heartbeat",
+        details={"construction_stage": "kernel_lowering"},
+    ):
+        reach_lowered = reach_kernel.lower(
+            dummy_origins,
+            dummy_valid,
+            prototype_probability,
+            prototype_effective,
+            *graph_arrays,
+        )
+        gather_lowered = gather_kernel.lower(
+            jnp.zeros(
+                (config.od_chunk_size, inputs.graph.num_nodes),
+                dtype=inputs.base_link_cost.dtype,
+            ),
+            prototype_probability,
+            prototype_effective,
+            dummy_links,
+            dummy_link_mask,
+            tail_device,
+        )
     lowering_seconds = perf_counter() - lowering_start
+    if reporting_enabled:
+        events.emit(
+            phase=ConstructionPhase.SHARD_CONSTRUCTION,
+            status="heartbeat",
+            force=True,
+            completed_units=len(completed),
+            total_units=plan.num_shards,
+            current_unit="operator_kernel_lowering",
+            recent_unit_seconds=lowering_seconds,
+            checkpoint_location=str(directory),
+            details={
+                "construction_stage": "kernel_lowering",
+                "construction_stage_status": "completed",
+            },
+        )
     compilation_start = perf_counter()
-    reach_compiled = reach_lowered.compile()
-    gather_compiled = gather_lowered.compile()
+    if reporting_enabled:
+        events.emit(
+            phase=ConstructionPhase.SHARD_CONSTRUCTION,
+            status="heartbeat",
+            force=True,
+            completed_units=len(completed),
+            total_units=plan.num_shards,
+            current_unit="operator_kernel_compilation",
+            checkpoint_location=str(directory),
+            details={"construction_stage": "kernel_compilation"},
+        )
+    with events.heartbeat_scope(
+        current_unit="operator_kernel_compilation",
+        completed_units=len(completed),
+        total_units=plan.num_shards,
+        phase=ConstructionPhase.SHARD_CONSTRUCTION,
+        heartbeat_status="heartbeat",
+        details={"construction_stage": "kernel_compilation"},
+    ):
+        reach_compiled = reach_lowered.compile()
+        gather_compiled = gather_lowered.compile()
     compilation_seconds = perf_counter() - compilation_start
+    if reporting_enabled:
+        events.emit(
+            phase=ConstructionPhase.SHARD_CONSTRUCTION,
+            status="heartbeat",
+            force=True,
+            completed_units=len(completed),
+            total_units=plan.num_shards,
+            current_unit="operator_kernel_compilation",
+            recent_unit_seconds=compilation_seconds,
+            checkpoint_location=str(directory),
+            details={
+                "construction_stage": "kernel_compilation",
+                "construction_stage_status": "completed",
+            },
+        )
 
     origins = np.asarray(inputs.od_origin_node, dtype=np.int32)
     mapping_links = np.asarray(spec.link_index, dtype=np.int32)
@@ -2443,7 +2533,7 @@ def prepare_sharded_fixed_routing_measurement_operator(
     edge_gather_evaluations = 0
     reachability_dispatch = 0.0
     edge_gather_dispatch = 0.0
-    recent_shard_seconds: list[float] = []
+    recent_shard_seconds: deque[float] = deque(maxlen=32)
     missing = tuple(
         identity for identity in plan.expected_shards if identity.key not in completed
     )
@@ -2479,7 +2569,7 @@ def prepare_sharded_fixed_routing_measurement_operator(
     def predicted_next_seconds() -> float | None:
         if not recent_shard_seconds:
             return None
-        return float(np.mean(recent_shard_seconds[-3:]))
+        return float(np.mean(tuple(recent_shard_seconds)[-3:]))
 
     def deadline_allows_dispatch(predicted: float | None) -> bool:
         remaining = control.remaining_seconds
@@ -2565,7 +2655,8 @@ def prepare_sharded_fixed_routing_measurement_operator(
         ):
             checkpoint_manifest()
         if legacy_progress is not None:
-            legacy_progress(
+            _emit_legacy_progress(
+                legacy_progress,
                 {
                     "completed_shards": len(completed),
                     "expected_shards": plan.num_shards,
@@ -2574,18 +2665,35 @@ def prepare_sharded_fixed_routing_measurement_operator(
                     **progress_details(),
                 }
             )
+        eta = None
+        if reporting_enabled:
+            eta = estimate_completed_unit_eta(
+                recent_shard_seconds,
+                completed_units=len(completed),
+                total_units=plan.num_shards,
+                parallelism=admitted_workers,
+                elapsed_seconds=max(0.0, perf_counter() - total_start),
+            )
         events.emit(
             phase=ConstructionPhase.SHARD_CONSTRUCTION,
             status="running",
-            force=True,
+            force=(len(completed) == 1 or len(completed) == plan.num_shards),
             completed_units=len(completed),
             total_units=plan.num_shards,
             current_unit=result.identity.key,
             recent_unit_seconds=result.elapsed_seconds,
             predicted_remaining_seconds=(
-                result.elapsed_seconds
-                * (plan.num_shards - len(completed))
-                / admitted_workers
+                None if eta is None else eta.predicted_remaining_seconds
+            ),
+            eta_confidence=("unavailable" if eta is None else eta.eta_confidence),
+            estimated_completion_at_utc=(
+                None if eta is None else eta.estimated_completion_at_utc
+            ),
+            eta_reason=(None if eta is None else eta.eta_reason),
+            eta_lower_seconds=(None if eta is None else eta.eta_lower_seconds),
+            eta_upper_seconds=(None if eta is None else eta.eta_upper_seconds),
+            throughput_units_per_second=(
+                None if eta is None else eta.throughput_units_per_second
             ),
             checkpoint_location=str(directory),
             cache_hits=len(completed) - rebuilt,
@@ -2680,7 +2788,8 @@ def prepare_sharded_fixed_routing_measurement_operator(
                         for pending in active:
                             pending.cancel()
                         if legacy_progress is not None:
-                            legacy_progress(
+                            _emit_legacy_progress(
+                                legacy_progress,
                                 {
                                     "completed_shards": len(completed),
                                     "expected_shards": plan.num_shards,
@@ -2741,6 +2850,40 @@ def prepare_sharded_fixed_routing_measurement_operator(
     finally:
         shutil.rmtree(staging_directory, ignore_errors=True)
     final = load_sharded_operator_manifest(directory)
+    final_eta = None
+    if reporting_enabled:
+        final_eta = estimate_completed_unit_eta(
+            recent_shard_seconds,
+            completed_units=len(completed),
+            total_units=plan.num_shards,
+            parallelism=admitted_workers,
+            elapsed_seconds=max(0.0, perf_counter() - total_start),
+        )
+    events.emit(
+        phase=ConstructionPhase.SHARD_CONSTRUCTION,
+        status="completed",
+        force=True,
+        completed_units=len(completed),
+        total_units=plan.num_shards,
+        current_unit=None,
+        predicted_remaining_seconds=(
+            0.0 if final_eta is not None else None
+        ),
+        eta_confidence=("high" if final_eta is not None else "unavailable"),
+        estimated_completion_at_utc=(
+            None if final_eta is None else final_eta.estimated_completion_at_utc
+        ),
+        eta_reason=("all units completed" if final_eta is not None else None),
+        eta_lower_seconds=(0.0 if final_eta is not None else None),
+        eta_upper_seconds=(0.0 if final_eta is not None else None),
+        throughput_units_per_second=(
+            None if final_eta is None else final_eta.throughput_units_per_second
+        ),
+        checkpoint_location=str(directory),
+        cache_hits=len(completed) - rebuilt,
+        cache_misses=rebuilt,
+        details=progress_details(),
+    )
     return ShardedConstructionResult(
         directory=directory,
         manifest=final,

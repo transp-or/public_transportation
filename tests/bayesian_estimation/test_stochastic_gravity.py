@@ -76,6 +76,7 @@ def test_streaming_forward_reverse_share_selection_and_evict_every_shard(monkeyp
         problem, raw = _problem(operator)
         calls: list[tuple[str, tuple[int, ...]]] = []
         resident_after_calls: list[int] = []
+        events = []
         operator_type = ShardedMatrixFreeFixedRoutingMeasurementOperator
         original_forward = operator_type.partial_matvec
         original_reverse = operator_type.partial_rmatvec
@@ -103,6 +104,7 @@ def test_streaming_forward_reverse_share_selection_and_evict_every_shard(monkeyp
             config=StochasticGravityConfig(
                 effort_percent=50, seed=7, rss_safety_margin_bytes=0
             ),
+            progress_callback=events.append,
         )
         selected_groups = [
             tuple(operator.routing.shard_partition[index].destination_group_indices)
@@ -121,6 +123,35 @@ def test_streaming_forward_reverse_share_selection_and_evict_every_shard(monkeyp
             result.quality.measurement_standard_error_indicator
         )
         assert np.isfinite(result.quality.gradient_standard_error_indicator)
+        forward_after = [
+            event for event in events if event.phase == "forward" and event.boundary == "after"
+        ]
+        reverse_after = [
+            event for event in events if event.phase == "reverse" and event.boundary == "after"
+        ]
+        assert forward_after and reverse_after
+        assert forward_after[0].predicted_remaining_seconds is not None
+        assert reverse_after[0].predicted_remaining_seconds is not None
+        assert forward_after[-1].predicted_remaining_seconds == pytest.approx(0.0)
+        assert reverse_after[-1].predicted_remaining_seconds == pytest.approx(0.0)
+
+
+def test_stochastic_progress_sink_failure_does_not_change_result():
+    with TemporaryDirectory() as temporary:
+        operator = _operator(Path(temporary), groups=16)
+        problem, raw = _problem(operator)
+
+        def broken_sink(_event) -> None:
+            raise OSError("progress destination unavailable")
+
+        result = stochastic_gravity_value_and_gradient(
+            raw,
+            problem=problem,
+            config=StochasticGravityConfig(effort_percent=50, seed=7),
+            progress_callback=broken_sink,
+        )
+        assert result.status == "complete"
+        assert result.evaluation is not None
 
 
 def test_sampled_forward_reverse_obey_adjoint_identity():

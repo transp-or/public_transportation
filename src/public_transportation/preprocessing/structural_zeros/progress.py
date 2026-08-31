@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sys
+import json
+from collections import deque
 from dataclasses import dataclass
 import math
 from time import perf_counter
@@ -82,6 +84,8 @@ class StructuralZeroProgress:
     @property
     def eta_confidence(self) -> str:
         """Conservative confidence label for the linear ETA."""
+        if self.predicted_job_remaining_seconds is not None:
+            return self.job_eta_confidence
         if self.completed == self.total and self.total > 0:
             return "complete"
         if self.completed == 0 or self.total == 0:
@@ -104,6 +108,71 @@ class StructuralZeroProgress:
         if self.completed_weight is None or self.elapsed_seconds <= 0.0:
             return None
         return self.completed_weight / self.elapsed_seconds
+
+    # Common progress aliases are properties rather than new dataclass fields,
+    # so positional construction and the historical callback contract remain
+    # unchanged.  Serializers can use ``as_dict`` to include these fields.
+    @property
+    def schema_version(self) -> int:
+        return 1
+
+    @property
+    def status(self) -> str:
+        return "completed" if self.completed >= self.total else "running"
+
+    @property
+    def completed_units(self) -> int:
+        return self.completed
+
+    @property
+    def total_units(self) -> int:
+        return self.total
+
+    @property
+    def current_unit(self) -> str | None:
+        if self.status == "completed":
+            return None
+        return f"{self.phase}-{self.completed:06d}"
+
+    @property
+    def predicted_remaining_seconds(self) -> float | None:
+        if self.predicted_job_remaining_seconds is not None:
+            return self.predicted_job_remaining_seconds
+        return self.estimated_remaining_seconds
+
+    @property
+    def eta_reason(self) -> str | None:
+        if self.completed == self.total:
+            return "all units completed"
+        return self.job_eta_reason or (
+            None if self.completed > 0 else "no completed units are available"
+        )
+
+    @property
+    def estimated_completion_at_utc(self) -> str | None:
+        return self.estimated_job_completion_at_utc
+
+    def as_dict(self) -> dict[str, object]:
+        """Return a JSON-ready common progress payload.
+
+        The normalizer lives in the shared inference package and is imported
+        lazily to keep structural-zero preprocessing dependency-free at import
+        time.  It adds aliases and a one-level hierarchy without changing the
+        immutable event itself.
+        """
+
+        from public_transportation.inference.construction_control import (
+            normalize_progress_event,
+        )
+
+        return normalize_progress_event(self)
+
+    def to_json_line(self) -> str:
+        """Serialize this event deterministically for a durable JSONL sink."""
+
+        return json.dumps(
+            self.as_dict(), sort_keys=True, separators=(",", ":")
+        ) + "\n"
 
 
 StructuralZeroProgressCallback = Callable[[StructuralZeroProgress], None]
@@ -138,7 +207,24 @@ class ProgressEmitter:
         self.started = perf_counter()
         self.last_completed = -1
         self.last_emitted_at = self.started
+        self._last_observed_completed = 0
+        self._last_observed_at = self.started
+        self._recent_unit_seconds: deque[float] = deque(maxlen=32)
+        self._reporting_failures = 0
+        self._last_reporting_error: str | None = None
         self.count_interval = 1 if total <= 100 else max(25, (total + 99) // 100)
+
+    @property
+    def reporting_failures(self) -> int:
+        """Number of callback failures suppressed as reporting-only errors."""
+
+        return self._reporting_failures
+
+    @property
+    def last_reporting_error(self) -> str | None:
+        """Most recent callback failure, if any."""
+
+        return self._last_reporting_error
 
     def start(self) -> None:
         self.emit(0)
@@ -164,67 +250,69 @@ class ProgressEmitter:
         callback = self.progress
         if callback is None:
             return
-        callback(
-            StructuralZeroProgress(
-                phase=self.phase,
-                completed=completed,
-                total=self.total,
-                elapsed_seconds=now - self.started,
-                job_elapsed_seconds=now - self.started,
-                predicted_job_remaining_seconds=(
-                    (self.total - completed)
-                    / (completed / max(now - self.started, 1.0e-12))
-                    if completed > 0 and completed < self.total
-                    else (0.0 if completed == self.total else None)
-                ),
-                job_eta_confidence=(
-                    "high"
-                    if completed >= 10
-                    else ("medium" if completed >= 3 else "unavailable")
-                ),
-                job_eta_reason=(
-                    None
-                    if completed > 0
-                    else "no completed units are available"
-                ),
-                message=self.message,
-                phase_elapsed_seconds=now - self.started,
-                work_stack=(
-                    {
-                        "name": self.work_name,
-                        "completed_units": completed,
-                        "total_units": self.total,
-                        "current_unit": f"{self.work_name}-{completed:06d}",
-                        "completed_weight": (
-                            None
-                            if self.total_weight is None
-                            else float(self.total_weight) * completed / max(self.total, 1)
-                        ),
-                        "total_weight": self.total_weight,
-                        "status": "completed" if completed == self.total else "running",
-                    },
-                ),
-                active_units=(
-                    () if completed >= self.total else (f"{self.work_name}-{completed:06d}",)
-                ),
-                eta_lower_seconds=(
-                    None
-                    if completed == 0
-                    else ((self.total - completed) / (completed / max(now - self.started, 1.0e-12)))
-                ),
-                eta_upper_seconds=(
-                    None
-                    if completed == 0
-                    else ((self.total - completed) / (completed / max(now - self.started, 1.0e-12)))
-                ),
-                completed_weight=(
-                    None
-                    if self.total_weight is None
-                    else float(self.total_weight) * completed / max(self.total, 1)
-                ),
-                total_weight=self.total_weight,
-            )
+        elapsed = max(0.0, now - self.started)
+        delta_completed = completed - self._last_observed_completed
+        delta_seconds = max(0.0, now - self._last_observed_at)
+        if delta_completed > 0 and delta_seconds > 0.0:
+            self._recent_unit_seconds.append(delta_seconds / delta_completed)
+        self._last_observed_completed = completed
+        self._last_observed_at = now
+        from public_transportation.inference.construction_control import (
+            estimate_completed_unit_eta,
         )
+
+        eta = estimate_completed_unit_eta(
+            self._recent_unit_seconds,
+            completed_units=completed,
+            total_units=self.total,
+            elapsed_seconds=elapsed,
+        )
+        event = StructuralZeroProgress(
+            phase=self.phase,
+            completed=completed,
+            total=self.total,
+            elapsed_seconds=elapsed,
+            job_elapsed_seconds=now - self.started,
+            predicted_job_remaining_seconds=eta.predicted_remaining_seconds,
+            job_eta_confidence=eta.eta_confidence,
+            job_eta_reason=eta.eta_reason,
+            estimated_job_completion_at_utc=eta.estimated_completion_at_utc,
+            message=self.message,
+            phase_elapsed_seconds=elapsed,
+            work_stack=(
+                {
+                    "name": self.work_name,
+                    "completed_units": completed,
+                    "total_units": self.total,
+                    "current_unit": f"{self.work_name}-{completed:06d}",
+                    "completed_weight": (
+                        None
+                        if self.total_weight is None
+                        else float(self.total_weight) * completed / max(self.total, 1)
+                    ),
+                    "total_weight": self.total_weight,
+                    "status": "completed" if completed == self.total else "running",
+                },
+            ),
+            active_units=(
+                ()
+                if completed >= self.total
+                else (f"{self.work_name}-{completed:06d}",)
+            ),
+            eta_lower_seconds=eta.eta_lower_seconds,
+            eta_upper_seconds=eta.eta_upper_seconds,
+            completed_weight=(
+                None
+                if self.total_weight is None
+                else float(self.total_weight) * completed / max(self.total, 1)
+            ),
+            total_weight=self.total_weight,
+        )
+        try:
+            callback(event)
+        except Exception as error:  # progress must not fail preprocessing
+            self._reporting_failures += 1
+            self._last_reporting_error = f"{type(error).__name__}: {error}"
         self.last_completed = completed
         self.last_emitted_at = now
 
@@ -242,7 +330,12 @@ def emit_phase(
     if progress is None:
         return
     elapsed = 0.0 if started is None else perf_counter() - started
-    progress(StructuralZeroProgress(phase, completed, total, elapsed, message))
+    try:
+        progress(StructuralZeroProgress(phase, completed, total, elapsed, message))
+    except Exception:
+        # Progress is observability only; a broken sink must not fail the
+        # structural-zero calculation.
+        return
 
 
 class StructuralZeroTqdmProgress:

@@ -1059,6 +1059,96 @@ fingerprints are present. For `preflight`, also require
 `completed_phase = recommendation`; for `fit`, inspect the optimizer status
 and `success` separately; for `validate`, inspect the acceptance field.
 
+### Reuse a completed preflight and build the compact operator cache
+
+The first validation of a new temporal artifact can be long because the
+legacy loader opens every file below `artifact/blocks/`. A completed
+`results/manifests/preflight.json` is durable validation evidence and must not
+be discarded or rerun merely because the operator cache has not yet been
+created. Inspect it first:
+
+```bash
+jq '{status, artifact_identity_fingerprint,
+    result: {completed_phase, recommendation}}' \
+  "$RESULTS_ROOT/manifests/preflight.json"
+```
+
+Adoption is permitted only when `status` is `"completed"`,
+`result.completed_phase` is `6`, the final recommendation is present, and the
+artifact manifest is complete and fingerprint-compatible with the current
+case. The public API is:
+
+```python
+from public_transportation.inference.temporal_assignment_persistence import (
+    adopt_completed_preflight,
+)
+
+certificate = adopt_completed_preflight(
+    preflight_manifest=results_root / "manifests/preflight.json",
+    artifact_directory=results_root / "artifacts" / identity,
+    expected_identity=identity_object,
+    expected_canonical_index=canonical_index,
+    checkpoint_directory=results_root / "checkpoints",
+)
+```
+
+The function reads JSON metadata only; it does not open files below
+`artifact/blocks/`. It writes an atomic, identity-specific
+`temporal_operator_cache/validation_certificate.json` recording the
+preflight-manifest hash, artifact-manifest hash, canonical-index and binding
+fingerprints, block count, and fixed-offset hash. A failed, incomplete, or
+mismatched preflight never produces a certificate. Users must not edit or
+fabricate one.
+
+If the certificate is valid but the packed cache does not exist, the one-time
+consolidation pass may read each source block once. This is data persistence,
+not a second semantic validation: it must not repeat content-hash checks,
+realized-support discovery, or the full preflight. It writes the compact cache
+below the same identity-specific checkpoint directory:
+
+```text
+checkpoints/<artifact-identity>/temporal_operator_cache/
+  manifest.json
+  validation_certificate.json
+  row_indices.npy
+  column_indices.npy
+  values.npy
+  offsets.npy
+  fixed_measurement_offset.npy
+  keys.json
+```
+
+The cache preserves block ordering, temporal keys, sparse indices and values,
+fixed measurement offsets, dimensions, and both `matvec` and `rmatvec`
+results. Its manifest contains deterministic hashes for every packed array,
+the source artifact manifest, identity and binding fingerprints, and its
+provenance. Publication is atomic; incomplete caches are never accepted.
+
+After this one-time step, `preflight`, `benchmark`, and `fit` load the packed
+arrays and must not open any file under `artifact/blocks/`. A fast-path event
+has one logical unit rather than the legacy block count. It retains the
+`temporal_block_load` stage name for compatibility with existing progress
+consumers and marks the event as a packed-cache hit:
+
+```text
+cache_validation_stage=temporal_block_load
+operator_cache_hit=true
+cache_hits=1
+cache_misses=0
+completed_units=1
+total_units=1
+predicted_remaining_seconds=0
+```
+
+The realized positive-boarding support result is cached separately under
+`positive_boarding_support_cache/`. It is keyed by the artifact and operator
+cache manifests, canonical/binding fingerprints, observations, mapping,
+fixed-zero reasons, and the support-validator version. A valid zero-unsupported
+report is reused without rescanning operator blocks; changed observations or
+mapping inputs invalidate only this support cache. Delete a derived cache only
+if you accept the one-time reconstruction cost—the source artifact and its
+completed preflight remain valid.
+
 ### Current path/interface limitation
 
 The current template has relative defaults in `config/case.toml`,
@@ -1916,6 +2006,17 @@ checkpoint location when available. Estimator events report iteration,
 objective, gradient norm, elapsed time, and checkpoint state. An early ETA is
 provisional; it becomes more reliable after completed units accumulate.
 
+Progress delivery is deliberately isolated from the scientific calculation.
+When a callback is invoked from a construction worker, the event is placed in
+a bounded in-memory queue and written by a background sink worker; the
+construction worker does not wait for file I/O or `fsync`. Synchronous
+phase-boundary and terminal events drain that queue before writing, preserving
+the durable event order. If no callback/sink is supplied, the reporting path
+is a no-op. Reporting never requests an additional objective, gradient,
+routing, or JAX evaluation, and its fields are excluded from scientific and
+checkpoint identities. A failed progress sink is recorded as a reporting
+diagnostic and does not turn a successful calculation into a failed one.
+
 For the potentially long `routing_preparation` phase, the first event reports
 the actual planned destination-group and shard totals (never a hard-coded
 placeholder). Subsequent JSONL records are throttled heartbeats for planning,
@@ -1936,6 +2037,16 @@ An opaque `routing_factory()` has no shard callback, so it emits regular
 subphase heartbeats with a null ETA rather than inventing progress. These
 records are observational and do not alter routing decisions, numerical
 results, parallelism, or artifact fingerprints.
+
+The same reporting contract is used by the standalone exact/chunked temporal
+block constructors, selected-block construction probes, and progressive
+fidelity shard passes. Their legacy callback objects retain their historical
+fields, while the serialized/common view adds bounded recent-unit timing,
+remaining-time bounds, confidence, and an explicit terminal status. These
+diagnostic/reference paths do not add evaluations or alter the operator; an
+I/O failure in their progress sink is recorded as telemetry trouble, whereas
+an explicit non-I/O callback exception remains an intentional interruption
+hook for checkpoint/resume tests.
 
 The two routing progress controls are independent. Set
 `progress_interval_seconds` for the minimum wall-clock heartbeat interval and
@@ -1992,8 +2103,22 @@ while the loaded blocks are scanned for supported measurement rows. These
 events use the existing throttling policy, so a large number of blocks does
 not imply one output line per block.
 
-Heartbeats show that the process is alive, but they do not by themselves
-provide an ETA. Before stopping a job, check scheduler state and resource use:
+Every long preflight loop reports the following progress fields:
+`completed_units`, `total_units`, `predicted_remaining_seconds`,
+`eta_confidence`, `estimated_completion_at_utc`, `eta_lower_seconds`, and
+`eta_upper_seconds`. The initial zero-progress event may legitimately have an
+unavailable ETA. Once at least one block has completed, the loader and support
+scanner use completed-unit timings and elapsed wall-clock time to provide a
+finite low-, medium-, or high-confidence estimate, including an uncertainty
+interval and expected completion time. If a log still reports
+`predicted_remaining_seconds = null` and `eta_confidence = "unavailable"` after
+progress has started, treat that as an observability defect and record it with
+the run report.
+
+The first ETA is provisional and becomes more reliable as completed blocks
+accumulate. Heartbeats still show that the process is alive, but they should be
+interpreted together with the completion counts and ETA fields. Before stopping
+a job, check scheduler state and resource use:
 
 ```bash
 squeue -j "$JOB_ID"

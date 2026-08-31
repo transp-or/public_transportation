@@ -570,6 +570,69 @@ def test_progress_intervals_do_not_change_routing_plan_or_arrays(
     np.testing.assert_allclose(first_probability, second_probability)
 
 
+def test_legacy_progress_sink_failure_does_not_abort_sharded_preparation(
+    assignment_inputs, tmp_path
+):
+    def broken_sink(_event):
+        raise OSError("telemetry sink unavailable")
+
+    result = prepare_fixed_routing_sharded(
+        inputs=assignment_inputs,
+        theta=1.0,
+        config=FixedRoutingPreparationConfig(
+            maximum_groups_per_shard=2,
+            cache_directory=tmp_path / "cache",
+            checkpoint_directory=tmp_path / "checkpoint",
+        ),
+        progress=broken_sink,
+    )
+
+    assert result.status == "completed"
+
+
+def test_reporting_enabled_preserves_routing_artifacts_and_fingerprints(
+    assignment_inputs, tmp_path
+):
+    common = {
+        "maximum_groups_per_shard": 2,
+    }
+    enabled_config = FixedRoutingPreparationConfig(
+        **common,
+        cache_directory=tmp_path / "enabled-cache",
+        checkpoint_directory=tmp_path / "enabled-checkpoint",
+    )
+    disabled_config = FixedRoutingPreparationConfig(
+        **common,
+        cache_directory=tmp_path / "disabled-cache",
+        checkpoint_directory=tmp_path / "disabled-checkpoint",
+    )
+    events = []
+    enabled = prepare_fixed_routing_sharded(
+        inputs=assignment_inputs,
+        theta=1.0,
+        config=enabled_config,
+        progress=events.append,
+    )
+    disabled = prepare_fixed_routing_sharded(
+        inputs=assignment_inputs,
+        theta=1.0,
+        config=disabled_config,
+    )
+
+    assert events
+    assert enabled.plan.plan_fingerprint == disabled.plan.plan_fingerprint
+    assert (
+        enabled.routing.provenance.preparation_fingerprint
+        == disabled.routing.provenance.preparation_fingerprint
+    )
+    for enabled_descriptor, disabled_descriptor in zip(
+        enabled.plan.descriptors, disabled.plan.descriptors, strict=True
+    ):
+        enabled_path = fixed_routing_shard_path(enabled.routing, enabled_descriptor)
+        disabled_path = fixed_routing_shard_path(disabled.routing, disabled_descriptor)
+        assert enabled_path.read_bytes() == disabled_path.read_bytes()
+
+
 def test_batched_shards_match_serial_with_partial_final_batch(
     assignment_inputs, tmp_path
 ):

@@ -30,6 +30,35 @@ def test_progress_eta_is_unavailable_until_work_completes() -> None:
     assert event.eta_confidence == "unavailable"
 
 
+def test_structural_zero_progress_exposes_common_hierarchical_payload() -> None:
+    event = StructuralZeroProgress("path_metrics", 2, 5, 4.0, "working")
+
+    assert event.schema_version == 1
+    assert event.status == "running"
+    assert event.completed_units == 2
+    assert event.total_units == 5
+    assert event.current_unit == "path_metrics-000002"
+    assert event.predicted_remaining_seconds == pytest.approx(6.0)
+
+    payload = event.as_dict()
+    assert payload["phase"] == "path_metrics"
+    assert payload["completed_units"] == 2
+    assert payload["total_units"] == 5
+    assert payload["predicted_remaining_seconds"] == pytest.approx(6.0)
+    assert payload["work_stack"][0]["name"] == "path_metrics"
+    assert payload["work_stack"][0]["status"] == "running"
+    assert '"schema_version":1' in event.to_json_line()
+
+
+def test_structural_zero_progress_terminal_payload_has_zero_remaining() -> None:
+    event = StructuralZeroProgress("complete", 3, 3, 1.0)
+    payload = event.as_dict()
+    assert event.status == "completed"
+    assert event.current_unit is None
+    assert payload["predicted_remaining_seconds"] == pytest.approx(0.0)
+    assert payload["status"] == "completed"
+
+
 def test_tqdm_adapter_changes_phase_and_closes() -> None:
     stream = io.StringIO()
     adapter = structural_zero_tqdm_progress(file=stream)
@@ -59,6 +88,30 @@ def test_large_loop_count_throttle_emits_bounded_updates() -> None:
     for completed in range(1, 251):
         emitter.update(completed)
     assert [event.completed for event in events] == list(range(0, 251, 25))
+
+
+def test_progress_emitter_uses_shared_eta_and_suppresses_sink_failures() -> None:
+    events: list[StructuralZeroProgress] = []
+    emitter = ProgressEmitter(events.append, phase="large", total=4)
+    emitter.start()
+    for completed in range(1, 5):
+        emitter.emit(completed)
+
+    assert events[0].predicted_remaining_seconds is None
+    assert events[1].predicted_remaining_seconds is not None
+    assert events[1].eta_confidence == "low"
+    assert events[-1].completed_units == events[-1].total_units == 4
+    assert events[-1].predicted_remaining_seconds == pytest.approx(0.0)
+    assert events[-1].eta_confidence == "high"
+
+    def broken_sink(_event: StructuralZeroProgress) -> None:
+        raise OSError("progress destination unavailable")
+
+    failing = ProgressEmitter(broken_sink, phase="large", total=1)
+    failing.start()
+    failing.emit(1)
+    assert failing.reporting_failures == 2  # initial and terminal events
+    assert "progress destination unavailable" in (failing.last_reporting_error or "")
 
 
 def test_default_tqdm_stream_is_stderr(capsys) -> None:

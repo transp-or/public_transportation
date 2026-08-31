@@ -9,7 +9,7 @@ import os
 import resource
 import tempfile
 import threading
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,6 +29,10 @@ from public_transportation.inference.assignment_adapter import (
 )
 from public_transportation.inference.compact_od_assignment_layout import (
     CompactODAssignmentLayout,
+)
+from public_transportation.inference.construction_control import (
+    estimate_completed_unit_eta,
+    normalize_progress_event,
 )
 from public_transportation.measurement.mapping import AggregationSpec
 
@@ -288,6 +292,35 @@ class SelectedBlockConstructionProgress:
     total_od_chunks: int
     completed_measurement_chunks: int
     candidate_entries: int
+    schema_version: int = SELECTED_BLOCK_PROGRESS_SCHEMA_VERSION
+    phase: str = "selected_block_construction"
+    status: str = "running"
+    recent_unit_seconds: float | None = None
+    predicted_remaining_seconds: float | None = None
+    eta_confidence: str = "unavailable"
+    eta_reason: str | None = None
+    estimated_completion_at_utc: str | None = None
+    eta_lower_seconds: float | None = None
+    eta_upper_seconds: float | None = None
+    throughput_units_per_second: float | None = None
+
+
+def _emit_construction_progress(
+    callback: Callable[[SelectedBlockConstructionProgress], None] | None,
+    event: SelectedBlockConstructionProgress,
+) -> None:
+    """Deliver legacy progress while shielding I/O sink failures.
+
+    Non-I/O exceptions remain visible so callers can use the callback as an
+    explicit diagnostic interruption hook, as in the older implementation.
+    """
+
+    if callback is None:
+        return
+    try:
+        callback(event)
+    except OSError:
+        return
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,13 +364,26 @@ class SelectedBlockJSONLProgressSink:
         self._lock = threading.Lock()
 
     def __call__(self, event: SelectedBlockPhaseProgress) -> None:
-        payload = json.dumps(asdict(event), sort_keys=True, separators=(",", ":"))
+        payload = json.dumps(
+            normalize_progress_event(event), sort_keys=True, separators=(",", ":")
+        )
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._lock, self.path.open("a", encoding="utf-8") as stream:
-            stream.write(payload + "\n")
-            stream.flush()
-            if self.durable:
-                os.fsync(stream.fileno())
+        encoded = (payload + "\n").encode("utf-8")
+        with self._lock:
+            descriptor = os.open(
+                self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644
+            )
+            try:
+                offset = 0
+                while offset < len(encoded):
+                    written = os.write(descriptor, encoded[offset:])
+                    if written <= 0:
+                        raise OSError("progress append wrote no bytes")
+                    offset += written
+                if self.durable:
+                    os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
 
 
 class SelectedBlockDiagnosticStop(RuntimeError):
@@ -572,7 +618,12 @@ class FixedRoutingSelectedBlockBuilder:
             candidate_contributions_examined=self._candidate_contributions,
             accepted_nonzeros=self._accepted_nonzeros,
         )
-        callback(event)
+        try:
+            callback(event)
+        except OSError:
+            # Phase telemetry is ancillary.  Preserve the explicit diagnostic
+            # stop mechanism below while ignoring file/socket sink failures.
+            pass
         if (
             state == "complete"
             and self.diagnostic_stop_after is not None
@@ -1237,6 +1288,8 @@ class FixedRoutingSelectedBlockBuilder:
             len(plan.edge_chunks) for plan in measurement_plans
         )
         total_chunks = od_batches * len(measurement_plans)
+        progress_started = self.clock() if self.progress is not None else 0.0
+        recent_chunk_seconds: deque[float] = deque(maxlen=32)
         od_preparation_seconds = 0.0
         routing_evaluation_seconds = 0.0
         filtering_seconds = 0.0
@@ -1310,6 +1363,7 @@ class FixedRoutingSelectedBlockBuilder:
             self._emit_phase("jax_execution", "complete", reach_arguments)
             self._check_deadline("jax_reach_execution", indivisible=True)
             for plan in measurement_plans:
+                chunk_started = self.clock() if self.progress is not None else 0.0
                 self._emit_phase("support_filtering", "start")
                 self._check_deadline("measurement_support_filtering")
                 filtering_started = self.clock()
@@ -1417,14 +1471,40 @@ class FixedRoutingSelectedBlockBuilder:
                 self._completed_mapping_passes += 1
                 self._check_deadline("sparse_triplet_generation")
                 if self.progress is not None:
-                    self.progress(
+                    chunk_seconds = max(0.0, self.clock() - chunk_started)
+                    if chunk_seconds > 0.0:
+                        recent_chunk_seconds.append(chunk_seconds)
+                    eta = estimate_completed_unit_eta(
+                        recent_chunk_seconds,
+                        completed_units=completed_chunks,
+                        total_units=total_chunks,
+                        parallelism=1,
+                        elapsed_seconds=max(
+                            0.0, self.clock() - progress_started
+                        ),
+                    )
+                    _emit_construction_progress(
+                        self.progress,
                         SelectedBlockConstructionProgress(
-                            block.block_id,
-                            completed_chunks,
-                            total_chunks,
-                            measurement_chunks,
-                            accepted_nonzeros,
-                        )
+                            block_id=block.block_id,
+                            completed_od_chunks=completed_chunks,
+                            total_od_chunks=total_chunks,
+                            completed_measurement_chunks=measurement_chunks,
+                            candidate_entries=accepted_nonzeros,
+                            status=(
+                                "completed"
+                                if completed_chunks == total_chunks
+                                else "running"
+                            ),
+                            recent_unit_seconds=chunk_seconds,
+                            predicted_remaining_seconds=eta.predicted_remaining_seconds,
+                            eta_confidence=eta.eta_confidence,
+                            eta_reason=eta.eta_reason,
+                            estimated_completion_at_utc=eta.estimated_completion_at_utc,
+                            eta_lower_seconds=eta.eta_lower_seconds,
+                            eta_upper_seconds=eta.eta_upper_seconds,
+                            throughput_units_per_second=eta.throughput_units_per_second,
+                        ),
                     )
             self._completed_od_batches += 1
         numerical_seconds = self.clock() - numerical_started

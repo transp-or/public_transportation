@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import os
+from collections import deque
 from pathlib import Path
 import tempfile
 from time import perf_counter
@@ -56,6 +57,10 @@ from .temporal_assignment_blocks import (
 )
 from .temporal_assignment_sparse_backend import CSRCSCTemporalAssignmentOperator
 from .temporal_assignment_persistence import (
+    PREFLIGHT_ADOPTION_SCHEMA_VERSION,
+    TEMPORAL_OPERATOR_VALIDATOR_VERSION,
+    _atomic_json_write,
+    _materialize_operator_cache_from_operator,
     load_temporal_block_operator,
     save_temporal_block_operator,
     temporal_block_cache_path,
@@ -66,10 +71,13 @@ from .measurement_support_preflight import (
     audit_positive_boarding_support,
     boarding_access_supported_measurement_rows,
     enforce_positive_boarding_support,
+    load_positive_boarding_support_cache,
+    write_positive_boarding_support_cache,
 )
 from .construction_control import (
     ConstructionDeadline,
     ConstructionDeadlineStop,
+    ConstructionETA,
     ConstructionPhase,
     ConstructionProgressReporter,
     ConstructionTermination,
@@ -530,6 +538,31 @@ def _positive_boarding_context(
     )
 
 
+def _preflight_manifest_candidate(
+    *, checkpoint_root: str | Path, artifact_root: str | Path | None
+) -> Path | None:
+    """Locate the durable stage manifest without assuming a private layout."""
+    candidates = [Path(checkpoint_root).parent / "manifests" / "preflight.json"]
+    if artifact_root is not None:
+        candidates.append(Path(artifact_root).parent / "manifests" / "preflight.json")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _operator_cache_directory(checkpoint_directory: Path) -> Path:
+    return checkpoint_directory / "temporal_operator_cache"
+
+
 def _run_origin_positive_boarding_preflight(
     *,
     context: PositiveBoardingPreflightContext,
@@ -576,28 +609,116 @@ def _validate_cached_positive_boarding_support(
     operator: TemporalBlockAssignmentOperator,
     context: PositiveBoardingPreflightContext,
     reporter: ConstructionProgressReporter,
-) -> None:
+    artifact_directory: Path | None = None,
+    operator_cache_directory: Path | None = None,
+) -> ConstructionETA | None:
+    if artifact_directory is not None and operator_cache_directory is not None:
+        artifact_manifest = artifact_directory / "manifest.json"
+        operator_manifest = operator_cache_directory / "manifest.json"
+        if artifact_manifest.is_file() and operator_manifest.is_file():
+            cached_support = load_positive_boarding_support_cache(
+                directory=context.report_path.parent / "positive_boarding_support_cache"
+                if context.report_path is not None
+                else operator_cache_directory.parent / "positive_boarding_support_cache",
+                artifact_identity_fingerprint=operator.identity.fingerprint,
+                artifact_manifest_sha256=_file_sha256(artifact_manifest),
+                operator_cache_manifest_sha256=_file_sha256(operator_manifest),
+                canonical_index=context.canonical_index,
+                observations=context.observations,
+                mapping_info=context.mapping_info,
+                fixed_zero_reasons_by_full_index=context.fixed_zero_reasons_by_full_index,
+            )
+            if cached_support is not None:
+                _, cached_report = cached_support
+                enforce_positive_boarding_support(
+                    cached_report, report_path=context.report_path
+                )
+                eta = estimate_completed_unit_eta(
+                    (), completed_units=1, total_units=1, parallelism=1
+                )
+                reporter.emit(
+                    phase=ConstructionPhase.CACHE_VALIDATION,
+                    status="completed",
+                    force=True,
+                    completed_units=1,
+                    total_units=1,
+                    current_unit="positive_boarding_support_cache",
+                    checkpoint_location=str(operator_cache_directory.parent),
+                    predicted_remaining_seconds=0.0,
+                    eta_confidence="high",
+                    eta_lower_seconds=0.0,
+                    eta_upper_seconds=0.0,
+                    throughput_units_per_second=1.0,
+                    cache_hits=1,
+                    cache_misses=0,
+                    details={"cache_validation_stage": "positive_boarding_support_cache"},
+                )
+                reporter.emit(
+                    phase=ConstructionPhase.MEASUREMENT_SUPPORT_PREFLIGHT,
+                    status="completed",
+                    force=True,
+                    completed_units=2,
+                    total_units=2,
+                    checkpoint_location=(
+                        None if context.report_path is None else str(context.report_path)
+                    ),
+                    details={
+                        "preflight_stage": "realized_operator_support",
+                        "support_cache_hit": True,
+                        "positive_boarding_rows": cached_report.positive_boarding_rows,
+                        "unsupported_positive_boarding_rows": 0,
+                    },
+                )
+                return eta
     total_blocks = len(operator.blocks)
-    reporter.emit(
-        phase=ConstructionPhase.CACHE_VALIDATION,
-        status="running",
-        force=True,
-        completed_units=0,
-        total_units=total_blocks,
-        current_unit=("block-000000.npz" if total_blocks else None),
-        details={"cache_validation_stage": "realized_operator_support"},
-    )
-    supported: set[int] = set()
-    for block_position, block in enumerate(operator.blocks):
-        supported.update(int(row) for row in np.unique(block.row_indices))
+    reporting_enabled = reporter.sink is not None
+    recent_durations: deque[float] = deque(maxlen=16)
+    phase_started_at = perf_counter() if reporting_enabled else None
+    if reporting_enabled:
         reporter.emit(
             phase=ConstructionPhase.CACHE_VALIDATION,
             status="running",
-            completed_units=block_position + 1,
+            force=True,
+            completed_units=0,
             total_units=total_blocks,
-            current_unit=f"block-{block_position:06d}.npz",
+            current_unit=("block-000000.npz" if total_blocks else None),
             details={"cache_validation_stage": "realized_operator_support"},
         )
+    supported: set[int] = set()
+    for block_position, block in enumerate(operator.blocks):
+        block_started_at = perf_counter() if reporting_enabled else None
+        supported.update(int(row) for row in np.unique(block.row_indices))
+        if reporting_enabled:
+            assert block_started_at is not None
+            assert phase_started_at is not None
+            duration = max(0.0, perf_counter() - block_started_at)
+            recent_durations.append(duration)
+            phase_elapsed_seconds = max(
+                np.finfo(float).eps, perf_counter() - phase_started_at
+            )
+            eta = estimate_completed_unit_eta(
+                recent_durations,
+                completed_units=block_position + 1,
+                total_units=total_blocks,
+                parallelism=1,
+                elapsed_seconds=phase_elapsed_seconds,
+            )
+            reporter.emit(
+                phase=ConstructionPhase.CACHE_VALIDATION,
+                status="running",
+                completed_units=block_position + 1,
+                total_units=total_blocks,
+                current_unit=f"block-{block_position:06d}.npz",
+                recent_unit_seconds=duration,
+                predicted_remaining_seconds=eta.predicted_remaining_seconds,
+                eta_confidence=eta.eta_confidence,
+                estimated_completion_at_utc=eta.estimated_completion_at_utc,
+                eta_reason=eta.eta_reason,
+                eta_lower_seconds=eta.eta_lower_seconds,
+                eta_upper_seconds=eta.eta_upper_seconds,
+                throughput_units_per_second=eta.throughput_units_per_second,
+                details={"cache_validation_stage": "realized_operator_support"},
+            )
     supported.update(
         int(row) for row in np.flatnonzero(operator.fixed_measurement_offset != 0.0)
     )
@@ -610,14 +731,52 @@ def _validate_cached_positive_boarding_support(
         fixed_zero_reasons_by_full_index=context.fixed_zero_reasons_by_full_index,
     )
     enforce_positive_boarding_support(report, report_path=context.report_path)
-    reporter.emit(
-        phase=ConstructionPhase.CACHE_VALIDATION,
-        status="completed",
-        force=True,
-        completed_units=total_blocks,
-        total_units=total_blocks,
-        details={"cache_validation_stage": "realized_operator_support"},
-    )
+    if artifact_directory is not None and operator_cache_directory is not None:
+        artifact_manifest = artifact_directory / "manifest.json"
+        operator_manifest = operator_cache_directory / "manifest.json"
+        if artifact_manifest.is_file() and operator_manifest.is_file():
+            write_positive_boarding_support_cache(
+                directory=(
+                    context.report_path.parent / "positive_boarding_support_cache"
+                    if context.report_path is not None
+                    else operator_cache_directory.parent / "positive_boarding_support_cache"
+                ),
+                report=report,
+                supported_measurement_rows=np.asarray(sorted(supported), dtype=np.int64),
+                artifact_identity_fingerprint=operator.identity.fingerprint,
+                artifact_manifest_sha256=_file_sha256(artifact_manifest),
+                operator_cache_manifest_sha256=_file_sha256(operator_manifest),
+                canonical_index=context.canonical_index,
+                observations=context.observations,
+                mapping_info=context.mapping_info,
+                fixed_zero_reasons_by_full_index=context.fixed_zero_reasons_by_full_index,
+            )
+    final_eta: ConstructionETA | None = None
+    if reporting_enabled:
+        assert phase_started_at is not None
+        final_eta = estimate_completed_unit_eta(
+            recent_durations,
+            completed_units=total_blocks,
+            total_units=total_blocks,
+            parallelism=1,
+            elapsed_seconds=max(0.0, perf_counter() - phase_started_at),
+        )
+        reporter.emit(
+            phase=ConstructionPhase.CACHE_VALIDATION,
+            status="completed",
+            force=True,
+            completed_units=total_blocks,
+            total_units=total_blocks,
+            recent_unit_seconds=(recent_durations[-1] if recent_durations else None),
+            predicted_remaining_seconds=final_eta.predicted_remaining_seconds,
+            eta_confidence=final_eta.eta_confidence,
+            estimated_completion_at_utc=final_eta.estimated_completion_at_utc,
+            eta_reason=final_eta.eta_reason,
+            eta_lower_seconds=final_eta.eta_lower_seconds,
+            eta_upper_seconds=final_eta.eta_upper_seconds,
+            throughput_units_per_second=final_eta.throughput_units_per_second,
+            details={"cache_validation_stage": "realized_operator_support"},
+        )
     reporter.emit(
         phase=ConstructionPhase.MEASUREMENT_SUPPORT_PREFLIGHT,
         status="completed",
@@ -633,6 +792,7 @@ def _validate_cached_positive_boarding_support(
             "unsupported_positive_boarding_rows": 0,
         },
     )
+    return final_eta
 
 
 def _finalize_temporal_blocks(
@@ -657,15 +817,22 @@ def _finalize_temporal_blocks(
         canonical_index.number_of_measurements, dtype=np.dtype(identity.numeric_dtype)
     )
     retained_l1 = 0.0
-    recent_seconds: list[float] = []
+    # Only the recent tail is needed for deadline prediction and progress ETA;
+    # retaining every shard duration would make reporting memory grow with the
+    # number of temporal shards.
+    recent_seconds: deque[float] = deque(maxlen=32)
     expected = construction.manifest.expected_shards
+    reporting_enabled = reporter is not None and reporter.sink is not None
+    phase_started_at = perf_counter() if reporting_enabled else None
     if checkpoint_directory is not None:
         fragments = checkpoint_directory / "temporal_fragments"
         if fragments.exists():
             for abandoned in fragments.glob(".*.tmp"):
                 abandoned.unlink(missing_ok=True)
     for shard_position, shard_identity in enumerate(expected):
-        predicted = float(np.mean(recent_seconds[-3:])) if recent_seconds else None
+        predicted = (
+            float(np.mean(tuple(recent_seconds)[-3:])) if recent_seconds else None
+        )
         if deadline is not None and not deadline.may_start(predicted):
             raise deadline_stop(
                 deadline,
@@ -762,16 +929,36 @@ def _finalize_temporal_blocks(
         now = deadline.clock() if deadline is not None else perf_counter()
         recent_seconds.append(max(0.0, now - shard_started))
         if reporter is not None:
+            eta = None
+            if reporting_enabled:
+                assert phase_started_at is not None
+                eta = estimate_completed_unit_eta(
+                    recent_seconds,
+                    completed_units=shard_position + 1,
+                    total_units=len(expected),
+                    parallelism=1,
+                    elapsed_seconds=max(0.0, perf_counter() - phase_started_at),
+                )
             reporter.emit(
                 phase=ConstructionPhase.TEMPORAL_BLOCK_ASSEMBLY,
                 status="running",
-                force=True,
+                force=(shard_position == 0 or shard_position + 1 == len(expected)),
                 completed_units=shard_position + 1,
                 total_units=len(expected),
                 current_unit=shard_identity.key,
                 recent_unit_seconds=recent_seconds[-1],
                 predicted_remaining_seconds=(
-                    recent_seconds[-1] * (len(expected) - shard_position - 1)
+                    None if eta is None else eta.predicted_remaining_seconds
+                ),
+                eta_confidence=("unavailable" if eta is None else eta.eta_confidence),
+                estimated_completion_at_utc=(
+                    None if eta is None else eta.estimated_completion_at_utc
+                ),
+                eta_reason=(None if eta is None else eta.eta_reason),
+                eta_lower_seconds=(None if eta is None else eta.eta_lower_seconds),
+                eta_upper_seconds=(None if eta is None else eta.eta_upper_seconds),
+                throughput_units_per_second=(
+                    None if eta is None else eta.throughput_units_per_second
                 ),
                 checkpoint_location=(
                     None
@@ -877,6 +1064,11 @@ def prepare_direct_scheduled_temporal_operator(
     )
     _run_origin_positive_boarding_preflight(context=preflight, reporter=events)
     checkpoint_directory = Path(checkpoint_root) / identity.fingerprint
+    checkpoint_directory.mkdir(parents=True, exist_ok=True)
+    operator_cache_directory = _operator_cache_directory(checkpoint_directory)
+    preflight_manifest = _preflight_manifest_candidate(
+        checkpoint_root=checkpoint_root, artifact_root=artifact_root
+    )
     artifact_directory = (
         None
         if artifact_root is None
@@ -889,6 +1081,8 @@ def prepare_direct_scheduled_temporal_operator(
                 expected_identity=identity,
                 expected_canonical_index=canonical_index,
                 reporter=events,
+                validated_cache_directory=operator_cache_directory,
+                preflight_manifest=preflight_manifest,
             )
         except (AssignmentCompatibilityError, ValueError, KeyError, OSError):
             quarantine = artifact_directory.with_name(
@@ -897,7 +1091,11 @@ def prepare_direct_scheduled_temporal_operator(
             os.replace(artifact_directory, quarantine)
         else:
             _validate_cached_positive_boarding_support(
-                operator=operator, context=preflight, reporter=events
+                operator=operator,
+                context=preflight,
+                reporter=events,
+                artifact_directory=artifact_directory,
+                operator_cache_directory=operator_cache_directory,
             )
             return DirectScheduledTemporalConstructionResult(
                 operator=operator,
@@ -1001,6 +1199,46 @@ def prepare_direct_scheduled_temporal_operator(
             deadline=control,
             reporter=events,
             checkpoint_location=checkpoint_directory,
+        )
+        # The freshly validated in-memory operator is the authoritative source
+        # for the first compact-cache materialization.  Persisting this cache
+        # here means that a subsequent process can open packed arrays directly
+        # instead of re-reading and re-validating every source block.
+        artifact_manifest_path = artifact_directory / "manifest.json"
+        artifact_manifest = json.loads(
+            artifact_manifest_path.read_text(encoding="utf-8")
+        )
+        operator_cache_directory.mkdir(parents=True, exist_ok=True)
+        certificate_path = operator_cache_directory / "validation_certificate.json"
+        _atomic_json_write(
+            certificate_path,
+            {
+                "complete": True,
+                "schema_version": PREFLIGHT_ADOPTION_SCHEMA_VERSION,
+                "validator_version": TEMPORAL_OPERATOR_VALIDATOR_VERSION,
+                "provenance": {
+                    "source": "full_validation",
+                    "preflight_manifest_sha256": None,
+                    "preflight_completed_phase": None,
+                    "legacy_completed_preflight": False,
+                },
+                "artifact_identity_fingerprint": identity.fingerprint,
+                "artifact_manifest_sha256": _file_sha256(artifact_manifest_path),
+                "canonical_index_fingerprint": canonical_index.artifact_fingerprint,
+                "binding_fingerprint": canonical_index.binding_fingerprint,
+                "number_of_blocks": len(artifact_manifest.get("blocks", [])),
+                "fixed_measurement_offset_hash": artifact_manifest.get(
+                    "fixed_measurement_offset_hash"
+                ),
+            },
+        )
+        _materialize_operator_cache_from_operator(
+            operator=operator,
+            cache_directory=operator_cache_directory,
+            artifact_manifest_sha256=_file_sha256(artifact_manifest_path),
+            certificate_path=certificate_path,
+            provenance_source="full_validation",
+            reporter=events,
         )
     finalization_seconds = max(0.0, perf_counter() - finalization_started)
     if control.expired:
@@ -1115,6 +1353,12 @@ def activate_direct_scheduled_temporal_operator(
         raise AssignmentCompatibilityError(
             "direct temporal activation theta is incompatible."
         )
+    checkpoint_directory = Path(checkpoint_root) / identity.fingerprint
+    checkpoint_directory.mkdir(parents=True, exist_ok=True)
+    operator_cache_directory = _operator_cache_directory(checkpoint_directory)
+    preflight_manifest = _preflight_manifest_candidate(
+        checkpoint_root=checkpoint_root, artifact_root=artifact_root
+    )
     if mode == "off":
         decision = DirectScheduledActivationDecision(
             mode=mode,
@@ -1152,19 +1396,58 @@ def activate_direct_scheduled_temporal_operator(
                 expected_identity=identity,
                 expected_canonical_index=canonical_index,
                 reporter=reporter,
+                validated_cache_directory=operator_cache_directory,
+                preflight_manifest=preflight_manifest,
             )
         except (AssignmentCompatibilityError, ValueError, KeyError, OSError):
             cached = None
         if cached is not None:
-            _validate_cached_positive_boarding_support(
-                operator=cached, context=preflight, reporter=reporter
+            cache_eta = _validate_cached_positive_boarding_support(
+                operator=cached,
+                context=preflight,
+                reporter=reporter,
+                artifact_directory=artifact_directory,
+                operator_cache_directory=operator_cache_directory,
             )
             reporter.emit(
                 phase=ConstructionPhase.CACHE_VALIDATION,
                 status="completed",
                 force=True,
+                completed_units=len(cached.blocks),
+                total_units=len(cached.blocks),
+                current_unit=(
+                    None
+                    if not cached.blocks
+                    else f"block-{len(cached.blocks) - 1:06d}.npz"
+                ),
+                predicted_remaining_seconds=(
+                    None
+                    if cache_eta is None
+                    else cache_eta.predicted_remaining_seconds
+                ),
+                eta_confidence=(
+                    "unavailable" if cache_eta is None else cache_eta.eta_confidence
+                ),
+                estimated_completion_at_utc=(
+                    None
+                    if cache_eta is None
+                    else cache_eta.estimated_completion_at_utc
+                ),
+                eta_reason=None if cache_eta is None else cache_eta.eta_reason,
+                eta_lower_seconds=(
+                    None if cache_eta is None else cache_eta.eta_lower_seconds
+                ),
+                eta_upper_seconds=(
+                    None if cache_eta is None else cache_eta.eta_upper_seconds
+                ),
+                throughput_units_per_second=(
+                    None
+                    if cache_eta is None
+                    else cache_eta.throughput_units_per_second
+                ),
                 cache_hits=1,
                 cache_misses=0,
+                details={"cache_validation_stage": "realized_operator_support"},
             )
             decision = DirectScheduledActivationDecision(
                 mode=mode,

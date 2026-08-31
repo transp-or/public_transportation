@@ -209,6 +209,25 @@ def test_streaming_exact_support_matches_materialized_small_example(setup):
     assert result.retained_state_bytes < 100_000
 
 
+def test_timing_sink_failure_does_not_abort_support_analysis(setup):
+    inputs, compact, spec, _fingerprints, _partition = setup
+    routing = prepare_fixed_routing(inputs=inputs, theta=1.0)
+
+    def broken_timing_sink(_timing):
+        raise OSError("telemetry sink unavailable")
+
+    result = analyze_fixed_routing_origin_support(
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        compact_layout=compact,
+        config=OriginSupportConfig(origin_chunk_size=32, materialize=False),
+        timing_callback=broken_timing_sink,
+    )
+
+    assert result.summaries
+
+
 def test_interrupt_checkpoint_resume_is_exact(setup, tmp_path):
     inputs, compact, spec, fingerprints, partition = setup
     config = SupportPreflightConfig(
@@ -723,6 +742,7 @@ def test_production_selected_block_matches_complete_operator_and_reuses_cache(
         semantic_preflight_fingerprint=SupportPreflightConfig().semantics_fingerprint,
         theta=1.0,
     )
+    selected_progress = []
     builder = FixedRoutingSelectedBlockBuilder(
         inputs=inputs,
         spec=spec,
@@ -730,6 +750,7 @@ def test_production_selected_block_matches_complete_operator_and_reuses_cache(
         partition=partition,
         provenance=provenance,
         config=config,
+        progress=selected_progress.append,
     )
     import public_transportation.inference.block_coordinate.fixed_routing_selected_block_builder as builder_module
 
@@ -745,6 +766,12 @@ def test_production_selected_block_matches_complete_operator_and_reuses_cache(
     monkeypatch.undo()
     assert not cold.cache_hit
     assert cold.operator.shape == (spec.num_measurements, block.num_free_variables)
+    assert selected_progress[-1].status == "completed"
+    assert selected_progress[-1].predicted_remaining_seconds == 0.0
+    first_completed = next(
+        item for item in selected_progress if item.completed_od_chunks > 0
+    )
+    assert first_completed.predicted_remaining_seconds is not None
     assert set(cold.operator.measurement_support_indices).issubset(
         cold.support_artifact.support_rows
     )

@@ -47,6 +47,9 @@ from public_transportation.inference.fixed_routing_sharded_builder import (
 from public_transportation.inference.od_parameter_layout import ODParameterLayout
 from public_transportation.inference.measurement_support_preflight import (
     UnsupportedPositiveBoardingError,
+    audit_positive_boarding_support,
+    load_positive_boarding_support_cache,
+    write_positive_boarding_support_cache,
 )
 from public_transportation.inference.scheduled_reference_operator import (
     ScheduledTimeExpandedReferenceOperator,
@@ -66,7 +69,9 @@ from public_transportation.inference.sharded_fixed_routing import (
     FixedRoutingPreparationConfig,
 )
 from public_transportation.inference.temporal_assignment_persistence import (
+    adopt_completed_preflight,
     load_temporal_block_operator,
+    materialize_operator_cache_from_adopted_preflight,
     reuse_or_build_temporal_block_operator,
     temporal_block_cache_path,
 )
@@ -312,6 +317,9 @@ def test_exact_temporal_blocks_match_scheduled_reference_and_report_progress(
     )
     assert progress[-1].completed_columns == layout.num_free
     assert progress[-1].predicted_remaining_seconds == 0.0
+    assert progress[-1].status == "completed"
+    assert progress[-1].eta_confidence == "high"
+    assert progress[0].completed_columns > 0
     assert operator.diagnostics.columns_processed == layout.num_free
     assert operator.diagnostics.removed_l1_mass == 0.0
     assert operator.diagnostics.nonzero_entries == sum(
@@ -363,6 +371,188 @@ def test_temporal_block_artifact_reuses_and_rejects_incompatibility(
         )
 
 
+def test_completed_preflight_adoption_materializes_and_reuses_packed_cache(
+    artifacts, tmp_path, monkeypatch
+):
+    inputs = build_assignment_inputs(artifacts=artifacts)
+    layout = _layout(int(inputs.od_origin_node.shape[0]), fixed_positive=False)
+    reference = _scheduled_operator(
+        inputs=inputs,
+        spec=_spec(inputs.graph.num_links),
+        index=_canonical_index(layout),
+    )
+    artifact_directory = temporal_block_cache_path(tmp_path / "artifacts", reference.identity)
+    operator, reused = reuse_or_build_temporal_block_operator(
+        cache_root=tmp_path / "artifacts", reference=reference
+    )
+    assert not reused
+    preflight_path = tmp_path / "manifests" / "preflight.json"
+    preflight_path.parent.mkdir(parents=True)
+    preflight_path.write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "result": {
+                    "completed_phase": 6,
+                    "recommendation": {},
+                    "artifact_identity_fingerprint": reference.identity.fingerprint,
+                    "assignment_fingerprint": reference.identity.timetable_fingerprint,
+                    "binding_fingerprint": reference.canonical_index.binding_fingerprint,
+                    "canonical_index_fingerprint": reference.canonical_index.artifact_fingerprint,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    checkpoint_root = tmp_path / "checkpoints"
+    certificate = adopt_completed_preflight(
+        preflight_manifest=preflight_path,
+        artifact_directory=artifact_directory,
+        expected_identity=reference.identity,
+        expected_canonical_index=reference.canonical_index,
+        checkpoint_directory=checkpoint_root,
+    )
+    assert certificate.is_file()
+    certificate_payload = json.loads(certificate.read_text(encoding="utf-8"))
+    assert certificate_payload["provenance"]["legacy_completed_preflight"] is True
+    cache_directory = checkpoint_root / reference.identity.fingerprint / "temporal_operator_cache"
+    materialize_operator_cache_from_adopted_preflight(
+        artifact_directory=artifact_directory,
+        certificate_path=certificate,
+        cache_directory=cache_directory,
+    )
+    assert (cache_directory / "manifest.json").is_file()
+    original_load = np.load
+    opened: list[str] = []
+
+    def recording_load(file, *args, **kwargs):
+        opened.append(str(file))
+        return original_load(file, *args, **kwargs)
+
+    monkeypatch.setattr(np, "load", recording_load)
+    loaded = load_temporal_block_operator(
+        artifact_directory,
+        expected_identity=reference.identity,
+        expected_canonical_index=reference.canonical_index,
+        validated_cache_directory=cache_directory,
+    )
+    assert not any("/blocks/" in path for path in opened)
+    demand = jnp.linspace(0.2, 1.7, layout.num_free, dtype=jnp.float32)
+    residual = jnp.asarray([0.5, -0.25, 1.5], dtype=jnp.float32)
+    np.testing.assert_array_equal(loaded.matvec(demand), operator.matvec(demand))
+    np.testing.assert_array_equal(loaded.rmatvec(residual), operator.rmatvec(residual))
+
+
+def test_completed_preflight_adoption_rejects_incomplete_or_mismatched_manifest(
+    artifacts, tmp_path
+):
+    inputs = build_assignment_inputs(artifacts=artifacts)
+    layout = _layout(int(inputs.od_origin_node.shape[0]), fixed_positive=False)
+    reference = _scheduled_operator(
+        inputs=inputs,
+        spec=_spec(inputs.graph.num_links),
+        index=_canonical_index(layout),
+    )
+    artifact_directory = temporal_block_cache_path(tmp_path / "artifacts", reference.identity)
+    reuse_or_build_temporal_block_operator(cache_root=tmp_path / "artifacts", reference=reference)
+    incomplete = tmp_path / "incomplete.json"
+    incomplete.write_text(json.dumps({"status": "running"}), encoding="utf-8")
+    with pytest.raises(ValueError, match="status='completed'"):
+        adopt_completed_preflight(
+            preflight_manifest=incomplete,
+            artifact_directory=artifact_directory,
+            expected_identity=reference.identity,
+            expected_canonical_index=reference.canonical_index,
+            checkpoint_directory=tmp_path / "checkpoints",
+        )
+    mismatched = tmp_path / "mismatched.json"
+    mismatched.write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "result": {
+                    "completed_phase": 6,
+                    "recommendation": {},
+                    "artifact_identity_fingerprint": "different",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(AssignmentCompatibilityError):
+        adopt_completed_preflight(
+            preflight_manifest=mismatched,
+            artifact_directory=artifact_directory,
+            expected_identity=reference.identity,
+            expected_canonical_index=reference.canonical_index,
+            checkpoint_directory=tmp_path / "checkpoints",
+        )
+
+
+def test_positive_boarding_support_cache_round_trip_is_identity_bound(tmp_path):
+    layout = ODParameterLayout(
+        num_od_total=1,
+        od_keys=(("origin", "destination", "period"),),
+        free_od_indices=(0,),
+        fixed_od_indices=(),
+        fixed_od_values=(),
+        free_baseline_values=(1.0,),
+        fixed_zero_indices=(),
+        fixed_positive_indices=(),
+    )
+    index = build_canonical_assignment_index(
+        parameter_layout=layout,
+        time_intervals=(CanonicalTimeInterval("period", 0, 3600),),
+        measurements=(CanonicalMeasurement(0, "board", "boarding", "origin", "period"),),
+    )
+    report = audit_positive_boarding_support(
+        canonical_index=index,
+        observations=np.asarray([2.0]),
+        supported_measurement_rows=np.asarray([0]),
+        stage="realized_operator_support",
+    )
+    directory = tmp_path / "support-cache"
+    write_positive_boarding_support_cache(
+        directory=directory,
+        report=report,
+        supported_measurement_rows=np.asarray([0]),
+        artifact_identity_fingerprint="artifact",
+        artifact_manifest_sha256="artifact-manifest",
+        operator_cache_manifest_sha256="operator-manifest",
+        canonical_index=index,
+        observations=np.asarray([2.0]),
+        mapping_info=None,
+        fixed_zero_reasons_by_full_index=None,
+    )
+    loaded = load_positive_boarding_support_cache(
+        directory=directory,
+        artifact_identity_fingerprint="artifact",
+        artifact_manifest_sha256="artifact-manifest",
+        operator_cache_manifest_sha256="operator-manifest",
+        canonical_index=index,
+        observations=np.asarray([2.0]),
+        mapping_info=None,
+        fixed_zero_reasons_by_full_index=None,
+    )
+    assert loaded is not None
+    rows, loaded_report = loaded
+    np.testing.assert_array_equal(rows, np.asarray([0]))
+    assert loaded_report.safe
+    assert (
+        load_positive_boarding_support_cache(
+            directory=directory,
+            artifact_identity_fingerprint="artifact",
+            artifact_manifest_sha256="changed",
+            operator_cache_manifest_sha256="operator-manifest",
+            canonical_index=index,
+            observations=np.asarray([2.0]),
+            mapping_info=None,
+            fixed_zero_reasons_by_full_index=None,
+        )
+        is None
+    )
+
+
 def test_temporal_block_cache_validation_reports_throttled_progress(
     artifacts, tmp_path
 ):
@@ -378,6 +568,10 @@ def test_temporal_block_cache_validation_reports_throttled_progress(
     )
     directory = temporal_block_cache_path(tmp_path, reference.identity)
     manifest_before = (directory / "manifest.json").read_bytes()
+    block_bytes_before = {
+        path.name: path.read_bytes()
+        for path in (directory / "blocks").glob("*.npz")
+    }
 
     events: list[dict[str, object]] = []
     reporter = ConstructionProgressReporter(
@@ -406,12 +600,31 @@ def test_temporal_block_cache_validation_reports_throttled_progress(
     total_blocks = len(operator.blocks)
     assert load_events[0]["completed_units"] == 0
     assert load_events[0]["total_units"] == total_blocks
+    assert load_events[0]["predicted_remaining_seconds"] is None
     counts = [int(event["completed_units"]) for event in load_events]
     assert counts == sorted(counts)
     assert counts[-1] == total_blocks
     assert load_events[-1]["status"] == "completed"
+    first_completed = next(
+        event for event in load_events if int(event["completed_units"]) > 0
+    )
+    assert math.isfinite(float(first_completed["predicted_remaining_seconds"]))
+    assert first_completed["throughput_units_per_second"] > 0.0
+    assert (
+        first_completed["eta_lower_seconds"]
+        <= first_completed["predicted_remaining_seconds"]
+        <= first_completed["eta_upper_seconds"]
+    )
+    assert load_events[-1]["predicted_remaining_seconds"] == 0.0
+    assert load_events[-1]["eta_confidence"] == "high"
+    assert load_events[-1]["eta_lower_seconds"] == 0.0
+    assert load_events[-1]["eta_upper_seconds"] == 0.0
     assert loaded.identity.fingerprint == operator.identity.fingerprint
     assert (directory / "manifest.json").read_bytes() == manifest_before
+    assert {
+        path.name: path.read_bytes()
+        for path in (directory / "blocks").glob("*.npz")
+    } == block_bytes_before
 
     throttled_events: list[dict[str, object]] = []
     throttled_reporter = ConstructionProgressReporter(
@@ -433,6 +646,8 @@ def test_temporal_block_cache_validation_reports_throttled_progress(
     ]
     assert len(throttled_cache_events) == 2
     assert throttled_cache_events[-1]["completed_units"] == total_blocks
+    assert throttled_cache_events[-1]["predicted_remaining_seconds"] == 0.0
+    assert throttled_cache_events[-1]["eta_confidence"] == "high"
 
 
 def test_temporal_block_artifact_rejects_corrupt_payload(artifacts, tmp_path):
@@ -495,6 +710,12 @@ def test_chunked_constructor_compiles_once_and_pads_final_chunk(artifacts):
     assert chunked.diagnostics.num_chunks == math.ceil(layout.num_free / chunk_size)
     assert chunked.diagnostics.chunk_shape == (chunk_size, 3)
     assert progress[-1].completed_columns == layout.num_free
+    assert progress[-1].status == "completed"
+    assert progress[-1].eta_confidence == "high"
+    first_completed = next(
+        item for item in progress if item.completed_columns > 0
+    )
+    assert first_completed.predicted_remaining_seconds is not None
     assert layout.num_free % chunk_size != 0
 
 
@@ -636,6 +857,23 @@ def test_direct_resumable_builder_matches_reference_and_reuses_artifact(
         cached_support_events[-1]["completed_units"]
         == cached_support_events[-1]["total_units"]
     )
+    assert cached_support_events[0]["predicted_remaining_seconds"] is None
+    first_support_completed = next(
+        event
+        for event in cached_support_events
+        if int(event["completed_units"]) > 0
+    )
+    assert math.isfinite(
+        float(first_support_completed["predicted_remaining_seconds"])
+    )
+    assert first_support_completed["throughput_units_per_second"] > 0.0
+    assert (
+        first_support_completed["eta_lower_seconds"]
+        <= first_support_completed["predicted_remaining_seconds"]
+        <= first_support_completed["eta_upper_seconds"]
+    )
+    assert cached_support_events[-1]["predicted_remaining_seconds"] == 0.0
+    assert cached_support_events[-1]["eta_confidence"] == "high"
     np.testing.assert_array_equal(
         second.operator.matvec(demand), first.operator.matvec(demand)
     )
@@ -867,6 +1105,8 @@ def test_direct_activation_builds_then_fresh_call_reuses_without_routing(
         activation_load_events[-1]["completed_units"]
         == activation_load_events[-1]["total_units"]
     )
+    assert activation_load_events[-1]["predicted_remaining_seconds"] == 0.0
+    assert activation_load_events[-1]["eta_confidence"] == "high"
     activation_support_events = [
         event
         for event in activation_events
@@ -878,6 +1118,8 @@ def test_direct_activation_builds_then_fresh_call_reuses_without_routing(
         activation_support_events[-1]["completed_units"]
         == activation_support_events[-1]["total_units"]
     )
+    assert activation_support_events[-1]["predicted_remaining_seconds"] == 0.0
+    assert activation_support_events[-1]["eta_confidence"] == "high"
     vector = jnp.ones(reused.operator.num_free_od, dtype=jnp.float32)
     matrix = jnp.stack((vector, 2.0 * vector), axis=1)
     np.testing.assert_allclose(
@@ -1006,6 +1248,23 @@ def test_activation_stops_after_committed_shard_then_resumes(artifacts, tmp_path
     assert resumed.construction.source is not None
     assert resumed.construction.source.reused_shards >= 1
     assert len(routing_calls) == 1
+    shard_progress = [
+        event
+        for event in resume_events
+        if event["phase"] == "shard_construction"
+        and event["status"] == "running"
+        and int(event["completed_units"] or 0) > 0
+    ]
+    assert shard_progress
+    assert shard_progress[0]["predicted_remaining_seconds"] is not None
+    shard_terminal = [
+        event
+        for event in resume_events
+        if event["phase"] == "shard_construction"
+        and event["status"] == "completed"
+    ]
+    assert shard_terminal
+    assert shard_terminal[-1]["predicted_remaining_seconds"] == 0.0
 
 
 def test_activation_reuses_persisted_support_after_planning_stop(
@@ -1278,3 +1537,10 @@ def test_activation_reuses_temporal_fragment_after_finalization_stop(
     assert resumed.operator is not None
     assembly = [event for event in events if event["phase"] == "temporal_block_assembly"]
     assert any(event["cache_hits"] == 1 for event in assembly)
+    assembly_progress = [
+        event
+        for event in assembly
+        if int(event["completed_units"] or 0) > 0
+    ]
+    assert assembly_progress
+    assert assembly_progress[0]["predicted_remaining_seconds"] is not None

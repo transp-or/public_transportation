@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 import hashlib
 import json
 import math
@@ -35,6 +36,19 @@ SHARDED_FIXED_ROUTING_IMPLEMENTATION_VERSION = "dial-dp-fixed-routing-v1"
 ProgressCallback = Callable[["FixedRoutingShardProgress"], None]
 CachePolicy = Literal["reuse", "refresh"]
 ExecutionStrategy = Literal["thread_pool", "batched"]
+
+
+def _safe_progress(callback: ProgressCallback | None, event: FixedRoutingShardProgress) -> None:
+    """Deliver progress telemetry without changing routing control flow."""
+
+    if callback is None:
+        return
+    try:
+        callback(event)
+    except Exception:
+        # Progress is observability only.  Preserve the routing result when a
+        # legacy consumer or log sink is unavailable.
+        return
 
 
 def _array_fingerprint(*values: object) -> str:
@@ -1381,7 +1395,7 @@ def _prepare_fixed_routing_sharded_threads(
                 admitted_worker_count=0,
                 worker_architecture="shared-executable-thread-pool",
             )
-            progress(planning_event)
+            _safe_progress(progress, planning_event)
         _write_manifest(
             routing=routing,
             completed=completed,
@@ -1391,7 +1405,7 @@ def _prepare_fixed_routing_sharded_threads(
             config=config,
         )
         if progress is not None and planning_event is not None:
-            progress(replace(planning_event, phase="terminal"))
+            _safe_progress(progress, replace(planning_event, phase="terminal"))
         return ShardedFixedRoutingPreparationResult(
             routing=routing,
             plan=plan,
@@ -1471,7 +1485,7 @@ def _prepare_fixed_routing_sharded_threads(
                 cpu_limited_worker_count=cpu_limited_workers,
                 worker_architecture="shared-executable-thread-pool",
             )
-            progress(planning_event)
+            _safe_progress(progress, planning_event)
         _write_manifest(
             routing=routing,
             completed=completed,
@@ -1481,7 +1495,7 @@ def _prepare_fixed_routing_sharded_threads(
             config=config,
         )
         if progress is not None and planning_event is not None:
-            progress(replace(planning_event, phase="terminal"))
+            _safe_progress(progress, replace(planning_event, phase="terminal"))
         return ShardedFixedRoutingPreparationResult(
             routing=routing,
             plan=plan,
@@ -1515,7 +1529,7 @@ def _prepare_fixed_routing_sharded_threads(
     buffered: dict[int, _ThreadShardResult] = {}
     submitted_shards = 0
     failed_shards = 0
-    shard_times: list[float] = list(shard_duration_map.values())
+    shard_times: deque[float] = deque(shard_duration_map.values(), maxlen=32)
     dispatch_prevented = False
     dispatch_guard_emitted = False
 
@@ -1548,11 +1562,14 @@ def _prepare_fixed_routing_sharded_threads(
                 f"{accounted} != {routing.num_shards}."
             )
         elapsed = max(0.0, clock() - started)
-        completed_durations = [
-            shard_duration_map[index]
-            for index in completed
-            if index in shard_duration_map
-        ]
+        completed_durations: list[float] = []
+        for index in reversed(completed):
+            duration = shard_duration_map.get(index)
+            if duration is not None:
+                completed_durations.append(duration)
+            if len(completed_durations) == 32:
+                break
+        completed_durations.reverse()
         rolling = (
             float(np.mean(completed_durations[-5:]))
             if completed_durations
@@ -1563,8 +1580,10 @@ def _prepare_fixed_routing_sharded_threads(
             completed_units=len(completed),
             total_units=routing.num_shards,
             parallelism=admitted_workers,
+            elapsed_seconds=elapsed,
         )
-        progress(
+        _safe_progress(
+            progress,
             FixedRoutingShardProgress(
                 phase=phase,
                 status=status_value,
@@ -1924,7 +1943,7 @@ def _prepare_fixed_routing_sharded_threads(
     shard_diagnostics: list[FixedRoutingShardExecutionDiagnostics] = []
 
     predicted = config.initial_predicted_shard_seconds or (
-        float(np.mean(shard_times[-3:])) if shard_times else None
+        float(np.mean(tuple(shard_times)[-3:])) if shard_times else None
     )
     with ThreadPoolExecutor(
         max_workers=admitted_workers,
@@ -2041,7 +2060,7 @@ def _prepare_fixed_routing_sharded_threads(
                 # up.  ETA fields are computed separately from manifest-backed
                 # durations below and therefore remain completed-only.
                 shard_times.append(result.elapsed_seconds)
-                predicted = float(np.mean(shard_times[-3:]))
+                predicted = float(np.mean(tuple(shard_times)[-3:]))
                 if result.peak_rss_bytes is not None:
                     peak_rss = (
                         result.peak_rss_bytes
@@ -2273,16 +2292,23 @@ def _prepare_fixed_routing_sharded_batched(
                 f"{accounted} != {routing.num_shards}."
             )
         elapsed = max(0.0, clock() - started)
-        completed_durations = [
-            durations[index] for index in completed if index in durations
-        ]
+        completed_durations: list[float] = []
+        for index in reversed(completed):
+            duration = durations.get(index)
+            if duration is not None:
+                completed_durations.append(duration)
+            if len(completed_durations) == 32:
+                break
+        completed_durations.reverse()
         eta = estimate_completed_unit_eta(
             completed_durations,
             completed_units=len(completed),
             total_units=routing.num_shards,
             parallelism=1,
+            elapsed_seconds=elapsed,
         )
-        progress(
+        _safe_progress(
+            progress,
             FixedRoutingShardProgress(
                 phase=phase,
                 status=status,
@@ -2677,7 +2703,7 @@ def prepare_fixed_routing_sharded(
             estimated_completion_at_utc=initial_eta.estimated_completion_at_utc,
             eta_reason=initial_eta.eta_reason,
         )
-        progress(initial)
+        _safe_progress(progress, initial)
         heartbeat = _RoutingProgressHeartbeat(
             progress,
             initial,
@@ -2738,21 +2764,25 @@ def prepare_fixed_routing_sharded(
     status = "completed"
     shard_diagnostics: list[FixedRoutingShardExecutionDiagnostics] = []
     shard_duration_map = _manifest_shard_durations(routing)
-    shard_times: list[float] = list(shard_duration_map.values())
+    shard_times: deque[float] = deque(shard_duration_map.values(), maxlen=32)
     dispatch_prevented_by_deadline = False
 
     def emit(phase: str, state: str, descriptor: FixedRoutingShardDescriptor | None, recent: float | None) -> None:
         if progress is None:
             return
         elapsed = max(0.0, clock() - started)
-        rolling_mean = float(np.mean(shard_times[-5:])) if shard_times else None
+        rolling_mean = (
+            float(np.mean(tuple(shard_times)[-5:])) if shard_times else None
+        )
         eta = estimate_completed_unit_eta(
             shard_times,
             completed_units=len(completed),
             total_units=routing.num_shards,
             parallelism=1,
+            elapsed_seconds=elapsed,
         )
-        progress(
+        _safe_progress(
+            progress,
             FixedRoutingShardProgress(
                 phase=phase,
                 status=state,
@@ -2792,7 +2822,9 @@ def prepare_fixed_routing_sharded(
         if absolute_deadline is not None and clock() >= absolute_deadline:
             status, deadline_phase = "deadline_reached", "before shard"
             break
-        predicted = float(np.mean(shard_times[-3:])) if shard_times else None
+        predicted = (
+            float(np.mean(tuple(shard_times)[-3:])) if shard_times else None
+        )
         if (
             absolute_deadline is not None
             and predicted is not None
@@ -3047,7 +3079,7 @@ def prepare_fixed_routing_sharded(
         compilation_seconds=compilation,
         shard_diagnostics=tuple(shard_diagnostics),
         predicted_next_shard_seconds=(
-            float(np.mean(shard_times[-3:])) if shard_times else None
+            float(np.mean(tuple(shard_times)[-3:])) if shard_times else None
         ),
         dispatch_prevented_by_deadline=dispatch_prevented_by_deadline,
         compiled_kernel_identity=compiled_kernel_identity,

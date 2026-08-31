@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Callable
@@ -16,6 +17,7 @@ from .assignment_contract import (
     CanonicalAssignmentIndex,
 )
 from .scheduled_reference_operator import ScheduledTimeExpandedReferenceOperator
+from .construction_control import estimate_completed_unit_eta
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -176,9 +178,38 @@ class TemporalBlockConstructionProgress:
     elapsed_seconds: float
     predicted_remaining_seconds: float | None
     nonzero_entries: int
+    schema_version: int = 1
+    phase: str = "temporal_block_assembly"
+    status: str = "running"
+    recent_unit_seconds: float | None = None
+    eta_confidence: str = "unavailable"
+    eta_reason: str | None = None
+    estimated_completion_at_utc: str | None = None
+    eta_lower_seconds: float | None = None
+    eta_upper_seconds: float | None = None
+    throughput_units_per_second: float | None = None
 
 
 TemporalBlockProgressCallback = Callable[[TemporalBlockConstructionProgress], None]
+
+
+def _emit_temporal_progress(
+    callback: TemporalBlockProgressCallback | None,
+    event: TemporalBlockConstructionProgress,
+) -> None:
+    """Deliver legacy progress while shielding file/socket sink failures.
+
+    A callback may still deliberately raise a non-I/O exception to stop a
+    construction and resume from its checkpoint.  I/O failures are telemetry
+    failures and must not alter the numerical result.
+    """
+
+    if callback is None:
+        return
+    try:
+        callback(event)
+    except OSError:
+        return
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,11 +341,13 @@ def build_exact_temporal_block_operator(
     retained_l1 = 0.0
     removed_l1 = 0.0
     nonzeros = 0
+    recent_durations: deque[float] = deque(maxlen=32)
     for column in range(total):
         if absolute_deadline is not None and clock() >= absolute_deadline:
             raise TimeoutError(
                 f"temporal block construction stopped after {column}/{total} columns."
             )
+        unit_started = clock() if progress is not None else 0.0
         basis = jnp.zeros((total,), dtype=reference.dtype).at[column].set(1.0)
         response = np.asarray(jax.block_until_ready(reference.matvec(basis)))
         for row in np.flatnonzero(response):
@@ -334,18 +367,33 @@ def build_exact_temporal_block_operator(
         if progress is not None:
             elapsed = max(0.0, clock() - started)
             completed = column + 1
-            progress(
+            unit_seconds = max(0.0, clock() - unit_started)
+            if unit_seconds > 0.0:
+                recent_durations.append(unit_seconds)
+            eta = estimate_completed_unit_eta(
+                recent_durations,
+                completed_units=completed,
+                total_units=total,
+                parallelism=1,
+                elapsed_seconds=elapsed,
+            )
+            _emit_temporal_progress(
+                progress,
                 TemporalBlockConstructionProgress(
                     completed_columns=completed,
                     total_columns=total,
                     elapsed_seconds=elapsed,
-                    predicted_remaining_seconds=(
-                        elapsed / completed * (total - completed)
-                        if completed < total
-                        else 0.0
-                    ),
+                    predicted_remaining_seconds=eta.predicted_remaining_seconds,
                     nonzero_entries=nonzeros,
-                )
+                    status="completed" if completed == total else "running",
+                    recent_unit_seconds=unit_seconds,
+                    eta_confidence=eta.eta_confidence,
+                    eta_reason=eta.eta_reason,
+                    estimated_completion_at_utc=eta.estimated_completion_at_utc,
+                    eta_lower_seconds=eta.eta_lower_seconds,
+                    eta_upper_seconds=eta.eta_upper_seconds,
+                    throughput_units_per_second=eta.throughput_units_per_second,
+                ),
             )
     blocks = tuple(
         TemporalSparseBlock(
@@ -420,11 +468,13 @@ def build_chunked_temporal_block_operator(
     transfer_seconds = 0.0
     completed = 0
     num_chunks = 0
+    recent_durations: deque[float] = deque(maxlen=32)
     for start in range(0, total, chunk_size):
         if absolute_deadline is not None and clock() >= absolute_deadline:
             raise TimeoutError(
                 f"temporal block construction stopped after {completed}/{total} columns."
             )
+        unit_started = clock() if progress is not None else 0.0
         stop = min(total, start + chunk_size)
         width = stop - start
         basis = np.zeros((chunk_size, total), dtype=reference.dtype)
@@ -457,18 +507,33 @@ def build_chunked_temporal_block_operator(
         num_chunks += 1
         if progress is not None:
             elapsed = max(0.0, clock() - started)
-            progress(
+            unit_seconds = max(0.0, clock() - unit_started)
+            if unit_seconds > 0.0:
+                recent_durations.append(unit_seconds)
+            eta = estimate_completed_unit_eta(
+                recent_durations,
+                completed_units=completed,
+                total_units=total,
+                parallelism=1,
+                elapsed_seconds=elapsed,
+            )
+            _emit_temporal_progress(
+                progress,
                 TemporalBlockConstructionProgress(
                     completed_columns=completed,
                     total_columns=total,
                     elapsed_seconds=elapsed,
-                    predicted_remaining_seconds=(
-                        elapsed / completed * (total - completed)
-                        if completed < total
-                        else 0.0
-                    ),
+                    predicted_remaining_seconds=eta.predicted_remaining_seconds,
                     nonzero_entries=nonzeros,
-                )
+                    status="completed" if completed == total else "running",
+                    recent_unit_seconds=unit_seconds,
+                    eta_confidence=eta.eta_confidence,
+                    eta_reason=eta.eta_reason,
+                    estimated_completion_at_utc=eta.estimated_completion_at_utc,
+                    eta_lower_seconds=eta.eta_lower_seconds,
+                    eta_upper_seconds=eta.eta_upper_seconds,
+                    throughput_units_per_second=eta.throughput_units_per_second,
+                ),
             )
     blocks = tuple(
         TemporalSparseBlock(

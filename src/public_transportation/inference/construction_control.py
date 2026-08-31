@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections import deque
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import math
+import queue
 from statistics import median
 import threading
 from time import monotonic
@@ -16,11 +18,192 @@ from typing import Callable, Iterable, Iterator, Mapping, Sequence
 Clock = Callable[[], float]
 ConstructionProgressSink = Callable[[dict[str, object]], None]
 CONSTRUCTION_EVENT_SCHEMA_VERSION = 1
+# ETA estimation only needs a short recent history.  Keeping this bound in the
+# shared helper protects callers that pass a cumulative iterable from retaining
+# one duration for every unit in a long run.
+_ETA_DURATION_HISTORY_LIMIT = 32
+# Progress is telemetry, so a slow sink must never be allowed to grow memory
+# without bound.  Worker callbacks use ``put_nowait`` and drop an event when
+# this small queue is full; phase-boundary emissions still flush what was
+# accepted before continuing.
+_PROGRESS_SINK_QUEUE_MAXSIZE = 1024
+
+
+def normalize_progress_event(event: object) -> dict[str, object]:
+    """Return a common, additive payload for a progress event.
+
+    Several public callbacks intentionally retain their historical event
+    classes (for example, ``completed_shards`` or ``completed_columns``).
+    Sinks can call this helper at their serialization boundary to expose the
+    common hierarchical fields without changing the calculation or the event
+    object's callback contract.  Existing fields are preserved verbatim;
+    only missing aliases and a minimal work-stack entry are added.
+    """
+
+    if isinstance(event, Mapping):
+        payload: dict[str, object] = dict(event)
+    elif is_dataclass(event):
+        payload = dict(asdict(event))
+    else:
+        # Keep this fallback deliberately small: progress objects are expected
+        # to expose these names as attributes, and evaluating them is reporting
+        # work only (never a numerical callback).
+        names = (
+            "schema_version",
+            "phase",
+            "status",
+            "elapsed_seconds",
+            "phase_elapsed_seconds",
+            "job_elapsed_seconds",
+            "completed_units",
+            "completed_shards",
+            "completed_od_chunks",
+            "total_units",
+            "total_od_chunks",
+            "total_selected_shards",
+            "current_unit",
+            "current_shard_id",
+            "predicted_remaining_seconds",
+            "estimated_remaining_seconds",
+            "eta_confidence",
+            "eta_reason",
+            "estimated_completion_at_utc",
+            "throughput_units_per_second",
+            "work_stack",
+            "active_units",
+            "queued_units",
+            "active_workers",
+            "requested_workers",
+            "completed_weight",
+            "total_weight",
+            "weighted_fraction",
+            "throughput_weight_per_second",
+            "checkpoint_location",
+            "checkpoint_reusable",
+            "reused_units",
+            "rebuilt_units",
+            "next_resumable_position",
+        )
+        payload = {
+            name: getattr(event, name)
+            for name in names
+            if hasattr(event, name)
+        }
+
+    def first_present(*names: str) -> object | None:
+        for name in names:
+            value = payload.get(name)
+            if value is None and not isinstance(event, Mapping) and hasattr(event, name):
+                value = getattr(event, name)
+            if value is not None:
+                return value
+        return None
+
+    completed = first_present(
+        "completed_units",
+        "completed_shards",
+        "completed_groups",
+        "completed_columns",
+        "completed_od_chunks",
+        "completed",
+        "iteration",
+    )
+    total = first_present(
+        "total_units",
+        "total_shards",
+        "total_selected_shards",
+        "total_groups",
+        "total_columns",
+        "total_od_chunks",
+        "total",
+    )
+    current = first_present(
+        "current_unit",
+        "current_shard",
+        "current_shard_id",
+        "current_shard_indices",
+        "current_unit_id",
+    )
+    if isinstance(current, (tuple, list)):
+        current = current[0] if current else None
+    predicted = first_present(
+        "predicted_remaining_seconds",
+        "estimated_remaining_seconds",
+        "estimated_remaining_sweep_seconds",
+        "predicted_job_remaining_seconds",
+    )
+    phase = first_present("phase", "operation")
+    status = first_present("status", "state")
+    if status is None:
+        try:
+            status = (
+                "completed"
+                if completed is not None
+                and total is not None
+                and int(completed) >= int(total)
+                else "running"
+            )
+        except (TypeError, ValueError):
+            status = "running"
+
+    def set_if_missing(name: str, value: object | None) -> None:
+        if payload.get(name) is None and value is not None:
+            payload[name] = value
+
+    set_if_missing("schema_version", CONSTRUCTION_EVENT_SCHEMA_VERSION)
+    set_if_missing("phase", phase)
+    set_if_missing("status", status)
+    set_if_missing("completed_units", completed)
+    set_if_missing("total_units", total)
+    set_if_missing("current_unit", current)
+    set_if_missing("predicted_remaining_seconds", predicted)
+    set_if_missing(
+        "phase_elapsed_seconds",
+        first_present("phase_elapsed_seconds", "elapsed_seconds"),
+    )
+    set_if_missing(
+        "job_elapsed_seconds", first_present("job_elapsed_seconds", "elapsed_seconds")
+    )
+    set_if_missing(
+        "eta_confidence",
+        first_present("eta_confidence", "job_eta_confidence") or "unavailable",
+    )
+    set_if_missing("eta_reason", first_present("eta_reason", "job_eta_reason"))
+    set_if_missing(
+        "estimated_completion_at_utc",
+        first_present(
+            "estimated_completion_at_utc", "estimated_job_completion_at_utc"
+        ),
+    )
+    set_if_missing(
+        "throughput_units_per_second",
+        first_present("throughput_units_per_second"),
+    )
+    set_if_missing("weighted_fraction", first_present("weighted_fraction"))
+    set_if_missing(
+        "throughput_weight_per_second",
+        first_present("throughput_weight_per_second"),
+    )
+
+    stack = payload.get("work_stack")
+    if not stack:
+        stack = (
+            {
+                "name": str(phase or "progress"),
+                "completed_units": completed,
+                "total_units": total,
+                "current_unit": current,
+                "status": status,
+            },
+        )
+    payload["work_stack"] = stack
+    return payload
 
 
 class ConstructionPhase(str, Enum):
     MEASUREMENT_SUPPORT_PREFLIGHT = "measurement_support_preflight"
     CACHE_VALIDATION = "cache_validation"
+    VALIDATED_OPERATOR_CACHE_PERSISTENCE = "validated_operator_cache_persistence"
     ROUTING_PREPARATION = "routing_preparation"
     SUPPORT_DISCOVERY = "support_discovery"
     PLANNING = "planning"
@@ -236,9 +419,14 @@ class ProgressWorkUnit:
 
 
 def _finite_positive_samples(values: Iterable[float]) -> list[float]:
-    """Return finite positive samples without allowing an in-flight unit."""
+    """Return a bounded tail of finite positive completed-unit samples.
 
-    result: list[float] = []
+    ETA estimates use only the most recent observations.  A bounded deque keeps
+    this reporting-only bookkeeping constant-space even when a caller supplies
+    a cumulative duration list or generator from a very long operation.
+    """
+
+    result: deque[float] = deque(maxlen=_ETA_DURATION_HISTORY_LIMIT)
     for value in values:
         try:
             candidate = float(value)
@@ -246,7 +434,7 @@ def _finite_positive_samples(values: Iterable[float]) -> list[float]:
             continue
         if math.isfinite(candidate) and candidate > 0.0:
             result.append(candidate)
-    return result
+    return list(result)
 
 
 def _eta_interval(samples: Sequence[float], typical: float) -> tuple[float, float]:
@@ -427,6 +615,16 @@ def estimate_completed_unit_eta(
             None if total is None else max(0.0, remaining * upper_unit / workers)
         )
         unit_throughput = 1.0 / max(typical / workers, np_finfo_eps())
+    # The interval is intended to bound the point estimate.  When a wall-clock
+    # rate is available, small non-unit overheads (for example, set updates or
+    # reporter serialization) can make the point estimate fall just outside an
+    # interval based solely on completed-unit durations.  Keep the diagnostic
+    # interval internally consistent without changing the point estimate.
+    if prediction is not None:
+        if lower_prediction is not None:
+            lower_prediction = min(lower_prediction, prediction)
+        if upper_prediction is not None:
+            upper_prediction = max(upper_prediction, prediction)
     if prediction is None:
         return ConstructionETA(
             None,
@@ -541,8 +739,16 @@ class ConstructionProgressReporter:
     _last_event: dict[str, object] | None = field(
         default=None, init=False, repr=False
     )
+    _reporting_failures: int = field(default=0, init=False, repr=False)
+    _last_reporting_error: str | None = field(default=None, init=False, repr=False)
     _emit_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
+    )
+    _sink_queue: queue.Queue[dict[str, object] | None] | None = field(
+        default=None, init=False, repr=False
+    )
+    _sink_thread: threading.Thread | None = field(
+        default=None, init=False, repr=False
     )
 
     def __post_init__(self) -> None:
@@ -585,6 +791,25 @@ class ConstructionProgressReporter:
         with self._emit_lock:
             return None if self._last_event is None else dict(self._last_event)
 
+    @property
+    def reporting_failures(self) -> int:
+        """Return the number of progress-sink failures observed so far.
+
+        A progress sink is an observability aid, not part of the calculation.
+        Sink failures are therefore recorded for diagnostics but never allowed
+        to change the outcome of the scientific operation.
+        """
+
+        with self._emit_lock:
+            return self._reporting_failures
+
+    @property
+    def last_reporting_error(self) -> str | None:
+        """Return the most recent progress-sink error, if one occurred."""
+
+        with self._emit_lock:
+            return self._last_reporting_error
+
     def summary(self) -> dict[str, object]:
         """Return the latest progress fields suitable for a stage manifest."""
 
@@ -597,6 +822,78 @@ class ConstructionProgressReporter:
                 "phase": None,
             }
         return event
+
+    def _record_sink_failure(self, error: Exception) -> None:
+        with self._emit_lock:
+            self._reporting_failures += 1
+            self._last_reporting_error = f"{type(error).__name__}: {error}"
+
+    def _deliver_sink(
+        self, event: dict[str, object], *, lock_held: bool = False
+    ) -> None:
+        """Deliver one event while keeping sink failures out of the run."""
+
+        if self.sink is None:
+            return
+        try:
+            self.sink(event)
+        except Exception as error:  # reporting must not fail the run
+            if lock_held:
+                self._reporting_failures += 1
+                self._last_reporting_error = f"{type(error).__name__}: {error}"
+            else:
+                self._record_sink_failure(error)
+
+    def _sink_worker(
+        self, pending: queue.Queue[dict[str, object] | None]
+    ) -> None:
+        while True:
+            event = pending.get()
+            try:
+                if event is None:
+                    return
+                self._deliver_sink(event)
+            finally:
+                pending.task_done()
+
+    def _enqueue_sink_event(self, event: dict[str, object]) -> None:
+        """Queue telemetry without making a computational worker do I/O."""
+
+        # ``emit`` calls this while holding ``_emit_lock``.  Keeping queue
+        # insertion non-blocking is what prevents worker callbacks from doing
+        # sink I/O or waiting for the sink lock.
+        if self._sink_queue is None:
+            pending: queue.Queue[dict[str, object] | None] = queue.Queue(
+                maxsize=_PROGRESS_SINK_QUEUE_MAXSIZE
+            )
+            self._sink_queue = pending
+            self._sink_thread = threading.Thread(
+                target=self._sink_worker,
+                args=(pending,),
+                name="construction-progress-sink",
+                daemon=True,
+            )
+            self._sink_thread.start()
+        else:
+            pending = self._sink_queue
+        try:
+            pending.put_nowait(event)
+        except queue.Full as error:
+            # Dropping telemetry is preferable to blocking a computational
+            # worker or allowing an unbounded queue to consume the case's
+            # memory.  Keep a diagnostic count for the stage manifest.
+            self._reporting_failures += 1
+            self._last_reporting_error = (
+                f"{type(error).__name__}: progress sink queue is full"
+            )
+
+    def flush(self) -> None:
+        """Wait for queued telemetry, normally at a phase boundary."""
+
+        with self._emit_lock:
+            pending = self._sink_queue
+        if pending is not None:
+            pending.join()
 
     def push_work(
         self,
@@ -763,9 +1060,15 @@ class ConstructionProgressReporter:
         deadline_margin_seconds: float | None = None,
         will_finish_before_deadline: bool | None = None,
         details: dict[str, object] | None = None,
+        nonblocking: bool = False,
     ) -> None:
         if self.sink is None:
             return
+        # A synchronous emission is a phase-boundary operation.  Drain worker
+        # telemetry before it so that the durable log remains ordered, without
+        # ever making a worker that calls ``emit_nonblocking`` wait on I/O.
+        if not nonblocking:
+            self.flush()
         with self._emit_lock:
             now = self.clock()
             for name, value in (
@@ -894,7 +1197,23 @@ class ConstructionProgressReporter:
                 event.update(details)
             self._last_event = dict(event)
             if self.sink is not None:
-                self.sink(event)
+                if nonblocking:
+                    self._enqueue_sink_event(event)
+                else:
+                    self._deliver_sink(event, lock_held=True)
+
+    def emit_nonblocking(self, **kwargs: object) -> None:
+        """Emit telemetry through a background sink worker.
+
+        This is intended for callbacks running inside computational workers.
+        The event is still subject to the same deterministic throttling as
+        :meth:`emit`, while the worker only performs bounded in-memory queue
+        work.  A subsequent synchronous emission or explicit :meth:`flush`
+        drains the queue before a phase boundary.
+        """
+
+        kwargs["nonblocking"] = True
+        self.emit(**kwargs)  # type: ignore[arg-type]
 
     @contextmanager
     def heartbeat_scope(
@@ -906,6 +1225,7 @@ class ConstructionProgressReporter:
         details: dict[str, object] | None = None,
         interval_seconds: float | None = None,
         phase: ConstructionPhase = ConstructionPhase.ROUTING_PREPARATION,
+        heartbeat_status: str = "running",
     ) -> Iterator[None]:
         """Emit throttled observations while an indivisible operation runs.
 
@@ -934,7 +1254,7 @@ class ConstructionProgressReporter:
         def emit_heartbeat() -> None:
             self.emit(
                 phase=phase,
-                status="running",
+                status=heartbeat_status,
                 completed_units=completed_units,
                 total_units=total_units,
                 current_unit=current_unit,

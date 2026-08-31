@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -156,6 +157,11 @@ def test_progress_event_contains_required_fields_and_round_trips_json():
     assert line.endswith("\n")
     assert '"kind":"sampled"' in line
     assert '"percentage_precision"' not in line
+    payload = json.loads(line)
+    assert payload["schema_version"] == 1
+    assert payload["status"] == "running"
+    assert payload["completed_units"] == 1
+    assert payload["total_units"] == 4
 
 
 def test_progress_rejects_invalid_coverage_and_objective_order():

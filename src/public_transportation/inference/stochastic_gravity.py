@@ -15,6 +15,7 @@ dispersion indicators are diagnostics, not certified error bounds.  Effort
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import gc
 import hashlib
@@ -38,6 +39,7 @@ from .gravity.objective import (
     _objective_from_mean,
     gravity_value_and_gradient_adjoint,
 )
+from .construction_control import estimate_completed_unit_eta
 from .parallel_gravity_anchor import ParallelGravityAnchor, _validate_anchor
 from .sharded_fixed_routing import FixedRoutingShardDescriptor, fixed_routing_shard_path
 from .sharded_matrix_free_operator import (
@@ -157,6 +159,16 @@ class StochasticShardProgress:
     rss_bytes: int | None
     peak_rss_bytes: int | None
     estimated_next_shard_bytes: int
+    completed_units: int | None = None
+    total_units: int | None = None
+    recent_unit_seconds: float | None = None
+    predicted_remaining_seconds: float | None = None
+    eta_confidence: str = "unavailable"
+    eta_reason: str | None = None
+    estimated_completion_at_utc: str | None = None
+    eta_lower_seconds: float | None = None
+    eta_upper_seconds: float | None = None
+    throughput_units_per_second: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,6 +320,11 @@ def stochastic_gravity_value_and_gradient(
     padded_groups = max(item.num_groups for item in descriptors)
     contribution_norms: list[float] = []
     covered = np.zeros(operator.num_measurements, dtype=bool)
+    phase_started_at: dict[str, float] = {}
+    phase_durations: dict[str, deque[float]] = {
+        "forward": deque(maxlen=32),
+        "reverse": deque(maxlen=32),
+    }
 
     def report(
         phase: str,
@@ -320,16 +337,46 @@ def stochastic_gravity_value_and_gradient(
         if rss is not None:
             peak_rss = rss if peak_rss is None else max(peak_rss, rss)
         estimated = _estimated_shard_bytes(operator, descriptor, config)
+        now = perf_counter()
+        if boundary == "before":
+            phase_started_at[phase] = now
+            duration = None
+        else:
+            started_at = phase_started_at.get(phase, now)
+            duration = max(0.0, now - started_at)
+            if duration > 0.0:
+                phase_durations[phase].append(duration)
+        eta = estimate_completed_unit_eta(
+            phase_durations[phase],
+            completed_units=completed,
+            total_units=len(selected),
+            elapsed_seconds=max(0.0, now - started),
+        )
         item = StochasticShardProgress(
             phase=phase, boundary=boundary,
             current_shard_id=descriptor.shard_index,
             completed_shards=completed, total_selected_shards=len(selected),
             rss_bytes=rss, peak_rss_bytes=peak_rss,
             estimated_next_shard_bytes=estimated,
+            completed_units=completed,
+            total_units=len(selected),
+            recent_unit_seconds=duration,
+            predicted_remaining_seconds=eta.predicted_remaining_seconds,
+            eta_confidence=eta.eta_confidence,
+            eta_reason=eta.eta_reason,
+            estimated_completion_at_utc=eta.estimated_completion_at_utc,
+            eta_lower_seconds=eta.eta_lower_seconds,
+            eta_upper_seconds=eta.eta_upper_seconds,
+            throughput_units_per_second=eta.throughput_units_per_second,
         )
         progress.append(item)
         if progress_callback is not None:
-            progress_callback(item)
+            try:
+                progress_callback(item)
+            except Exception:
+                # Progress is ancillary; retain the numerical result if the
+                # user-provided sink fails.
+                pass
         return rss, estimated
 
     def admit(

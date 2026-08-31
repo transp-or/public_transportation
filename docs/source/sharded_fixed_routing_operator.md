@@ -134,6 +134,26 @@ must be called before construction when exploring a new scale.
 
 ## Cache layout and resumability
 
+### Validated temporal-operator cache
+
+For direct scheduled temporal artifacts, a completed preflight manifest is
+reusable validation evidence. The adoption certificate records the completed
+phase and all available artifact, canonical-index, binding, and fixed-offset
+fingerprints without opening source block files. If the packed temporal cache
+is absent, a one-time consolidation pass reads each already validated block
+once and writes deterministic packed NPY arrays plus `keys.json`. It does not
+repeat content-hash validation or realized positive-boarding support
+discovery.
+
+The fast loader verifies the certificate, source-manifest hash, cache schema,
+array hashes, dimensions, block ordering, and fixed-offset hash before loading
+the packed arrays. A mismatch or incomplete write is rejected and the normal
+validated source-block path remains available. Once the cache is complete,
+later preflight, benchmark, and fit processes load no files below
+`artifact/blocks/`; they report a one-unit cache-validation hit. A separate
+support cache is keyed by the observations and mapping fingerprints and
+reuses a zero-unsupported support report without rescanning blocks.
+
 A cache directory contains:
 
 ```text

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, is_dataclass
+import hashlib
 import json
 import math
 import os
@@ -18,6 +19,7 @@ from public_transportation.measurement.mapping import MappingInfo
 from .assignment_contract import CanonicalAssignmentIndex
 
 POSITIVE_BOARDING_PREFLIGHT_SCHEMA_VERSION = 1
+POSITIVE_BOARDING_SUPPORT_CACHE_SCHEMA_VERSION = 1
 
 PositiveBoardingPreflightStage = Literal[
     "canonical_origin_support",
@@ -154,6 +156,173 @@ class PositiveBoardingPreflightContext:
     mapping_info: MappingInfo | None = None
     fixed_zero_reasons_by_full_index: Mapping[int, str] | None = None
     canonical_supported_measurement_rows: object | None = None
+
+
+def _stable_hash(value: object) -> str:
+    if is_dataclass(value):
+        value = asdict(value)
+    if isinstance(value, np.ndarray):
+        digest = hashlib.sha256()
+        array = np.ascontiguousarray(value)
+        digest.update(str(array.dtype).encode())
+        digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+        digest.update(array.tobytes())
+        return digest.hexdigest()
+    if isinstance(value, Mapping):
+        payload = {str(key): value[key] for key in sorted(value, key=str)}
+    elif isinstance(value, (tuple, list)):
+        payload = list(value)
+    else:
+        payload = value
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _support_cache_paths(directory: str | Path) -> tuple[Path, Path]:
+    root = Path(directory)
+    return root / "manifest.json", root / "supported_measurement_rows.npy"
+
+
+def write_positive_boarding_support_cache(
+    *,
+    directory: str | Path,
+    report: PositiveBoardingSupportReport,
+    supported_measurement_rows: object,
+    artifact_identity_fingerprint: str,
+    artifact_manifest_sha256: str,
+    operator_cache_manifest_sha256: str,
+    canonical_index: CanonicalAssignmentIndex,
+    observations: object,
+    mapping_info: MappingInfo | None,
+    fixed_zero_reasons_by_full_index: Mapping[int, str] | None,
+) -> Path:
+    """Persist the realized positive-boarding support without source blocks."""
+    root = Path(directory)
+    root.mkdir(parents=True, exist_ok=True)
+    rows = np.asarray(supported_measurement_rows, dtype=np.int64)
+    rows_path = root / "supported_measurement_rows.npy"
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{rows_path.name}.", suffix=".tmp", dir=root)
+    os.close(descriptor)
+    try:
+        with open(temporary, "wb") as stream:
+            np.save(stream, rows)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, rows_path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    report_path = root / "report.json"
+    write_positive_boarding_support_report(report, report_path)
+    manifest = {
+        "complete": True,
+        "schema_version": POSITIVE_BOARDING_SUPPORT_CACHE_SCHEMA_VERSION,
+        "validator_version": POSITIVE_BOARDING_PREFLIGHT_SCHEMA_VERSION,
+        "artifact_identity_fingerprint": artifact_identity_fingerprint,
+        "artifact_manifest_sha256": artifact_manifest_sha256,
+        "operator_cache_manifest_sha256": operator_cache_manifest_sha256,
+        "canonical_index_fingerprint": canonical_index.artifact_fingerprint,
+        "binding_fingerprint": canonical_index.binding_fingerprint,
+        "observations_fingerprint": _stable_hash(observations),
+        "mapping_fingerprint": (
+            None if mapping_info is None else str(mapping_info.fingerprint)
+        ),
+        "fixed_zero_reasons_fingerprint": _stable_hash(
+            fixed_zero_reasons_by_full_index or {}
+        ),
+        "supported_rows_sha256": _stable_hash(rows),
+        "report": "report.json",
+    }
+    destination = root / "manifest.json"
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=root)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(manifest, stream, sort_keys=True, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return destination
+
+
+def read_positive_boarding_support_report(
+    path: str | Path,
+) -> PositiveBoardingSupportReport:
+    """Read a previously persisted support report without touching blocks."""
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    issues = tuple(
+        PositiveBoardingSupportIssue(**issue) for issue in payload.get("issues", [])
+    )
+    return PositiveBoardingSupportReport(
+        stage=payload["stage"],
+        number_of_measurements=int(payload["number_of_measurements"]),
+        positive_boarding_rows=int(payload["positive_boarding_rows"]),
+        supported_positive_boarding_rows=int(payload["supported_positive_boarding_rows"]),
+        unsupported_positive_boarding_rows=int(payload["unsupported_positive_boarding_rows"]),
+        unsupported_positive_boarding_mass=float(payload["unsupported_positive_boarding_mass"]),
+        issues=issues,
+        schema_version=int(payload.get("schema_version", POSITIVE_BOARDING_PREFLIGHT_SCHEMA_VERSION)),
+    )
+
+
+def load_positive_boarding_support_cache(
+    *,
+    directory: str | Path,
+    artifact_identity_fingerprint: str,
+    artifact_manifest_sha256: str,
+    operator_cache_manifest_sha256: str,
+    canonical_index: CanonicalAssignmentIndex,
+    observations: object,
+    mapping_info: MappingInfo | None,
+    fixed_zero_reasons_by_full_index: Mapping[int, str] | None,
+) -> tuple[np.ndarray, PositiveBoardingSupportReport] | None:
+    """Return a support report only when every identity component matches."""
+    manifest_path, rows_path = _support_cache_paths(directory)
+    report_path = Path(directory) / "report.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (
+            manifest.get("complete") is not True
+            or manifest.get("schema_version") != POSITIVE_BOARDING_SUPPORT_CACHE_SCHEMA_VERSION
+            or manifest.get("validator_version") != POSITIVE_BOARDING_PREFLIGHT_SCHEMA_VERSION
+            or manifest.get("artifact_identity_fingerprint") != artifact_identity_fingerprint
+            or manifest.get("artifact_manifest_sha256") != artifact_manifest_sha256
+            or manifest.get("operator_cache_manifest_sha256") != operator_cache_manifest_sha256
+            or manifest.get("canonical_index_fingerprint") != canonical_index.artifact_fingerprint
+            or manifest.get("binding_fingerprint") != canonical_index.binding_fingerprint
+            or manifest.get("observations_fingerprint") != _stable_hash(observations)
+            or manifest.get("mapping_fingerprint") != (None if mapping_info is None else str(mapping_info.fingerprint))
+            or manifest.get("fixed_zero_reasons_fingerprint") != _stable_hash(fixed_zero_reasons_by_full_index or {})
+            or not rows_path.is_file()
+            or not report_path.is_file()
+        ):
+            return None
+        rows = np.load(rows_path, allow_pickle=False)
+        if manifest.get("supported_rows_sha256") != _stable_hash(rows):
+            return None
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+        issues = tuple(
+            PositiveBoardingSupportIssue(**issue) for issue in payload.get("issues", [])
+        )
+        report = PositiveBoardingSupportReport(
+            stage=payload["stage"],
+            number_of_measurements=int(payload["number_of_measurements"]),
+            positive_boarding_rows=int(payload["positive_boarding_rows"]),
+            supported_positive_boarding_rows=int(payload["supported_positive_boarding_rows"]),
+            unsupported_positive_boarding_rows=int(payload["unsupported_positive_boarding_rows"]),
+            unsupported_positive_boarding_mass=float(payload["unsupported_positive_boarding_mass"]),
+            issues=issues,
+            schema_version=int(payload.get("schema_version", POSITIVE_BOARDING_PREFLIGHT_SCHEMA_VERSION)),
+        )
+        if not report.safe:
+            return None
+        return np.asarray(rows, dtype=np.int64), report
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 
 class UnsupportedPositiveBoardingError(ValueError):

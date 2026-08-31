@@ -808,40 +808,44 @@ class ShardedMatrixFreeFixedRoutingMeasurementOperator:
             if self.shard_execution_strategy == "aggregate"
             else self.effective_operator_concurrency
         )
-        self.progress_callback(
-            ShardedOperatorProgress(
-                phase=phase,
-                operation=operation,
-                completed_shards=completed,
-                total_shards=len(self.routing.shard_partition),
-                current_shard_indices=current,
-                elapsed_seconds=perf_counter() - started,
-                recent_batch_seconds=recent,
-                predicted_remaining_seconds=(
-                    None
-                    if predicted is None
-                    else np.ceil(remaining / dispatch_width) * predicted
-                ),
-                deadline_remaining_seconds=(
-                    None
-                    if self.absolute_deadline is None
-                    else max(0.0, self.absolute_deadline - perf_counter())
-                ),
-                peak_rss_bytes=_peak_rss(),
-                resident_shards=self.resident_shards,
-                cache_hits=self._metrics.cache_hits,
-                cache_misses=self._metrics.cache_misses,
-                effective_cpu_cores=cores,
-                safety_margin_seconds=self.deadline_safety_margin_seconds,
-                discarded_partial_seconds=discarded,
-                batch_size=(
-                    self.operator_shards_per_batch
-                    if self.shard_execution_strategy == "aggregate"
-                    else 1
-                ),
-                concurrency=self.effective_operator_concurrency,
-            )
+        event = ShardedOperatorProgress(
+            phase=phase,
+            operation=operation,
+            completed_shards=completed,
+            total_shards=len(self.routing.shard_partition),
+            current_shard_indices=current,
+            elapsed_seconds=perf_counter() - started,
+            recent_batch_seconds=recent,
+            predicted_remaining_seconds=(
+                None
+                if predicted is None
+                else np.ceil(remaining / dispatch_width) * predicted
+            ),
+            deadline_remaining_seconds=(
+                None
+                if self.absolute_deadline is None
+                else max(0.0, self.absolute_deadline - perf_counter())
+            ),
+            peak_rss_bytes=_peak_rss(),
+            resident_shards=self.resident_shards,
+            cache_hits=self._metrics.cache_hits,
+            cache_misses=self._metrics.cache_misses,
+            effective_cpu_cores=cores,
+            safety_margin_seconds=self.deadline_safety_margin_seconds,
+            discarded_partial_seconds=discarded,
+            batch_size=(
+                self.operator_shards_per_batch
+                if self.shard_execution_strategy == "aggregate"
+                else 1
+            ),
+            concurrency=self.effective_operator_concurrency,
         )
+        try:
+            self.progress_callback(event)
+        except Exception:
+            # Progress is observability only; a broken sink must not change
+            # the operator product or its deadline behavior.
+            pass
 
     def _check_dispatch(self, operation, completed, started):
         if self.cancellation_requested is not None and self.cancellation_requested():

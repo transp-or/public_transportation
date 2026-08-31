@@ -569,20 +569,6 @@ def run_candidate_od_time_expansion(
     if any(value < 0 for value in limits.values()) or limits["maximum_journey_seconds"] <= 0:
         raise ValueError("feasibility limits must be non-negative (journey time positive)")
     feasible_destinations_by_origin_period = None
-    if (
-        timetable_feasibility is None
-        and feasibility_index is not None
-        and policy == "required"
-        and scenario is not None
-        and scenario.timetable is not None
-    ):
-        feasible_destinations_by_origin_period = _precompute_temporal_feasibility(
-            universe=universe,
-            bins=bins,
-            feasibility_index=feasibility_index,
-            feasibility_contract=feasibility_contract,
-            **limits,
-        )
     contract = {
         "status": "running",
         "algorithm_version": EXPANSION_ALGORITHM_VERSION,
@@ -641,7 +627,10 @@ def run_candidate_od_time_expansion(
         _atomic_json(manifest_path, contract)
 
     start = time.monotonic()
-    rates: list[float] = []
+    # Keep only a short history: ETA is a reporting aid and must not turn a
+    # long expansion into an additional unbounded memory consumer.
+    rates: deque[float] = deque(maxlen=32)
+    chunk_durations: deque[float] = deque(maxlen=32)
     lock_path = checkpoint / ".lock"
     try:
         lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -655,31 +644,78 @@ def run_candidate_od_time_expansion(
         rate = completed_cells / elapsed if completed_cells else 0.0
         if rate > 0.0:
             rates.append(rate)
-        eta = None
-        if len(rates) >= 3 and rates[-3:]:
-            eta = max(total_rows - completed_cells, 0) / (sum(rates[-3:]) / len(rates[-3:]))
+        from public_transportation.inference.construction_control import (
+            estimate_completed_unit_eta,
+        )
+
+        eta = estimate_completed_unit_eta(
+            chunk_durations,
+            completed_units=len(completed),
+            total_units=total_chunks,
+            elapsed_seconds=elapsed,
+        )
         event: dict[str, object] = {
+            "phase": "od_time_expansion",
             "status": status,
             "chunk": chunk,
             "completed_chunks": len(completed),
             "total_chunks": total_chunks,
+            "completed_units": len(completed),
+            "total_units": total_chunks,
+            "current_unit": (
+                None if final or chunk is None else f"chunk-{chunk:06d}"
+            ),
             "completed_cells": completed_cells,
             "total_cells": total_rows,
             "retained_cells": int(contract["retained_cells"]),
             "excluded_cells": int(contract["excluded_cells"]),
             "elapsed_seconds": elapsed,
-            "rolling_rate_cells_per_second": rates[-3:] if rates else [],
-            "eta_seconds": eta,
+            "phase_elapsed_seconds": elapsed,
+            "job_elapsed_seconds": elapsed,
+            "rolling_rate_cells_per_second": list(rates)[-3:] if rates else [],
+            "recent_unit_seconds": (
+                chunk_durations[-1] if chunk_durations else None
+            ),
+            "eta_seconds": eta.predicted_remaining_seconds,
+            "predicted_remaining_seconds": eta.predicted_remaining_seconds,
+            "eta_confidence": eta.eta_confidence,
+            "eta_reason": eta.eta_reason,
+            "estimated_completion_at_utc": eta.estimated_completion_at_utc,
+            "eta_lower_seconds": eta.eta_lower_seconds,
+            "eta_upper_seconds": eta.eta_upper_seconds,
+            "throughput_units_per_second": eta.throughput_units_per_second,
             "memory_bytes": _memory_bytes(),
             "next_chunk": int(contract["next_chunk"]),
             "checkpoint_directory": str(checkpoint),
+            "checkpoint_location": str(checkpoint),
             "expansion_fingerprint": expansion_fingerprint,
+            "work_stack": (
+                {
+                    "name": "od_chunks",
+                    "completed_units": len(completed),
+                    "total_units": total_chunks,
+                    "current_unit": (
+                        None if final or chunk is None else f"chunk-{chunk:06d}"
+                    ),
+                    "status": (
+                        "completed"
+                        if final or len(completed) == total_chunks
+                        else "running"
+                    ),
+                },
+            ),
         }
         if final:
             event["checkpoint_reusable"] = False
         _atomic_json(progress_path, event)
         if progress is not None:
-            progress(event)
+            try:
+                progress(event)
+            except Exception:
+                # A reporting sink is ancillary.  Preserve the historical
+                # callback contract for control-flow exceptions such as
+                # KeyboardInterrupt while shielding ordinary sink failures.
+                pass
 
     old_sigterm = None
     active_chunk_path: Path | None = None
@@ -697,9 +733,25 @@ def run_candidate_od_time_expansion(
             report("started")
         else:
             report("resuming")
+        if (
+            timetable_feasibility is None
+            and feasibility_index is not None
+            and policy == "required"
+            and scenario is not None
+            and scenario.timetable is not None
+        ):
+            feasible_destinations_by_origin_period = _precompute_temporal_feasibility(
+                universe=universe,
+                bins=bins,
+                feasibility_index=feasibility_index,
+                feasibility_contract=feasibility_contract,
+                progress=progress,
+                **limits,
+            )
         for chunk_index in range(total_chunks):
             if chunk_index in completed:
                 continue
+            chunk_started = time.monotonic()
             pair_slice = universe.pairs[chunk_index * chunk_size : (chunk_index + 1) * chunk_size]
             rows: list[dict[str, object]] = []
             active_chunk_path = checkpoint / f"chunk-{chunk_index:06d}.jsonl"
@@ -741,6 +793,9 @@ def run_candidate_od_time_expansion(
             contract["excluded_cells"] = int(contract["excluded_cells"]) + sum(row["status"] == "excluded" for row in rows)
             contract["next_chunk"] = chunk_index + 1
             _atomic_json(manifest_path, contract)
+            chunk_seconds = max(0.0, time.monotonic() - chunk_started)
+            if chunk_seconds > 0.0:
+                chunk_durations.append(chunk_seconds)
             report("running", chunk=chunk_index)
             active_chunk_path = None
             active_chunk_index = None
@@ -1125,6 +1180,7 @@ def _precompute_temporal_feasibility(
     maximum_waiting_seconds: int,
     maximum_journey_seconds: int,
     feasibility_contract: ScheduledFeasibilityContract | None = None,
+    progress: Callable[[Mapping[str, object]], None] | None = None,
 ) -> dict[tuple[str, str], frozenset[str]]:
     """Evaluate each distinct origin/time slice once.
 
@@ -1147,15 +1203,97 @@ def _precompute_temporal_feasibility(
             for pair in universe.pairs
         }
     )
-    return {
-        (origin, period[0]): frozenset(
+    units = [(origin, period) for origin in origins for period in bins]
+    result: dict[tuple[str, str], frozenset[str]] = {}
+    started = time.monotonic()
+    recent_durations: deque[float] = deque(maxlen=32)
+    completed = 0
+    if progress is not None:
+        try:
+            progress(
+                {
+                    "phase": "feasibility_precompute",
+                    "status": "running" if units else "completed",
+                    "completed_units": 0,
+                    "total_units": len(units),
+                    "current_unit": None,
+                    "elapsed_seconds": 0.0,
+                    "predicted_remaining_seconds": 0.0 if not units else None,
+                    "eta_confidence": "high" if not units else "unavailable",
+                    "eta_reason": (
+                        "all units completed"
+                        if not units
+                        else "no completed units are available"
+                    ),
+                    "work_stack": (
+                        {
+                            "name": "origin_time_slices",
+                            "completed_units": 0,
+                            "total_units": len(units),
+                            "current_unit": None,
+                            "status": "completed" if not units else "running",
+                        },
+                    ),
+                }
+            )
+        except Exception:
+            pass
+    for origin, period in units:
+        unit_started = time.monotonic()
+        result[(origin, period[0])] = frozenset(
             contract.path_metrics(
                 feasibility_index, origin=origin, period=period
             )
         )
-        for origin in origins
-        for period in bins
-    }
+        completed += 1
+        if progress is None:
+            continue
+        duration = max(0.0, time.monotonic() - unit_started)
+        if duration > 0.0:
+            recent_durations.append(duration)
+        from public_transportation.inference.construction_control import (
+            estimate_completed_unit_eta,
+        )
+
+        eta = estimate_completed_unit_eta(
+            recent_durations,
+            completed_units=completed,
+            total_units=len(units),
+            elapsed_seconds=max(0.0, time.monotonic() - started),
+        )
+        try:
+            progress(
+                {
+                    "phase": "feasibility_precompute",
+                    "status": "completed" if completed == len(units) else "running",
+                    "completed_units": completed,
+                    "total_units": len(units),
+                    "current_unit": f"{origin}:{period[0]}",
+                    "elapsed_seconds": max(0.0, time.monotonic() - started),
+                    "recent_unit_seconds": duration,
+                    "predicted_remaining_seconds": eta.predicted_remaining_seconds,
+                    "eta_confidence": eta.eta_confidence,
+                    "eta_reason": eta.eta_reason,
+                    "estimated_completion_at_utc": eta.estimated_completion_at_utc,
+                    "eta_lower_seconds": eta.eta_lower_seconds,
+                    "eta_upper_seconds": eta.eta_upper_seconds,
+                    "throughput_units_per_second": eta.throughput_units_per_second,
+                    "work_stack": (
+                        {
+                            "name": "origin_time_slices",
+                            "completed_units": completed,
+                            "total_units": len(units),
+                            "current_unit": f"{origin}:{period[0]}",
+                            "status": "completed" if completed == len(units) else "running",
+                        },
+                    ),
+                }
+            )
+        except Exception:
+            # Reporting is observability only; a broken sink must not change
+            # feasibility or prevent the expansion from completing.
+            pass
+    return result
 
 
 def _mapping_for_level(
@@ -1535,6 +1673,7 @@ def expand_candidate_od_time_cells(
     timetable_feasibility: Callable[[CandidateODPair, tuple[str, int, int]], bool] | None = None,
     feasibility_index: TimetableFeasibilityIndex | None = None,
     timetable_index: "CanonicalTimetableIndex | None" = None,
+    progress: Callable[[Mapping[str, object]], None] | None = None,
 ) -> ODTimeExpansion:
     """Expand a pair universe across approved bins and audit each exclusion."""
     if maximum_transfers < 0 or maximum_initial_wait_seconds < 0 or maximum_journey_seconds <= 0 or maximum_waiting_seconds < 0:
@@ -1550,6 +1689,16 @@ def expand_candidate_od_time_cells(
         raise ValueError("approved time periods must be sorted by start/end/id.")
     if any(left[2] > right[1] for left, right in zip(bins, bins[1:], strict=False)):
         raise ValueError("approved time periods must not overlap.")
+    expansion_progress = None
+    if progress is not None:
+        from .structural_zeros.progress import ProgressEmitter
+
+        expansion_progress = ProgressEmitter(
+            lambda event: progress(event.as_dict()),
+            phase="expand_od_time_cells",
+            total=len(universe.pairs) * len(bins),
+        )
+        expansion_progress.start()
     mapping = universe.physical_stop_mapping
     departures, arrivals = (
         (set(), set())
@@ -1606,9 +1755,11 @@ def expand_candidate_od_time_cells(
             maximum_initial_wait_seconds=maximum_initial_wait_seconds,
             maximum_waiting_seconds=maximum_waiting_seconds,
             maximum_journey_seconds=maximum_journey_seconds,
+            progress=progress,
         )
     cells: list[CandidateODTimeCell] = []
     exclusions: list[ODTimeExclusion] = []
+    completed_cells = 0
     for pair in universe.pairs:
         pair_reason: str | None = None
         if pair.origin_stop_id == pair.destination_stop_id and not universe.include_same_stop:
@@ -1622,6 +1773,9 @@ def expand_candidate_od_time_cells(
         for period in bins:
             if pair_reason is not None:
                 exclusions.append(ODTimeExclusion(*pair.tuple, period[0], pair_reason))
+                completed_cells += 1
+                if expansion_progress is not None:
+                    expansion_progress.update(completed_cells)
                 continue
             feasible: bool | None
             if timetable_feasibility is not None:
@@ -1667,6 +1821,9 @@ def expand_candidate_od_time_cells(
                 )
             else:
                 cells.append(CandidateODTimeCell(*pair.tuple, period[0]))
+            completed_cells += 1
+            if expansion_progress is not None:
+                expansion_progress.update(completed_cells)
     feasibility_contract = ScheduledFeasibilityContract(
         maximum_transfers=maximum_transfers,
         maximum_initial_wait_seconds=maximum_initial_wait_seconds,
@@ -1965,6 +2122,49 @@ def materialize_prior_demand_from_checkpoint(
     excluded_count = 0
     retained_pairs: set[tuple[str, str]] = set()
     semantic_digest = hashlib.sha256()
+    started = time.monotonic()
+    recent_chunk_seconds: deque[float] = deque(maxlen=32)
+    if progress is not None:
+        try:
+            progress(
+                {
+                    "phase": "materialize_prior",
+                    "status": "running" if total_chunks else "completed",
+                    "completed_chunks": 0,
+                    "total_chunks": total_chunks,
+                    "completed_cells": 0,
+                    "total_cells": total_rows,
+                    "retained_cells": 0,
+                    "excluded_cells": 0,
+                    "completed_units": 0,
+                    "total_units": total_chunks,
+                    "elapsed_seconds": 0.0,
+                    "predicted_remaining_seconds": (
+                        0.0 if total_chunks == 0 else None
+                    ),
+                    "eta_seconds": 0.0 if total_chunks == 0 else None,
+                    "eta_confidence": "high" if total_chunks == 0 else "unavailable",
+                    "eta_reason": (
+                        "all units completed"
+                        if total_chunks == 0
+                        else "no completed units are available"
+                    ),
+                    "checkpoint_directory": str(checkpoint),
+                    "expansion_fingerprint": checkpoint_expansion,
+                    "current_unit": None,
+                    "work_stack": (
+                        {
+                            "name": "prior_chunks",
+                            "completed_units": 0,
+                            "total_units": total_chunks,
+                            "current_unit": None,
+                            "status": "completed" if total_chunks == 0 else "running",
+                        },
+                    ),
+                }
+            )
+        except Exception:
+            pass
     try:
         fd, temporary_name = tempfile.mkstemp(
             prefix=f".{output.name}.", suffix=".tmp", dir=output.parent
@@ -1977,6 +2177,7 @@ def materialize_prior_demand_from_checkpoint(
             )
             writer.writeheader()
             for chunk_index in range(total_chunks):
+                chunk_started = time.monotonic()
                 chunk_path = checkpoint / f"chunk-{chunk_index:06d}.jsonl"
                 with chunk_path.open("r", encoding="utf-8") as chunk_stream:
                     for line_number, line in enumerate(chunk_stream, start=1):
@@ -2031,21 +2232,66 @@ def materialize_prior_demand_from_checkpoint(
                         }
                         writer.writerow(output_row)
                 if progress is not None:
-                    progress(
-                        {
-                            "phase": "materialize_prior",
-                            "status": "running",
-                            "completed_chunks": chunk_index + 1,
-                            "total_chunks": total_chunks,
-                            "completed_cells": row_count,
-                            "total_cells": total_rows,
-                            "retained_cells": retained_count,
-                            "excluded_cells": excluded_count,
-                            "checkpoint_directory": str(checkpoint),
-                            "expansion_fingerprint": checkpoint_expansion,
-                            "current_unit": f"chunk-{chunk_index:06d}",
-                        }
+                    chunk_seconds = max(0.0, time.monotonic() - chunk_started)
+                    if chunk_seconds > 0.0:
+                        recent_chunk_seconds.append(chunk_seconds)
+                    from public_transportation.inference.construction_control import (
+                        estimate_completed_unit_eta,
                     )
+
+                    completed_chunks = chunk_index + 1
+                    eta = estimate_completed_unit_eta(
+                        recent_chunk_seconds,
+                        completed_units=completed_chunks,
+                        total_units=total_chunks,
+                        elapsed_seconds=max(0.0, time.monotonic() - started),
+                    )
+                    event = {
+                        "phase": "materialize_prior",
+                        "status": (
+                            "completed" if completed_chunks == total_chunks else "running"
+                        ),
+                        "completed_chunks": completed_chunks,
+                        "total_chunks": total_chunks,
+                        "completed_cells": row_count,
+                        "total_cells": total_rows,
+                        "retained_cells": retained_count,
+                        "excluded_cells": excluded_count,
+                        "completed_units": completed_chunks,
+                        "total_units": total_chunks,
+                        "elapsed_seconds": max(0.0, time.monotonic() - started),
+                        "recent_unit_seconds": chunk_seconds,
+                        "predicted_remaining_seconds": eta.predicted_remaining_seconds,
+                        # Retain the historical field for callers that have
+                        # not migrated to the common progress vocabulary.
+                        "eta_seconds": eta.predicted_remaining_seconds,
+                        "eta_confidence": eta.eta_confidence,
+                        "eta_reason": eta.eta_reason,
+                        "estimated_completion_at_utc": eta.estimated_completion_at_utc,
+                        "eta_lower_seconds": eta.eta_lower_seconds,
+                        "eta_upper_seconds": eta.eta_upper_seconds,
+                        "throughput_units_per_second": eta.throughput_units_per_second,
+                        "checkpoint_directory": str(checkpoint),
+                        "expansion_fingerprint": checkpoint_expansion,
+                        "current_unit": f"chunk-{chunk_index:06d}",
+                        "work_stack": (
+                            {
+                                "name": "prior_chunks",
+                                "completed_units": completed_chunks,
+                                "total_units": total_chunks,
+                                "current_unit": f"chunk-{chunk_index:06d}",
+                                "status": (
+                                    "completed"
+                                    if completed_chunks == total_chunks
+                                    else "running"
+                                ),
+                            },
+                        ),
+                    }
+                    try:
+                        progress(event)
+                    except Exception:
+                        pass
             stream.flush()
             os.fsync(stream.fileno())
         if row_count != total_rows or row_count != expected_completed_cells:
@@ -2061,21 +2307,53 @@ def materialize_prior_demand_from_checkpoint(
             if extra_pairs:
                 raise ValueError(f"external prior contains pairs absent from the checkpoint: {extra_pairs}")
         if progress is not None:
-            progress(
-                {
-                    "phase": "materialize_prior",
-                    "status": "completed",
-                    "completed_chunks": total_chunks,
-                    "total_chunks": total_chunks,
-                    "completed_cells": row_count,
-                    "total_cells": total_rows,
-                    "retained_cells": retained_count,
-                    "excluded_cells": excluded_count,
-                    "checkpoint_directory": str(checkpoint),
-                    "expansion_fingerprint": checkpoint_expansion,
-                    "current_unit": output.name,
-                }
+            from public_transportation.inference.construction_control import (
+                estimate_completed_unit_eta,
             )
+
+            eta = estimate_completed_unit_eta(
+                recent_chunk_seconds,
+                completed_units=total_chunks,
+                total_units=total_chunks,
+                elapsed_seconds=max(0.0, time.monotonic() - started),
+            )
+            try:
+                progress(
+                    {
+                        "phase": "materialize_prior",
+                        "status": "completed",
+                        "completed_chunks": total_chunks,
+                        "total_chunks": total_chunks,
+                        "completed_cells": row_count,
+                        "total_cells": total_rows,
+                        "retained_cells": retained_count,
+                        "excluded_cells": excluded_count,
+                        "completed_units": total_chunks,
+                        "total_units": total_chunks,
+                        "elapsed_seconds": max(0.0, time.monotonic() - started),
+                        "predicted_remaining_seconds": 0.0,
+                        "eta_seconds": 0.0,
+                        "eta_confidence": "high",
+                        "eta_reason": "all units completed",
+                        "eta_lower_seconds": 0.0,
+                        "eta_upper_seconds": 0.0,
+                        "throughput_units_per_second": eta.throughput_units_per_second,
+                        "checkpoint_directory": str(checkpoint),
+                        "expansion_fingerprint": checkpoint_expansion,
+                        "current_unit": output.name,
+                        "work_stack": (
+                            {
+                                "name": "prior_chunks",
+                                "completed_units": total_chunks,
+                                "total_units": total_chunks,
+                                "current_unit": None,
+                                "status": "completed",
+                            },
+                        ),
+                    }
+                )
+            except Exception:
+                pass
         os.replace(temporary_path, output)
         temporary_path = None
         result = PriorCheckpointMaterializationResult(

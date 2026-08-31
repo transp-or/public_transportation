@@ -254,9 +254,11 @@ def test_interleaved_estimator_batch_resume_matches_uninterrupted(tmp_path) -> N
         fingerprints=identity(uninterrupted_config),
         progress_callback=uninterrupted_events.append,
     )
-    assert len(uninterrupted_events) == 2
-    assert all(event.blocks_completed_in_sweep == 3 for event in uninterrupted_events)
-    assert all(event.block_or_batch.startswith("batch-") for event in uninterrupted_events)
+    assert len(uninterrupted_events) == 3
+    sweep_events = uninterrupted_events[:-1]
+    assert all(event.blocks_completed_in_sweep == 3 for event in sweep_events)
+    assert all(event.block_or_batch.startswith("batch-") for event in sweep_events)
+    assert uninterrupted_events[-1].status == "stopped_by_sweep_budget"
 
     resumed_config = configuration(tmp_path / "resumed")
     resumed_identity = identity(resumed_config)

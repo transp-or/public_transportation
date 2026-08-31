@@ -405,6 +405,50 @@ def test_estimator_converges_to_dense_reference_with_monotone_progress(tmp_path)
     assert result.state.best_objective <= result.state.current_objective
 
 
+def test_reporting_does_not_change_deterministic_result_or_checkpoint_bytes(tmp_path) -> None:
+    problem = _problem()
+    partition = _partition()
+
+    def run(directory, *, reporting):
+        config = _config(directory)
+        events = []
+        estimator = BlockCoordinateMAPEstimator(
+            problem=problem,
+            partition=partition,
+            config=config,
+            fingerprints=_fingerprints(config, partition),
+            progress_callback=events.append if reporting else None,
+            # Freeze elapsed-time bookkeeping so this test compares the
+            # scientific checkpoint payload byte-for-byte.
+            clock=lambda: 0.0,
+        )
+        result = estimator.run()
+        files = {
+            path.relative_to(directory): path.read_bytes()
+            for path in sorted(directory.rglob("*"))
+            if path.is_file()
+        }
+        return result, files, events
+
+    disabled, disabled_files, disabled_events = run(
+        tmp_path / "reporting-disabled", reporting=False
+    )
+    enabled, enabled_files, enabled_events = run(
+        tmp_path / "reporting-enabled", reporting=True
+    )
+
+    assert disabled_events == []
+    assert enabled_events
+    assert disabled.status == enabled.status
+    np.testing.assert_array_equal(disabled.latest_free_flow, enabled.latest_free_flow)
+    np.testing.assert_array_equal(
+        disabled.state.current_prediction, enabled.state.current_prediction
+    )
+    assert disabled.state.current_objective == enabled.state.current_objective
+    assert disabled.state.best_objective == enabled.state.best_objective
+    assert disabled_files == enabled_files
+
+
 def test_update_budget_returns_valid_anytime_solution_after_one_block(tmp_path) -> None:
     problem = _problem()
     partition = _partition()
