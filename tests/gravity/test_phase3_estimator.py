@@ -22,6 +22,7 @@ from public_transportation.inference.fixed_routing_measurement_operator import (
 from public_transportation.inference.gravity import (
     GravityEstimatorConfig,
     GravityBiogemePilotResult,
+    GravityOptimizerComparisonResult,
     GravityEstimatorProgress,
     GravityExecutionPolicy,
     GravityFeatures,
@@ -34,9 +35,11 @@ from public_transportation.inference.gravity import (
     build_gravity_run_manifest,
     estimate_gravity_model,
     predict_gravity_measurements,
+    reclassify_gravity_result,
     run_gravity_preflight,
     scaled_gradient_inf_norm,
     run_biogeme_tr_bfgs_pilot,
+    compare_gravity_optimizers,
     write_gravity_run_manifest,
 )
 
@@ -276,6 +279,71 @@ def test_scipy_success_is_accepted_when_scaled_gradient_meets_tolerance(monkeypa
     assert result.scaled_gradient_inf_norm == pytest.approx(0.5)
 
 
+def test_reclassify_gravity_result_changes_only_acceptance_metadata(tmp_path):
+    with jax.enable_x64():
+        problem, layout, _ = setup_problem()
+        original = estimate_gravity_model(
+            problem=problem,
+            compact_layout=layout,
+            initial_raw_parameters=np.zeros(3),
+            config=GravityEstimatorConfig(maximum_iterations=2),
+            execution=GravityExecutionPolicy(gradient_strategy="adjoint"),
+        )
+    candidate = replace(
+        original,
+        status="iteration_limit",
+        success=False,
+        acceptance="not_accepted",
+        message="CONVERGENCE: REL_REDUCTION_OF_F_<=_FACTR*EPSMCH",
+        scaled_gradient_tolerance=1.0e-12,
+    )
+    destination = tmp_path / "reclassified.json"
+    reviewed = reclassify_gravity_result(
+        candidate,
+        scaled_gradient_tolerance=1.0,
+        expected_model_fingerprint=candidate.model_fingerprint,
+        expected_operator_fingerprint=candidate.direct_operator_artifact_fingerprint,
+        output_path=destination,
+    )
+    assert reviewed.status == "converged"
+    assert reviewed.success
+    assert reviewed.acceptance == "accepted"
+    np.testing.assert_array_equal(reviewed.raw_parameters, candidate.raw_parameters)
+    np.testing.assert_array_equal(reviewed.gradient, candidate.gradient)
+    np.testing.assert_array_equal(reviewed.predicted_measurements, candidate.predicted_measurements)
+    assert reviewed.objective == candidate.objective
+    assert reviewed.scaled_gradient_inf_norm == pytest.approx(
+        scaled_gradient_inf_norm(
+            candidate.raw_parameters,
+            candidate.gradient,
+            candidate.objective,
+            typical_objective_scale=candidate.typical_objective_scale,
+            typical_parameter_scales=candidate.typical_parameter_scales,
+        )
+    )
+    assert reviewed.convergence_reclassification is not None
+    assert reviewed.convergence_reclassification["previous_status"] == "iteration_limit"
+    assert reviewed.convergence_reclassification["new_scaled_gradient_tolerance"] == 1.0
+    payload = json.loads(destination.read_text(encoding="utf-8"))
+    assert payload["acceptance"] == "accepted"
+    assert payload["model_fingerprint"] == candidate.model_fingerprint
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        reclassify_gravity_result(
+            candidate,
+            scaled_gradient_tolerance=1.0,
+            expected_model_fingerprint=candidate.model_fingerprint,
+            expected_operator_fingerprint=candidate.direct_operator_artifact_fingerprint,
+            output_path=destination,
+        )
+    with pytest.raises(ValueError, match="model fingerprint"):
+        reclassify_gravity_result(
+            candidate,
+            scaled_gradient_tolerance=1.0,
+            expected_model_fingerprint="different",
+            expected_operator_fingerprint=candidate.direct_operator_artifact_fingerprint,
+        )
+
+
 def test_minimal_estimator_recovers_impedance_and_complete_od_layout(tmp_path):
     with jax.enable_x64():
         problem, layout, true_raw = setup_problem()
@@ -469,7 +537,7 @@ def test_optional_biogeme_tr_bfgs_pilot_uses_same_convergence_audit(monkeypatch)
     )
 
     assert isinstance(result, GravityBiogemePilotResult)
-    assert result.optimizer == "TR-BFGS"
+    assert result.optimizer == "biogeme_tr_bfgs"
     assert result.success
     assert result.status == "converged"
     assert result.objective_dtype == "float32"
@@ -480,6 +548,186 @@ def test_optional_biogeme_tr_bfgs_pilot_uses_same_convergence_audit(monkeypatch)
     assert result.typical_objective_scale_provenance
     assert result.typical_parameter_scales_provenance
     assert progress and progress[-1].scaled_gradient_inf_norm == pytest.approx(2.0)
+
+
+def test_optional_biogeme_tr_bfgs_pilot_real_interface_when_available():
+    """Exercise the current Biogeme ``FunctionToMinimize`` protocol when installed."""
+    pytest.importorskip("biogeme.optimization")
+
+    target = np.asarray((3.0, -2.0), dtype=np.float64)
+
+    def objective_and_gradient(value):
+        delta = np.asarray(value, dtype=np.float64) - target
+        return float(np.dot(delta, delta)), 2.0 * delta
+
+    result = run_biogeme_tr_bfgs_pilot(
+        objective_and_gradient=objective_and_gradient,
+        initial_raw_parameters=np.zeros(2, dtype=np.float64),
+        config=GravityEstimatorConfig(
+            maximum_iterations=100,
+            gradient_tolerance=1.0e-8,
+            scaled_gradient_tolerance=1.0e-6,
+            typical_objective_scale=1.0,
+            typical_parameter_scales=1.0,
+        ),
+        variable_names=("a", "b"),
+    )
+
+    assert result.optimizer == "biogeme_tr_bfgs"
+    assert result.success
+    assert result.status == "converged"
+    np.testing.assert_allclose(result.raw_parameters, target, atol=1.0e-10)
+    assert result.objective == pytest.approx(0.0, abs=1.0e-18)
+    assert result.scaled_gradient_inf_norm <= 1.0e-6
+    assert result.message
+
+
+def test_estimator_biogeme_selector_uses_common_callback_and_metadata(monkeypatch):
+    optimization_module = ModuleType("biogeme.optimization")
+    observed: dict[str, object] = {}
+
+    def fake_tr_bfgs(function, initial, bounds, variable_names, parameters):
+        observed["initial"] = np.asarray(initial, dtype=float).copy()
+        observed["bounds"] = bounds
+        observed["names"] = variable_names
+        observed["parameters"] = parameters
+        function.set_variables(initial)
+        function.f_g()
+        return SimpleNamespace(
+            solution=np.asarray(initial, dtype=float),
+            messages={
+                "Cause of termination": "stub trust-region termination",
+                "Number of iterations": 3,
+            },
+            convergence=True,
+        )
+
+    optimization_module.bfgs_trust_region_for_biogeme = fake_tr_bfgs
+    biogeme_module = ModuleType("biogeme")
+    biogeme_module.optimization = optimization_module
+    monkeypatch.setitem(sys.modules, "biogeme", biogeme_module)
+    monkeypatch.setitem(sys.modules, "biogeme.optimization", optimization_module)
+
+    with jax.enable_x64():
+        problem, layout, _ = setup_problem()
+        initial = np.zeros(3)
+        progress: list[GravityEstimatorProgress] = []
+        result = estimate_gravity_model(
+            problem=problem,
+            compact_layout=layout,
+            initial_raw_parameters=initial,
+            config=GravityEstimatorConfig(
+                optimizer="biogeme_tr_bfgs",
+                maximum_iterations=12,
+                scaled_gradient_tolerance=1.0e9,
+            ),
+            execution=GravityExecutionPolicy(gradient_strategy="adjoint"),
+            progress=progress.append,
+        )
+
+    assert result.optimizer == "biogeme_tr_bfgs"
+    assert result.optimizer_message == "stub trust-region termination"
+    assert result.optimizer_iterations == 3
+    assert result.optimizer_evaluations is not None
+    assert observed["names"] == list(problem.parameter_layout.names)
+    assert observed["bounds"] == [(None, None)] * 3
+    np.testing.assert_array_equal(observed["initial"], initial)
+    assert observed["parameters"]["maxiter"] == 12
+    assert "maxls" not in observed["parameters"]
+    assert any(event.phase == "optimizer_evaluations" for event in progress)
+
+
+def test_optimizer_comparison_uses_independent_checkpoints(monkeypatch, tmp_path):
+    optimization_module = ModuleType("biogeme.optimization")
+
+    def fake_tr_bfgs(function, initial, bounds, variable_names, parameters):
+        candidate = np.ones_like(np.asarray(initial, dtype=float))
+        function.set_variables(candidate)
+        function.f_g()
+        return SimpleNamespace(
+            solution=candidate,
+            messages={"Cause of termination": "stub convergence", "Number of iterations": 2},
+            convergence=True,
+        )
+
+    optimization_module.bfgs_trust_region_for_biogeme = fake_tr_bfgs
+    biogeme_module = ModuleType("biogeme")
+    biogeme_module.optimization = optimization_module
+    monkeypatch.setitem(sys.modules, "biogeme", biogeme_module)
+    monkeypatch.setitem(sys.modules, "biogeme.optimization", optimization_module)
+
+    result = compare_gravity_optimizers(
+        objective_and_gradient=lambda value: (
+            np.sum((value - 1.0) ** 2),
+            2.0 * (value - 1.0),
+        ),
+        initial_raw_parameters=np.zeros(2),
+        config=GravityEstimatorConfig(
+            maximum_iterations=25,
+            scaled_gradient_tolerance=1.0e-8,
+        ),
+        variable_names=("a", "b"),
+        scipy_checkpoint_path=tmp_path / "scipy.json",
+        biogeme_checkpoint_path=tmp_path / "biogeme.json",
+        model_fingerprint="model-id",
+        operator_fingerprint="operator-id",
+    )
+
+    assert isinstance(result, GravityOptimizerComparisonResult)
+    assert result.scipy.optimizer == "scipy"
+    assert result.biogeme_tr_bfgs.optimizer == "biogeme_tr_bfgs"
+    assert result.same_initial_parameters
+    assert result.scipy_checkpoint_path != result.biogeme_checkpoint_path
+    assert json.loads((tmp_path / "scipy.json").read_text())["optimizer"] == "scipy"
+    assert json.loads((tmp_path / "biogeme.json").read_text())["optimizer"] == "biogeme_tr_bfgs"
+    assert result.scipy.model_fingerprint == "model-id"
+    assert result.biogeme_tr_bfgs.operator_fingerprint == "operator-id"
+
+
+def test_optimizer_selector_defaults_and_rejects_unknown_value():
+    assert GravityEstimatorConfig().optimizer == "scipy"
+    with pytest.raises(ValueError, match="optimizer must be"):
+        GravityEstimatorConfig(optimizer="not-an-optimizer")
+
+
+def test_biogeme_selection_reports_actionable_missing_dependency(monkeypatch):
+    import builtins
+
+    original_import = builtins.__import__
+
+    def blocked_import(name, *args, **kwargs):
+        if name == "biogeme" or name.startswith("biogeme."):
+            raise ImportError("blocked for test")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocked_import)
+    with pytest.raises(ImportError, match="optional.*Biogeme|optional.*biogeme"):
+        run_biogeme_tr_bfgs_pilot(
+            objective_and_gradient=lambda value: (
+                np.sum(value**2),
+                2.0 * value,
+            ),
+            initial_raw_parameters=np.zeros(2),
+        )
+
+
+def test_biogeme_checkpoint_cannot_resume_scipy_state(tmp_path):
+    checkpoint = tmp_path / "checkpoint.json"
+    estimator_module._write_checkpoint(
+        checkpoint,
+        model_fingerprint="model",
+        raw_parameters=np.zeros(2),
+        iterations=1,
+        elapsed_seconds=2.0,
+        optimizer="scipy",
+    )
+    with pytest.raises(ValueError, match="optimizer mismatch"):
+        estimator_module._load_checkpoint(
+            checkpoint,
+            "model",
+            parameter_count=2,
+            expected_optimizer="biogeme_tr_bfgs",
+        )
 
 
 def test_resume_reaches_same_solution_as_uninterrupted(tmp_path):
@@ -691,8 +939,14 @@ def test_run_manifest_and_progress_log_are_durable_and_serializable(tmp_path):
     loaded = json.loads(manifest_path.read_text())
     assert loaded["repository_revision"] == "test-revision"
     assert loaded["model_fingerprint"] == manifest["model_fingerprint"]
+    assert loaded["optimizer"] == "scipy"
+    assert loaded["optimizer_message"] == result.optimizer_message
+    assert loaded["optimizer_iterations"] == result.optimizer_iterations
+    assert loaded["optimizer_evaluations"] == result.optimizer_evaluations
     assert loaded["estimator_config"]["optimizer_maxls"] == 100
     diagnostics = loaded["convergence_diagnostics"]
+    assert diagnostics["optimizer"] == "scipy"
+    assert diagnostics["optimizer_message"] == result.optimizer_message
     assert diagnostics["objective"] == pytest.approx(result.objective)
     assert diagnostics["initial_objective"] == pytest.approx(
         result.initial_objective

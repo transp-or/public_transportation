@@ -83,10 +83,14 @@ from .estimator import (
     GravityStrategySelection,
     estimate_gravity_model,
     gravity_model_fingerprint,
+    reclassify_gravity_result,
     scaled_gradient_inf_norm,
 )
 from .biogeme_pilot import (
     GravityBiogemePilotResult,
+    GravityOptimizerComparisonResult,
+    GravityOptimizerRunSummary,
+    compare_gravity_optimizers,
     run_biogeme_tr_bfgs_pilot,
 )
 from .parameters import (

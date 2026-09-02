@@ -11,6 +11,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+import public_transportation.inference.temporal_assignment_persistence as persistence_module
+
 from public_transportation.assignment import AssignmentConfig
 from public_transportation.assignment.assign import prepare_assignment
 from public_transportation.domain import Scenario
@@ -56,6 +58,7 @@ from public_transportation.inference.scheduled_reference_operator import (
     build_scheduled_reference_artifact_identity,
 )
 from public_transportation.inference.temporal_assignment_blocks import (
+    PackedTemporalBlockAssignmentOperator,
     TemporalSupportProfileConfig,
     build_chunked_temporal_block_operator,
     build_exact_temporal_block_operator,
@@ -69,6 +72,8 @@ from public_transportation.inference.sharded_fixed_routing import (
     FixedRoutingPreparationConfig,
 )
 from public_transportation.inference.temporal_assignment_persistence import (
+    _file_sha256,
+    _load_validated_operator_cache,
     adopt_completed_preflight,
     load_temporal_block_operator,
     materialize_operator_cache_from_adopted_preflight,
@@ -430,17 +435,84 @@ def test_completed_preflight_adoption_materializes_and_reuses_packed_cache(
         return original_load(file, *args, **kwargs)
 
     monkeypatch.setattr(np, "load", recording_load)
+    def fail_if_block_materialized(*args, **kwargs):
+        raise AssertionError("packed-cache activation materialized a source block")
+
+    monkeypatch.setattr(
+        persistence_module, "TemporalSparseBlock", fail_if_block_materialized
+    )
+    progress_events: list[dict[str, object]] = []
+    reporter = ConstructionProgressReporter(
+        ConstructionDeadline.unlimited(),
+        progress_events.append,
+        minimum_interval_seconds=0.0,
+    )
     loaded = load_temporal_block_operator(
         artifact_directory,
         expected_identity=reference.identity,
         expected_canonical_index=reference.canonical_index,
         validated_cache_directory=cache_directory,
+        reporter=reporter,
     )
     assert not any("/blocks/" in path for path in opened)
+    assert isinstance(loaded, PackedTemporalBlockAssignmentOperator)
+    # Loading and sparse execution must not materialize the legacy block view.
+    assert loaded._blocks is None
+    assert isinstance(loaded.row_indices, np.memmap)
+    assert isinstance(loaded.column_indices, np.memmap)
+    assert isinstance(loaded.values, np.memmap)
+    assert isinstance(loaded.offsets, np.memmap)
+    assert isinstance(loaded.fixed_measurement_offset, np.memmap)
+    packed_events = [
+        event
+        for event in progress_events
+        if event.get("cache_validation_stage") == "packed_cache_loading"
+    ]
+    assert packed_events
+    assert packed_events[-1]["status"] == "completed"
+    assert packed_events[-1]["completed_units"] == 1
+    assert packed_events[-1]["total_units"] == 1
+    hit_events = [
+        event
+        for event in progress_events
+        if event.get("packed_cache_hit") is True
+    ]
+    assert hit_events
+    assert hit_events[-1]["cache_hits"] == 1
+    assert hit_events[-1]["completed_units"] == 1
+    assert hit_events[-1]["total_units"] == 1
+    packed_backend = CSRCSCTemporalAssignmentOperator(loaded)
+    assert loaded._blocks is None
     demand = jnp.linspace(0.2, 1.7, layout.num_free, dtype=jnp.float32)
     residual = jnp.asarray([0.5, -0.25, 1.5], dtype=jnp.float32)
     np.testing.assert_array_equal(loaded.matvec(demand), operator.matvec(demand))
     np.testing.assert_array_equal(loaded.rmatvec(residual), operator.rmatvec(residual))
+    np.testing.assert_allclose(
+        packed_backend.matvec(demand), operator.matvec(demand), rtol=1e-6, atol=1e-6
+    )
+    np.testing.assert_allclose(
+        packed_backend.rmatvec(residual), operator.rmatvec(residual), rtol=1e-6, atol=1e-6
+    )
+
+    # Packed-array content hashes remain fail-closed.  A modified optional
+    # cache is rejected rather than being trusted by a later fit.
+    packed_values_path = cache_directory / "values.npy"
+    packed_values = np.load(packed_values_path, allow_pickle=False)
+    assert packed_values.size
+    packed_values = np.array(packed_values, copy=True)
+    packed_values[0] += 1.0
+    np.save(packed_values_path, packed_values)
+    assert (
+        _load_validated_operator_cache(
+            cache_directory=cache_directory,
+            expected_identity=reference.identity,
+            expected_canonical_index=reference.canonical_index,
+            artifact_manifest_sha256=_file_sha256(
+                artifact_directory / "manifest.json"
+            ),
+        )
+        is None
+    )
 
 
 def test_completed_preflight_adoption_rejects_incomplete_or_mismatched_manifest(

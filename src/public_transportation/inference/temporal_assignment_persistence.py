@@ -10,6 +10,7 @@ import tempfile
 from collections import deque
 from dataclasses import asdict
 from collections.abc import Mapping
+from contextlib import nullcontext
 from pathlib import Path
 from time import perf_counter
 
@@ -25,6 +26,7 @@ from .assignment_contract import (
     assert_assignment_artifact_compatible,
 )
 from .temporal_assignment_blocks import (
+    PackedTemporalBlockAssignmentOperator,
     TemporalBlockAssignmentOperator,
     TemporalBlockConstructionDiagnostics,
     TemporalBlockKey,
@@ -775,7 +777,8 @@ def _load_validated_operator_cache(
     expected_identity: AssignmentArtifactIdentity,
     expected_canonical_index: CanonicalAssignmentIndex,
     artifact_manifest_sha256: str,
-) -> TemporalBlockAssignmentOperator | None:
+    reporter: ConstructionProgressReporter | None = None,
+) -> TemporalBlockAssignmentOperator | PackedTemporalBlockAssignmentOperator | None:
     """Load packed arrays after validating their metadata and hashes."""
     cache = Path(cache_directory)
     manifest_path = cache / "manifest.json"
@@ -821,24 +824,107 @@ def _load_validated_operator_cache(
             "fixed_measurement_offset.npy",
             "keys.json",
         )
-        for filename in filenames:
+        reporting_enabled = reporter is not None and reporter.sink is not None
+        started = perf_counter() if reporting_enabled else None
+        recent_durations: deque[float] = deque(maxlen=16)
+        if reporting_enabled:
+            reporter.emit(
+                phase=ConstructionPhase.CACHE_VALIDATION,
+                status="running",
+                force=True,
+                completed_units=0,
+                total_units=len(filenames),
+                current_unit=filenames[0],
+                checkpoint_location=str(cache),
+                details={"cache_validation_stage": "packed_array_validation"},
+            )
+        for position, filename in enumerate(filenames):
+            file_started = perf_counter() if reporting_enabled else None
             path = cache / filename
-            if not path.is_file() or hashes.get(filename) != _file_sha256(path):
+            hash_scope = (
+                reporter.heartbeat_scope(
+                    current_unit=filename,
+                    phase=ConstructionPhase.CACHE_VALIDATION,
+                    details={"cache_validation_stage": "packed_array_hash"},
+                )
+                if reporting_enabled
+                else nullcontext()
+            )
+            with hash_scope:
+                actual_hash = None if not path.is_file() else _file_sha256(path)
+            if actual_hash is None or hashes.get(filename) != actual_hash:
                 return None
-        rows = np.load(cache / "row_indices.npy", mmap_mode="r", allow_pickle=False)
-        columns = np.load(cache / "column_indices.npy", mmap_mode="r", allow_pickle=False)
-        values = np.load(cache / "values.npy", mmap_mode="r", allow_pickle=False)
-        offsets = np.load(cache / "offsets.npy", mmap_mode="r", allow_pickle=False)
-        fixed_offset = np.load(
-            cache / "fixed_measurement_offset.npy", mmap_mode="r", allow_pickle=False
+            if reporting_enabled:
+                assert file_started is not None and started is not None
+                duration = max(0.0, perf_counter() - file_started)
+                recent_durations.append(duration)
+                eta = estimate_completed_unit_eta(
+                    recent_durations,
+                    completed_units=position + 1,
+                    total_units=len(filenames),
+                    parallelism=1,
+                    elapsed_seconds=max(0.0, perf_counter() - started),
+                )
+                reporter.emit(
+                    phase=ConstructionPhase.CACHE_VALIDATION,
+                    status="running",
+                    completed_units=position + 1,
+                    total_units=len(filenames),
+                    current_unit=filename,
+                    checkpoint_location=str(cache),
+                    recent_unit_seconds=duration,
+                    predicted_remaining_seconds=eta.predicted_remaining_seconds,
+                    eta_confidence=eta.eta_confidence,
+                    estimated_completion_at_utc=eta.estimated_completion_at_utc,
+                    eta_reason=eta.eta_reason,
+                    eta_lower_seconds=eta.eta_lower_seconds,
+                    eta_upper_seconds=eta.eta_upper_seconds,
+                    throughput_units_per_second=eta.throughput_units_per_second,
+                    details={"cache_validation_stage": "packed_array_validation"},
+                )
+        load_scope = (
+            reporter.heartbeat_scope(
+                current_unit="packed_operator_arrays",
+                phase=ConstructionPhase.CACHE_VALIDATION,
+                details={"cache_validation_stage": "packed_cache_loading"},
+            )
+            if reporting_enabled
+            else nullcontext()
         )
-        keys_payload = json.loads((cache / "keys.json").read_text(encoding="utf-8"))
+        with load_scope:
+            rows = np.load(
+                cache / "row_indices.npy", mmap_mode="r", allow_pickle=False
+            )
+            columns = np.load(
+                cache / "column_indices.npy", mmap_mode="r", allow_pickle=False
+            )
+            values = np.load(
+                cache / "values.npy", mmap_mode="r", allow_pickle=False
+            )
+            offsets = np.load(
+                cache / "offsets.npy", mmap_mode="r", allow_pickle=False
+            )
+            fixed_offset = np.load(
+                cache / "fixed_measurement_offset.npy",
+                mmap_mode="r",
+                allow_pickle=False,
+            )
+            keys_payload = json.loads(
+                (cache / "keys.json").read_text(encoding="utf-8")
+            )
         if (
-            rows.shape != (total_nonzeros,)
+            number_of_demand_cells != expected_canonical_index.number_of_demand_cells
+            or number_of_measurements != expected_canonical_index.number_of_measurements
+            or rows.shape != (total_nonzeros,)
             or columns.shape != (total_nonzeros,)
             or values.shape != (total_nonzeros,)
             or offsets.shape != (block_count + 1,)
             or fixed_offset.shape != (number_of_measurements,)
+            or rows.dtype != np.dtype(np.int32)
+            or columns.dtype != np.dtype(np.int32)
+            or offsets.dtype != np.dtype(np.int64)
+            or values.dtype != np.dtype(expected_identity.numeric_dtype)
+            or fixed_offset.dtype != np.dtype(expected_identity.numeric_dtype)
             or not isinstance(keys_payload, list)
             or len(keys_payload) != block_count
             or int(offsets[0]) != 0
@@ -846,33 +932,54 @@ def _load_validated_operator_cache(
             or np.any(np.diff(offsets) < 0)
         ):
             return None
-        blocks: list[TemporalSparseBlock] = []
-        for position, key in enumerate(keys_payload):
+        keys: list[TemporalBlockKey] = []
+        for key in keys_payload:
             if not isinstance(key, Mapping):
                 return None
-            start, stop = int(offsets[position]), int(offsets[position + 1])
-            blocks.append(
-                TemporalSparseBlock(
-                    key=TemporalBlockKey(**key),
-                    row_indices=np.asarray(rows[start:stop]),
-                    column_indices=np.asarray(columns[start:stop]),
-                    values=np.asarray(values[start:stop]),
-                    number_of_measurements=number_of_measurements,
-                    number_of_demand_cells=number_of_demand_cells,
-                )
-            )
+            keys.append(TemporalBlockKey(**key))
         diagnostics = TemporalBlockConstructionDiagnostics(
             **dict(manifest.get("diagnostics", {}))
         )
         if _array_content_hash(fixed_offset) != manifest.get("fixed_measurement_offset_hash"):
             return None
-        return TemporalBlockAssignmentOperator(
+        operator = PackedTemporalBlockAssignmentOperator(
             canonical_index=expected_canonical_index,
             identity=expected_identity,
-            blocks=tuple(blocks),
-            fixed_measurement_offset=np.asarray(fixed_offset),
+            row_indices=rows,
+            column_indices=columns,
+            values=values,
+            offsets=offsets,
+            keys=tuple(keys),
+            fixed_measurement_offset=fixed_offset,
             diagnostics=diagnostics,
         )
+        if reporting_enabled:
+            assert started is not None
+            load_eta = estimate_completed_unit_eta(
+                (perf_counter() - started,),
+                completed_units=1,
+                total_units=1,
+                parallelism=1,
+                elapsed_seconds=max(0.0, perf_counter() - started),
+            )
+            reporter.emit(
+                phase=ConstructionPhase.CACHE_VALIDATION,
+                status="completed",
+                force=True,
+                completed_units=1,
+                total_units=1,
+                current_unit="packed_operator_arrays",
+                checkpoint_location=str(cache),
+                predicted_remaining_seconds=0.0,
+                eta_confidence="high",
+                estimated_completion_at_utc=load_eta.estimated_completion_at_utc,
+                eta_reason="packed arrays loaded without source block objects",
+                eta_lower_seconds=0.0,
+                eta_upper_seconds=0.0,
+                throughput_units_per_second=load_eta.throughput_units_per_second,
+                details={"cache_validation_stage": "packed_cache_loading"},
+            )
+        return operator
     except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
         return None
 
@@ -885,7 +992,7 @@ def load_temporal_block_operator(
     reporter: ConstructionProgressReporter | None = None,
     validated_cache_directory: str | Path | None = None,
     preflight_manifest: str | Path | Mapping[str, object] | None = None,
-) -> TemporalBlockAssignmentOperator:
+) -> TemporalBlockAssignmentOperator | PackedTemporalBlockAssignmentOperator:
     """Validate every identity and payload before accepting an artifact.
 
     When supplied, ``reporter`` receives throttled cache-validation progress;
@@ -928,6 +1035,7 @@ def load_temporal_block_operator(
             expected_identity=expected_identity,
             expected_canonical_index=expected_canonical_index,
             artifact_manifest_sha256=artifact_manifest_sha256,
+            reporter=reporter,
         )
         if cached is None and preflight_manifest is not None:
             try:
@@ -949,6 +1057,7 @@ def load_temporal_block_operator(
                     expected_identity=expected_identity,
                     expected_canonical_index=expected_canonical_index,
                     artifact_manifest_sha256=artifact_manifest_sha256,
+                    reporter=reporter,
                 )
             except (AssignmentCompatibilityError, OSError, TypeError, ValueError):
                 # Adoption is an optimization.  If evidence is stale or
@@ -979,6 +1088,7 @@ def load_temporal_block_operator(
                     details={
                         "cache_validation_stage": "temporal_block_load",
                         "operator_cache_hit": True,
+                        "packed_cache_hit": True,
                     },
                 )
             return cached
@@ -1141,7 +1251,7 @@ def reuse_or_build_temporal_block_operator(
     reference,
     zero_tolerance: float = 0.0,
     progress=None,
-) -> tuple[TemporalBlockAssignmentOperator, bool]:
+) -> tuple[TemporalBlockAssignmentOperator | PackedTemporalBlockAssignmentOperator, bool]:
     """Reuse a compatible content-addressed artifact or construct it once."""
     from .temporal_assignment_blocks import build_exact_temporal_block_operator
 

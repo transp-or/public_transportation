@@ -625,8 +625,14 @@ def fit(root: Path, resume: bool = False) -> None:
         typical_objective_scale, typical_parameter_scales = (
             _explicit_convergence_scales(model)
         )
+        optimizer = str(model.get("optimizer", "scipy"))
         initial_parameters = initial_raw_parameters(parameters, model)
-        checkpoint = context.settings.results / "checkpoints/gravity.json"
+        checkpoint_name = (
+            "gravity.json"
+            if optimizer == "scipy"
+            else f"gravity-{optimizer}.json"
+        )
+        checkpoint = context.settings.results / "checkpoints" / checkpoint_name
         wall = float(model.get("wall_time_seconds", 0.0))
         execution = GravityExecutionPolicy(
             gradient_strategy=str(model.get("gradient_strategy", "auto")),
@@ -645,6 +651,7 @@ def fit(root: Path, resume: bool = False) -> None:
             ),
             typical_objective_scale=typical_objective_scale,
             typical_parameter_scales=typical_parameter_scales,
+            optimizer=optimizer,
         )
         fit_started = perf_counter()
 
@@ -694,6 +701,7 @@ def fit(root: Path, resume: bool = False) -> None:
                     event, "typical_objective_scale_selection", None
                 ),
                 "termination_message": getattr(event, "termination_message", None),
+                "optimizer": getattr(event, "optimizer", config.optimizer),
                 "checkpoint_written": bool(getattr(event, "checkpoint_written")),
                 "wall_clock_seconds": perf_counter() - fit_started,
             })

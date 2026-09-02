@@ -1124,8 +1124,13 @@ results. Its manifest contains deterministic hashes for every packed array,
 the source artifact manifest, identity and binding fingerprints, and its
 provenance. Publication is atomic; incomplete caches are never accepted.
 
-After this one-time step, `preflight`, `benchmark`, and `fit` load the packed
-arrays and must not open any file under `artifact/blocks/`. A fast-path event
+After this one-time step, `preflight`, `benchmark`, and `fit` memory-map the
+packed arrays and must not open any file under `artifact/blocks/`. The loader
+does not create one `TemporalSparseBlock` object per cached block; the legacy
+block view is lazy and is materialized only by an explicit compatibility
+consumer. CSR/CSC execution structures are built directly from the packed
+triplets, preserving the source operator's shape, dtype, duplicate handling,
+sorting, zero elimination, and products. A fast-path event
 has one logical unit rather than the legacy block count. It retains the
 `temporal_block_load` stage name for compatibility with existing progress
 consumers and marks the event as a packed-cache hit:
@@ -1140,6 +1145,20 @@ total_units=1
 predicted_remaining_seconds=0
 ```
 
+Cache progress also distinguishes the finite subphases
+`packed_array_validation`, `packed_cache_loading`, and
+`csr_csc_construction`. Hash validation reports one unit per packed file;
+loading and CSR/CSC assembly report one logical unit and emit heartbeats while
+the operation is indivisible. A valid packed-cache hit therefore must not claim
+that all source blocks were revalidated. The realized-support stage reports
+bounded scans of packed row-index chunks when its support cache is absent. Once
+the support cache is valid, it reports `support_cache_hit=true` and does not
+scan the temporal blocks at all. Every finite stage exposes
+`completed_units`, `total_units`, `current_unit`, `elapsed_seconds`,
+`predicted_remaining_seconds`, `eta_confidence`, and `eta_reason`; an
+indivisible stage may legitimately have an unavailable ETA but continues to
+emit heartbeats.
+
 The realized positive-boarding support result is cached separately under
 `positive_boarding_support_cache/`. It is keyed by the artifact and operator
 cache manifests, canonical/binding fingerprints, observations, mapping,
@@ -1148,6 +1167,16 @@ report is reused without rescanning operator blocks; changed observations or
 mapping inputs invalidate only this support cache. Delete a derived cache only
 if you accept the one-time reconstruction cost—the source artifact and its
 completed preflight remain valid.
+
+For SciPy/Biogeme comparison runs, activate the operator once and record that
+common activation time separately. Pass it as `operator_activation_seconds` to
+`compare_gravity_optimizers`; both optimizer summaries then include the same
+activation time in `elapsed_total_seconds` and report their optimizer times
+separately. Use distinct optimizer checkpoints and result files. If only the
+convergence threshold changes, `reclassify_gravity_result` can write a new
+result record from the stored final parameters, objective, and gradient after
+checking matching model/operator fingerprints; it never overwrites the
+original result or reruns the operator.
 
 ### Current path/interface limitation
 
@@ -2370,8 +2399,8 @@ The estimator returns `GravityEstimationResult`. Interpret the status as:
 | `stopped_by_time_budget` | clean resumable stop; do not call it complete |
 | numerical/other failure | diagnose before changing the model |
 
-The estimator certifies `converged` only when SciPy reports success **and** the
-Dennis--Schnabel scaled-gradient infinity norm is no larger than
+The estimator certifies `converged` only when the selected optimizer reports
+success **and** the Dennis--Schnabel scaled-gradient infinity norm is no larger than
 `scaled_gradient_tolerance`. The norm is computed per parameter as
 
 ```text
@@ -2382,9 +2411,9 @@ abs(gradient_i) * max(abs(parameter_i), typical_parameter_scale_i)
 `typical_parameter_scales` may be one scalar or one positive value per
 parameter. The result and fit progress report the raw and scaled gradient
 norms, the scale settings, the initial objective, scale-selection provenance,
-and SciPy's termination message. A relative-
+and the optimizer's termination message. A relative-
 objective termination with a large scaled gradient is therefore not an
-accepted fit, even when SciPy's success flag is true. The final diagnostics also
+accepted fit, even when the optimizer's native success flag is true. The final diagnostics also
 record objective/gradient dtypes, `np.spacing(objective)`, the reduction between
 the last accepted iterates, and whether `objective_tolerance` is below the
 available floating-point resolution. Do not silently treat a float32 result as
@@ -2414,6 +2443,44 @@ parameters should be materially unchanged, and convergence classification
 should be interpreted together with the reported scaled-gradient value. A
 large classification change under these modest scale changes is not a robust
 convergence certificate.
+
+### Selecting and comparing optimizers
+
+SciPy L-BFGS-B remains the default and should be selected explicitly in the
+case-owned `config/model.toml` when reproducibility is important:
+
+```toml
+optimizer = "scipy"
+```
+
+An optional Biogeme TR-BFGS path is available for a controlled comparison:
+
+```toml
+optimizer = "biogeme_tr_bfgs"
+```
+
+Biogeme is not installed by the default public package. The verified pilot
+environment currently uses Python 3.14 with `biogeme==3.3.5` and
+`biogeme-optimization==0.0.11`; it resolves NumPy 2.4.6 and Pandas 2.3.3,
+which differ from the public package lockfile. Install and pin this separate
+environment only for a controlled comparison. Selecting Biogeme without that
+environment produces an actionable error. Do not add it to the default
+environment or change the core NumPy/Pandas bounds without repeating the full
+compatibility and test checks.
+Both algorithms consume the same compiled objective-and-gradient callback,
+initial raw vector, unconstrained bounds, parameter names, scales, tolerances,
+and iteration limit. They do not rebuild the scientific model or warm-start
+one method from the other. Use distinct checkpoint and result locations, and
+compare final objective, parameter distance, raw/scaled gradient norms, dtypes,
+termination messages, and optimizer time. Separate common JAX compilation and
+model setup time from optimizer time whenever possible.
+
+The optimizer name and termination metadata are execution records, not part of
+the scientific model or operator fingerprints. A checkpoint tagged `scipy`
+cannot be resumed as `biogeme_tr_bfgs` (or vice versa); start a separate
+comparison checkpoint. Biogeme's native convergence flag is not sufficient:
+the common scaled-gradient criterion still determines `success` and the final
+acceptance decision.
 
 Before accepting or submitting a validation job, inspect the durable fit
 manifest:

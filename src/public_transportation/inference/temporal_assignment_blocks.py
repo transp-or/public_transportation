@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Callable
 
@@ -308,6 +308,165 @@ class TemporalBlockAssignmentOperator:
                 * value[jnp.asarray(block.row_indices)]
             )
         return result
+
+    def jax_matvec(self, demand: object) -> jax.Array:
+        return self.matvec(demand)
+
+    def jax_rmatvec(self, residual: object) -> jax.Array:
+        return self.rmatvec(residual)
+
+
+@dataclass(frozen=True, slots=True)
+class PackedTemporalBlockAssignmentOperator:
+    """Packed temporal operator loaded without eager block objects.
+
+    The persisted operator-cache format stores all triplets in contiguous
+    arrays and uses ``offsets`` to delimit logical temporal blocks.  This
+    representation keeps those arrays (often memory mapped) as the source of
+    truth.  The legacy ``blocks`` view is deliberately lazy: callers that
+    still need individual :class:`TemporalSparseBlock` objects can request it,
+    while normal activation and sparse execution never create one object per
+    block.
+    """
+
+    canonical_index: CanonicalAssignmentIndex
+    identity: AssignmentArtifactIdentity
+    row_indices: np.ndarray
+    column_indices: np.ndarray
+    values: np.ndarray
+    offsets: np.ndarray
+    keys: tuple[TemporalBlockKey, ...]
+    fixed_measurement_offset: np.ndarray
+    diagnostics: TemporalBlockConstructionDiagnostics
+    _blocks: tuple[TemporalSparseBlock, ...] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        if (
+            self.identity.canonical_index_fingerprint
+            != self.canonical_index.artifact_fingerprint
+        ):
+            raise AssignmentCompatibilityError(
+                "packed temporal arrays and canonical index have different identities."
+            )
+        def preserve_array(value: object) -> np.ndarray:
+            # ``np.asarray`` strips the ``memmap`` subclass even when it does
+            # not copy.  Keep ndarray/memmap inputs untouched so the packed
+            # loader can retain its memory-mapped backing storage.
+            return value if isinstance(value, np.ndarray) else np.asarray(value)
+
+        rows = preserve_array(self.row_indices)
+        columns = preserve_array(self.column_indices)
+        values = preserve_array(self.values)
+        offsets = preserve_array(self.offsets)
+        fixed = preserve_array(self.fixed_measurement_offset)
+        if rows.ndim != 1 or columns.shape != rows.shape or values.shape != rows.shape:
+            raise ValueError("packed temporal triplet arrays are not aligned.")
+        if offsets.ndim != 1 or offsets.size != len(self.keys) + 1:
+            raise ValueError("packed temporal offsets have an invalid shape.")
+        if offsets.size == 0 or int(offsets[0]) != 0 or int(offsets[-1]) != rows.size:
+            raise ValueError("packed temporal offsets do not delimit the arrays.")
+        if np.any(np.diff(offsets) < 0):
+            raise ValueError("packed temporal offsets must be nondecreasing.")
+        if fixed.shape != (self.number_of_measurements,) or not np.all(
+            np.isfinite(fixed)
+        ):
+            raise ValueError("packed fixed measurement offset is invalid.")
+        if rows.size and (
+            np.any(rows < 0)
+            or np.any(rows >= self.number_of_measurements)
+            or np.any(columns < 0)
+            or np.any(columns >= self.number_of_demand_cells)
+        ):
+            raise ValueError("packed temporal indices are out of bounds.")
+        if not np.all(np.isfinite(values)):
+            raise ValueError("packed temporal values must be finite.")
+        # Preserve read-only mmap views and prevent accidental mutation through
+        # the compatibility object.  ``setflags`` is harmless for read-only
+        # memmaps and does not copy the data.
+        for array in (rows, columns, values, offsets, fixed):
+            try:
+                array.setflags(write=False)
+            except ValueError:
+                pass
+        object.__setattr__(self, "row_indices", rows)
+        object.__setattr__(self, "column_indices", columns)
+        object.__setattr__(self, "values", values)
+        object.__setattr__(self, "offsets", offsets)
+        object.__setattr__(self, "fixed_measurement_offset", fixed)
+        object.__setattr__(self, "keys", tuple(self.keys))
+
+    @property
+    def number_of_demand_cells(self) -> int:
+        return self.canonical_index.number_of_demand_cells
+
+    @property
+    def number_of_measurements(self) -> int:
+        return self.canonical_index.number_of_measurements
+
+    @property
+    def number_of_blocks(self) -> int:
+        return len(self.keys)
+
+    @property
+    def canonical_index_fingerprint(self) -> str:
+        return self.canonical_index.artifact_fingerprint
+
+    @property
+    def artifact_fingerprint(self) -> str:
+        return self.identity.fingerprint
+
+    @property
+    def representation(self) -> str:
+        # Preserve the public representation label of the legacy loader.  The
+        # packed storage is an execution detail and must not alter scientific
+        # identity or downstream manifest comparisons.
+        return "sparse_temporal_blocks"
+
+    @property
+    def dtype(self) -> np.dtype:
+        return np.dtype(self.identity.numeric_dtype)
+
+    @property
+    def nonzero_entries(self) -> int:
+        return int(self.values.size)
+
+    @property
+    def blocks(self) -> tuple[TemporalSparseBlock, ...]:
+        """Materialize the legacy block view only when explicitly requested."""
+        cached = self._blocks
+        if cached is not None:
+            return cached
+        materialized = tuple(
+            TemporalSparseBlock(
+                key=key,
+                row_indices=self.row_indices[int(self.offsets[position]) : int(self.offsets[position + 1])],
+                column_indices=self.column_indices[int(self.offsets[position]) : int(self.offsets[position + 1])],
+                values=self.values[int(self.offsets[position]) : int(self.offsets[position + 1])],
+                number_of_measurements=self.number_of_measurements,
+                number_of_demand_cells=self.number_of_demand_cells,
+            )
+            for position, key in enumerate(self.keys)
+        )
+        object.__setattr__(self, "_blocks", materialized)
+        return materialized
+
+    def matvec(self, demand: object) -> jax.Array:
+        value = jnp.asarray(demand, dtype=self.dtype)
+        if value.shape != (self.number_of_demand_cells,):
+            raise ValueError("demand has an incompatible shape.")
+        return jnp.zeros((self.number_of_measurements,), dtype=self.dtype).at[
+            jnp.asarray(self.row_indices)
+        ].add(jnp.asarray(self.values) * value[jnp.asarray(self.column_indices)])
+
+    def rmatvec(self, residual: object) -> jax.Array:
+        value = jnp.asarray(residual, dtype=self.dtype)
+        if value.shape != (self.number_of_measurements,):
+            raise ValueError("residual has an incompatible shape.")
+        return jnp.zeros((self.number_of_demand_cells,), dtype=self.dtype).at[
+            jnp.asarray(self.column_indices)
+        ].add(jnp.asarray(self.values) * value[jnp.asarray(self.row_indices)])
 
     def jax_matvec(self, demand: object) -> jax.Array:
         return self.matvec(demand)

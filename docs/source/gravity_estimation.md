@@ -138,10 +138,27 @@ phases.
 ## Phase 3: minimal estimator
 
 `estimate_gravity_model` fits the three-parameter minimal model with SciPy
-L-BFGS-B using an explicitly traced, lowered, compiled, and synchronized JAX
-objective-and-gradient kernel. Smooth softplus transformations enforce positive
-time, transfer, and negative-binomial dispersion parameters; optimizer bounds
-are unnecessary.
+L-BFGS-B by default, using an explicitly traced, lowered, compiled, and
+synchronized JAX objective-and-gradient kernel. Smooth softplus
+transformations enforce positive time, transfer, and negative-binomial
+dispersion parameters; optimizer bounds are unnecessary. The optional
+`optimizer = "biogeme_tr_bfgs"` selector uses Biogeme's trust-region BFGS
+implementation against that same compiled `raw_parameters -> (objective,
+gradient)` callback. It does not rebuild the objective, demand model, routing
+operator, likelihood, or derivatives. Biogeme is imported lazily and remains
+outside the default dependency set; selecting it without the optional
+environment produces an actionable import error.
+
+The optional path has been verified in a separate Python 3.14 environment with
+`biogeme==3.3.5` and `biogeme-optimization==0.0.11`. This environment resolves
+Biogeme's compatible numerical stack (including NumPy 2.4.6 and Pandas 2.3.3)
+and is intentionally separate from the public package lockfile. Do not add
+Biogeme to the default environment or relax its dependency bounds without
+repeating the compatibility and full-test checks. The adapter implements
+Biogeme's `FunctionToMinimize` protocol while retaining the public estimator's
+scaled-gradient acceptance audit. It sets Biogeme's relative-gradient epsilon
+and Dennis--Schnabel `typx`/`typf` explicitly; callers must not rely on the
+optional wrapper's tolerance payload alone.
 
 `GravityEstimatorConfig` contains statistical stopping controls: maximum total
 iterations, gradient tolerance, and objective tolerance. It also records the
@@ -155,8 +172,8 @@ max_i |g_i| max(|x_i|, typx_i) / max(|objective|, typf).
 
 `scaled_gradient_tolerance`, `typical_objective_scale`, and the optional scalar
 or per-parameter `typical_parameter_scales` are validated as finite positive
-values. SciPy's success flag is accepted only when this scaled norm also meets
-the configured tolerance. A relative-objective termination with a large
+values. The selected optimizer's success flag is accepted only when this scaled
+norm also meets the configured tolerance. A relative-objective termination with a large
 scaled gradient is therefore reported as not converged, while the original
 optimizer termination message is retained.
 The library defaults (`typical_objective_scale = 1.0` and unit `typx`) are
@@ -170,7 +187,10 @@ documented value, preferably
 objective. Choose `typx` from natural parameter units or prior scales and
 provide exactly one value per raw parameter unless one scalar genuinely applies
 to all parameters.
-`GravityExecutionPolicy` separately controls the derivative strategy, bounded
+`GravityEstimatorConfig.optimizer` accepts only `scipy` and `biogeme_tr_bfgs`;
+omission selects SciPy and preserves the historical L-BFGS-B behavior. The
+optimizer choice is execution metadata, not part of the scientific model
+fingerprint. `GravityExecutionPolicy` separately controls the derivative strategy, bounded
 automatic-strategy threshold, wall-time allowance, progress interval,
 checkpoint path, and optional persistent JAX compilation-cache directory. The
 saved model specification is therefore independent of laptop or cluster
@@ -187,15 +207,18 @@ is also recorded. Automatic preflight is deliberately bounded to these two
 fixed candidates and two executions apiece.
 
 Checkpoints are atomic, flushed JSON records written at the initial state and
-after every completed L-BFGS iteration. They contain the raw parameters, total
-completed iterations, accumulated elapsed time, schema, and a model fingerprint
+after every completed SciPy L-BFGS-B iteration. They contain the raw
+parameters, total completed iterations, accumulated elapsed time, schema, the
+selected optimizer, and a model fingerprint
 covering gravity inputs, specification, parameter layout, compact OD layout,
 routing/mapping provenance, observations, calibration mask, likelihood, and
 fixed numerical semantics. Resume rejects any mismatch. Invocation limits may
 change without changing model identity. SciPy's internal L-BFGS history is not
 portable across processes, so resume restarts the quasi-Newton history from the
 saved iterate; converged predictions are deterministic within the documented
-floating-point tolerance rather than bitwise identical.
+floating-point tolerance rather than bitwise identical. A checkpoint tagged for
+one optimizer cannot be resumed by the other; comparison runs must use distinct
+checkpoint and result paths.
 
 The monotonic wall-time check occurs before optimization and after completed
 iterations. An initial checkpoint therefore remains valid even if compilation
@@ -216,11 +239,35 @@ metadata describing how `typf` and `typx` were selected. The same convergence
 diagnostics are included in the result-aware
 `convergence_diagnostics` section of `build_gravity_run_manifest`.
 
-The production estimator remains SciPy L-BFGS-B. An isolated optional pilot,
-`run_biogeme_tr_bfgs_pilot`, can compare Biogeme's TR-BFGS on a caller-supplied
-objective-and-gradient callback. Biogeme is imported lazily and is not part of
-the package's default dependencies; the pilot reports the same scaled-gradient
-and precision diagnostics and never changes the production estimator.
+Both production algorithms use the same convergence certificate: the optimizer
+must report success *and* the Dennis--Schnabel scaled-gradient infinity norm
+must be no larger than `scaled_gradient_tolerance`. A solver's native
+convergence flag, raw gradient norm, or relative-objective message alone is not
+sufficient. Results and manifests include `optimizer`, `optimizer_message`,
+`optimizer_iterations`, `optimizer_evaluations`, and `optimizer_options`
+alongside the common scaled-gradient and precision diagnostics.
+
+For a controlled pilot, `compare_gravity_optimizers` runs SciPy and Biogeme
+independently from the same initial raw vector, callback, parameter names,
+unconstrained bounds, tolerances, and maximum iteration count. It never
+warm-starts one method from the other. Supply separate checkpoint/result paths
+and compare final objective, parameter distance, raw/scaled gradient norms,
+termination reasons, and dtypes. Report elapsed optimizer time separately
+from any common model construction or JAX compilation time; a comparison that
+includes compilation should say so. If a common operator activation is timed,
+pass it once as `operator_activation_seconds`; both summaries then report it
+separately and include it equally in `elapsed_total_seconds`. The optional Biogeme pilot reports the same
+scaled-gradient and precision diagnostics and does not alter the default
+production path.
+
+When only the acceptance threshold is being reviewed, use
+`reclassify_gravity_result` instead of rerunning the operator or optimizer.
+The helper requires matching model and operator fingerprints, recomputes the
+Dennis--Schnabel audit from the stored final parameters/objective/gradient, and
+changes only status, acceptance, and tolerance metadata. Supplying an output
+path writes a new record and refuses to overwrite an existing result; the
+original result remains unchanged. It must not be used after any scientific
+input, operator, data, or scaling change.
 
 Phase 3 does not implement spatial effects, model adequacy reporting, holdout
 validation, or relaxation recommendations.
@@ -562,6 +609,41 @@ enabled-support complexity. Compact support remains conditional: the packaged
 example is approximately 91% dense, so its indexing overhead would outweigh the
 reduction. Measure a target network with detailed diagnostics before selecting
 a sparse-support cache schema.
+
+#### Persistent temporal-operator cache loading
+
+Direct-scheduled temporal artifacts have two distinct persistence layers. The
+source artifact contains one validated ``block-*.npz`` file per temporal block;
+the identity-bound operator cache contains packed ``.npy`` arrays, offsets,
+keys, and the fixed measurement offset. Source-block validation is retained as
+the fail-closed fallback and still checks every source block when no validated
+packed cache is available. Once the packed cache has been validated, normal
+``fit``, ``preflight``, and optimizer-comparison activation memory-map the
+packed arrays and do not reopen the individual source block files or recreate
+one Python object per block. CSR and CSC execution structures are built
+directly from those packed arrays; duplicate summation, zero elimination,
+sorting, dtypes, dimensions, and products retain the source-operator contract.
+
+The first use of an existing artifact may therefore still spend time on the
+one-time packed-cache consolidation (or on CSR/CSC construction). That work is
+reported separately from source-block validation. Subsequent processes reuse
+the packed cache and, when present, the identity-bound
+``positive_boarding_support_cache`` without scanning all temporal blocks.
+Progress events distinguish ``packed_array_validation``,
+``packed_cache_loading``, ``csr_csc_construction``,
+``realized_operator_support``, and ``positive_boarding_support_cache``. Finite
+loops report completed/total units and a bounded ETA; a CSR/CSC build is an
+indivisible operation and emits regular heartbeats while its ETA is otherwise
+unavailable. A packed-cache hit is represented as one logical completed unit,
+not as the number of source blocks that were not opened.
+
+Packed-cache acceptance remains strict: completion, schema and validator
+versions, artifact and canonical-index identities, binding and manifest
+fingerprints, packed-array content hashes, shapes, offsets, dtypes, and the
+fixed-offset hash must all match. A modified or incomplete packed cache is
+rejected and the existing source-artifact validation path is used. Progress
+settings and cache representation are execution metadata; they are excluded
+from scientific identities and do not change objective or gradient kernels.
 
 `ShardedMatrixFreeFixedRoutingMeasurementOperator` loads at most the configured
 number of routing shards. Production products no longer traverse graph nodes in

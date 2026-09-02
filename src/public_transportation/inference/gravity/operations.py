@@ -33,7 +33,7 @@ from public_transportation.inference.construction_control import (
     normalize_progress_event,
 )
 
-GRAVITY_RUN_MANIFEST_SCHEMA_VERSION = 3
+GRAVITY_RUN_MANIFEST_SCHEMA_VERSION = 4
 GRAVITY_PROGRESS_SCHEMA_VERSION = 1
 
 
@@ -162,6 +162,23 @@ def build_gravity_run_manifest(
         "repository_revision": str(repository_revision),
         "package_version": __version__,
         "model_fingerprint": gravity_model_fingerprint(problem, compact_layout),
+        "optimizer": estimator_config.optimizer if result is None else result.optimizer,
+        "optimizer_message": None if result is None else result.optimizer_message,
+        "optimizer_iterations": (
+            None if result is None else result.optimizer_iterations
+        ),
+        "optimizer_evaluations": (
+            None if result is None else result.optimizer_evaluations
+        ),
+        "optimizer_options": (
+            None if result is None else _json_value(result.optimizer_options)
+        ),
+        "acceptance": None if result is None else result.acceptance,
+        "convergence_reclassification": (
+            None
+            if result is None
+            else _json_value(result.convergence_reclassification)
+        ),
         "model_specification": specification.to_dict(),
         "specification_fingerprint": specification.fingerprint,
         "parameter_layout": problem.parameter_layout.to_dict(),
@@ -295,8 +312,31 @@ def build_gravity_run_manifest(
                 else result.objective_tolerance_below_precision
             ),
             "termination_message": None if result is None else result.message,
+            "optimizer": (
+                estimator_config.optimizer
+                if result is None
+                else result.optimizer
+            ),
+            "optimizer_message": (
+                None if result is None else result.optimizer_message
+            ),
+            "optimizer_iterations": (
+                None if result is None else result.optimizer_iterations
+            ),
+            "optimizer_evaluations": (
+                None if result is None else result.optimizer_evaluations
+            ),
+            "optimizer_options": (
+                None if result is None else _json_value(result.optimizer_options)
+            ),
             "status": None if result is None else result.status,
             "success": None if result is None else result.success,
+            "acceptance": None if result is None else result.acceptance,
+            "convergence_reclassification": (
+                None
+                if result is None
+                else _json_value(result.convergence_reclassification)
+            ),
         },
         "jax": {
             "backend": jax.default_backend(),

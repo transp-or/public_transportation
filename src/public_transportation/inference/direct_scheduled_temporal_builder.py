@@ -50,6 +50,7 @@ from .sharded_fixed_routing import (
     prepare_fixed_routing_sharded,
 )
 from .temporal_assignment_blocks import (
+    PackedTemporalBlockAssignmentOperator,
     TemporalBlockAssignmentOperator,
     TemporalBlockConstructionDiagnostics,
     TemporalBlockKey,
@@ -91,9 +92,18 @@ DirectFixedRoutingSource = FixedRoutingInputs | ShardedFixedRoutingInputs
 TEMPORAL_FRAGMENT_SCHEMA_VERSION = 1
 
 
+def _operator_number_of_blocks(
+    operator: TemporalBlockAssignmentOperator | PackedTemporalBlockAssignmentOperator,
+) -> int:
+    """Return block count without forcing a packed operator's lazy view."""
+    if isinstance(operator, PackedTemporalBlockAssignmentOperator):
+        return operator.number_of_blocks
+    return len(operator.blocks)
+
+
 @dataclass(frozen=True, slots=True)
 class DirectScheduledTemporalConstructionResult:
-    operator: TemporalBlockAssignmentOperator
+    operator: TemporalBlockAssignmentOperator | PackedTemporalBlockAssignmentOperator
     checkpoint_directory: Path
     artifact_directory: Path | None
     source: ShardedConstructionResult | None
@@ -133,8 +143,11 @@ class _DirectScheduledMetrics:
 class DirectScheduledGravityOperator:
     """Expose temporal blocks through the established gravity protocol."""
 
-    operator: TemporalBlockAssignmentOperator
+    operator: TemporalBlockAssignmentOperator | PackedTemporalBlockAssignmentOperator
     theta: float
+    reporter: ConstructionProgressReporter | None = field(
+        default=None, repr=False, compare=False
+    )
     _execution_backend: CSRCSCTemporalAssignmentOperator = field(
         init=False, repr=False
     )
@@ -157,7 +170,7 @@ class DirectScheduledGravityOperator:
         object.__setattr__(
             self,
             "_execution_backend",
-            CSRCSCTemporalAssignmentOperator(self.operator),
+            CSRCSCTemporalAssignmentOperator(self.operator, reporter=self.reporter),
         )
 
     @property
@@ -202,12 +215,21 @@ class DirectScheduledGravityOperator:
 
     @property
     def metrics(self) -> _DirectScheduledMetrics:
-        stored = int(self.operator.fixed_measurement_offset.nbytes) + sum(
-            block.row_indices.nbytes
-            + block.column_indices.nbytes
-            + block.values.nbytes
-            for block in self.operator.blocks
-        )
+        if isinstance(self.operator, PackedTemporalBlockAssignmentOperator):
+            stored = int(
+                self.operator.fixed_measurement_offset.nbytes
+                + self.operator.row_indices.nbytes
+                + self.operator.column_indices.nbytes
+                + self.operator.values.nbytes
+                + self.operator.offsets.nbytes
+            )
+        else:
+            stored = int(self.operator.fixed_measurement_offset.nbytes) + sum(
+                block.row_indices.nbytes
+                + block.column_indices.nbytes
+                + block.values.nbytes
+                for block in self.operator.blocks
+            )
         return _DirectScheduledMetrics(stored_bytes=stored, peak_construction_bytes=0)
 
     @property
@@ -606,7 +628,7 @@ def _run_origin_positive_boarding_preflight(
 
 def _validate_cached_positive_boarding_support(
     *,
-    operator: TemporalBlockAssignmentOperator,
+    operator: TemporalBlockAssignmentOperator | PackedTemporalBlockAssignmentOperator,
     context: PositiveBoardingPreflightContext,
     reporter: ConstructionProgressReporter,
     artifact_directory: Path | None = None,
@@ -651,7 +673,10 @@ def _validate_cached_positive_boarding_support(
                     throughput_units_per_second=1.0,
                     cache_hits=1,
                     cache_misses=0,
-                    details={"cache_validation_stage": "positive_boarding_support_cache"},
+                    details={
+                        "cache_validation_stage": "positive_boarding_support_cache",
+                        "support_cache_hit": True,
+                    },
                 )
                 reporter.emit(
                     phase=ConstructionPhase.MEASUREMENT_SUPPORT_PREFLIGHT,
@@ -670,55 +695,105 @@ def _validate_cached_positive_boarding_support(
                     },
                 )
                 return eta
-    total_blocks = len(operator.blocks)
     reporting_enabled = reporter.sink is not None
     recent_durations: deque[float] = deque(maxlen=16)
     phase_started_at = perf_counter() if reporting_enabled else None
-    if reporting_enabled:
-        reporter.emit(
-            phase=ConstructionPhase.CACHE_VALIDATION,
-            status="running",
-            force=True,
-            completed_units=0,
-            total_units=total_blocks,
-            current_unit=("block-000000.npz" if total_blocks else None),
-            details={"cache_validation_stage": "realized_operator_support"},
-        )
     supported: set[int] = set()
-    for block_position, block in enumerate(operator.blocks):
-        block_started_at = perf_counter() if reporting_enabled else None
-        supported.update(int(row) for row in np.unique(block.row_indices))
+    if isinstance(operator, PackedTemporalBlockAssignmentOperator):
+        # Support is a property of the packed row-index array.  Scan bounded
+        # chunks so a cache miss never recreates one Python block per shard.
+        chunk_size = 1_000_000
+        total_units = max(1, (operator.row_indices.size + chunk_size - 1) // chunk_size)
         if reporting_enabled:
-            assert block_started_at is not None
-            assert phase_started_at is not None
-            duration = max(0.0, perf_counter() - block_started_at)
-            recent_durations.append(duration)
-            phase_elapsed_seconds = max(
-                np.finfo(float).eps, perf_counter() - phase_started_at
-            )
-            eta = estimate_completed_unit_eta(
-                recent_durations,
-                completed_units=block_position + 1,
-                total_units=total_blocks,
-                parallelism=1,
-                elapsed_seconds=phase_elapsed_seconds,
-            )
             reporter.emit(
                 phase=ConstructionPhase.CACHE_VALIDATION,
                 status="running",
-                completed_units=block_position + 1,
-                total_units=total_blocks,
-                current_unit=f"block-{block_position:06d}.npz",
-                recent_unit_seconds=duration,
-                predicted_remaining_seconds=eta.predicted_remaining_seconds,
-                eta_confidence=eta.eta_confidence,
-                estimated_completion_at_utc=eta.estimated_completion_at_utc,
-                eta_reason=eta.eta_reason,
-                eta_lower_seconds=eta.eta_lower_seconds,
-                eta_upper_seconds=eta.eta_upper_seconds,
-                throughput_units_per_second=eta.throughput_units_per_second,
+                force=True,
+                completed_units=0,
+                total_units=total_units,
+                current_unit="packed_row_indices",
                 details={"cache_validation_stage": "realized_operator_support"},
             )
+        if operator.row_indices.size:
+            for unit, start in enumerate(range(0, operator.row_indices.size, chunk_size), 1):
+                started = perf_counter() if reporting_enabled else None
+                stop = min(operator.row_indices.size, start + chunk_size)
+                supported.update(int(row) for row in np.unique(operator.row_indices[start:stop]))
+                if reporting_enabled:
+                    assert started is not None and phase_started_at is not None
+                    duration = max(0.0, perf_counter() - started)
+                    recent_durations.append(duration)
+                    eta = estimate_completed_unit_eta(
+                        recent_durations,
+                        completed_units=unit,
+                        total_units=total_units,
+                        parallelism=1,
+                        elapsed_seconds=max(
+                            np.finfo(float).eps, perf_counter() - phase_started_at
+                        ),
+                    )
+                    reporter.emit(
+                        phase=ConstructionPhase.CACHE_VALIDATION,
+                        status="running",
+                        completed_units=unit,
+                        total_units=total_units,
+                        current_unit=f"packed_row_indices[{start}:{stop}]",
+                        recent_unit_seconds=duration,
+                        predicted_remaining_seconds=eta.predicted_remaining_seconds,
+                        eta_confidence=eta.eta_confidence,
+                        estimated_completion_at_utc=eta.estimated_completion_at_utc,
+                        eta_reason=eta.eta_reason,
+                        eta_lower_seconds=eta.eta_lower_seconds,
+                        eta_upper_seconds=eta.eta_upper_seconds,
+                        throughput_units_per_second=eta.throughput_units_per_second,
+                        details={"cache_validation_stage": "realized_operator_support"},
+                    )
+        elif reporting_enabled:
+            recent_durations.append(max(0.0, perf_counter() - phase_started_at))
+    else:
+        total_units = len(operator.blocks)
+        if reporting_enabled:
+            reporter.emit(
+                phase=ConstructionPhase.CACHE_VALIDATION,
+                status="running",
+                force=True,
+                completed_units=0,
+                total_units=total_units,
+                current_unit=("block-000000.npz" if total_units else None),
+                details={"cache_validation_stage": "realized_operator_support"},
+            )
+        for block_position, block in enumerate(operator.blocks):
+            block_started_at = perf_counter() if reporting_enabled else None
+            supported.update(int(row) for row in np.unique(block.row_indices))
+            if reporting_enabled:
+                assert block_started_at is not None and phase_started_at is not None
+                duration = max(0.0, perf_counter() - block_started_at)
+                recent_durations.append(duration)
+                eta = estimate_completed_unit_eta(
+                    recent_durations,
+                    completed_units=block_position + 1,
+                    total_units=total_units,
+                    parallelism=1,
+                    elapsed_seconds=max(
+                        np.finfo(float).eps, perf_counter() - phase_started_at
+                    ),
+                )
+                reporter.emit(
+                    phase=ConstructionPhase.CACHE_VALIDATION,
+                    status="running",
+                    completed_units=block_position + 1,
+                    total_units=total_units,
+                    current_unit=f"block-{block_position:06d}.npz",
+                    recent_unit_seconds=duration,
+                    predicted_remaining_seconds=eta.predicted_remaining_seconds,
+                    eta_confidence=eta.eta_confidence,
+                    estimated_completion_at_utc=eta.estimated_completion_at_utc,
+                    eta_reason=eta.eta_reason,
+                    eta_lower_seconds=eta.eta_lower_seconds,
+                    eta_upper_seconds=eta.eta_upper_seconds,
+                    throughput_units_per_second=eta.throughput_units_per_second,
+                    details={"cache_validation_stage": "realized_operator_support"},
+                )
     supported.update(
         int(row) for row in np.flatnonzero(operator.fixed_measurement_offset != 0.0)
     )
@@ -756,8 +831,8 @@ def _validate_cached_positive_boarding_support(
         assert phase_started_at is not None
         final_eta = estimate_completed_unit_eta(
             recent_durations,
-            completed_units=total_blocks,
-            total_units=total_blocks,
+            completed_units=total_units,
+            total_units=total_units,
             parallelism=1,
             elapsed_seconds=max(0.0, perf_counter() - phase_started_at),
         )
@@ -765,8 +840,8 @@ def _validate_cached_positive_boarding_support(
             phase=ConstructionPhase.CACHE_VALIDATION,
             status="completed",
             force=True,
-            completed_units=total_blocks,
-            total_units=total_blocks,
+            completed_units=total_units,
+            total_units=total_units,
             recent_unit_seconds=(recent_durations[-1] if recent_durations else None),
             predicted_remaining_seconds=final_eta.predicted_remaining_seconds,
             eta_confidence=final_eta.eta_confidence,
@@ -1413,12 +1488,12 @@ def activate_direct_scheduled_temporal_operator(
                 phase=ConstructionPhase.CACHE_VALIDATION,
                 status="completed",
                 force=True,
-                completed_units=len(cached.blocks),
-                total_units=len(cached.blocks),
+                completed_units=_operator_number_of_blocks(cached),
+                total_units=_operator_number_of_blocks(cached),
                 current_unit=(
                     None
-                    if not cached.blocks
-                    else f"block-{len(cached.blocks) - 1:06d}.npz"
+                    if _operator_number_of_blocks(cached) == 0
+                    else f"block-{_operator_number_of_blocks(cached) - 1:06d}.npz"
                 ),
                 predicted_remaining_seconds=(
                     None
@@ -1458,7 +1533,9 @@ def activate_direct_scheduled_temporal_operator(
                 break_even_evaluations=0.0,
             )
             return DirectScheduledActivationResult(
-                DirectScheduledGravityOperator(cached, theta), decision, None
+                DirectScheduledGravityOperator(cached, theta, reporter=reporter),
+                decision,
+                None,
             )
     reporter.emit(
         phase=ConstructionPhase.CACHE_VALIDATION,
@@ -1815,7 +1892,9 @@ def activate_direct_scheduled_temporal_operator(
         break_even_evaluations=break_even,
     )
     return DirectScheduledActivationResult(
-        DirectScheduledGravityOperator(construction.operator, theta),
+        DirectScheduledGravityOperator(
+            construction.operator, theta, reporter=reporter
+        ),
         decision,
         construction,
     )

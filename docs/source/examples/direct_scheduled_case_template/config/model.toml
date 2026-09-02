@@ -1,4 +1,5 @@
 likelihood = "negative_binomial"
+optimizer = "scipy"
 gradient_strategy = "auto"
 maximum_iterations = 100
 gradient_tolerance = 1.0e-6

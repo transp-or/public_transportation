@@ -6,7 +6,7 @@ import json
 import os
 import tempfile
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable, Literal
@@ -33,7 +33,7 @@ from .objective import (
 )
 
 GRAVITY_CHECKPOINT_SCHEMA_VERSION = 1
-GRAVITY_RESULT_SCHEMA_VERSION = 3
+GRAVITY_RESULT_SCHEMA_VERSION = 4
 
 
 def _validate_positive_finite_scale(name: str, value: object) -> float:
@@ -132,6 +132,7 @@ class GravityEstimatorConfig:
     scaled_gradient_tolerance: float = 1.0e-4
     typical_objective_scale: float = 1.0
     typical_parameter_scales: float | tuple[float, ...] | None = None
+    optimizer: Literal["scipy", "biogeme_tr_bfgs"] = "scipy"
 
     def __post_init__(self) -> None:
         if self.maximum_iterations <= 0:
@@ -149,6 +150,10 @@ class GravityEstimatorConfig:
             )
         if self.optimizer_maxls <= 0:
             raise ValueError("optimizer_maxls must be positive.")
+        if self.optimizer not in ("scipy", "biogeme_tr_bfgs"):
+            raise ValueError(
+                "optimizer must be 'scipy' or 'biogeme_tr_bfgs'."
+            )
         if self.typical_parameter_scales is not None:
             if _is_scalar_scale(self.typical_parameter_scales):
                 object.__setattr__(
@@ -263,7 +268,9 @@ class GravityEstimatorProgress:
     typical_objective_scale_provenance: str | None = None
     typical_parameter_scales_provenance: str | None = None
     typical_objective_scale_selection: str | None = None
+    current_unit: str | None = None
     schema_version: int = 1
+    optimizer: Literal["scipy", "biogeme_tr_bfgs"] = "scipy"
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,10 +324,25 @@ class GravityEstimationResult:
     typical_objective_scale_provenance: str | None = None
     typical_parameter_scales_provenance: str | None = None
     typical_objective_scale_selection: str | None = None
+    optimizer: Literal["scipy", "biogeme_tr_bfgs"] = "scipy"
+    optimizer_message: str | None = None
+    optimizer_iterations: int | None = None
+    optimizer_evaluations: int | None = None
+    optimizer_options: dict[str, object] | None = None
+    acceptance: str | None = None
+    convergence_reclassification: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != GRAVITY_RESULT_SCHEMA_VERSION:
             raise ValueError("unsupported gravity result schema version.")
+        if self.optimizer not in ("scipy", "biogeme_tr_bfgs"):
+            raise ValueError("unsupported gravity optimizer metadata.")
+        if self.acceptance is None:
+            object.__setattr__(
+                self,
+                "acceptance",
+                "accepted" if self.success else "not_accepted",
+            )
         for name in (
             "raw_parameters",
             "physical_parameters",
@@ -340,6 +362,91 @@ class GravityEstimationResult:
             raise ValueError(
                 "gravity result parameter names do not match the estimates."
             )
+
+
+def _json_safe_result_payload(result: GravityEstimationResult) -> dict[str, object]:
+    """Return a small JSON-safe record for a reclassified result."""
+    return {
+        "schema_version": result.schema_version,
+        "status": result.status,
+        "success": result.success,
+        "acceptance": result.acceptance,
+        "message": result.message,
+        "raw_parameters": result.raw_parameters.tolist(),
+        "objective": result.objective,
+        "gradient": result.gradient.tolist(),
+        "scaled_gradient_inf_norm": result.scaled_gradient_inf_norm,
+        "scaled_gradient_tolerance": result.scaled_gradient_tolerance,
+        "model_fingerprint": result.model_fingerprint,
+        "direct_operator_artifact_fingerprint": result.direct_operator_artifact_fingerprint,
+        "convergence_reclassification": result.convergence_reclassification,
+    }
+
+
+def reclassify_gravity_result(
+    result: GravityEstimationResult,
+    *,
+    scaled_gradient_tolerance: float,
+    expected_model_fingerprint: str,
+    expected_operator_fingerprint: str,
+    output_path: Path | None = None,
+) -> GravityEstimationResult:
+    """Reclassify a completed fit using only a new convergence tolerance.
+
+    No objective, gradient, parameter, prediction, or scientific identity is
+    recomputed.  The caller must supply the model and operator fingerprints
+    from the run being reviewed.  If ``output_path`` is supplied it must not
+    already exist; the original result is therefore never overwritten.
+    """
+    tolerance = _validate_positive_finite_scale(
+        "scaled_gradient_tolerance", scaled_gradient_tolerance
+    )
+    if not expected_model_fingerprint or expected_model_fingerprint != result.model_fingerprint:
+        raise ValueError("model fingerprint does not match the stored gravity result.")
+    if not expected_operator_fingerprint or expected_operator_fingerprint != result.direct_operator_artifact_fingerprint:
+        raise ValueError("operator fingerprint does not match the stored gravity result.")
+    if result.typical_objective_scale is None:
+        raise ValueError("stored result has no typical objective scale.")
+    scaled = scaled_gradient_inf_norm(
+        result.raw_parameters,
+        result.gradient,
+        result.objective,
+        typical_objective_scale=result.typical_objective_scale,
+        typical_parameter_scales=result.typical_parameter_scales,
+    )
+    message_lower = result.message.lower()
+    optimizer_success = result.status == "converged" or (
+        result.optimizer in {"scipy", "biogeme_tr_bfgs"}
+        and any(token in message_lower for token in ("converg", "relative gradient"))
+        and "failed" not in message_lower
+    )
+    accepted = bool(optimizer_success and scaled <= tolerance)
+    metadata = {
+        "previous_status": result.status,
+        "previous_success": result.success,
+        "previous_scaled_gradient_tolerance": result.scaled_gradient_tolerance,
+        "new_scaled_gradient_tolerance": tolerance,
+        "scaled_gradient_inf_norm": scaled,
+        "model_fingerprint": result.model_fingerprint,
+        "operator_fingerprint": result.direct_operator_artifact_fingerprint,
+    }
+    reclassified = replace(
+        result,
+        status="converged" if accepted else "iteration_limit",
+        success=accepted,
+        scaled_gradient_inf_norm=scaled,
+        scaled_gradient_tolerance=tolerance,
+        acceptance="accepted" if accepted else "not_accepted",
+        convergence_reclassification=metadata,
+    )
+    if output_path is not None:
+        destination = Path(output_path)
+        if destination.exists():
+            raise FileExistsError(
+                f"refusing to overwrite existing gravity result: {destination}"
+            )
+        _atomic_checkpoint(destination, _json_safe_result_payload(reclassified))
+    return reclassified
 
 
 def gravity_model_fingerprint(
@@ -395,6 +502,7 @@ def _write_checkpoint(
     iterations: int,
     elapsed_seconds: float,
     auxiliary_observations: dict[str, object] | None = None,
+    optimizer: Literal["scipy", "biogeme_tr_bfgs"] = "scipy",
 ) -> None:
     payload: dict[str, object] = {
         "schema_version": GRAVITY_CHECKPOINT_SCHEMA_VERSION,
@@ -402,6 +510,7 @@ def _write_checkpoint(
         "raw_parameters": raw_parameters.tolist(),
         "iterations": iterations,
         "elapsed_seconds": elapsed_seconds,
+        "optimizer": optimizer,
     }
     if auxiliary_observations is not None:
         payload["auxiliary_observations"] = auxiliary_observations
@@ -409,7 +518,10 @@ def _write_checkpoint(
 
 
 def _load_checkpoint(
-    path: Path, model_fingerprint: str, parameter_count: int = 3
+    path: Path,
+    model_fingerprint: str,
+    parameter_count: int = 3,
+    expected_optimizer: Literal["scipy", "biogeme_tr_bfgs"] = "scipy",
 ) -> tuple[np.ndarray, int, float]:
     try:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -419,6 +531,17 @@ def _load_checkpoint(
         raise ValueError("incompatible gravity checkpoint schema.")
     if payload.get("model_fingerprint") != model_fingerprint:
         raise ValueError("gravity checkpoint model fingerprint mismatch.")
+    checkpoint_optimizer = payload.get("optimizer")
+    if checkpoint_optimizer is not None and checkpoint_optimizer != expected_optimizer:
+        raise ValueError(
+            "gravity checkpoint optimizer mismatch: "
+            f"checkpoint={checkpoint_optimizer!r}, expected={expected_optimizer!r}."
+        )
+    if checkpoint_optimizer is None and expected_optimizer != "scipy":
+        raise ValueError(
+            "gravity checkpoint does not identify an optimizer; "
+            "start a separate Biogeme checkpoint."
+        )
     raw = np.asarray(payload.get("raw_parameters"), dtype=np.float64)
     if raw.shape != (parameter_count,) or not np.all(np.isfinite(raw)):
         raise ValueError("gravity checkpoint parameters are invalid.")
@@ -447,7 +570,7 @@ def _compile_strategy(
     lowering = clock() - started
     try:
         lowered_bytes = len(lowered.as_text().encode("utf-8"))
-    except AttributeError, TypeError, ValueError:
+    except (AttributeError, TypeError, ValueError):
         lowered_bytes = None
     started = clock()
     compiled = lowered.compile()
@@ -557,6 +680,170 @@ class _DeadlineStop(RuntimeError):
         self.phase = phase
 
 
+@dataclass(frozen=True, slots=True)
+class _OptimizerRun:
+    """Normalized optimizer output used by the common estimator finalization."""
+
+    raw_parameters: np.ndarray
+    success: bool
+    message: str
+    iterations: int
+    evaluations: int
+    options: dict[str, object]
+
+
+def _run_scipy_lbfgsb(
+    *,
+    evaluate: Callable[[np.ndarray], tuple[float, np.ndarray]],
+    initial: np.ndarray,
+    callback: Callable[[np.ndarray], None],
+    remaining_iterations: int,
+    config: GravityEstimatorConfig,
+) -> _OptimizerRun:
+    """Run the existing SciPy path with its historical options unchanged."""
+    options: dict[str, object] = {
+        "maxiter": remaining_iterations,
+        "gtol": config.gradient_tolerance,
+        "ftol": config.objective_tolerance,
+        "maxls": config.optimizer_maxls,
+    }
+    solver = minimize(
+        evaluate,
+        initial,
+        method="L-BFGS-B",
+        jac=True,
+        callback=callback,
+        options=options,
+    )
+    return _OptimizerRun(
+        raw_parameters=np.asarray(solver.x, dtype=np.float64),
+        success=bool(solver.success),
+        message=str(solver.message),
+        iterations=int(getattr(solver, "nit", 0) or 0),
+        evaluations=int(getattr(solver, "nfev", 0) or 0),
+        options=options,
+    )
+
+
+def _biogeme_messages(value: object) -> dict[str, object]:
+    """Normalize Biogeme's version-dependent termination metadata."""
+    if isinstance(value, dict):
+        return {str(key): item for key, item in value.items()}
+    if value is None:
+        return {}
+    try:
+        return {str(key): item for key, item in vars(value).items()}
+    except TypeError:
+        return {"value": value}
+
+
+def _biogeme_iteration_count(
+    messages: dict[str, object], *, configured_limit: int
+) -> int:
+    """Recover the iteration count when Biogeme omits it at its limit."""
+    for key in ("Number of iterations", "iterations"):
+        value = messages.get(key)
+        if value is not None:
+            try:
+                return max(0, int(value))
+            except (TypeError, ValueError):
+                break
+    termination = str(messages.get("Cause of termination", ""))
+    if "maximum number of iterations" in termination.lower():
+        return configured_limit
+    return 0
+
+
+def _run_biogeme_tr_bfgs(
+    *,
+    evaluate: Callable[[np.ndarray], tuple[float, np.ndarray]],
+    initial: np.ndarray,
+    parameter_names: tuple[str, ...],
+    remaining_iterations: int,
+    config: GravityEstimatorConfig,
+    typical_parameter_scales: np.ndarray | None = None,
+    on_evaluation: Callable[[int, float, np.ndarray], None] | None = None,
+) -> _OptimizerRun:
+    """Run Biogeme TR-BFGS against the already compiled common callback."""
+    try:
+        from biogeme.optimization import bfgs_trust_region_for_biogeme
+    except ImportError as error:  # pragma: no cover - depends on optional extra
+        raise ImportError(
+            "The Biogeme optimizer requires a separately installed, verified "
+            "Biogeme environment. Install the optional 'biogeme' and "
+            "'biogeme-optimization' packages before selecting "
+            "optimizer = 'biogeme_tr_bfgs'."
+        ) from error
+
+    # Reuse the adapter from the isolated pilot.  Importing this module does
+    # not import Biogeme; only the optimizer selection above is optional.
+    from .biogeme_pilot import _BiogemeObjective
+
+    resolved_parameter_scales = (
+        _resolve_typical_parameter_scales(
+            initial.size, config.typical_parameter_scales
+        )
+        if typical_parameter_scales is None
+        else np.asarray(typical_parameter_scales, dtype=np.float64)
+    )
+    objective = _BiogemeObjective(
+        evaluate,
+        on_evaluation=on_evaluation,
+        epsilon=config.gradient_tolerance,
+        typical_objective_scale=config.typical_objective_scale,
+        typical_parameter_scales=resolved_parameter_scales,
+    )
+    objective.set_variables(initial)
+    options: dict[str, object] = {
+        "maxiter": remaining_iterations,
+        "tolerance": config.gradient_tolerance,
+        "objective_tolerance": config.objective_tolerance,
+    }
+    bounds = [(None, None) for _ in range(initial.size)]
+    optimization_result = bfgs_trust_region_for_biogeme(
+        objective,
+        initial,
+        bounds,
+        list(parameter_names),
+        options,
+    )
+    if hasattr(optimization_result, "solution"):
+        solution = np.asarray(optimization_result.solution, dtype=np.float64)
+        messages = _biogeme_messages(
+            getattr(optimization_result, "messages", None)
+        )
+        optimizer_success = bool(
+            getattr(optimization_result, "convergence", False)
+        )
+    else:
+        try:
+            solution = np.asarray(optimization_result[0], dtype=np.float64)
+            messages = _biogeme_messages(optimization_result[1])
+        except (IndexError, TypeError, ValueError) as error:
+            raise RuntimeError(
+                "Biogeme TR-BFGS returned an unsupported result."
+            ) from error
+        optimizer_success = bool(messages.get("convergence", False))
+    if solution.shape != initial.shape or not np.all(np.isfinite(solution)):
+        raise RuntimeError("Biogeme TR-BFGS returned invalid parameters.")
+    message = messages.get(
+        "Cause of termination", messages.get("message", "")
+    )
+    if not message:
+        message = "Biogeme TR-BFGS did not provide a termination message."
+    iterations = _biogeme_iteration_count(
+        messages, configured_limit=remaining_iterations
+    )
+    return _OptimizerRun(
+        raw_parameters=solution,
+        success=optimizer_success,
+        message=str(message),
+        iterations=iterations,
+        evaluations=len(objective.evaluations),
+        options=options,
+    )
+
+
 def estimate_gravity_model(
     *,
     problem: GravityObjectiveProblem,
@@ -592,7 +879,10 @@ def estimate_gravity_model(
         if checkpoint is None:
             raise ValueError("resume requires checkpoint_path.")
         raw_numpy, completed_iterations, resumed_elapsed = _load_checkpoint(
-            checkpoint, model_fingerprint, problem.parameter_layout.size
+            checkpoint,
+            model_fingerprint,
+            problem.parameter_layout.size,
+            expected_optimizer=config.optimizer,
         )
         resumed = True
     else:
@@ -615,6 +905,7 @@ def estimate_gravity_model(
                 iterations=0,
                 elapsed_seconds=0.0,
                 auxiliary_observations=auxiliary_metadata,
+                optimizer=config.optimizer,
             )
     deadline = (
         None
@@ -725,6 +1016,7 @@ def estimate_gravity_model(
                 iterations=completed_iterations,
                 elapsed_seconds=elapsed,
                 auxiliary_observations=auxiliary_metadata,
+                optimizer=config.optimizer,
             )
         if (
             progress is not None
@@ -817,14 +1109,69 @@ def estimate_gravity_model(
                     job_eta_confidence=eta.eta_confidence,
                     job_eta_reason=eta.eta_reason,
                     estimated_job_completion_at_utc=eta.estimated_completion_at_utc,
+                    optimizer=config.optimizer,
                 )
             )
         if deadline is not None and clock() >= deadline:
             raise _DeadlineStop("after a completed optimizer iteration")
 
+    def biogeme_evaluation_progress(
+        evaluation_count: int, objective: float, gradient: np.ndarray
+    ) -> None:
+        """Report Biogeme evaluations when no accepted-iterate callback exists.
+
+        Biogeme's public TR-BFGS entry point does not expose accepted
+        trust-region iterates.  These events are therefore deliberately labeled
+        as evaluations, do not claim resumable iteration checkpoints, and do
+        not invent an ETA for the opaque optimizer call.
+        """
+        if progress is None or evaluation_count % execution.progress_interval != 0:
+            return
+        now = clock()
+        elapsed = resumed_elapsed + now - started
+        emit_progress(
+            GravityEstimatorProgress(
+                iteration=evaluation_count,
+                objective=float(objective),
+                gradient_inf_norm=float(np.max(np.abs(gradient), initial=0.0)),
+                elapsed_seconds=elapsed,
+                checkpoint_written=False,
+                scaled_gradient_inf_norm=scaled_gradient_inf_norm(
+                    latest_raw,
+                    gradient,
+                    float(objective),
+                    typical_objective_scale=config.typical_objective_scale,
+                    typical_parameter_scales=typical_parameter_scales,
+                ),
+                scaled_gradient_tolerance=config.scaled_gradient_tolerance,
+                typical_objective_scale=config.typical_objective_scale,
+                typical_parameter_scales=typical_parameter_scales_tuple,
+                initial_objective=initial_objective,
+                typical_objective_scale_provenance=typical_objective_scale_provenance,
+                typical_parameter_scales_provenance=typical_parameter_scales_provenance,
+                typical_objective_scale_selection=typical_objective_scale_selection,
+                status="running",
+                phase="optimizer_evaluations",
+                completed_units=evaluation_count,
+                total_units=None,
+                current_unit=f"evaluation-{evaluation_count:06d}",
+                eta_confidence="unavailable",
+                eta_reason=(
+                    "Biogeme exposes objective evaluations but not accepted "
+                    "trust-region iterates"
+                ),
+                checkpoint_location=(None if checkpoint is None else str(checkpoint)),
+                checkpoint_reusable=False,
+                job_elapsed_seconds=elapsed,
+                optimizer="biogeme_tr_bfgs",
+            )
+        )
+
     status = "completed"
     success = False
     message = ""
+    optimizer_run: _OptimizerRun | None = None
+    optimizer_start_iterations = completed_iterations
     if deadline is not None and clock() >= deadline:
         status, message = (
             "stopped_by_time_budget",
@@ -848,38 +1195,80 @@ def estimate_gravity_model(
             )
         else:
             try:
-                solver = minimize(
-                    evaluate,
-                    raw_numpy,
-                    method="L-BFGS-B",
-                    jac=True,
-                    callback=callback,
-                    options={
-                        "maxiter": remaining,
-                        "gtol": config.gradient_tolerance,
-                        "ftol": config.objective_tolerance,
-                        "maxls": config.optimizer_maxls,
-                    },
-                )
+                if config.optimizer == "scipy":
+                    optimizer_run = _run_scipy_lbfgsb(
+                        evaluate=evaluate,
+                        initial=raw_numpy,
+                        callback=callback,
+                        remaining_iterations=remaining,
+                        config=config,
+                    )
+                else:
+                    optimizer_run = _run_biogeme_tr_bfgs(
+                        evaluate=evaluate,
+                        initial=raw_numpy,
+                        parameter_names=problem.parameter_layout.names,
+                        remaining_iterations=remaining,
+                        config=config,
+                        typical_parameter_scales=typical_parameter_scales,
+                        on_evaluation=biogeme_evaluation_progress,
+                    )
             except _DeadlineStop as stop:
                 deadline_phase = stop.phase
                 status, message = (
                     "stopped_by_time_budget",
                     f"wall-time budget reached {stop.phase}",
                 )
-                latest_raw = valid_raw.copy()
-                latest_evaluation = valid_evaluation
-                latest_gradient = valid_gradient.copy()
+                if valid_evaluation is None:
+                    evaluation_deadline = None
+                    if hasattr(problem.operator, "absolute_deadline"):
+                        problem.operator.absolute_deadline = None
+                    evaluate(raw_numpy)
+                else:
+                    latest_raw = valid_raw.copy()
+                    latest_evaluation = valid_evaluation
+                    latest_gradient = valid_gradient.copy()
             else:
-                solver_raw = np.asarray(solver.x, dtype=np.float64)
+                assert optimizer_run is not None
+                solver_raw = optimizer_run.raw_parameters
                 if not np.array_equal(latest_raw, solver_raw):
                     evaluate(solver_raw)
                     assert latest_evaluation is not None
                     accepted_objectives.append(float(latest_evaluation.objective))
                 latest_raw = solver_raw
-                success = bool(solver.success)
+                if config.optimizer == "biogeme_tr_bfgs":
+                    completed_iterations += optimizer_run.iterations
+                    if checkpoint is not None:
+                        _write_checkpoint(
+                            checkpoint,
+                            model_fingerprint=model_fingerprint,
+                            raw_parameters=solver_raw,
+                            iterations=completed_iterations,
+                            elapsed_seconds=resumed_elapsed + clock() - started,
+                            auxiliary_observations=auxiliary_metadata,
+                            optimizer=config.optimizer,
+                        )
+                success = optimizer_run.success
                 status = "converged" if success else "iteration_limit"
-                message = str(solver.message)
+                message = optimizer_run.message
+                if deadline is not None and clock() >= deadline:
+                    status = "stopped_by_time_budget"
+                    success = False
+                    deadline_phase = "after optimizer returned"
+    optimizer_message = message
+    optimizer_iterations = (
+        completed_iterations
+        if optimizer_run is None
+        else (
+            optimizer_run.iterations
+            if optimizer_run.iterations > 0
+            else max(0, completed_iterations - optimizer_start_iterations)
+        )
+    )
+    optimizer_evaluations = (
+        0 if optimizer_run is None else optimizer_run.evaluations
+    )
+    optimizer_options = {} if optimizer_run is None else optimizer_run.options
     assert latest_evaluation is not None
     objective_value = float(latest_evaluation.objective)
     gradient_inf_norm = float(np.max(np.abs(latest_gradient), initial=0.0))
@@ -953,6 +1342,7 @@ def estimate_gravity_model(
                 checkpoint_reusable=checkpoint is not None,
                 reused_units=(completed_iterations if resumed else 0),
                 rebuilt_units=(0 if resumed else completed_iterations),
+                optimizer=config.optimizer,
             )
         )
     free_demand = np.asarray(latest_evaluation.demand)
@@ -1045,4 +1435,9 @@ def estimate_gravity_model(
         typical_objective_scale_provenance=typical_objective_scale_provenance,
         typical_parameter_scales_provenance=typical_parameter_scales_provenance,
         typical_objective_scale_selection=typical_objective_scale_selection,
+        optimizer=config.optimizer,
+        optimizer_message=optimizer_message,
+        optimizer_iterations=optimizer_iterations,
+        optimizer_evaluations=optimizer_evaluations,
+        optimizer_options=optimizer_options,
     )

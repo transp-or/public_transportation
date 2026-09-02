@@ -279,11 +279,18 @@ raw optimizer coordinates (before positive transformations), while
 cache, and shard/memory limits are execution/model choices that the case owner
 must review. The estimator also supports `scaled_gradient_tolerance`,
 `typical_objective_scale`, scalar or per-parameter `typical_parameter_scales`,
-and `optimizer_maxls`. The template contains syntactically valid illustrative
+and `optimizer_maxls`. The optimizer selector is `optimizer = "scipy"` by
+default; `optimizer = "biogeme_tr_bfgs"` is an optional comparison path and
+requires a separately verified Biogeme environment. The currently verified
+environment uses Python 3.14 with `biogeme==3.3.5` and
+`biogeme-optimization==0.0.11` (and therefore its compatible NumPy/Pandas
+versions) rather than the public package lockfile. Both algorithms receive
+the same objective-and-gradient callback and must use separate checkpoints and
+result locations. The template contains syntactically valid illustrative
 values for `typical_objective_scale` and `typical_parameter_scales`; they are
 required case-owned inputs and must be replaced or justified before a
 scientific fit. The scaled-gradient values use Dennis--Schnabel
-parameter/objective scaling; SciPy success is accepted only when the
+parameter/objective scaling; optimizer success is accepted only when the
 scaled-gradient tolerance is met. These settings and their provenance should
 be recorded with the fit manifest.
 
