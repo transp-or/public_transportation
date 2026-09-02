@@ -8,6 +8,34 @@
 \input{traffic_assignment/preserved/099_3032_3037_when_estimates_should_be_close.tex}
 \input{traffic_assignment/preserved/100_3038_3046_recommended_comparisons.tex}
 
+\subsection{How the current package compares methods}
+
+For a fair comparison, all point estimators must use the same canonical
+OD--time layout, fixed-routing response operator, observed measurements,
+likelihood family, initial raw parameter vector, convergence scales, and
+parameterization.  A gravity ML fit omits the prior contribution; a gravity
+MAP fit adds the declared Gaussian prior or regularization term.  They are
+therefore comparable as two objectives on the same forward model, but they are
+not expected to give identical estimates when the prior is informative or the
+counts are weakly identifying.
+
+The public function
+\texttt{compare\_gravity\_optimizers} compares the default SciPy L--BFGS--B
+fit with the optional Biogeme TR--BFGS pilot on that same gravity objective.
+The comparison is numerical rather than scientific: it asks whether two
+optimizers reach the same objective and parameter solution under common
+scaling and tolerances.  It does not compare ML with MAP, Poisson with
+negative binomial, or fixed-routing with a different assignment model.  The
+Biogeme path is deliberately optional and is kept outside the default package
+dependency set; a missing optional dependency is reported explicitly.
+
+Each result should be judged using the same convergence contract.  In
+particular, an optimizer success flag is not sufficient: the resolved
+Dennis--Schnabel scaled-gradient norm must satisfy its tolerance, and the
+objective-spacing diagnostic must be considered before accepting a fit.  A
+fit that stops at an iteration or time limit remains useful for diagnostics or
+resume, but is not a final estimate.
+
 \subsection{Decision Rule for the Present Application}
 
 The full-network default is conditional-gravity MAP with fixed routing. The ML

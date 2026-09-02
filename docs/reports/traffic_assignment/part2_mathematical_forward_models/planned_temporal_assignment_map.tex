@@ -1,14 +1,16 @@
-\section{Planned Reusable Temporal Assignment-Map Architecture}
+\section{Reusable Temporal Assignment-Map Architecture}
 \label{sec:planned-temporal-assignment-map}
 
-This section is a design specification and implementation roadmap.  It extracts
-a stable computational architecture from the forward models developed earlier
-in this part, especially the scheduled time-expanded formulation, the reduced
-journey-response formulation, the additive fixed-routing decomposition, and the
-measurement model.  It deliberately distinguishes verified public-library
-functionality from proposed work.  In particular, it does not specify an
-alternative supply model: the first target backend remains scheduled,
-time-expanded assignment.
+This section presents the architecture implemented by the current package and
+identifies the deliberately incomplete extensions.  It extracts a stable
+computational interface from the forward models developed earlier in this
+part, especially the scheduled time-expanded formulation, the reduced
+journey-response formulation, the additive fixed-routing decomposition, and
+the measurement model.  It deliberately distinguishes verified
+public-library functionality from proposed work.  In particular, it does not
+specify an alternative supply model: the authoritative supply backend remains
+scheduled, time-expanded assignment, while estimation uses its persisted
+fixed-routing response.
 
 The following labels are used throughout this section.
 \begin{description}
@@ -185,10 +187,13 @@ partition, preprocessing should eventually report a precision--complexity
 Pareto frontier from which a documented choice can be made.
 
 \paragraph{Implementation status.}
-\textbf{UNIMPLEMENTED.}  The library accepts temporal layouts in existing
-pipelines, but it does not generally select a data-driven non-uniform partition
-or construct the Pareto frontier described by
-Equation~\eqref{eq:temporal-partition-objective}.
+\textbf{PARTIALLY IMPLEMENTED.}  The public preprocessing module provides
+\texttt{recommend\_time\_discretization} and its CSV convenience wrapper.  It
+scores explicit candidate partitions from timestamped count data and returns a
+documented recommendation together with candidate diagnostics.  The selected
+intervals must still be reviewed and materialized by the case owner before
+they become the case input.  There is no universal automatic partition
+selector or Pareto-frontier search integrated into every case-study workflow.
 
 \subsection{Scheduled time-expanded preprocessing}
 
@@ -350,11 +355,13 @@ assumption, dispersion, detection terms when modeled, zero-inflation design,
 and calibration mask, while remaining independent of assignment internals.
 
 \paragraph{Implementation status.}
-\textbf{PARTIALLY IMPLEMENTED.}  The generic reduced-demand path implements
-Poisson, negative-binomial, zero-inflated Poisson, and zero-inflated
-negative-binomial contributions independently of routing, and automatic
-differentiation composes them with operator products.  A stable general
-observation-model protocol shared by every estimation path is not yet defined.
+\textbf{PARTIALLY IMPLEMENTED.}  The current gravity objective implements
+Poisson and negative-binomial count likelihoods, and automatic differentiation
+composes either one with the fixed-routing operator products.  The aggregate
+GPS channel provides separate multinomial, Dirichlet--multinomial, and
+tempered-multinomial contributions when enabled.  Zero-inflated count forms
+remain future work, and a stable observation-model protocol shared by every
+estimation path is not yet defined.
 
 \subsection{Reusable assignment artifact}
 
@@ -531,7 +538,7 @@ Stable assignment-operator abstraction & IMPLEMENTED & -- \\
 \hline
 Canonical physical OD-time index & IMPLEMENTED & -- \\
 \hline
-Data-driven non-uniform partition selection & UNIMPLEMENTED & 1 \\
+Data-driven non-uniform partition recommendation & PARTIALLY IMPLEMENTED & 1 \\
 \hline
 Block-support complexity profiler & PARTIALLY IMPLEMENTED & 1 \\
 \hline

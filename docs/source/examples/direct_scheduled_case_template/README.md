@@ -281,12 +281,14 @@ must review. The estimator also supports `scaled_gradient_tolerance`,
 `typical_objective_scale`, scalar or per-parameter `typical_parameter_scales`,
 and `optimizer_maxls`. The optimizer selector is `optimizer = "scipy"` by
 default; `optimizer = "biogeme_tr_bfgs"` is an optional comparison path and
-requires a separately verified Biogeme environment. The currently verified
-environment uses Python 3.14 with `biogeme==3.3.5` and
-`biogeme-optimization==0.0.11` (and therefore its compatible NumPy/Pandas
-versions) rather than the public package lockfile. Both algorithms receive
-the same objective-and-gradient callback and must use separate checkpoints and
-result locations. The template contains syntactically valid illustrative
+requires a separately verified Biogeme environment. The case owner must pin
+the revised Biogeme source (and `biogeme_optimization` separately when it is a
+separate distribution) to an immutable Git revision in the case
+`pyproject.toml` and `uv.lock`. Do not copy versions from an older pilot or
+rely on a moving branch; verify pandas 3 and both imports before selecting the
+optional optimizer. Both algorithms receive the same objective-and-gradient
+callback and must use separate checkpoints and result locations. The template
+contains syntactically valid illustrative
 values for `typical_objective_scale` and `typical_parameter_scales`; they are
 required case-owned inputs and must be replaced or justified before a
 scientific fit. The scaled-gradient values use Dennis--Schnabel
@@ -309,6 +311,12 @@ two fields; a missing field stops the fit with a configuration error.
 ## Commands
 
 Run all commands from the copied case-study root:
+
+The template driver enables its durable JSONL progress sink automatically; it
+does not parse a `--json-progress` command-line option. Keep the commands below
+as written. A private driver may provide an explicit progress switch, but it
+must document that option separately and retain the same durable log and
+manifest contracts.
 
 ```bash
 uv run --frozen python run_case.py bootstrap-prior

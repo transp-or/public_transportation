@@ -5,47 +5,69 @@
 \hbadness=10000
 \input{traffic_assignment/preserved/088_2880_2894_numerical_optimization_and_local_uncertainty.tex}
 
-\subsection{Precision, Bounds, and Convergence Semantics}
+\subsection{Numerical Optimization, Scaling, and Precision}
 \label{sec:reduced-od-numerical-contract}
 
-The reduced-OD estimator uses double precision by default. In the
-\texttt{float64\_required} mode, estimation stops before compilation unless
-JAX 64-bit support is active; it can be enabled by setting
-\texttt{JAX\_ENABLE\_X64=true} before starting the process or by calling
-\texttt{jax.config.update('jax\_enable\_x64', True)} before creating JAX
-arrays. The less restrictive \texttt{float64\_preferred} and
-\texttt{allow\_float32} modes are explicit choices. The result records the
-requested NumPy type, actual JAX input type, compiled objective and gradient
-types, and whether 64-bit support was enabled.
+The current gravity estimator evaluates a JAX value-and-gradient kernel and
+uses SciPy L--BFGS--B by default.  The execution setting
+\texttt{optimizer\_maxls} controls the maximum number of line-search steps
+(20 by default).  An optional Biogeme TR--BFGS pilot is selected explicitly
+through the gravity optimizer-comparison interface; it is not a default
+dependency or a replacement for the SciPy estimator.  Optimizer and progress
+settings are execution metadata and are excluded from the scientific model
+fingerprint.
 
-A requested function tolerance is checked against floating-point resolution.
-If $Q_0$ is the initial objective, the implementation compares
+The raw parameter vector is mapped to physical demand and likelihood
+parameters by the declared \texttt{GravityModelSpecification}.  Positive
+quantities and other domain restrictions are represented by those transforms.
+The default SciPy gravity fit is not a bounded optimization in raw
+coordinates.  The isolated Biogeme pilot can receive explicit bounds, but
+those bounds must be treated as part of that pilot's declared configuration,
+not assumed to apply to the default estimator.
+
+Convergence certification uses a scale-aware Dennis--Schnabel gradient rather
+than SciPy's success flag alone.  For raw parameter $\eta_i$, objective $Q$,
+typical parameter scale $\operatorname{typx}_i>0$, and objective floor
+$\operatorname{typf}>0$,
 \[
-  \texttt{ftol}\max(1,|Q_0|)
+ g^{\mathrm{scaled}}_i
+ =\frac{|\nabla_i Q|\max(|\eta_i|,\operatorname{typx}_i)}
+        {\max(|Q|,\operatorname{typf})},
+ \qquad
+ \|g^{\mathrm{scaled}}\|_\infty
+ =\max_i g^{\mathrm{scaled}}_i .
 \]
-with a conservative multiple of
-$\epsilon_{\mathrm{mach}}\max(1,|Q_0|)$. An unresolvable tolerance is rejected
-by default and may instead be admitted with an explicit warning. This avoids
-reporting convergence from a stopping threshold finer than the arithmetic can
-represent.
+The configuration records \texttt{scaled\_gradient\_tolerance},
+\texttt{typical\_objective\_scale} (\texttt{typf}), and either a scalar or
+complete vector of \texttt{typical\_parameter\_scales} (\texttt{typx}).
+Scales are finite and strictly positive; case studies should choose them from
+the initial objective and the natural units or prior scales of each parameter,
+not from the final fitted values.  The result and manifest retain the resolved
+scales and their provenance.
 
-Optional lower and upper bounds apply to the raw optimization parameters.
-Their dimensions and the initial point are validated before SciPy is called.
-Convergence at a bound is assessed using the projected gradient: components
-that point outside the feasible region at an active bound are removed, while
-the remaining infinity norm is compared with the declared gradient tolerance.
-Non-finite objectives or gradients fail immediately.
+A fit is accepted as numerically converged only when the optimizer reports
+success and the scaled-gradient infinity norm is no larger than the declared
+tolerance.  If L--BFGS--B stops on relative objective reduction while the
+scaled gradient remains large, the termination message is preserved but the
+fit is reported as not converged.  An iteration or time-budget stop is
+resumable when its identity-compatible checkpoint is complete, but is not an
+accepted estimate.
 
-Three conclusions are deliberately distinct:
+The final evaluation also records the objective and gradient dtypes,
+$\operatorname{spacing}(Q)$ near the objective, the reduction in objective
+between the last two accepted iterates, and whether the requested objective
+tolerance is below the available floating-point resolution.  These are
+diagnostics: the package does not silently promote float32 to float64 and does
+not reject a fit solely because the tolerance is finer than the spacing.  The
+arithmetic follows the dtype of the supplied feature and operator arrays.
+
+Each fit report should therefore be read as three separate statements:
 \begin{description}
-  \item[Optimizer termination] records SciPy's status, success flag, and
-        message without reinterpretation.
-  \item[Numerical convergence] additionally requires finite quantities, a
-        resolvable tolerance, and a sufficiently small projected gradient.
-  \item[Scientific admissibility] is not assigned automatically. It remains a
-        user decision informed by adequacy, identification, production, and
-        sensitivity diagnostics.
+  \item[Optimizer termination] SciPy or the selected pilot's status, success
+        flag, options, and message;
+  \item[Numerical convergence] finite objective and gradients together with
+        the scaled-gradient criterion and precision diagnostics;
+  \item[Scientific admissibility] a case-owner decision based on adequacy,
+        identification, prior sensitivity, and validation.
 \end{description}
-Consequently, an optimizer success flag alone is not reported as a successful
-scientific estimate.
 \endgroup

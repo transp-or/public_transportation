@@ -149,12 +149,30 @@ operator, likelihood, or derivatives. Biogeme is imported lazily and remains
 outside the default dependency set; selecting it without the optional
 environment produces an actionable import error.
 
-The optional path has been verified in a separate Python 3.14 environment with
-`biogeme==3.3.5` and `biogeme-optimization==0.0.11`. This environment resolves
-Biogeme's compatible numerical stack (including NumPy 2.4.6 and Pandas 2.3.3)
-and is intentionally separate from the public package lockfile. Do not add
-Biogeme to the default environment or relax its dependency bounds without
-repeating the compatibility and full-test checks. The adapter implements
+The optional path must be installed in a separate environment from the public
+package's default dependencies. For a case study, pin the revised Biogeme
+source (and `biogeme_optimization` separately when it is a separate
+distribution) to immutable Git revisions in the case `pyproject.toml` and
+`uv.lock`. Do not rely on a moving branch or on the older pilot versions. Verify
+the resolved imports and pandas 3 before selecting the optional optimizer:
+
+```bash
+uv run --frozen python -c '
+import pandas, biogeme
+print("pandas:", pandas.__version__)
+print("biogeme:", biogeme.__file__)
+try:
+    import biogeme_optimization
+except ImportError:
+    print("biogeme_optimization: not a separate installed distribution")
+else:
+    print("biogeme_optimization:", biogeme_optimization.__file__)
+'
+```
+
+Do not add Biogeme to the public package's default environment or relax its
+dependency bounds without repeating the compatibility and full-test checks.
+The adapter implements
 Biogeme's `FunctionToMinimize` protocol while retaining the public estimator's
 scaled-gradient acceptance audit. It sets Biogeme's relative-gradient epsilon
 and Dennis--Schnabel `typx`/`typf` explicitly; callers must not rely on the

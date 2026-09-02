@@ -2,3 +2,30 @@
 % Existing prose is included byte-for-byte from preserved blocks.
 
 \input{traffic_assignment/preserved/001_0026_0042_introduction.tex}
+
+\subsection{Scope of the current package}
+
+The methodology described here is the one implemented by the current public
+package.  The authoritative production path constructs a scheduled,
+time-dependent routing response during preprocessing, persists it as a
+content-addressed fixed-routing operator, and then estimates a low-dimensional
+conditional-gravity demand model without traversing the time-expanded graph at
+every objective evaluation.  Structural-zero and frozen-demand rules reduce
+the free OD--time layout before construction; the complete OD table is rebuilt
+only for reporting or detailed post-fit validation.
+
+The primary point estimator is gravity MAP with a Poisson or
+negative-binomial count likelihood.  ML is the corresponding no-prior
+reference, and NumPyro variational inference is available when posterior
+uncertainty is required.  SciPy L--BFGS--B is the default gravity optimizer;
+an optional Biogeme TR--BFGS pilot supports an explicitly isolated optimizer
+comparison.  Aggregate GPS journey attributes can be added as an optional
+multinomial, Dirichlet--multinomial, or tempered-multinomial channel when the
+case-specific data contract is satisfied.  These choices are stated as model
+assumptions below; implementation-only controls such as progress intervals,
+worker counts, and checkpoint locations do not change the scientific identity.
+
+The report retains a relocated implementation record in the appendix for
+traceability.  That record preserves earlier design notes, whereas the main
+parts of the report use the status labels and current interfaces documented in
+this section and should be read as the operative methodological description.

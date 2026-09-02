@@ -3,39 +3,41 @@
 
 \section{Maximum Likelihood as a Reference Estimator}
 
-ML removes the explicit prior contribution while retaining the same
-parameterization and likelihood as the corresponding nonlinear MAP problem.
-It is therefore the appropriate diagnostic for prior sensitivity. A large
-ML--MAP difference is expected when the likelihood is weak, the prior is
-informative, or the optimum lies near a bound. Conversely, numerical agreement
-does not prove identification.
+Maximum likelihood (ML) removes the prior contribution while retaining the
+same demand parameterization, fixed-routing response, observations, and count
+likelihood as the corresponding MAP fit.  It is therefore the appropriate
+reference for assessing prior sensitivity.  A substantial ML--MAP difference
+is expected when the likelihood is weak or the prior is informative; numerical
+agreement is reassuring but does not establish identification or model
+adequacy.
 
-The public interface \texttt{compare\_reduced\_od\_likelihoods} fits Poisson
-and negative-binomial specifications from the same gravity features and
-response operator. The shared artifact fingerprint establishes that the
-comparison changes the observation model rather than the underlying network
-problem, while distinct model fingerprints prevent accidental result reuse.
-Poisson is primarily a dispersion diagnostic: a material improvement from the
-negative-binomial model indicates variation beyond the Poisson mean--variance
-relationship, but does not by itself establish that the gravity specification
-is adequate.
+The current public gravity entry point is
+\texttt{public\_transportation.inference.gravity.estimate\_gravity\_model}.
+The estimator is configured with \texttt{GravityEstimatorConfig}; its default
+optimizer is SciPy L--BFGS--B.  A gravity ML fit is obtained by omitting the
+prior or setting the declared prior contribution to zero, while keeping every
+other input identical to the MAP fit.  The general-purpose
+\texttt{public\_transportation.estimation.maximum\_likelihood.run\_ml} engine
+is available for compatible objective functions, but there is no current
+public convenience function named
+\texttt{compare\_reduced\_od\_likelihoods} or
+\texttt{run\_reduced\_od\_prior\_sensitivity}; those names must not be used
+as package interfaces.
 
-The companion \texttt{run\_reduced\_od\_prior\_sensitivity} operation first
-computes ML and then warm-starts named MAP scenarios from the ML solution.
-Each scenario records its prior fingerprint and displacement from ML. This
-makes weak, moderate, and informative prior comparisons reproducible without
-silently changing the likelihood or prepared response artifacts.
+Poisson and negative-binomial fits remain distinct observation models.  They
+must use the same prepared response artifact, canonical data, initial point,
+and parameterization, with likelihood-specific configuration where their raw
+parameter layouts differ.  A negative-binomial improvement indicates
+overdispersion relative to the Poisson mean--variance relationship; it does
+not by itself validate the gravity form.
 
-Because the negative-binomial raw vector contains a dispersion coordinate that
-is absent from Poisson, one aligned bounds vector cannot safely configure both
-fits. The comparison interface therefore accepts likelihood-specific fit
-configurations. Bounds may be keyed by canonical raw parameter name and are
-resolved against each actual layout before compilation. Shared parameter names
-receive the same declared intervals, while the dispersion interval applies
-only to negative binomial. Returned entries retain the resolved ordering,
-initial point, bounds, shared prepared-artifact fingerprint, and distinct model
-fingerprint. Structured callbacks expose compilation, optimization iterations,
-checkpoint writes, deadlines, and model completion without adding objective
-evaluations.
+The current optimizer comparison is exposed by
+\texttt{compare\_gravity\_optimizers}.  It runs SciPy L--BFGS--B and, when the
+optional Biogeme dependencies are installed, the isolated TR--BFGS pilot on
+the same objective, initial vector, scaling, and tolerances.  Each optimizer
+has its own execution checkpoint, and the comparison reports termination,
+objective, raw and scaled gradients, and precision diagnostics.  Biogeme is
+optional and is not part of the default dependency set; an unavailable pilot
+must therefore fail explicitly rather than silently changing the estimator.
 
 \input{traffic_assignment/preserved/086_2814_2851_maximum_likelihood_estimation.tex}

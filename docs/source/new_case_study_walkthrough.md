@@ -964,6 +964,15 @@ for key in (
 If this check raises `KeyError`, the tracked case configuration is incomplete;
 do not submit the job and do not infer a default from the routing settings.
 
+The forwarding snippet above is the required adapter contract, not a promise
+that every copied template revision already forwards every key. At the current
+public revision, inspect the case adapter before relying on
+`support_edge_block_size`, `maximum_resident_shards`, or any operational limit;
+if a key is absent from the `ShardedConstructionConfig` call, editing
+`model.toml` alone has no effect. Treat that as a template/adapter issue and
+correct the private adapter (with a test of the resolved settings) before
+submitting a large preparation run.
+
 After an operational configuration change, rerun `prepare` against the same
 results root so that matching support checkpoints can be reused and the new
 construction plan can be validated. Do not run `uv sync` merely because
@@ -1585,6 +1594,11 @@ The case-owned `run_case.py` should expose independent stages with these
 names (the driver may use a different CLI implementation, but the stage
 boundaries must remain explicit):
 
+The current template driver enables durable JSONL progress automatically; it
+does not parse a `--json-progress` option. Keep these commands as written. If
+a private driver exposes an explicit progress switch, use only that driver's
+documented option and preserve the separate stdout/stderr logging contract.
+
 ```bash
 uv run --frozen python run_case.py bootstrap-prior
 uv run --frozen python run_case.py check
@@ -1990,8 +2004,13 @@ and writes a **generated** JSONL file under the required-convention
 the progress log plus the stage's normal manifest. A log without the matching
 successful stage manifest is diagnostic evidence only, not a completed stage.
 
-The current package uses callbacks rather than a package-wide command-line
-progress switch. Progress is enabled by passing callbacks. For gravity
+The current public template uses callbacks rather than a package-wide
+command-line progress switch. The template driver creates its durable JSONL
+progress sink automatically when a stage starts. Do not append an
+`--json-progress` option to the current `run_case.py` commands: the current
+template parser does not accept that option. A private driver may expose its
+own equivalent, but it must document and test that interface explicitly.
+Low-level library calls enable progress by passing callbacks. For gravity
 estimation, use the durable JSONL sink:
 
 ```python
@@ -2459,14 +2478,33 @@ An optional Biogeme TR-BFGS path is available for a controlled comparison:
 optimizer = "biogeme_tr_bfgs"
 ```
 
-Biogeme is not installed by the default public package. The verified pilot
-environment currently uses Python 3.14 with `biogeme==3.3.5` and
-`biogeme-optimization==0.0.11`; it resolves NumPy 2.4.6 and Pandas 2.3.3,
-which differ from the public package lockfile. Install and pin this separate
-environment only for a controlled comparison. Selecting Biogeme without that
-environment produces an actionable error. Do not add it to the default
-environment or change the core NumPy/Pandas bounds without repeating the full
-compatibility and test checks.
+Biogeme is not installed by the default public package. The case owner must
+install the revised Biogeme source in a separate, explicitly pinned
+environment. Pin both the public package and the Biogeme source(s) to
+immutable Git revisions in the private case's `pyproject.toml` and `uv.lock`;
+do not document a moving branch or copy a version number from an older pilot.
+If `biogeme_optimization` is a separate distribution, pin and record its
+revision separately. Verify the resolved imports and pandas 3 in that
+environment before selecting `biogeme_tr_bfgs`:
+
+```bash
+uv run --frozen python -c '
+import pandas, public_transportation, biogeme
+print("pandas:", pandas.__version__)
+print("public_transportation:", public_transportation.__file__)
+print("biogeme:", biogeme.__file__)
+try:
+    import biogeme_optimization
+except ImportError:
+    print("biogeme_optimization: not a separate installed distribution")
+else:
+    print("biogeme_optimization:", biogeme_optimization.__file__)
+'
+```
+
+Selecting Biogeme without this verified environment produces an actionable
+error. Do not add it to the public package's default dependencies or change
+the public NumPy/pandas bounds merely to make the optional pilot resolve.
 Both algorithms consume the same compiled objective-and-gradient callback,
 initial raw vector, unconstrained bounds, parameter names, scales, tolerances,
 and iteration limit. They do not rebuild the scientific model or warm-start
@@ -2474,6 +2512,22 @@ one method from the other. Use distinct checkpoint and result locations, and
 compare final objective, parameter distance, raw/scaled gradient norms, dtypes,
 termination messages, and optimizer time. Separate common JAX compilation and
 model setup time from optimizer time whenever possible.
+
+For a fair comparison, the private case driver should activate the prepared
+operator once, construct one objective-and-gradient callback, and call
+`compare_gravity_optimizers` with the same initial raw vector, bounds,
+parameter names, scales, tolerances, model/data/operator fingerprints, and
+iteration limit. Use separate checkpoint and result paths, for example
+`results/fits/comparison/scipy/` and
+`results/fits/comparison/biogeme/`; never warm-start one optimizer from the
+other. Pass the measured common activation time as
+`operator_activation_seconds` when available. The comparison report must keep
+optimizer-only time separate from common activation/compilation time and must
+record each optimizer's objective, parameters, raw and scaled gradients,
+precision diagnostics, iterations, evaluations, termination message, status,
+success, acceptance, and checkpoint path. A Biogeme run is a pilot result; the
+normal production setting remains `optimizer = "scipy"` until the comparison
+has been reviewed.
 
 The optimizer name and termination metadata are execution records, not part of
 the scientific model or operator fingerprints. A checkpoint tagged `scipy`

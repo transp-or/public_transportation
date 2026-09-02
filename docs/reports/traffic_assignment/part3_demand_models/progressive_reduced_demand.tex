@@ -44,10 +44,14 @@ Multiplicative gravity relationships are fitted in count scale rather than by
 log-linear least squares, following the Poisson pseudo-likelihood argument of
 \cite{SantosSilvaTenreyro2006}.  The negative-binomial parameterization has
 mean $\mu$, dispersion $r$, and variance $\mu+\mu^2/r$
-\cite{CameronTrivedi2013}.  ZIP and ZINB add a separate Bernoulli zero state
-using stable log-space mixtures \cite{Lambert1992}.  This state is not a
-timetable structural zero: network-infeasible cells have already been removed,
-whereas zero inflation concerns retained measurement records.
+\cite{CameronTrivedi2013}.  These are the two count likelihood families
+implemented by the current gravity objective.  Zero-inflated Poisson and
+zero-inflated negative-binomial forms are useful future alternatives, but are
+not available in the current gravity estimator and must not be presented as
+production options.  In either case, a timetable structural zero remains
+distinct from an observed zero: network-infeasible cells are removed before
+estimation, whereas a zero-inflation component would describe retained
+measurement records.
 
 \begin{table}[htbp]
 \centering\scriptsize
@@ -61,7 +65,7 @@ Origin groups & $G_O-1$ & Production heterogeneity & Low & Weakly observed origi
 Destination groups & $G_D-1$ & Attraction heterogeneity & Low & Attraction confounding & Destination residuals\\
 Rank $r$ & $r(G_O+G_D)$ & Residual OD association & Moderate & Scale and rotation & OD pattern after margins\\
 Negative binomial & 1 & Overdispersion & Low & Large-$r$ boundary & Variance beyond Poisson\\
-ZIP/ZINB & design columns & Separate zero process & Low & Mean/zero confounding & Excess zeros after NB\\
+ZIP/ZINB (future) & design columns & Separate zero process & -- & Not implemented in current gravity path & Excess zeros after NB\\
 \hline
 \end{tabular}
 \caption{Optional components of the resolved demand family.}
@@ -80,7 +84,7 @@ M3 & Add origin groups & Negative binomial\\
 M4 & Add destination groups & Negative binomial\\
 M5 & Add rank one & Negative binomial\\
 M6 & Ranks 2, 4, then 8 & Negative binomial\\
-Sensitivity & Smallest adequate mean & ZIP or ZINB only if justified\\
+Sensitivity & Smallest adequate mean & Future ZIP/ZINB only after implementation and validation\\
 \hline
 \end{tabular}
 \caption{Recommended progressive ladder; advancement is diagnostic, not automatic.}
@@ -99,19 +103,25 @@ and identification constraints remain explicit assumptions.
 
 The generic optimizer applies the same operational contract as the minimal
 reduced-OD fitter.  Maximum likelihood and Gaussian-prior MAP are distinct
-modes; vector or canonical named bounds act in raw parameter coordinates.
-An absolute time budget requires an atomic checkpoint.  A stopped run records
-the latest accepted iterate and resumes only when the complete model identity
+modes.  GravityModelSpecification transforms raw parameters to their physical
+domain; the default SciPy gravity fit is unbounded in raw coordinates, while
+the optional Biogeme pilot may receive explicit bounds.  An absolute time
+budget requires an atomic checkpoint.  A stopped run records the latest
+accepted iterate and resumes only when the complete model identity
 (specification, layout, features, grouping, response operator, observations,
 and software schema) matches.  Compilation time and warm value-and-gradient
 time are reported separately from optimization time.
-Each accepted iteration additionally reports its duration, a rolling mean over
-at most ten iterations, the remaining iteration allowance, estimated remaining
-seconds, and the expected UTC completion time.  The estimate excludes JAX
-compilation and is therefore meaningful only after several iterations.  With a
-configured checkpoint, progress includes its path and age; an interactive
-interrupt atomically saves the latest accepted iterate and returns an explicit
-``interrupted'' status suitable for later identity-validated resume.
+Each accepted iteration reports its duration and a bounded recent-duration
+history (up to 32 iterations in the current gravity estimator), together with
+the remaining iteration allowance, estimated remaining seconds, and expected
+UTC completion time.  The estimate excludes JAX compilation and is therefore
+meaningful only after measured iterations exist.  Progress callbacks are
+optional at low level, while case-study drivers normally create a durable
+progress sink; reporting adds no objective evaluations and is outside model
+identity.  With a configured checkpoint, progress includes its path and age;
+an interactive interrupt atomically saves the latest accepted iterate and
+returns an explicit ``interrupted'' status suitable for later identity-
+validated resume.
 
 For migration of existing examples, a thin adapter exposes an established
 fixed-routing gravity operator directly to the generic kernel.  If the legacy

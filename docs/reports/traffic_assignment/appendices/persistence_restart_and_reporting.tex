@@ -45,6 +45,28 @@ Reporting is throttled by both a query interval and a wall-clock interval, with
 the final query always emitted. The callback therefore provides useful live
 feedback without changing reproducibility or flooding logs on fast cases.
 
+The same reporting contract is used by long fixed-routing and temporal-cache
+operations when their caller supplies a reporter.  Unit-based loops retain
+only a bounded history of recent unit durations and use it to report
+throughput, an estimated remaining time, a confidence level, and an expected
+UTC completion time.  The first event may legitimately have no ETA; once a
+measured unit has completed, the estimate is reported whenever the operation
+exposes a meaningful unit of work.  Indivisible compilation or device calls
+remain heartbeat-only when no defensible unit estimate is available.  Progress
+events are throttled and additive: they do not trigger an extra objective,
+gradient, routing, or JAX evaluation, and progress settings are excluded from
+artifact and checkpoint identities.  A caller may explicitly disable a
+reporter, but the high-level case-study workflow normally creates a durable
+JSONL sink so that a long run does not appear silent.
+
+Fixed-routing preparation distinguishes two independent reporting controls:
+\path{progress_interval_seconds} limits the wall-clock spacing between
+heartbeats, while \path{progress_interval_groups} requests updates after
+completed destination groups or routing units.  Supplying both honors both
+constraints; neither is converted into the other.  A terminal event is forced
+after a completed phase, and a successful stage is accepted only after its
+durable completion manifest and identity-specific artifact manifest validate.
+
 Gravity run manifests use a separate model-level identity. They now contain
 the complete serialized gravity specification and fingerprint, named parameter
 blocks and transformations, feature-cache and direct-operator artifact
