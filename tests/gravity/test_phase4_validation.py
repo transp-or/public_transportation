@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
+import json
 
 import jax
 import jax.numpy as jnp
@@ -24,10 +25,13 @@ from public_transportation.inference.gravity import (
     GravityObjectiveProblem,
     GravityParameterLayout,
     GravityValidationMetadata,
+    build_gravity_adequacy_report,
     estimate_gravity_model,
     predict_gravity_measurements,
     validate_full_data_gravity_adequacy,
+    write_gravity_detailed_report,
 )
+from public_transportation.inference.od_parameter_layout import ODParameterLayout
 
 
 def validation_case(observation_shift=None):
@@ -226,3 +230,71 @@ def test_float32_recomputation_uses_float32_validation_tolerance():
             result=perturbed, problem=problem32, compact_layout=layout
         )
         assert report.measurements == problem32.observations.size
+
+
+def test_detailed_report_writes_tables_and_executive_summary(tmp_path):
+    with jax.enable_x64():
+        problem, compact_layout, result = validation_case()
+        od_layout = ODParameterLayout(
+            num_od_total=6,
+            od_keys=tuple((f"o{i // 3}", f"d{i % 3}", "am") for i in range(6)),
+            free_od_indices=tuple(range(6)),
+            fixed_od_indices=(),
+            fixed_od_values=(),
+            free_baseline_values=(1.0,) * 6,
+            fixed_zero_indices=(),
+            fixed_positive_indices=(),
+        )
+        metadata = GravityValidationMetadata(
+            6,
+            measurement_type=np.asarray(("boarding",) * 3 + ("alighting",) * 3),
+            method_id=np.asarray(("m1",) * 6),
+            observation_time=np.asarray(("08:00:00",) * 6),
+            time_period=np.asarray(("am",) * 6),
+        )
+        detailed = write_gravity_detailed_report(
+            result=result,
+            observations=problem.observations,
+            predicted_measurements=result.predicted_measurements,
+            od_layout=od_layout,
+            metadata=metadata,
+            likelihood=GravityLikelihood.NEGATIVE_BINOMIAL,
+            output_directory=tmp_path / "report",
+        )
+        assert detailed.report_fingerprint
+        assert detailed.files["full_od.csv"].is_file()
+        assert detailed.files["executive_summary.md"].is_file()
+        assert detailed.files["report.md"].is_file()
+        payload = json.loads(detailed.files["report.json"].read_text())
+        assert payload["status"] == "completed"
+        assert payload["od"]["estimated_free_cells"] == 6
+        assert payload["executive_messages"]
+
+
+def test_persisted_result_can_be_restored():
+    with jax.enable_x64():
+        _, _, result = validation_case()
+
+        def jsonable(value):
+            if isinstance(value, dict):
+                return {key: jsonable(item) for key, item in value.items()}
+            if isinstance(value, (tuple, list)):
+                return [jsonable(item) for item in value]
+            if isinstance(value, np.ndarray):
+                return value.tolist()
+            return value
+
+        restored = type(result).from_dict(jsonable(asdict(result)))
+        np.testing.assert_array_equal(restored.raw_parameters, result.raw_parameters)
+        np.testing.assert_array_equal(restored.full_od_demand, result.full_od_demand)
+        assert restored.model_fingerprint == result.model_fingerprint
+
+
+def test_poisson_adequacy_report_uses_poisson_variance():
+    report = build_gravity_adequacy_report(
+        observations=np.asarray((0.0, 2.0, 5.0)),
+        modeled=np.asarray((1.0, 3.0, 4.0)),
+        likelihood=GravityLikelihood.POISSON,
+    )
+    assert report.negative_binomial_deviance is None
+    assert report.poisson_deviance >= 0.0

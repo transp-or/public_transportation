@@ -178,5 +178,11 @@ from .validation import (
     GravityGroupedResidualSummary,
     GravityJourneyCorrelationSummary,
     GravityValidationMetadata,
+    build_gravity_adequacy_report,
     validate_full_data_gravity_adequacy,
+)
+from .reporting import (
+    GRAVITY_DETAILED_REPORT_SCHEMA_VERSION,
+    GravityDetailedReport,
+    write_gravity_detailed_report,
 )

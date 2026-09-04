@@ -6,10 +6,10 @@ import json
 import os
 import tempfile
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -362,6 +362,62 @@ class GravityEstimationResult:
             raise ValueError(
                 "gravity result parameter names do not match the estimates."
             )
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "GravityEstimationResult":
+        """Restore a persisted JSON result for diagnostics and reporting.
+
+        The estimator itself continues to use its typed in-memory result. This
+        loader is intentionally limited to the JSON representation emitted by
+        the gravity driver and validates it through the normal dataclass
+        invariants.
+        """
+        values = dict(payload)
+        array_fields = (
+            "raw_parameters",
+            "physical_parameters",
+            "free_od_demand",
+            "active_od_demand",
+            "full_od_demand",
+            "predicted_measurements",
+            "gradient",
+        )
+        for name in array_fields:
+            if name not in values:
+                raise ValueError(f"persisted gravity result is missing {name!r}.")
+            values[name] = np.asarray(values[name])
+
+        selection = values.get("strategy_selection")
+        if not isinstance(selection, Mapping):
+            raise ValueError("persisted gravity result has no strategy selection.")
+        candidates = []
+        for candidate in selection.get("candidates", ()):
+            if not isinstance(candidate, Mapping):
+                raise ValueError("invalid gravity compilation diagnostic.")
+            candidates.append(GravityCompilationDiagnostics(**dict(candidate)))
+        values["strategy_selection"] = GravityStrategySelection(
+            requested=str(selection.get("requested", "auto")),
+            selected=str(selection.get("selected", "")),
+            reason=str(selection.get("reason", "")),
+            candidates=tuple(candidates),
+            persistent_compilation_cache_enabled=bool(
+                selection.get("persistent_compilation_cache_enabled", False)
+            ),
+            persistent_compilation_cache_directory=(
+                None
+                if selection.get("persistent_compilation_cache_directory") is None
+                else str(selection["persistent_compilation_cache_directory"])
+            ),
+        )
+        for name in ("parameter_names", "auxiliary_channel_log_likelihoods"):
+            if name in values and values[name] is not None:
+                values[name] = tuple(values[name])
+        if "parameter_blocks" in values and values["parameter_blocks"] is not None:
+            values["parameter_blocks"] = tuple(values["parameter_blocks"])
+        if values.get("checkpoint_path") is not None:
+            values["checkpoint_path"] = Path(str(values["checkpoint_path"]))
+        allowed = {field.name for field in fields(cls)}
+        return cls(**{name: value for name, value in values.items() if name in allowed})
 
 
 def _json_safe_result_payload(result: GravityEstimationResult) -> dict[str, object]:

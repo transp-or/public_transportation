@@ -38,15 +38,19 @@ class GravityValidationMetadata:
     origin_zone: np.ndarray | None = None
     destination_zone: np.ndarray | None = None
     vehicle_journey: np.ndarray | None = None
+    method_id: np.ndarray | None = None
+    observation_time: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if self.num_measurements <= 0:
             raise ValueError("num_measurements must be positive.")
         for name in (
+            "method_id",
             "measurement_type",
             "line",
             "direction",
             "stop",
+            "observation_time",
             "time_period",
             "origin_zone",
             "destination_zone",
@@ -120,7 +124,7 @@ class GravityAdequacyReport:
     measurements: int
     observed_total: float
     modeled_total: float
-    negative_binomial_deviance: float
+    negative_binomial_deviance: float | None
     poisson_deviance: float
     mae: float
     rmse: float
@@ -153,16 +157,26 @@ def _nb_logpmf(y: np.ndarray, mu: np.ndarray, dispersion: float) -> np.ndarray:
     )
 
 
-def _deviances(
+def _poisson_deviance(observed: np.ndarray, modeled: np.ndarray) -> float:
+    return float(
+        max(
+            0.0,
+            2
+            * np.sum(
+                xlogy(observed, observed / modeled) - (observed - modeled)
+            ),
+        )
+    )
+
+
+def _negative_binomial_deviance(
     observed: np.ndarray, modeled: np.ndarray, dispersion: float
-) -> tuple[float, float]:
-    poisson = 2 * np.sum(xlogy(observed, observed / modeled) - (observed - modeled))
+) -> float:
     saturated_mean = np.maximum(observed, np.finfo(modeled.dtype).tiny)
-    nb = 2 * np.sum(
+    return float(max(0.0, 2 * np.sum(
         _nb_logpmf(observed, saturated_mean, dispersion)
         - _nb_logpmf(observed, modeled, dispersion)
-    )
-    return float(max(0.0, nb)), float(max(0.0, poisson))
+    )))
 
 
 def _summary(
@@ -202,6 +216,7 @@ def _groups(
 ) -> tuple[GravityGroupedResidualSummary, ...]:
     summaries = []
     for name in (
+        "method_id",
         "measurement_type",
         "line",
         "direction",
@@ -247,6 +262,159 @@ def _journeys(
     return tuple(result)
 
 
+def build_gravity_adequacy_report(
+    *,
+    observations: object,
+    modeled: object,
+    model_fingerprint: str = "",
+    likelihood: str = "negative_binomial",
+    dispersion: float | None = None,
+    metadata: GravityValidationMetadata | None = None,
+    config: GravityAdequacyConfig = GravityAdequacyConfig(),
+) -> GravityAdequacyReport:
+    """Build adequacy diagnostics from already computed observations and means.
+
+    This lower-level entry point is useful for report generation in a fresh
+    process: callers can reuse persisted fit and validation vectors without
+    rebuilding the measurement operator.
+    """
+    observed = np.asarray(observations, dtype=np.float64)
+    modeled_array = np.asarray(modeled, dtype=np.float64)
+    if observed.ndim != 1 or modeled_array.shape != observed.shape:
+        raise ValueError("observations and modeled must be aligned one-dimensional vectors.")
+    if observed.size == 0:
+        raise ValueError("observations must not be empty.")
+    if np.any(~np.isfinite(observed)) or np.any(observed < 0.0):
+        raise ValueError("observations must be finite and non-negative.")
+    if np.any(~np.isfinite(modeled_array)) or np.any(modeled_array <= 0.0):
+        raise ValueError("modeled measurements must be finite and strictly positive.")
+
+    selected_metadata = metadata or GravityValidationMetadata(observed.size)
+    if selected_metadata.num_measurements != observed.size:
+        raise ValueError("validation metadata has the wrong measurement dimension.")
+    try:
+        likelihood_value = str(likelihood.value)
+    except AttributeError:
+        likelihood_value = str(likelihood)
+    if likelihood_value == "poisson":
+        resolved_dispersion = None
+        variance = modeled_array
+    elif likelihood_value == "negative_binomial":
+        if dispersion is None or not np.isfinite(dispersion) or dispersion <= 0:
+            raise ValueError("negative-binomial adequacy requires positive dispersion.")
+        resolved_dispersion = float(dispersion)
+        variance = modeled_array + modeled_array**2 / resolved_dispersion
+    else:
+        raise ValueError(f"unsupported likelihood {likelihood_value!r}.")
+    residual = observed - modeled_array
+    standardized = residual / np.sqrt(variance)
+    poisson_deviance = _poisson_deviance(observed, modeled_array)
+    nb_deviance = (
+        None
+        if resolved_dispersion is None
+        else _negative_binomial_deviance(observed, modeled_array, resolved_dispersion)
+    )
+    weights = 1 / variance
+    grouped = _groups(
+        selected_metadata,
+        observed,
+        modeled_array,
+        residual,
+        standardized,
+        variance,
+    )
+    journeys = _journeys(selected_metadata.vehicle_journey, standardized)
+    threshold_counts = tuple(
+        (
+            threshold,
+            int(np.count_nonzero(np.abs(standardized) > threshold)),
+            float(np.mean(np.abs(standardized) > threshold)),
+        )
+        for threshold in config.standardized_residual_thresholds
+    )
+    quantiles = tuple(
+        (float(q), float(np.quantile(observed, q)), float(np.quantile(modeled_array, q)))
+        for q in (0.0, 0.25, 0.5, 0.75, 1.0)
+    )
+    systematic_groups = tuple(
+        item
+        for item in grouped
+        if abs(item.mean_standardized_residual)
+        >= config.systematic_group_mean_threshold
+    )
+    coherent_journeys = tuple(
+        item
+        for item in journeys
+        if item.adjacent_residual_correlation is not None
+        and abs(item.adjacent_residual_correlation)
+        >= config.journey_correlation_threshold
+    )
+    isolated = bool(
+        threshold_counts[-1][1] > 0
+        and threshold_counts[-1][2] < 0.05
+        and not systematic_groups
+    )
+    overdispersion = bool(
+        nb_deviance is not None
+        and poisson_deviance > 1.25 * max(nb_deviance, 1e-12)
+    )
+    messages = []
+    if systematic_groups:
+        messages.append(
+            "Systematic grouped residuals may be explainable by gravity-demand restrictions."
+        )
+    if coherent_journeys:
+        messages.append(
+            "Coherent within-journey residuals may indicate routing or timing discrepancies."
+        )
+    if isolated:
+        messages.append("A small number of isolated observations are suspect.")
+    if overdispersion:
+        messages.append("Poisson variation is insufficient relative to the NB model.")
+    if not messages:
+        messages.append("No configured structural discrepancy flag was triggered.")
+    findings = GravityAdequacyFindings(
+        bool(systematic_groups),
+        bool(coherent_journeys),
+        isolated,
+        overdispersion,
+        tuple(messages),
+    )
+    report_payload: dict[str, Any] = {
+        "schema_version": 1,
+        "model_fingerprint": model_fingerprint,
+        "observed": observed,
+        "modeled": modeled_array,
+        "likelihood": likelihood_value,
+        "dispersion": resolved_dispersion,
+        "metadata": {
+            name: getattr(selected_metadata, name)
+            for name in selected_metadata.__dataclass_fields__
+        },
+        "config": config,
+    }
+    return GravityAdequacyReport(
+        1,
+        model_fingerprint,
+        fingerprint(report_payload),
+        observed.size,
+        float(np.sum(observed)),
+        float(np.sum(modeled_array)),
+        nb_deviance,
+        poisson_deviance,
+        float(np.mean(np.abs(residual))),
+        float(np.sqrt(np.mean(residual**2))),
+        float(np.sqrt(np.sum(weights * residual**2) / np.sum(weights))),
+        residual,
+        standardized,
+        threshold_counts,
+        quantiles,
+        grouped,
+        journeys,
+        findings,
+    )
+
+
 def validate_full_data_gravity_adequacy(
     *,
     result: GravityEstimationResult,
@@ -276,106 +444,21 @@ def validate_full_data_gravity_adequacy(
         demand, result.free_od_demand, rtol=tolerance, atol=tolerance
     )
     observed = np.asarray(problem.observations, dtype=np.float64)
-    dispersion = float(result.physical_parameters[2])
-    variance = modeled + modeled**2 / dispersion
-    residual = observed - modeled
-    standardized = residual / np.sqrt(variance)
-    nb_deviance, poisson_deviance = _deviances(observed, modeled, dispersion)
-    weights = 1 / variance
     selected_metadata = metadata or GravityValidationMetadata(observed.size)
-    if selected_metadata.num_measurements != observed.size:
-        raise ValueError("validation metadata has the wrong measurement dimension.")
-    grouped = _groups(
-        selected_metadata,
-        observed,
-        modeled,
-        residual,
-        standardized,
-        variance,
-    )
-    journeys = _journeys(selected_metadata.vehicle_journey, standardized)
-    threshold_counts = tuple(
-        (
-            threshold,
-            int(np.count_nonzero(np.abs(standardized) > threshold)),
-            float(np.mean(np.abs(standardized) > threshold)),
-        )
-        for threshold in config.standardized_residual_thresholds
-    )
-    quantiles = tuple(
-        (float(q), float(np.quantile(observed, q)), float(np.quantile(modeled, q)))
-        for q in (0.0, 0.25, 0.5, 0.75, 1.0)
-    )
-    systematic_groups = tuple(
-        item
-        for item in grouped
-        if abs(item.mean_standardized_residual)
-        >= config.systematic_group_mean_threshold
-    )
-    coherent_journeys = tuple(
-        item
-        for item in journeys
-        if item.adjacent_residual_correlation is not None
-        and abs(item.adjacent_residual_correlation)
-        >= config.journey_correlation_threshold
-    )
-    isolated = bool(
-        threshold_counts[-1][1] > 0
-        and threshold_counts[-1][2] < 0.05
-        and not systematic_groups
-    )
-    overdispersion = bool(poisson_deviance > 1.25 * max(nb_deviance, 1e-12))
-    messages = []
-    if systematic_groups:
-        messages.append(
-            "Systematic grouped residuals may be explainable by gravity-demand restrictions."
-        )
-    if coherent_journeys:
-        messages.append(
-            "Coherent within-journey residuals may indicate routing or timing discrepancies."
-        )
-    if isolated:
-        messages.append("A small number of isolated observations are suspect.")
-    if overdispersion:
-        messages.append("Poisson variation is insufficient relative to the NB model.")
-    if not messages:
-        messages.append("No configured structural discrepancy flag was triggered.")
-    findings = GravityAdequacyFindings(
-        bool(systematic_groups),
-        bool(coherent_journeys),
-        isolated,
-        overdispersion,
-        tuple(messages),
-    )
-    report_payload: dict[str, Any] = {
-        "schema_version": 1,
-        "model_fingerprint": result.model_fingerprint,
-        "observed": observed,
-        "modeled": modeled,
-        "dispersion": dispersion,
-        "metadata": {
-            name: getattr(selected_metadata, name)
-            for name in selected_metadata.__dataclass_fields__
-        },
-        "config": config,
-    }
-    return GravityAdequacyReport(
-        1,
-        result.model_fingerprint,
-        fingerprint(report_payload),
-        observed.size,
-        float(np.sum(observed)),
-        float(np.sum(modeled)),
-        nb_deviance,
-        poisson_deviance,
-        float(np.mean(np.abs(residual))),
-        float(np.sqrt(np.mean(residual**2))),
-        float(np.sqrt(np.sum(weights * residual**2) / np.sum(weights))),
-        residual,
-        standardized,
-        threshold_counts,
-        quantiles,
-        grouped,
-        journeys,
-        findings,
+    names = tuple(str(name) for name in result.parameter_names)
+    if problem.likelihood.value == "poisson":
+        dispersion = None
+    else:
+        try:
+            dispersion = float(result.physical_parameters[names.index("dispersion")])
+        except (ValueError, IndexError):
+            dispersion = float(result.physical_parameters[2])
+    return build_gravity_adequacy_report(
+        observations=observed,
+        modeled=modeled,
+        model_fingerprint=result.model_fingerprint,
+        likelihood=problem.likelihood.value,
+        dispersion=dispersion,
+        metadata=selected_metadata,
+        config=config,
     )
