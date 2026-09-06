@@ -1225,6 +1225,312 @@ large checkpoints, generated OD/time tables, exclusion/audit tables, routing
 artifacts, operator blocks, logs, and intermediate files in the archive rather
 than committing them to GitHub.
 
+## Moving a case study between JED and a local computer
+
+Git synchronizes the program and the tracked scientific configuration. A
+separate runtime archive synchronizes generated state. Neither mechanism
+replaces the other. This section is the complete procedure for moving a case
+between JED and a laptop without rebuilding an expensive routing or temporal
+operator.
+
+### Files controlled by Git
+
+Git should control the source code, tests, tracked scripts, `pyproject.toml`,
+`uv.lock`, tracked scientific configuration such as `config/case.toml` and
+`config/model.toml`, and the documentation and walkthrough files. Update these
+files normally on each machine:
+
+```bash
+git pull
+UV_CACHE_DIR=/tmp/tpg-medium-uv-cache uv sync --frozen
+```
+
+Do not transfer `.venv`, UV caches, generated results, Slurm `.out`/`.err`
+logs, or machine-specific paths through Git. `config/case.local.toml` is an
+ignored, machine-specific override and must be recreated separately on each
+computer. On a laptop it should use relative paths:
+
+```toml
+scenario_demand = "results/inputs/scenario/prior_demand.csv"
+measurements = "results/inputs/filtered/measurements_boarding_alighting.csv"
+results = "results"
+```
+
+On JED, the same local file may use absolute paths below `/scratch`. The
+case-owned driver must explicitly load the local override; the public package
+does not discover `case.local.toml` automatically. If a driver only reads
+`config/case.toml`, report that as a case-driver interface issue rather than
+assuming that the ignored file has been applied.
+
+### Runtime files transferred with a tarball
+
+Generated runtime data under `results/` must be transferred separately. To
+continue fitting, validating, or reporting without rebuilding the expensive
+artifacts, the archive must contain:
+
+```text
+results/inputs/
+results/artifacts/<IDENTITY>/
+results/checkpoints/<IDENTITY>/
+results/checkpoints/gravity.json        # when present
+results/fits/
+results/manifests/
+results/audit/
+results/validation/                     # when present
+```
+
+Transfer the complete identity-specific artifact directory and the complete
+identity-specific checkpoint directory. Do not transfer only an artifact
+manifest: block files, routing data, support data, temporal-operator cache
+files, and other checkpoint contents are required for reuse. Selected JSONL
+logs may be included when detailed diagnostics are needed, but logs are not
+required for resuming or reporting when durable manifests are present.
+
+Normally exclude `.git/`, `.venv/`, UV caches, temporary staging directories,
+large Slurm `.out` and `.err` files, and the machine-specific
+`config/case.local.toml` from the runtime archive.
+
+### Create the archive on JED
+
+The following commands are independent of the current working directory.
+Replace the example account, case, results, and identity values with the
+values recorded by the completed run:
+
+```bash
+export CASE_ROOT="/home/bierlair/github/public_transport_TPG/case_studies/medium_network"
+export RESULTS_ROOT="/scratch/bierlair/tpg-medium-network-20260817-feasibility-fix/results"
+export IDENTITY="219c55205b90403d7003a0694325c788678f7b79170bd42b7d3145ff6a69607e"
+export ARCHIVE="/scratch/bierlair/tpg-medium-network-20260817-feasibility-fix/tpg-medium-network-runtime-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+```
+
+Before archiving, verify that the source data and durable outputs exist:
+
+```bash
+test -d "$RESULTS_ROOT/inputs"
+test -f "$RESULTS_ROOT/artifacts/$IDENTITY/manifest.json"
+test -d "$RESULTS_ROOT/checkpoints/$IDENTITY"
+test -d "$RESULTS_ROOT/fits"
+test -d "$RESULTS_ROOT/manifests"
+test -d "$RESULTS_ROOT/audit"
+```
+
+Do not archive files that are actively being modified. For a completed fit,
+validation, or report, wait for the Slurm job to finish. If an emergency
+snapshot is unavoidable, include only completed checkpoint files and label the
+archive as a snapshot.
+
+Create the archive from the directory containing `results/`. The conditional
+file list keeps optional `validation/` and `gravity.json` entries from causing
+the archive command to fail:
+
+```bash
+cd "$(dirname "$RESULTS_ROOT")"
+
+TAR_ITEMS=(
+  results/inputs
+  "results/artifacts/$IDENTITY"
+  "results/checkpoints/$IDENTITY"
+  results/fits
+  results/manifests
+  results/audit
+)
+if [ -d results/validation ]; then
+  TAR_ITEMS+=(results/validation)
+fi
+if [ -f results/checkpoints/gravity.json ]; then
+  TAR_ITEMS+=(results/checkpoints/gravity.json)
+fi
+
+tar -czf "$ARCHIVE" "${TAR_ITEMS[@]}"
+```
+
+Create the checksum only after `tar` has finished:
+
+```bash
+cd "$(dirname "$ARCHIVE")"
+sha256sum "$(basename "$ARCHIVE")" > "$(basename "$ARCHIVE").sha256"
+
+test -s "$ARCHIVE"
+test -s "$ARCHIVE.sha256"
+ls -lh "$ARCHIVE" "$ARCHIVE.sha256"
+```
+
+The checksum file must contain one SHA-256 hash and the archive filename. Do
+not create it before the archive is complete.
+
+### Transfer the archive
+
+From the laptop, create or select the case-study destination and transfer both
+the archive and its checksum:
+
+```bash
+export CASE_ROOT="/Users/bierlair/MyFiles/github/public_transport_TPG/case_studies/medium_network"
+export ARCHIVE_NAME="tpg-medium-network-runtime-YYYYMMDDTHHMMSSZ.tar.gz"
+
+scp "bierlair@jed.epfl.ch:/scratch/bierlair/tpg-medium-network-20260817-feasibility-fix/$ARCHIVE_NAME" \
+  "$CASE_ROOT/"
+
+scp "bierlair@jed.epfl.ch:/scratch/bierlair/tpg-medium-network-20260817-feasibility-fix/$ARCHIVE_NAME.sha256" \
+  "$CASE_ROOT/"
+```
+
+For a multi-gigabyte archive, `rsync -avP` can resume an interrupted
+transfer:
+
+```bash
+rsync -avP \
+  "bierlair@jed.epfl.ch:/scratch/bierlair/tpg-medium-network-20260817-feasibility-fix/$ARCHIVE_NAME" \
+  "$CASE_ROOT/"
+
+rsync -avP \
+  "bierlair@jed.epfl.ch:/scratch/bierlair/tpg-medium-network-20260817-feasibility-fix/$ARCHIVE_NAME.sha256" \
+  "$CASE_ROOT/"
+```
+
+### Verify and extract on the laptop
+
+Verify the checksum before extracting anything:
+
+```bash
+cd "$CASE_ROOT"
+
+EXPECTED=$(awk '{print $1}' "$ARCHIVE_NAME.sha256")
+ACTUAL=$(shasum -a 256 "$ARCHIVE_NAME" | awk '{print $1}')
+
+test "$EXPECTED" = "$ACTUAL"
+echo "Checksum verified."
+```
+
+Inspect the archive layout:
+
+```bash
+tar -tzf "$ARCHIVE_NAME" | head -n 20
+tar -tzf "$ARCHIVE_NAME" | rg '^results/(inputs|artifacts|checkpoints|fits|manifests|audit|validation)'
+```
+
+Do not extract inside an existing `results/` directory: the archive already
+contains the `results/` prefix. If local results exist, preserve them first:
+
+```bash
+if [ -d "$CASE_ROOT/results" ]; then
+  mv "$CASE_ROOT/results" \
+    "$CASE_ROOT/results-before-runtime-$(date -u +%Y%m%dT%H%M%SZ)"
+fi
+
+tar -xzf "$CASE_ROOT/$ARCHIVE_NAME" -C "$CASE_ROOT"
+```
+
+The resulting layout must be:
+
+```text
+case_studies/medium_network/
+├── adapter.py
+├── run_case.py
+├── config/
+│   └── case.local.toml
+└── results/
+    ├── inputs/
+    ├── artifacts/
+    ├── checkpoints/
+    ├── fits/
+    ├── manifests/
+    ├── audit/
+    └── validation/
+```
+
+### Recreate the local configuration
+
+From the case-study root, recreate the ignored local configuration and point
+it to the extracted results:
+
+```toml
+scenario_demand = "results/inputs/scenario/prior_demand.csv"
+measurements = "results/inputs/filtered/measurements_boarding_alighting.csv"
+results = "results"
+```
+
+Do not modify tracked scientific settings merely because the machine changed.
+If the case driver does not support a local overlay, keep the tracked
+scientific configuration unchanged and use the driver's documented local-path
+mechanism; do not silently edit `config/case.toml` and commit laptop-specific
+paths.
+
+### Verify the imported runtime
+
+From the case-study root, install the locked environment and verify that the
+resolved inputs and results root are the extracted local files:
+
+```bash
+cd "$CASE_ROOT"
+export UV_CACHE_DIR=/tmp/tpg-medium-uv-cache
+
+UV_CACHE_DIR="$UV_CACHE_DIR" uv sync --frozen
+
+UV_CACHE_DIR="$UV_CACHE_DIR" uv run --frozen python -c '
+from pathlib import Path
+from adapter import CaseSettings
+
+settings = CaseSettings.load(Path("."))
+
+print("scenario demand:", settings.scenario_demand)
+print("measurements:", settings.measurements)
+print("results:", settings.results)
+
+assert settings.scenario_demand.is_file()
+assert settings.measurements.is_file()
+assert settings.results.is_dir()
+'
+```
+
+Verify the imported artifact and, when present, the temporal-operator cache:
+
+```bash
+export IDENTITY="219c55205b90403d7003a0694325c788678f7b79170bd42b7d3145ff6a69607e"
+export ARTIFACT="$CASE_ROOT/results/artifacts/$IDENTITY"
+export CHECKPOINT="$CASE_ROOT/results/checkpoints/$IDENTITY"
+
+jq -e \
+  --arg id "$IDENTITY" '
+  .complete == true and
+  .identity_fingerprint == $id and
+  (.blocks | length) > 0 and
+  all(.blocks[]; (.content_hash | type) == "string")
+' "$ARTIFACT/manifest.json"
+
+if [ -f "$CHECKPOINT/temporal_operator_cache/manifest.json" ]; then
+  jq -e \
+    --arg id "$IDENTITY" '
+    .complete == true and
+    .artifact_identity_fingerprint == $id
+  ' "$CHECKPOINT/temporal_operator_cache/manifest.json"
+
+  jq -e \
+    --arg id "$IDENTITY" '
+    .complete == true and
+    .artifact_identity_fingerprint == $id
+  ' "$CHECKPOINT/temporal_operator_cache/validation_certificate.json"
+fi
+```
+
+### Version and fingerprint consistency
+
+Before resuming a fit or running validation/reporting, verify all of the
+following:
+
+- the installed package revision equals the exact `package_revision` recorded
+  in the case configuration and stage manifests;
+- the artifact identity equals the identity-specific checkpoint identity;
+- the artifact manifest hash agrees with the hash recorded in the
+  operator-cache manifest;
+- the imported results use the same model configuration, time bins, timetable,
+  measurements, fixed demand, and input fingerprints as the completed JED run.
+
+Only after these checks pass may the case run `fit --resume`, validation, or
+reporting. A successful transfer must reuse the transferred artifact and
+checkpoint data; it must not silently rebuild them. If an identity or
+fingerprint differs, stop and diagnose the mismatch rather than deleting the
+archive or creating a new result root.
+
 ### 0.1 Determine time bins from the count data before the audit
 
 Before starting this potentially long diagnostic, read **Large outputs, scratch
