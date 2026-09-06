@@ -2668,6 +2668,73 @@ operators, rerun `check`/`preflight`/`benchmark`, and start a new fit
 checkpoint.  Preserve the earlier count-only fit for comparison rather than
 overwriting it.
 
+### Time-regime production deviations
+
+The gravity model can retain the supplied origin--time totals while allowing a
+case-defined, low-dimensional correction by time regime.  The implemented
+production multiplier is
+
+```text
+log production_multiplier(o, t) = alpha + delta[regime(t)]
+```
+
+where `alpha` is the global production scale and `regime(t)` is supplied by
+the adapter through the `time_period_index` feature mapping.  The package does
+not infer regimes from the observations and does not assume names such as
+`morning`, `evening`, or `peak`; the case owner must define and fingerprint the
+mapping from detailed time bins to regime indices.
+
+Use the public API as follows (the values are illustrative and must be
+replaced by the case-owned number of regimes and ridge strength):
+
+```python
+from public_transportation.inference.gravity import (
+    GravityComponentSpecification,
+    GravityConstraint,
+    GravityDeviationSpecification,
+    GravityEffectScope,
+    GravityParameterization,
+    GravityRegularization,
+    GravityRegularizationType,
+)
+
+production = GravityComponentSpecification(
+    name="production",
+    scope=GravityEffectScope.GLOBAL,
+    parameterization=GravityParameterization.LOG_MULTIPLIER,
+    source="origin_time_totals",
+    deviation=GravityDeviationSpecification(
+        scope=GravityEffectScope.TIME_PERIOD,
+        grouping="time_period_index",
+        group_count=<number_of_regimes>,
+        constraint=GravityConstraint.SUM_ZERO,
+        regularization=GravityRegularization(
+            GravityRegularizationType.RIDGE,
+            <ridge_strength>,
+        ),
+    ),
+)
+```
+
+The sum-to-zero constraint stores `R-1` free deviations and derives the final
+one, so `alpha` remains the overall production level.  The parameter layout
+reports the stable names `production_scale` and
+`production_time_deviation[0]`, ..., and only the deviation block is
+regularized.  The objective contribution is
+
+```text
+0.5 * ridge_strength * sum(delta[g] ** 2)
+```
+
+in the objective's native units; it is not rescaled by
+`typical_objective_scale`.  Setting every deviation to zero reproduces the
+global-production model exactly.  Nonzero deviations change origin--time
+totals, not the within-group destination probabilities.  A changed production
+specification changes the gravity-model and parameter-layout fingerprints, so
+the gravity fit checkpoint must be new; the existing routing and fixed
+operator artifacts remain reusable because their identities do not include the
+gravity specification.
+
 **Stage contract.** Inputs are the **generated** complete operator artifact,
 matching preflight and benchmark manifests, the **case-owned** model and
 optimizer settings in `config/model.toml`, and a persistent checkpoint root
@@ -3706,6 +3773,17 @@ template uses zero except for explicitly configured raw starts), choose the
 derivative strategy recommended by preflight, and accept a fit only when the
 objective, gradient, checkpoint identity, and reconstructed counts pass the
 case's tolerances.
+
+To enable the optional time-regime production correction, replace the simple
+production component above with the `GravityDeviationSpecification` form in
+the Stage 6 section.  The resulting layout adds
+`production_time_deviation[0]` through `production_time_deviation[R-2]` and
+requires a `time_period_index` array with contiguous regime labels that are
+constant within each origin--time group.  The adapter must validate this
+mapping before fitting and must record the regime definition and ridge
+strength in the model manifest.  This is a gravity-model change only: do not
+rebuild or rewrite routing blocks, temporal fragments, or fixed-operator
+artifacts solely because the production parameterization changed.
 
 ## 21. Reuse and incompatibility boundary
 

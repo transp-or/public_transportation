@@ -158,6 +158,7 @@ from .preflight import (
 from .specification import (
     GravityComponentSpecification,
     GravityConstraint,
+    GravityDeviationSpecification,
     GravityEffectScope,
     GravityLikelihoodSpecification,
     GravityModelSpecification,

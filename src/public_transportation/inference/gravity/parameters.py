@@ -57,13 +57,14 @@ class GravityParameterBlock:
     names: tuple[str, ...]
     regularization_type: GravityRegularizationType
     regularization_strength: float
+    parent_component: str | None = None
 
     @property
     def size(self) -> int:
         return self.parameter_slice.stop - self.parameter_slice.start
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "component": self.component,
             "scope": self.scope.value,
             "parameterization": self.parameterization.value,
@@ -79,6 +80,9 @@ class GravityParameterBlock:
                 "strength": self.regularization_strength,
             },
         }
+        if self.parent_component is not None:
+            payload["parent_component"] = self.parent_component
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> GravityParameterBlock:
@@ -107,12 +111,16 @@ class GravityParameterBlock:
                 str(regularization.get("type", "none"))
             ),
             regularization_strength=float(regularization.get("strength", 0.0)),
+            parent_component=(
+                None
+                if payload.get("parent_component") is None
+                else str(payload["parent_component"])
+            ),
         )
 
 
 def _component_names(component: GravityComponentSpecification) -> tuple[str, ...]:
-    count = component.parameter_count
-    if count == 0:
+    if component.scope in (GravityEffectScope.NONE, GravityEffectScope.FIXED):
         return ()
     legacy = {
         ("journey_time", GravityEffectScope.GLOBAL): "beta_time",
@@ -141,8 +149,26 @@ def _component_names(component: GravityComponentSpecification) -> tuple[str, ...
         ("production", GravityEffectScope.ORIGIN_ZONE): "origin_zone_deviation",
     }.get((component.name, component.scope))
     prefix = legacy_prefix or f"{component.name}.deviation"
-    result.extend(f"{prefix}[{index}]" for index in range(count - len(result)))
+    result.extend(
+        f"{prefix}[{index}]"
+        for index in range(component.parameter_count - len(result))
+    )
     return tuple(result)
+
+
+def _deviation_names(component: GravityComponentSpecification) -> tuple[str, ...]:
+    deviation = component.deviation
+    if deviation is None:
+        return ()
+    prefix = (
+        f"{component.name}_time_deviation"
+        if component.name == "production"
+        and deviation.scope is GravityEffectScope.TIME_PERIOD
+        else f"{component.name}_deviation"
+    )
+    return tuple(
+        f"{prefix}[{index}]" for index in range(deviation.parameter_count)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,25 +189,63 @@ class GravityParameterLayout:
         for component in self.specification.active_components:
             names = _component_names(component)
             if not names:
-                continue
+                if component.deviation is None:
+                    continue
             stop = start + len(names)
-            result.append(
-                GravityParameterBlock(
-                    component=component.name,
-                    scope=component.scope,
-                    parameterization=component.parameterization,
-                    constraint=component.constraint,
-                    mapping=component.grouping
-                    or _DEFAULT_MAPPINGS.get(component.scope),
-                    group_count=component.group_count,
-                    reference_category=component.reference_category,
-                    parameter_slice=slice(start, stop),
-                    names=names,
-                    regularization_type=component.regularization.kind,
-                    regularization_strength=component.regularization.strength,
+            if names:
+                result.append(
+                    GravityParameterBlock(
+                        component=component.name,
+                        scope=component.scope,
+                        parameterization=component.parameterization,
+                        constraint=component.constraint,
+                        mapping=component.grouping
+                        or _DEFAULT_MAPPINGS.get(component.scope),
+                        group_count=0 if component.deviation is not None else component.group_count,
+                        reference_category=(
+                            None if component.deviation is not None else component.reference_category
+                        ),
+                        parameter_slice=slice(start, stop),
+                        names=names,
+                        regularization_type=(
+                            GravityRegularizationType.NONE
+                            if component.deviation is not None
+                            else component.regularization.kind
+                        ),
+                        regularization_strength=(
+                            0.0 if component.deviation is not None else component.regularization.strength
+                        ),
+                    )
                 )
-            )
-            start = stop
+                start = stop
+            deviation_names = _deviation_names(component)
+            if deviation_names:
+                deviation = component.deviation
+                assert deviation is not None
+                stop = start + len(deviation_names)
+                result.append(
+                    GravityParameterBlock(
+                        component=(
+                            "production_time_deviation"
+                            if component.name == "production"
+                            and deviation.scope is GravityEffectScope.TIME_PERIOD
+                            else f"{component.name}_deviation"
+                        ),
+                        scope=deviation.scope,
+                        parameterization=GravityParameterization.ADDITIVE,
+                        constraint=deviation.constraint,
+                        mapping=deviation.grouping
+                        or _DEFAULT_MAPPINGS.get(deviation.scope),
+                        group_count=deviation.group_count,
+                        reference_category=deviation.reference_category,
+                        parameter_slice=slice(start, stop),
+                        names=deviation_names,
+                        regularization_type=deviation.regularization.kind,
+                        regularization_strength=deviation.regularization.strength,
+                        parent_component=component.name,
+                    )
+                )
+                start = stop
         return tuple(result)
 
     @property
@@ -216,6 +280,12 @@ class GravityParameterLayout:
     def block(self, component: str) -> GravityParameterBlock | None:
         return next((item for item in self.blocks if item.component == component), None)
 
+    def deviation_block(self, component: str) -> GravityParameterBlock | None:
+        """Return the separate deviation block attached to ``component``."""
+        return next(
+            (item for item in self.blocks if item.parent_component == component), None
+        )
+
     def _raw(self, raw_parameters: object) -> jax.Array:
         raw = jnp.asarray(raw_parameters)
         if raw.ndim != 1 or raw.shape[0] != self.size:
@@ -233,6 +303,10 @@ class GravityParameterLayout:
         """Expand free categorical deviations under the declared constraint."""
         raw = self._raw(raw_parameters)
         block = self.block(component)
+        if block is None or block.group_count == 0:
+            attached = self.deviation_block(component)
+            if attached is not None:
+                block = attached
         if block is None or block.group_count == 0:
             return jnp.empty((0,), dtype=raw.dtype)
         values = raw[block.parameter_slice]
@@ -305,11 +379,34 @@ class GravityParameterLayout:
                 (features.num_origin_time_groups,), fixed, dtype=raw.dtype
             )
         if component.scope is GravityEffectScope.GLOBAL:
-            return jnp.full(
-                (features.num_origin_time_groups,),
-                self.scalar_or_base(raw, "production"),
-                dtype=raw.dtype,
+            base = self.scalar_or_base(raw, "production")
+            if component.deviation is None:
+                return jnp.full(
+                    (features.num_origin_time_groups,),
+                    base,
+                    dtype=raw.dtype,
+                )
+            deviation_block = self.deviation_block("production")
+            assert deviation_block is not None and deviation_block.mapping is not None
+            deviations = self.constrained_deviations(
+                raw, deviation_block.component
             )
+            indices = jnp.asarray(
+                features.mapping(deviation_block.mapping), dtype=jnp.int32
+            )
+            cell_deviation = deviations[indices]
+            groups = jnp.asarray(features.origin_time_group_index, dtype=jnp.int32)
+            totals = jax.ops.segment_sum(
+                cell_deviation,
+                groups,
+                num_segments=features.num_origin_time_groups,
+            )
+            counts = jax.ops.segment_sum(
+                jnp.ones(features.num_cells, dtype=raw.dtype),
+                groups,
+                num_segments=features.num_origin_time_groups,
+            )
+            return base + totals / counts
         cell_effect = self.cell_effect(raw, "production", features)
         groups = jnp.asarray(features.origin_time_group_index, dtype=jnp.int32)
         totals = jax.ops.segment_sum(
@@ -479,25 +576,48 @@ def validate_gravity_relaxation_features(
 ) -> None:
     """Validate every feature mapping required by the declarative specification."""
     for component in specification.active_components:
-        if component.scope not in _DEFAULT_MAPPINGS and component.scope not in (
+        if component.scope in _DEFAULT_MAPPINGS or component.scope in (
             GravityEffectScope.CUSTOM_GROUP,
             GravityEffectScope.SMOOTH_BASIS,
         ):
-            continue
-        mapping = component.grouping or _DEFAULT_MAPPINGS.get(component.scope)
-        if mapping is None:
-            raise ValueError(
-                f"component {component.name!r} requires an explicit feature mapping."
+            mapping = component.grouping or _DEFAULT_MAPPINGS.get(component.scope)
+            if mapping is None:
+                raise ValueError(
+                    f"component {component.name!r} requires an explicit feature mapping."
+                )
+            constant = component.name == "production" or mapping in {
+                "origin_index",
+                "time_period_index",
+                "origin_time_group_index",
+                "origin_zone_index",
+            }
+            features.validate_mapping(
+                mapping,
+                group_count=component.group_count,
+                constant_within_origin_time=constant,
+                smooth_basis=component.scope is GravityEffectScope.SMOOTH_BASIS,
             )
-        constant = component.name == "production" or mapping in {
-            "origin_index",
-            "time_period_index",
-            "origin_time_group_index",
-            "origin_zone_index",
-        }
-        features.validate_mapping(
-            mapping,
-            group_count=component.group_count,
-            constant_within_origin_time=constant,
-            smooth_basis=component.scope is GravityEffectScope.SMOOTH_BASIS,
-        )
+        if component.deviation is not None:
+            deviation = component.deviation
+            deviation_mapping = deviation.grouping or _DEFAULT_MAPPINGS.get(
+                deviation.scope
+            )
+            if deviation_mapping is None:
+                raise ValueError(
+                    f"component {component.name!r} deviation requires an explicit "
+                    "feature mapping."
+                )
+            features.validate_mapping(
+                deviation_mapping,
+                group_count=deviation.group_count,
+                constant_within_origin_time=(
+                    component.name == "production"
+                    or deviation_mapping
+                    in {
+                        "origin_index",
+                        "time_period_index",
+                        "origin_time_group_index",
+                        "origin_zone_index",
+                    }
+                ),
+            )

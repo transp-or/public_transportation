@@ -52,6 +52,53 @@ Structural-zero and frozen cells do not receive free gravity-response rows.
 The count mean is obtained by applying the response operator to $\bm x$ and
 adding the frozen offset.
 
+\subsection{Time-Regime Production Deviations}
+
+The current public implementation provides a specific production extension
+when the supplied origin--time totals are systematically too high or too low
+in broad, case-defined time regimes.  Let $r(t)$ map each detailed
+departure-time bin to one of $R$ regimes.  The production multiplier is
+\[
+    \log m_{o,t}=\alpha+\delta_{r(t)},
+    \qquad
+    q_{o,t}=q^{(0)}_{o,t}\,m_{o,t},
+    \qquad
+    x_{o,d,t}=q_{o,t}p_{o,d,t}.
+\]
+Here $\alpha$ is the existing global log production scale and $\delta_r$ is a
+regime deviation.  The mapping is supplied by the case adapter through the
+feature array \texttt{time\_period\_index}; the package does not assume names
+such as morning, evening, or peak and does not infer regimes from counts.
+
+For the default sum-to-zero constraint, only $R-1$ deviations are stored and
+the final one is the negative sum of the others:
+\[
+    \sum_{r=1}^{R}\delta_r=0.
+\]
+This keeps $\alpha$ identifiable as the overall production level.  The
+deviation block is ridge-regularized while the global scale is not:
+\[
+    R_{\mathrm{time}}(\bm\delta)
+      =\frac{\lambda}{2}\sum_{r=1}^{R}\delta_r^2,
+    \qquad
+    J=-\ell_{\mathrm{counts}}-\ell_{\mathrm{auxiliary}}
+      +R_{\mathrm{time}}(\bm\delta)+\cdots .
+\]
+The unit weights shown here are the implemented default.  The penalty is in
+the native objective units and is not rescaled by the optimizer's typical
+objective scale.  Its gradient is therefore included in the reported raw and
+Dennis--Schnabel scaled-gradient diagnostics.
+
+The parameter layout contains the stable names
+\texttt{production\_scale}, followed by
+\texttt{production\_time\_deviation[0]}, \ldots .  Setting all deviations to
+zero reproduces the global-production model exactly; nonzero deviations alter
+only the origin--time totals assigned to their mapped regimes, not the
+within-group destination normalization.  A change to this gravity
+specification changes the gravity-model fingerprint and requires a new gravity
+fit checkpoint, but it does not change the routing or fixed-operator artifact
+identity, so those expensive artifacts remain reusable.
+
 \subsection{Declarative Gravity Specifications}
 
 The implementation no longer assumes that the first three parameters exhaust
@@ -89,9 +136,11 @@ strictly positive floor. Production corrections are log multipliers;
 attractiveness and temporal corrections are additive utilities. Categorical
 deviations use either an explicit reference category or an exact sum-to-zero
 expansion. A grouped positive coefficient consists of one positive base and
-normalized log deviations. Origin--time and custom production corrections
-must carry ridge regularization because their dimension can otherwise approach
-the number of production groups.
+normalized log deviations. The implemented time-regime production deviation
+is a separate centered block attached to a global production scale and must
+carry ridge regularization. More general origin--time and custom production
+corrections must also carry ridge regularization because their dimension can
+otherwise approach the number of production groups.
 
 The parameter layout is derived deterministically from the specification. It
 records one named slice per block, raw-to-physical and physical-to-raw

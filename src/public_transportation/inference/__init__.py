@@ -74,6 +74,7 @@ from .gravity import (  # noqa: F401
     GravityAssignedCountDiagnostics,
     GravityChildWarmStart,
     GravityDemandResult,
+    GravityDeviationSpecification,
     GravityEstimationResult,
     GravityEstimatorConfig,
     GravityEstimatorProgress,

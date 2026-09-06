@@ -17,6 +17,7 @@ from .parameters import (
 from .specification import (
     GravityComponentSpecification,
     GravityConstraint,
+    GravityDeviationSpecification,
     GravityEffectScope,
     GravityLikelihoodSpecification,
     GravityModelSpecification,
@@ -137,6 +138,7 @@ def _component(
             "fixed_value",
             "source",
             "parameterization",
+            "deviation",
         },
         context=f"{name} component",
     )
@@ -197,6 +199,77 @@ def _component(
     regularization = GravityRegularization.from_dict(
         dict(_mapping(payload.get("regularization"), context=f"{name}.regularization"))
     )
+    deviation_payload = _mapping(payload.get("deviation"), context=f"{name}.deviation")
+    deviation: GravityDeviationSpecification | None = None
+    if deviation_payload:
+        _reject_unknown(
+            deviation_payload,
+            {
+                "scope",
+                "grouping",
+                "group_count",
+                "constraint",
+                "reference_category",
+                "regularization",
+            },
+            context=f"{name}.deviation",
+        )
+        deviation_scope = GravityEffectScope(
+            str(deviation_payload.get("scope", GravityEffectScope.TIME_PERIOD.value))
+        )
+        deviation_grouping = (
+            None
+            if deviation_payload.get("grouping") is None
+            else str(deviation_payload.get("grouping"))
+        ) or _DEFAULT_GROUPINGS.get(deviation_scope)
+        deviation_count = int(deviation_payload.get("group_count", 0))
+        if deviation_grouping is None:
+            raise ValueError(f"component {name!r} deviation requires a grouping mapping.")
+        if features is not None:
+            values = features.mapping(deviation_grouping)
+            if values is None:
+                raise ValueError(
+                    f"feature mapping {deviation_grouping!r} is required by component "
+                    f"{name!r} deviation."
+                )
+            inferred = np.unique(np.asarray(values)).size
+            if deviation_count not in (0, inferred):
+                raise ValueError(
+                    f"component {name!r} deviation declares group_count={deviation_count}, "
+                    f"but mapping {deviation_grouping!r} contains {inferred} groups."
+                )
+            deviation_count = int(inferred)
+        if deviation_count == 0:
+            raise ValueError(
+                f"component {name!r} deviation requires group_count when features "
+                "are not supplied."
+            )
+        deviation_constraint = GravityConstraint(
+            str(
+                deviation_payload.get(
+                    "constraint", GravityConstraint.SUM_ZERO.value
+                )
+            )
+        )
+        deviation = GravityDeviationSpecification(
+            scope=deviation_scope,
+            grouping=deviation_grouping,
+            group_count=deviation_count,
+            constraint=deviation_constraint,
+            reference_category=(
+                None
+                if deviation_payload.get("reference_category") is None
+                else int(deviation_payload["reference_category"])
+            ),
+            regularization=GravityRegularization.from_dict(
+                dict(
+                    _mapping(
+                        deviation_payload.get("regularization"),
+                        context=f"{name}.deviation.regularization",
+                    )
+                )
+            ),
+        )
     return GravityComponentSpecification(
         name=name,
         scope=scope,
@@ -218,6 +291,7 @@ def _component(
             else float(cast(float, payload["fixed_value"]))
         ),
         source=str(payload.get("source", source)) if payload.get("source", source) is not None else None,
+        deviation=deviation,
     )
 
 

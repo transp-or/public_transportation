@@ -104,6 +104,81 @@ class GravityRegularization:
 
 
 @dataclass(frozen=True, slots=True)
+class GravityDeviationSpecification:
+    """Centered categorical deviations attached to a base component.
+
+    A deviation block is deliberately separate from its base component.  This
+    lets the production scale remain unpenalized while the time-regime
+    deviations carry their own centering and regularization contract.
+    """
+
+    scope: GravityEffectScope
+    grouping: str | None = None
+    group_count: int = 0
+    constraint: GravityConstraint = GravityConstraint.SUM_ZERO
+    reference_category: int | None = None
+    regularization: GravityRegularization = GravityRegularization()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.scope, GravityEffectScope):
+            object.__setattr__(self, "scope", GravityEffectScope(self.scope))
+        if not isinstance(self.constraint, GravityConstraint):
+            object.__setattr__(self, "constraint", GravityConstraint(self.constraint))
+        if self.scope not in _GROUP_SCOPES:
+            raise ValueError("gravity deviations require a grouped scope.")
+        if self.group_count < 2:
+            raise ValueError("gravity deviations require group_count >= 2.")
+        if self.constraint is GravityConstraint.NONE:
+            raise ValueError("gravity deviations require sum_zero or reference constraint.")
+        if self.scope is GravityEffectScope.CUSTOM_GROUP and not self.grouping:
+            raise ValueError("custom-group deviations require an explicit grouping name.")
+        if self.constraint is GravityConstraint.REFERENCE:
+            if self.reference_category is None:
+                raise ValueError("reference deviations require reference_category.")
+            if not 0 <= self.reference_category < self.group_count:
+                raise ValueError("deviation reference_category is outside the declared groups.")
+        elif self.reference_category is not None:
+            raise ValueError("reference_category is valid only with reference constraint.")
+        if not isinstance(self.regularization, GravityRegularization):
+            raise TypeError("deviation regularization must be a GravityRegularization.")
+
+    @property
+    def parameter_count(self) -> int:
+        return self.group_count - 1
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "scope": self.scope.value,
+            "grouping": self.grouping,
+            "group_count": self.group_count,
+            "constraint": self.constraint.value,
+            "reference_category": self.reference_category,
+            "regularization": self.regularization.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(
+        cls, payload: dict[str, object] | None
+    ) -> GravityDeviationSpecification | None:
+        if payload is None:
+            return None
+        return cls(
+            scope=GravityEffectScope(str(payload["scope"])),
+            grouping=None if payload.get("grouping") is None else str(payload["grouping"]),
+            group_count=int(payload.get("group_count", 0)),
+            constraint=GravityConstraint(str(payload.get("constraint", "sum_zero"))),
+            reference_category=(
+                None
+                if payload.get("reference_category") is None
+                else int(payload["reference_category"])
+            ),
+            regularization=GravityRegularization.from_dict(
+                payload.get("regularization")  # type: ignore[arg-type]
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class GravityComponentSpecification:
     """Complete declarative contract for one model component."""
 
@@ -117,6 +192,7 @@ class GravityComponentSpecification:
     regularization: GravityRegularization = GravityRegularization()
     fixed_value: float | None = None
     source: str | None = None
+    deviation: GravityDeviationSpecification | None = None
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -131,6 +207,10 @@ class GravityComponentSpecification:
                 object.__setattr__(self, field_name, enum_type(value))
         if not isinstance(self.regularization, GravityRegularization):
             raise TypeError("regularization must be a GravityRegularization.")
+        if self.deviation is not None and not isinstance(
+            self.deviation, GravityDeviationSpecification
+        ):
+            raise TypeError("deviation must be a GravityDeviationSpecification.")
         grouped = self.scope in _GROUP_SCOPES
         basis = self.scope in _BASIS_SCOPES
         if grouped:
@@ -176,6 +256,8 @@ class GravityComponentSpecification:
             raise ValueError("fixed_value must be finite.")
         if self.scope is GravityEffectScope.NONE and self.fixed_value not in (None, 0):
             raise ValueError("scope 'none' cannot carry a nonzero fixed value.")
+        if self.deviation is not None and self.scope is not GravityEffectScope.GLOBAL:
+            raise ValueError("component deviations require a global base component.")
 
     @property
     def grouped(self) -> bool:
@@ -192,7 +274,7 @@ class GravityComponentSpecification:
         if self.scope in (GravityEffectScope.NONE, GravityEffectScope.FIXED):
             return 0
         if self.scope is GravityEffectScope.GLOBAL:
-            return 1
+            return 1 + (0 if self.deviation is None else self.deviation.parameter_count)
         if self.scope is GravityEffectScope.SMOOTH_BASIS:
             return self.group_count
         if self.parameterization is GravityParameterization.POSITIVE:
@@ -200,7 +282,7 @@ class GravityComponentSpecification:
         return self.deviation_count
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "name": self.name,
             "scope": self.scope.value,
             "parameterization": self.parameterization.value,
@@ -212,6 +294,9 @@ class GravityComponentSpecification:
             "fixed_value": self.fixed_value,
             "source": self.source,
         }
+        if self.deviation is not None:
+            payload["deviation"] = self.deviation.to_dict()
+        return payload
 
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> GravityComponentSpecification:
@@ -240,6 +325,9 @@ class GravityComponentSpecification:
                 else float(payload["fixed_value"])
             ),
             source=None if payload.get("source") is None else str(payload["source"]),
+            deviation=GravityDeviationSpecification.from_dict(
+                payload.get("deviation")  # type: ignore[arg-type]
+            ),
         )
 
 
@@ -508,6 +596,31 @@ class GravityModelSpecification:
                 raise ValueError(
                     "production requires source 'origin_time_totals'."
                 )
+            if component.deviation is not None:
+                if component.name != "production":
+                    raise ValueError(
+                        "deviation blocks are currently supported only for production."
+                    )
+                if component.scope is not GravityEffectScope.GLOBAL:
+                    raise ValueError(
+                        "production deviations require a global production scale."
+                    )
+                if component.parameterization is not GravityParameterization.LOG_MULTIPLIER:
+                    raise ValueError(
+                        "production deviations require log_multiplier production."
+                    )
+                if (
+                    component.deviation.regularization.kind
+                    is not GravityRegularizationType.RIDGE
+                ):
+                    raise ValueError(
+                        "production deviations require ridge regularization."
+                    )
+                if component.regularization.kind is not GravityRegularizationType.NONE:
+                    raise ValueError(
+                        "the global production scale is unregularized; attach ridge "
+                        "regularization to the deviation block."
+                    )
         temporal = self.component("temporal")
         if temporal.scope is GravityEffectScope.SMOOTH_BASIS:
             if self.time.smooth_basis_name is None:
@@ -687,6 +800,11 @@ class GravityModelSpecification:
                 names.append("dispersion")
             elif component.name == "production" and component.scope is GravityEffectScope.GLOBAL:
                 names.append("production_scale")
+                if component.deviation is not None:
+                    names.extend(
+                        f"production_time_deviation[{index}]"
+                        for index in range(component.deviation.parameter_count)
+                    )
             elif component.parameterization is GravityParameterization.POSITIVE:
                 names.append(
                     {
@@ -724,14 +842,22 @@ class GravityModelSpecification:
             GravityEffectScope.ZONE_PAIR: "zone_pair_index",
         }
         for component in self.active_components:
-            if not component.grouped and component.scope is not GravityEffectScope.SMOOTH_BASIS:
-                continue
-            mapping = component.grouping or default.get(component.scope)
-            if mapping is None:
-                raise ValueError(
-                    f"component {component.name!r} has no feature grouping."
+            if component.grouped or component.scope is GravityEffectScope.SMOOTH_BASIS:
+                mapping = component.grouping or default.get(component.scope)
+                if mapping is None:
+                    raise ValueError(
+                        f"component {component.name!r} has no feature grouping."
+                    )
+                required.append(mapping)
+            if component.deviation is not None:
+                mapping = component.deviation.grouping or default.get(
+                    component.deviation.scope
                 )
-            required.append(mapping)
+                if mapping is None:
+                    raise ValueError(
+                        f"component {component.name!r} deviation has no feature grouping."
+                    )
+                required.append(mapping)
         return tuple(dict.fromkeys(required))
 
     def identifiability_warnings(self) -> tuple[str, ...]:

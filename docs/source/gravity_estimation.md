@@ -39,8 +39,10 @@ The minimal specification estimates three positive quantities:
 The production total correction is disabled. Destination attractiveness is a
 fixed input, not an estimated effect. Waiting-time, spatial, temporal, and
 residual-demand effects are absent. The specification contains explicit scope
-slots for those later relaxations but Phase 1 rejects them rather than silently
-ignoring them.
+slots for extensions, but the minimal specification keeps them disabled rather
+than silently ignoring them. An optional time-regime production deviation is
+documented below; it is a separate, explicitly declared specification and is
+not enabled by the minimal parent.
 
 `GravityParameterLayout` maps a three-element unconstrained optimizer vector to
 strictly positive physical parameters using stable softplus transformations.
@@ -319,6 +321,53 @@ overdispersion. These flags do not establish causality and never alter the
 model. Holdout validation and relaxation recommendations remain future phases.
 
 ## Phase 5: atomic centered relaxations
+
+### Time-regime production deviations
+
+The package also supports a low-dimensional correction to the externally
+prepared origin--time production totals.  A case supplies a mapping
+`time_period_index` from detailed departure bins to `R` case-defined regimes
+and declares a `GravityDeviationSpecification` attached to the global
+production component:
+
+```python
+production = GravityComponentSpecification(
+    name="production",
+    scope=GravityEffectScope.GLOBAL,
+    parameterization=GravityParameterization.LOG_MULTIPLIER,
+    source="origin_time_totals",
+    deviation=GravityDeviationSpecification(
+        scope=GravityEffectScope.TIME_PERIOD,
+        grouping="time_period_index",
+        group_count=number_of_regimes,
+        constraint=GravityConstraint.SUM_ZERO,
+        regularization=GravityRegularization(
+            GravityRegularizationType.RIDGE,
+            ridge_strength,
+        ),
+    ),
+)
+```
+
+The production multiplier is
+
+```text
+log multiplier(o, t) = alpha + delta[regime(t)]
+```
+
+with `sum(delta) = 0`.  The layout therefore stores `R - 1` deviation
+coordinates in addition to the unpenalized global scale, using stable names
+`production_scale` and `production_time_deviation[...]`.  The ridge penalty
+applies to the deviation block only and is expressed in native objective
+units.  Zero deviations reproduce the minimal model exactly; nonzero values
+change origin--time totals, not the destination softmax within each group.
+
+The adapter must validate that regime labels are contiguous and constant
+within each origin--time group, and must record the mapping and ridge strength
+in the model specification and fit manifest.  The package does not infer
+regimes or attach semantic names to them.  Changing this gravity specification
+requires a new gravity fit checkpoint and model fingerprint, but does not
+invalidate routing or fixed measurement-operator artifacts.
 
 Three deliberately small child models can now be added one at a time to the
 minimal parent. Destination-zone deviations add to log attractiveness; broad

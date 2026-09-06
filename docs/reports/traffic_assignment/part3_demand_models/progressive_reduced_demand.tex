@@ -21,6 +21,19 @@ residuals can otherwise be aliased into every spatial component.  Origin-group
 effects modify productions, whereas destination-group effects modify relative
 attractiveness; they are not interchangeable.
 
+The current production implementation includes a deliberately low-dimensional
+time-regime option.  For a case-supplied mapping $r(t)$ from detailed bins to
+regimes, it uses
+\[
+    \log P_{o,t}=\log P^{(0)}_{o,t}+\alpha+\delta_{r(t)},
+    \qquad \sum_r\delta_r=0,
+\]
+with a ridge penalty on $\bm\delta$ only.  Thus the global scale $\alpha$ and
+the centered regime deviations are separate parameter blocks.  This option
+changes origin--time totals rather than adding a utility term that would cancel
+within the destination softmax.  The case adapter supplies the regime mapping;
+the package does not infer or name the regimes.
+
 Automatic regions are deterministic nested partitions of normalized supply,
 topology, and measurement-observability signatures.  They are model-resolution
 regions, not socioeconomic zones.  The implementation adapts the automated
@@ -60,7 +73,8 @@ measurement records.
 \hline
 Component & Added parameters & Purpose & Cost & Risk & Diagnostic trigger\\
 \hline
-Period effects & $T-1$ per block & Temporal heterogeneity & Low & Reference/centering & Residuals by period\\
+Period effects & $T-1$ per block & Temporal utility heterogeneity & Low & Reference/centering & Residuals by period\\
+Time-regime production & $R-1$ & Production heterogeneity by departure regime & Low & Sum-to-zero/ridge & Origin--time mass residuals\\
 Origin groups & $G_O-1$ & Production heterogeneity & Low & Weakly observed origins & Origin-group residuals\\
 Destination groups & $G_D-1$ & Attraction heterogeneity & Low & Attraction confounding & Destination residuals\\
 Rank $r$ & $r(G_O+G_D)$ & Residual OD association & Moderate & Scale and rotation & OD pattern after margins\\

@@ -235,6 +235,23 @@ def gravity_demand_numpy_reference(
         log_multipliers = np.full(
             features.num_origin_time_groups, scalar_or_base("production")
         )
+        if production.deviation is not None:
+            deviation_block = parameter_layout.deviation_block("production")
+            assert deviation_block is not None and deviation_block.mapping is not None
+            deviation_values = deviations(deviation_block.component)
+            mapping = features.mapping(deviation_block.mapping)
+            assert mapping is not None
+            per_cell = deviation_values[np.asarray(mapping)]
+            log_multipliers = np.zeros(
+                features.num_origin_time_groups, dtype=raw.dtype
+            )
+            for group in range(features.num_origin_time_groups):
+                positions = np.flatnonzero(
+                    features.origin_time_group_index == group
+                )
+                log_multipliers[group] = scalar_or_base("production") + float(
+                    np.mean(per_cell[positions])
+                )
     else:
         per_cell = np.asarray(cell_effect("production"))
         log_multipliers = np.zeros(features.num_origin_time_groups, dtype=raw.dtype)
