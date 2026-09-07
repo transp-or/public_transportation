@@ -920,3 +920,205 @@ BCOO indices and data directly, avoiding the general node-by-measurement
 intermediate. The bounded run covers minimal estimation, adequacy, recommendations,
 an exact child warm start, lineage, and grouped journey holdout. Its iteration-limited
 metrics validate integration and are not converged scientific estimates.
+
+## OD-cell information and identifiability diagnostics
+
+After a fit, `compute_gravity_od_identifiability` provides an optional local
+information diagnostic for every canonical full-OD cell. It is deliberately a
+post-estimation operation: it evaluates derivatives at the supplied result and
+does not refit the model, alter the objective, or change the routing operator.
+The calculation is chunked over measurement and OD cells, so it does not
+materialize a complete measurement-by-OD Jacobian.
+
+For the calibration rows, the count contribution is the Gauss--Newton
+curvature
+
+```text
+H_counts = J_mu^T W J_mu,
+```
+
+with `W = 1 / max(mu, mean_floor)` for Poisson observations and
+`W = r / (max(mu, mean_floor) * (r + max(mu, mean_floor)))` for a
+negative-binomial likelihood with dispersion `r`. The existing parameter
+regularization is differentiated separately as `H_reg`. If optional observed
+data channels (for example, a trip-attribute histogram) are enabled, their
+curvature is retained as a third, separate contribution rather than being
+folded into the count share.
+
+The symmetric total Hessian is eigendecomposed. Eigenvalues below
+`max(eigenvalue_absolute_tolerance,
+eigenvalue_relative_tolerance * max(abs(eigenvalues)))` are discarded and the
+remaining eigenvalues define a pseudoinverse. For a free OD cell `j`, let
+`g_j` be the derivative of its demand with respect to the raw fitted
+parameters. The local variance proxy is `g_j^T H^+ g_j`; each information
+share is the corresponding component quadratic form divided by this proxy.
+Shares are therefore local linearized diagnostics of curvature allocation, not
+probabilities, posterior probabilities, or standard errors. All free OD cells
+remain coupled through the shared parameters and the origin-time normalization.
+
+The result classifies free cells as `count_dominated`, `assumption_dominated`,
+`auxiliary_data_dominated`, `mixed_information`, or
+`not_locally_identifiable`. Cells fixed by the input or structural-zero policy
+have null shares and variance and are classified as `fixed_by_policy` with
+reason `fixed_input_or_structural_zero_policy`. Small floating-point excursions
+outside `[0, 1]` are clipped; larger violations are retained as a diagnostic
+reason rather than hidden.
+
+```python
+from public_transportation.inference.gravity import (
+    GravityIdentifiabilityConfig,
+    compute_gravity_od_identifiability,
+    write_gravity_od_identifiability,
+)
+
+diagnostic = compute_gravity_od_identifiability(
+    problem=problem,
+    result=fit_result,
+    config=GravityIdentifiabilityConfig(
+        measurement_chunk_size=4096,
+        od_chunk_size=4096,
+    ),
+)
+write_gravity_od_identifiability(diagnostic, results / "identifiability")
+```
+
+Persistence consists of `identifiability.json` metadata and a compressed
+`identifiability.npz` numerical payload. The metadata records schema version,
+artifact/model/layout provenance, effective Hessian rank and dimension,
+discarded eigenvalues, classification counts, configuration, array names, and
+array checksums. Readers verify dimensions, checksums, and any supplied
+provenance before returning the immutable arrays.
+
+The detailed report can receive the diagnostic through its optional
+`identifiability=` argument. It adds the six diagnostic columns to
+`full_od.csv` while preserving the existing `inference_score` and
+`inference_basis` fields. `report.json` contains a compact identifiability
+summary and classification counts. If no diagnostic is supplied, reports state
+exactly:
+
+```text
+OD identifiability diagnostics were not available; inference_score remains only a structural fixed/free indicator.
+```
+
+Set `require_identifiability=True` when a report is not acceptable without the
+diagnostic. A supplied diagnostic whose model, operator/layout provenance,
+parameter dimension, array lengths, or fitted-vector fingerprints disagree
+with the report inputs is rejected before the output directory is created.
+
+## Viewer-ready gravity-result bundles
+
+The public package can export a completed fit, validation report, OD table,
+measurement diagnostics, network snapshot, and exact model specification as a
+portable `gravity_viewer_bundle_v1`. The bundle is a data contract for an
+independent graphical application; the public package does not install or
+implement a GUI and bundle reading never activates routing, evaluates the
+objective, or calls an optimizer.
+
+Use the report and typed fit/validation results that have already been
+produced:
+
+```python
+from public_transportation.inference.gravity import write_gravity_viewer_bundle
+
+bundle = write_gravity_viewer_bundle(
+    output_directory=results / "viewer_bundle",
+    fit_result=fit_result,
+    validation_result=validation_report.adequacy,
+    report=detailed_report,
+    identifiability=identifiability,       # optional
+    network_files={                         # optional, explicit paths
+        "stops.csv": network_dir / "stops.csv",
+        "lines.csv": network_dir / "lines.csv",
+        "trips.csv": network_dir / "trips.csv",
+        "stop_times.csv": network_dir / "stop_times.csv",
+    },
+    metadata={
+        "time_zone": "Europe/Zurich",
+        "coordinate_system": "latitude_longitude",
+        "x_column": "lon",
+        "y_column": "lat",
+    },
+)
+```
+
+The fit result is the authoritative source for the exact model specification.
+The writer validates it through `GravityModelSpecification`, writes it to
+`model_specification.json`, and records its fingerprint in both that file and
+`bundle_manifest.json`. If a fit result does not carry a specification, the
+writer stops instead of creating a viewer bundle that cannot explain the model.
+An explicit `model_specification=` argument may be supplied when restoring a
+result from an older persistence format. It must have the same fingerprint as
+the fitted result when that fingerprint is present.
+
+The resulting directory contains:
+
+```text
+gravity_viewer_bundle_v1/
+  bundle_manifest.json
+  model_specification.json
+  report.json
+  executive_summary.md
+  report.md                         # when present in the source report
+  full_od.csv
+  predicted_measurements.csv
+  residuals.csv
+  grouped_residuals.csv
+  parameters.csv
+  identifiability/                  # only when a diagnostic is supplied
+    identifiability.json
+    identifiability.npz
+  network/                          # only when an explicit snapshot is supplied
+    stops.csv
+    lines.csv
+    trips.csv
+    stop_times.csv
+```
+
+`full_od.csv` retains the complete canonical OD schema, including structural
+fixed/free status and the local identifiability columns. The latter are
+linearized information diagnostics, not probabilities, standard errors, or
+causal attribution. If no diagnostic is supplied, the bundle records
+`identifiability.available = false` and preserves the message that
+`inference_score` is only a structural fixed/free indicator. Pass
+`require_identifiability=True` to reject such a bundle.
+
+The manifest records SHA-256 checksums, file sizes, row counts, fit,
+validation, report, and identifiability provenance, all canonical layout and
+operator fingerprints, package revision, model-specification fingerprint,
+time-zone convention, and coordinate convention. The default coordinate
+convention is latitude/longitude with `lon` as x and `lat` as y. A projected
+coordinate system must be supplied explicitly; the package never infers or
+claims one. Network snapshots require `stops.csv` with
+`stop_id,name,lat,lon`; report stop IDs and available line/trip references are
+checked against that snapshot. When route geometries are unavailable, a GUI
+may connect consecutive stops to form an approximate display.
+
+Read and validate a bundle on another computer without the original case
+directory:
+
+```python
+from public_transportation.inference.gravity import read_gravity_viewer_bundle
+
+bundle = read_gravity_viewer_bundle("gravity_viewer_bundle_v1")
+bundle.validate()  # safe to repeat before a viewer session
+specification = bundle.model_specification
+od_for_peak = bundle.query_od(
+    departure_time_bin="am",
+    minimum_flow=1.0,
+    top_n=100,
+)
+for chunk in bundle.iter_table("full_od.csv", chunksize=100_000):
+    consume(chunk)
+```
+
+The reader verifies every checksum, required file, row count, model and
+report provenance, model-specification fingerprint, identifiability payload,
+and network joins. Mismatches identify the field, conflicting values, and
+affected file; the reader never repairs or overwrites data. `iter_table` and
+`query_od` use bounded pandas chunks for large OD tables, and support filtering
+by origin, destination, time bin, identifiability class, minimum flow, and
+top-N demand. `aggregate_measurements` provides a chunked observed/modelled
+summary by line, stop, or time-period columns. The optional
+`od_measurement_links.csv` influence artifact is not generated by the core
+writer; if a viewer needs it, it must be supplied and labelled as a local
+influence diagnostic rather than a unique explanation of an OD cell.

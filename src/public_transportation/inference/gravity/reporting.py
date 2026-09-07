@@ -14,6 +14,7 @@ import numpy as np
 from public_transportation.inference.od_parameter_layout import ODParameterLayout
 
 from .estimator import GravityEstimationResult
+from .identifiability import GravityODIdentifiability
 from .objective import GravityLikelihood
 from .validation import (
     GravityAdequacyConfig,
@@ -75,6 +76,12 @@ _OD_FIELDS = (
     "fixed_value",
     "prior_demand",
     "estimated_to_prior_ratio",
+    "count_information_share",
+    "regularization_information_share",
+    "auxiliary_information_share",
+    "local_information_variance",
+    "identifiability_class",
+    "identifiability_reason",
 )
 _MISSING = object()
 _PREDICTION_RTOL = 5.0e-6
@@ -314,6 +321,7 @@ class GravityDetailedReport:
     fixed_od_cells: int
     structural_zero_cells: int
     executive_messages: tuple[str, ...]
+    identifiability: GravityODIdentifiability | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -451,7 +459,80 @@ def _parameter_rows(result: GravityEstimationResult) -> list[dict[str, object]]:
     ]
 
 
-def _od_rows(result: GravityEstimationResult, layout: ODParameterLayout) -> list[dict[str, object]]:
+def _validate_identifiability_for_report(
+    diagnostic: GravityODIdentifiability,
+    *,
+    result: GravityEstimationResult,
+    od_layout: ODParameterLayout,
+    expected_provenance: Mapping[str, object] | None = None,
+) -> None:
+    """Validate a diagnostic before report output is created."""
+    if not isinstance(diagnostic, GravityODIdentifiability):
+        raise TypeError("identifiability must be GravityODIdentifiability or None.")
+    if diagnostic.num_cells != od_layout.num_od_total:
+        raise ValueError(
+            "identifiability length does not match the OD layout: "
+            f"{diagnostic.num_cells} != {od_layout.num_od_total}."
+        )
+    expected_fixed = np.ones(od_layout.num_od_total, dtype=bool)
+    expected_fixed[np.asarray(od_layout.free_od_indices, dtype=np.int64)] = False
+    actual_fixed = np.asarray(diagnostic.classification) == "fixed_by_policy"
+    if not np.array_equal(actual_fixed, expected_fixed):
+        raise ValueError(
+            "identifiability fixed/free classification does not match the OD layout."
+        )
+    if diagnostic.total_hessian_dimension != np.asarray(result.raw_parameters).size:
+        raise ValueError(
+            "identifiability parameter dimension does not match the fitted result."
+        )
+    provenance = diagnostic.provenance
+    if not isinstance(provenance, Mapping):
+        raise ValueError("identifiability provenance is missing or invalid.")
+    diagnostic_layout = provenance.get("od_layout_fingerprint")
+    allowed_layouts = {od_layout.fingerprint}
+    compact_layout = provenance.get("compact_layout_fingerprint")
+    if compact_layout is not None:
+        allowed_layouts.add(compact_layout)
+    if diagnostic_layout is not None and diagnostic_layout not in allowed_layouts:
+        raise ValueError("identifiability OD-layout fingerprint does not match the report layout.")
+    if provenance.get("model_fingerprint") != result.model_fingerprint:
+        raise ValueError("identifiability model_fingerprint does not match the fit result.")
+    raw_fingerprint = provenance.get("raw_parameters_fingerprint")
+    if raw_fingerprint is not None and raw_fingerprint != _vector_fingerprint(
+        result.raw_parameters
+    ):
+        raise ValueError("identifiability raw-parameter fingerprint does not match the fit result.")
+    prediction_fingerprint = provenance.get("predicted_measurements_fingerprint")
+    if prediction_fingerprint is not None and prediction_fingerprint != _vector_fingerprint(
+        result.predicted_measurements
+    ):
+        raise ValueError(
+            "identifiability prediction fingerprint does not match the fit result."
+        )
+    if expected_provenance is not None:
+        if not isinstance(expected_provenance, Mapping):
+            raise TypeError("expected_provenance must be a mapping or None.")
+        for field in (*GRAVITY_REPORT_PROVENANCE_FIELDS, "model_fingerprint"):
+            expected = expected_provenance.get(field, _MISSING)
+            if expected is _MISSING:
+                continue
+            actual = provenance.get(field, _MISSING)
+            if actual is _MISSING or actual != expected:
+                raise ValueError(
+                    f"identifiability provenance field {field!r} differs from the fit/validation provenance."
+                )
+
+
+def _vector_fingerprint(value: object) -> str:
+    array = np.ascontiguousarray(np.asarray(value))
+    return hashlib.sha256(array.tobytes()).hexdigest()
+
+
+def _od_rows(
+    result: GravityEstimationResult,
+    layout: ODParameterLayout,
+    identifiability: GravityODIdentifiability | None = None,
+) -> list[dict[str, object]]:
     demand = np.asarray(result.full_od_demand, dtype=np.float64)
     if demand.shape != (layout.num_od_total,) or np.any(~np.isfinite(demand)):
         raise ValueError("full_od_demand does not match the OD parameter layout.")
@@ -462,6 +543,55 @@ def _od_rows(result: GravityEstimationResult, layout: ODParameterLayout) -> list
     for index, key in enumerate(layout.od_keys):
         origin, destination, time_period = key
         value = float(demand[index])
+        if identifiability is None:
+            identifiability_values: dict[str, object] = {
+                "count_information_share": "",
+                "regularization_information_share": "",
+                "auxiliary_information_share": "",
+                "local_information_variance": "",
+                "identifiability_class": "",
+                "identifiability_reason": "",
+            }
+        elif index in free_indices:
+            count_share_value = identifiability.count_information_share[index]
+            regularization_share_value = identifiability.regularization_information_share[
+                index
+            ]
+            variance_value = identifiability.local_information_variance[index]
+            auxiliary_share_value = (
+                None
+                if identifiability.auxiliary_information_share is None
+                else identifiability.auxiliary_information_share[index]
+            )
+            identifiability_values = {
+                "count_information_share": (
+                    "" if np.isnan(count_share_value) else float(count_share_value)
+                ),
+                "regularization_information_share": (
+                    ""
+                    if np.isnan(regularization_share_value)
+                    else float(regularization_share_value)
+                ),
+                "auxiliary_information_share": (
+                    ""
+                    if auxiliary_share_value is None or np.isnan(auxiliary_share_value)
+                    else float(auxiliary_share_value)
+                ),
+                "local_information_variance": (
+                    "" if np.isnan(variance_value) else float(variance_value)
+                ),
+                "identifiability_class": str(identifiability.classification[index]),
+                "identifiability_reason": str(identifiability.diagnostic_reason[index]),
+            }
+        else:
+            identifiability_values = {
+                "count_information_share": "",
+                "regularization_information_share": "",
+                "auxiliary_information_share": "",
+                "local_information_variance": "",
+                "identifiability_class": "fixed_by_policy",
+                "identifiability_reason": "fixed_input_or_structural_zero_policy",
+            }
         if index in free_indices:
             baseline = float(baselines[index])
             rows.append(
@@ -477,6 +607,7 @@ def _od_rows(result: GravityEstimationResult, layout: ODParameterLayout) -> list
                     "fixed_value": "",
                     "prior_demand": baseline,
                     "estimated_to_prior_ratio": value / baseline,
+                    **identifiability_values,
                 }
             )
         else:
@@ -494,6 +625,7 @@ def _od_rows(result: GravityEstimationResult, layout: ODParameterLayout) -> list
                     "fixed_value": fixed,
                     "prior_demand": "",
                     "estimated_to_prior_ratio": "",
+                    **identifiability_values,
                 }
             )
     return rows
@@ -534,6 +666,50 @@ def _adequacy_json(report: GravityAdequacyReport) -> dict[str, object]:
     }
 
 
+def _identifiability_json(
+    diagnostic: GravityODIdentifiability | None,
+) -> dict[str, object]:
+    """Return a compact report summary without duplicating large arrays."""
+    if diagnostic is None:
+        return {
+            "available": False,
+            "message": (
+                "OD identifiability diagnostics were not available; inference_score "
+                "remains only a structural fixed/free indicator."
+            ),
+        }
+    provenance = dict(diagnostic.provenance)
+    return {
+        "available": True,
+        "schema_version": 1,
+        "artifact_identity_fingerprint": provenance.get(
+            "artifact_identity_fingerprint"
+        ),
+        "diagnostic_artifact": provenance.get(
+            "diagnostic_artifact", provenance.get("diagnostic_artifact_fingerprint")
+        ),
+        "od_layout_fingerprint": provenance.get("od_layout_fingerprint"),
+        "model_fingerprint": provenance.get("model_fingerprint"),
+        "effective_hessian_rank": diagnostic.effective_hessian_rank,
+        "total_hessian_dimension": diagnostic.total_hessian_dimension,
+        "discarded_eigenvalues": diagnostic.discarded_eigenvalues,
+        "fixed_cells": diagnostic.fixed_cells,
+        "free_cells": diagnostic.free_cells,
+        "classification_counts": diagnostic.classification_counts,
+        "config": asdict(diagnostic.config),
+        "provenance": provenance,
+        "count_share_quantiles": diagnostic._quantiles(
+            diagnostic.count_information_share
+        ),
+        "regularization_share_quantiles": diagnostic._quantiles(
+            diagnostic.regularization_information_share
+        ),
+        "auxiliary_share_quantiles": diagnostic._quantiles(
+            diagnostic.auxiliary_information_share
+        ),
+    }
+
+
 def _executive_messages(
     *,
     result: GravityEstimationResult,
@@ -541,6 +717,7 @@ def _executive_messages(
     estimated_od_cells: int,
     fixed_od_cells: int,
     structural_zero_cells: int,
+    identifiability: GravityODIdentifiability | None = None,
 ) -> tuple[str, ...]:
     messages = [
         (
@@ -567,6 +744,35 @@ def _executive_messages(
             f"{threshold_three} observations have an absolute standardized residual above 3."
         )
     messages.extend(adequacy.findings.messages)
+    if identifiability is None:
+        messages.append(
+            "OD identifiability diagnostics were not available; inference_score "
+            "remains only a structural fixed/free indicator."
+        )
+    else:
+        counts = identifiability.classification_counts
+        denominator = max(identifiability.free_cells, 1)
+        labels = (
+            ("count-dominated", "count_dominated"),
+            ("assumption-dominated", "assumption_dominated"),
+            ("auxiliary-data-dominated", "auxiliary_data_dominated"),
+            ("mixed", "mixed_information"),
+            ("not locally identifiable", "not_locally_identifiable"),
+        )
+        percentages = ", ".join(
+            f"{label} {100.0 * counts.get(key, 0) / denominator:.1f}%"
+            for label, key in labels
+        )
+        messages.append(
+            f"Local OD identifiability across {identifiability.free_cells} free cells: "
+            + percentages
+            + "."
+        )
+        messages.append(
+            "Identifiability shares are local linearized information diagnostics, "
+            "not probabilities, posterior probabilities, or standard errors; all "
+            "free OD cells remain jointly coupled through the fitted model."
+        )
     messages.append(
         "These are full-data adequacy diagnostics, not an independent holdout validation."
     )
@@ -648,6 +854,22 @@ def _detailed_markdown(
         "",
     ]
     lines.extend(f"- {message}" for message in summary["executive_messages"])
+    ident_summary = summary.get("identifiability")
+    if isinstance(ident_summary, Mapping):
+        lines.extend(["", "## OD identifiability", ""])
+        if not ident_summary.get("available", False):
+            lines.append(str(ident_summary.get("message", "")))
+        else:
+            lines.append(
+                "The OD information shares are local linearized diagnostics. They "
+                "are not probabilities, posterior probabilities, or standard errors."
+            )
+            lines.append("")
+            lines.append(
+                "Classification counts: "
+                + json.dumps(ident_summary.get("classification_counts", {}), sort_keys=True)
+                + "."
+            )
     lines.extend(
         [
             "",
@@ -677,6 +899,8 @@ def write_gravity_detailed_report(
     adequacy_config: GravityAdequacyConfig = GravityAdequacyConfig(),
     provenance: Mapping[str, object] | None = None,
     expected_provenance: Mapping[str, object] | None = None,
+    identifiability: GravityODIdentifiability | None = None,
+    require_identifiability: bool = False,
     force: bool = False,
 ) -> GravityDetailedReport:
     """Write CSV, JSON, Markdown, and executive reports for a gravity fit.
@@ -712,6 +936,17 @@ def write_gravity_detailed_report(
         )
     if expected_provenance is not None:
         _validate_expected_provenance(provenance, expected_provenance)
+    if require_identifiability and identifiability is None:
+        raise ValueError(
+            "OD identifiability diagnostics are required but were not supplied."
+        )
+    if identifiability is not None:
+        _validate_identifiability_for_report(
+            identifiability,
+            result=result,
+            od_layout=od_layout,
+            expected_provenance=expected_provenance,
+        )
 
     output = Path(output_directory).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -736,7 +971,7 @@ def write_gravity_detailed_report(
         config=adequacy_config,
     )
 
-    od_rows = _od_rows(result, od_layout)
+    od_rows = _od_rows(result, od_layout, identifiability)
     measurement_rows = _metadata_rows(observed, selected_metadata)
     residual = adequacy.residual
     standardized = adequacy.standardized_nb_residual
@@ -806,6 +1041,7 @@ def write_gravity_detailed_report(
         estimated_od_cells=free_cells,
         fixed_od_cells=fixed_cells,
         structural_zero_cells=structural_zero_cells,
+        identifiability=identifiability,
     )
     summary: dict[str, object] = {
         "schema_version": GRAVITY_DETAILED_REPORT_SCHEMA_VERSION,
@@ -833,6 +1069,7 @@ def write_gravity_detailed_report(
             },
         },
         "adequacy": _adequacy_json(adequacy),
+        "identifiability": _identifiability_json(identifiability),
         "executive_messages": list(executive_messages),
         "provenance": dict(provenance or {}),
         "files": {name: str(output / name) for name in _REPORT_FILES},
@@ -846,7 +1083,17 @@ def write_gravity_detailed_report(
         output / "executive_summary.md",
         _executive_markdown(result=result, adequacy=adequacy, messages=executive_messages),
     )
-    _write_text(output / "report.md", _detailed_markdown(result=result, adequacy=adequacy, summary={"executive_messages": executive_messages}))
+    _write_text(
+        output / "report.md",
+        _detailed_markdown(
+            result=result,
+            adequacy=adequacy,
+            summary={
+                "executive_messages": executive_messages,
+                "identifiability": _identifiability_json(identifiability),
+            },
+        ),
+    )
     return GravityDetailedReport(
         GRAVITY_DETAILED_REPORT_SCHEMA_VERSION,
         report_hash,
@@ -857,6 +1104,7 @@ def write_gravity_detailed_report(
         fixed_cells,
         structural_zero_cells,
         executive_messages,
+        identifiability,
     )
 
 
@@ -870,6 +1118,8 @@ def write_persisted_gravity_detailed_report(
     likelihood: GravityLikelihood | str = GravityLikelihood.NEGATIVE_BINOMIAL,
     output_directory: str | Path,
     adequacy_config: GravityAdequacyConfig = GravityAdequacyConfig(),
+    identifiability: GravityODIdentifiability | None = None,
+    require_identifiability: bool = False,
     force: bool = False,
 ) -> GravityDetailedReport:
     """Generate a detailed report using only persisted fit/validation data.
@@ -917,5 +1167,7 @@ def write_persisted_gravity_detailed_report(
         adequacy_config=adequacy_config,
         provenance=report_provenance,
         expected_provenance=persisted_provenance,
+        identifiability=identifiability,
+        require_identifiability=require_identifiability,
         force=force,
     )

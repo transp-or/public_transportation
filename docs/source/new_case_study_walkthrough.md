@@ -4027,3 +4027,74 @@ Do not silently repair inputs, drop unsupported observations, substitute local
 package code, or mix artifacts across fingerprints. Record the failing command,
 revision, configuration, traceback, and durable artifact state before applying
 a narrowly scoped correction.
+
+## 23. Exporting results for an independent graphical viewer
+
+The public package does not implement the graphical application. After a
+completed fit, validation report, and (when required) OD identifiability
+diagnostic, the case owner may export a self-contained
+`gravity_viewer_bundle_v1`. The bundle is portable: the viewer needs only the
+bundle directory and does not need the original case root, routing cache, or
+assignment operator.
+
+```python
+from public_transportation.inference.gravity import write_gravity_viewer_bundle
+
+write_gravity_viewer_bundle(
+    output_directory=results_root / "viewer_bundle",
+    fit_result=fit_result,
+    validation_result=validation_report.adequacy,
+    report=detailed_report,
+    identifiability=identifiability,  # optional, but recommended
+    network_files={
+        "stops.csv": network_dir / "stops.csv",
+        "lines.csv": network_dir / "lines.csv",
+        "trips.csv": network_dir / "trips.csv",
+        "stop_times.csv": network_dir / "stop_times.csv",
+    },
+    metadata={
+        "time_zone": "Europe/Zurich",
+        "coordinate_system": "latitude_longitude",
+        "x_column": "lon",
+        "y_column": "lat",
+    },
+)
+```
+
+The writer records the exact gravity model specification carried by the fit
+in `model_specification.json`, together with its specification fingerprint.
+This includes the likelihood family, component scopes, parameterizations,
+constraints, regularization, time-bin definition, and model schema. A bundle
+cannot be written from a fit that lacks an exact specification. The GUI must
+display this file and the fingerprint as the authoritative model description;
+it must not infer the model from plotted values or from the case directory.
+
+The bundle also contains `bundle_manifest.json`, the existing report tables
+(`full_od.csv`, `predicted_measurements.csv`, `residuals.csv`,
+`grouped_residuals.csv`, and `parameters.csv`), the report summaries, and an
+optional `identifiability/` directory. The manifest stores checksums, file
+sizes, row counts, all fit/validation/report/diagnostic provenance, operator
+and layout fingerprints, package revision, time zone, and coordinate
+convention. Network files are copied only from explicit paths supplied by the
+case owner; `stops.csv` must contain `stop_id,name,lat,lon`, and all report
+stop/line/trip references are checked against the snapshot.
+
+The independent viewer loads and validates the bundle without recomputing the
+model:
+
+```python
+from public_transportation.inference.gravity import read_gravity_viewer_bundle
+
+bundle = read_gravity_viewer_bundle(results_root / "viewer_bundle")
+bundle.validate()
+specification = bundle.model_specification
+od_subset = bundle.query_od(departure_time_bin="am", top_n=100)
+```
+
+For large cases, use `iter_table` or `query_od` with bounded chunks and filter
+by time bin, origin, destination, identifiability class, or minimum demand.
+The GUI should treat information shares as local linearized diagnostics, not
+probabilities or standard errors. If no identifiability artifact was supplied,
+the manifest explicitly records `identifiability.available = false` and the
+existing structural-only `inference_score` message. A strict export can pass
+`require_identifiability=True`.
