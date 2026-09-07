@@ -1531,6 +1531,197 @@ checkpoint data; it must not silently rebuild them. If an identity or
 fingerprint differs, stop and diagnose the mismatch rather than deleting the
 archive or creating a new result root.
 
+## Cross-computer transfer and artifact-identity gate
+
+Transferring fitted parameters alone is insufficient. Before `validate` or
+`report` is run on a different computer, that computer must reproduce the same
+operator identity as the source run. This identity gate is mandatory for every
+cross-computer continuation, not only after a failed or interrupted run.
+
+### 1. Record the source fingerprints
+
+On the source computer, after `prepare` has completed:
+
+```bash
+export SOURCE_MANIFEST="$RESULTS_ROOT/manifests/prepare.json"
+export TRANSFER_AUDIT="$RESULTS_ROOT/audit/cross-computer-transfer"
+
+mkdir -p "$TRANSFER_AUDIT"
+
+jq -S '{
+  package_revision,
+  artifact_identity_fingerprint,
+  assignment_fingerprint,
+  od_layout_fingerprint,
+  compact_layout_fingerprint,
+  canonical_index_fingerprint,
+  binding_fingerprint,
+  mapping_fingerprint,
+  gravity_features_fingerprint
+}' "$SOURCE_MANIFEST" \
+  > "$TRANSFER_AUDIT/source-fingerprints.json"
+```
+
+Also preserve:
+
+- the complete artifact directory,
+  `results/artifacts/<artifact_identity>/`;
+- the identity-specific checkpoint directory,
+  `results/checkpoints/<artifact_identity>/`;
+- the temporal operator-cache manifest and validation certificate;
+- `results/manifests/prepare.json`;
+- the relevant input files and audit files;
+- `pyproject.toml`, `uv.lock`, and all scientific configuration files.
+
+The archive must preserve the relative directory structure below the results
+root. Do not rename an identity-specific directory.
+
+### 2. Verify the destination software and configuration
+
+Before running any computational stage on the destination computer:
+
+```bash
+cd "$CASE_ROOT"
+
+uv sync --frozen
+
+uv run --frozen python -c '
+import json
+from importlib.metadata import distribution
+from pathlib import Path
+from adapter import CaseSettings
+
+settings = CaseSettings.load(Path("."))
+installed = json.loads(
+    distribution("public-transportation")
+    .read_text("direct_url.json")
+)["vcs_info"]["commit_id"]
+
+print("installed package:", installed)
+print("configured package:", settings.package_revision)
+assert installed == settings.package_revision
+'
+```
+
+The destination must use the same package revision and the same scientific
+configuration as the source. Machine-specific path overrides are allowed, but
+they must point to byte-identical input files.
+
+### 3. Compute the destination identity before validation
+
+Run the lightweight case check:
+
+```bash
+uv run --frozen python run_case.py check
+```
+
+This must complete successfully and create:
+
+```text
+$RESULTS_ROOT/manifests/check.json
+```
+
+Extract the destination fingerprints:
+
+```bash
+jq -S '{
+  package_revision,
+  artifact_identity_fingerprint,
+  assignment_fingerprint,
+  od_layout_fingerprint,
+  canonical_index_fingerprint,
+  binding_fingerprint,
+  mapping_fingerprint,
+  gravity_features_fingerprint
+}' "$RESULTS_ROOT/manifests/check.json" \
+  > "$RESULTS_ROOT/audit/cross-computer-transfer/destination-fingerprints.json"
+```
+
+Compare the source and destination records:
+
+```bash
+diff -u \
+  "$RESULTS_ROOT/audit/cross-computer-transfer/source-fingerprints.json" \
+  "$RESULTS_ROOT/audit/cross-computer-transfer/destination-fingerprints.json"
+```
+
+The command must produce no differences.
+
+### 4. Verify the transferred artifact itself
+
+```bash
+IDENTITY="$(
+  jq -r '.artifact_identity_fingerprint' \
+    "$RESULTS_ROOT/audit/cross-computer-transfer/source-fingerprints.json"
+)"
+
+ARTIFACT="$RESULTS_ROOT/artifacts/$IDENTITY"
+
+test -d "$ARTIFACT"
+test -f "$ARTIFACT/manifest.json"
+
+jq -e \
+  --arg id "$IDENTITY" '
+  .complete == true and
+  .identity_fingerprint == $id and
+  (.blocks | length) > 0 and
+  (.fixed_measurement_offset_hash | type) == "string" and
+  all(.blocks[]; (.content_hash | type) == "string")
+' "$ARTIFACT/manifest.json"
+```
+
+If a temporal operator cache is present, also verify its manifest and
+validation certificate against the same identity and artifact-manifest
+checksum.
+
+### 5. Mandatory stop condition
+
+The following are hard stop conditions:
+
+- do not run `validate` if the fingerprints differ;
+- do not run `report` if the fingerprints differ;
+- do not rename an artifact or checkpoint directory to force a match;
+- do not assume that equal fitted parameters imply equal assignment operators.
+
+A path difference alone is acceptable only when the resolved input files are
+byte-identical and all computed fingerprints match.
+
+If the fingerprints differ, compare the following before proceeding:
+
+- package revision;
+- scenario and timetable files;
+- time-bin definition;
+- measurement file and mapping;
+- fixed-demand and prior-demand files;
+- OD-universe and structural-zero configuration;
+- transfer and journey-feasibility settings;
+- numeric dtype and coefficient policy.
+
+### 6. Only after the identity gate passes
+
+Run:
+
+```bash
+uv run --frozen python run_case.py validate
+```
+
+Then verify:
+
+```bash
+jq -e '
+  .status == "completed" and
+  .acceptance == "accepted"
+' "$RESULTS_ROOT/manifests/validate.json"
+```
+
+Only after that should the report be generated:
+
+```bash
+uv run --frozen python run_case.py report \
+  --output-directory "$RESULTS_ROOT/validation/fit-report" \
+  --force
+```
+
 ### 0.1 Determine time bins from the count data before the audit
 
 Before starting this potentially long diagnostic, read **Large outputs, scratch
