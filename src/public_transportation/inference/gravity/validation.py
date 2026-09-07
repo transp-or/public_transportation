@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -63,6 +64,75 @@ class GravityValidationMetadata:
                     name,
                     _immutable(value, name=name, length=self.num_measurements),
                 )
+
+    def to_dict(self) -> dict[str, object]:
+        """Return JSON-compatible, measurement-aligned metadata."""
+        fields = (
+            "method_id",
+            "measurement_type",
+            "line",
+            "direction",
+            "stop",
+            "observation_time",
+            "time_period",
+            "origin_zone",
+            "destination_zone",
+            "vehicle_journey",
+        )
+        return {
+            "num_measurements": self.num_measurements,
+            **{
+                name: None
+                if (value := getattr(self, name)) is None
+                else value.tolist()
+                for name in fields
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "GravityValidationMetadata":
+        """Restore measurement metadata from JSON-compatible data."""
+        if not isinstance(payload, Mapping):
+            raise TypeError("gravity validation metadata payload must be a mapping.")
+        if "num_measurements" not in payload:
+            raise ValueError("gravity validation metadata is missing num_measurements.")
+        raw_num_measurements = payload["num_measurements"]
+        if isinstance(raw_num_measurements, bool):
+            raise ValueError("num_measurements must be an integer.")
+        try:
+            numeric_num_measurements = float(raw_num_measurements)
+        except (TypeError, ValueError) as error:
+            raise ValueError("num_measurements must be an integer.") from error
+        if not np.isfinite(numeric_num_measurements) or not numeric_num_measurements.is_integer():
+            raise ValueError("num_measurements must be an integer.")
+        num_measurements = int(numeric_num_measurements)
+        fields = (
+            "method_id",
+            "measurement_type",
+            "line",
+            "direction",
+            "stop",
+            "observation_time",
+            "time_period",
+            "origin_zone",
+            "destination_zone",
+            "vehicle_journey",
+        )
+        values: dict[str, object] = {}
+        for name in fields:
+            value = payload.get(name)
+            if value is None:
+                values[name] = None
+            elif isinstance(value, (str, bytes)):
+                raise ValueError(f"metadata field {name!r} must be an array or null.")
+            else:
+                try:
+                    values[name] = np.asarray(value)
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        f"metadata field {name!r} must be an array or null."
+                    ) from error
+        return cls(num_measurements=num_measurements, **values)
 
 
 @dataclass(frozen=True, slots=True)

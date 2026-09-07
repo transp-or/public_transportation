@@ -320,6 +320,58 @@ or timing discrepancies, isolated suspect observations, and systematic
 overdispersion. These flags do not establish causality and never alter the
 model. Holdout validation and relaxation recommendations remain future phases.
 
+## Portable persisted-data reporting
+
+Detailed gravity reports can be generated on a separate reporting machine from
+persisted fit and validation data. The portable entry point
+`write_persisted_gravity_detailed_report` accepts a serialized fit manifest, a
+serialized validation manifest, the observed measurement vector, an
+`ODParameterLayout`, and optional `GravityValidationMetadata`. It restores the
+typed gravity result and calls the same report writer used by the ordinary
+in-memory workflow, so the CSV, JSON, and Markdown outputs retain the same
+meaning.
+
+For example, after loading the JSON manifests and persisted arrays on the
+reporting machine:
+
+```python
+from public_transportation.inference.gravity import (
+    write_persisted_gravity_detailed_report,
+)
+
+write_persisted_gravity_detailed_report(
+    fit_manifest=fit_manifest,
+    validation_manifest=validation_manifest,
+    observations=observations,
+    od_layout=od_layout,
+    metadata=metadata,
+    likelihood="poisson",
+    output_directory=report_directory,
+)
+```
+
+This path is deliberately independent of a case context. It does not load or
+activate routing, read a temporal cache, rebuild an assignment operator, rerun
+an objective, or invoke an optimizer. Reporting can therefore be performed
+where the original model data or execution environment is unavailable. The fit
+and validation manifests must both be completed and must contain matching
+predictions and all canonical provenance fields: artifact, assignment,
+binding, canonical-index, compact-layout, gravity-feature, mapping,
+OD-layout, and package-revision fingerprints. The supplied layout fingerprint
+must agree with the persisted value. A mismatch, missing field, non-completed
+manifest, vector-shape error, or prediction disagreement is a hard failure and
+is checked before the output directory is created.
+
+The portable report's `report.json` records the canonical provenance values
+exactly and labels its origin as `persisted_fit_validation`. This makes it
+possible to audit which fit, validation predictions, OD layout, and package
+revision produced the report without rerunning scientific computation. The
+layout and validation metadata contracts provide deterministic `to_dict` and
+`from_dict` methods; restored arrays are immutable, while layout fingerprints
+and vector dimensions are verified. Persisted reports are diagnostic artifacts only:
+they do not alter model identity, checkpoints, routing artifacts, or optimizer
+behavior.
+
 ## Phase 5: atomic centered relaxations
 
 ### Time-regime production deviations

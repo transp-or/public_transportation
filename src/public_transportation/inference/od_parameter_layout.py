@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import hashlib
 import json
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -129,6 +130,108 @@ class ODParameterLayout:
     def fingerprint(self) -> str:
         """Return a stable digest of the complete reduced-parameter contract."""
         return hashlib.sha256(self.fingerprint_payload_json.encode("utf-8")).hexdigest()
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-compatible representation of the complete layout."""
+        return {
+            "num_od_total": self.num_od_total,
+            "od_keys": [list(key) for key in self.od_keys],
+            "free_od_indices": list(self.free_od_indices),
+            "fixed_od_indices": list(self.fixed_od_indices),
+            "fixed_od_values": list(self.fixed_od_values),
+            "free_baseline_values": list(self.free_baseline_values),
+            "fixed_zero_indices": list(self.fixed_zero_indices),
+            "fixed_positive_indices": list(self.fixed_positive_indices),
+            "fingerprint": self.fingerprint,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "ODParameterLayout":
+        """Restore and validate a layout persisted as JSON-compatible data."""
+        if not isinstance(payload, Mapping):
+            raise TypeError("OD parameter layout payload must be a mapping.")
+
+        required = (
+            "num_od_total",
+            "od_keys",
+            "free_od_indices",
+            "fixed_od_indices",
+            "fixed_od_values",
+            "free_baseline_values",
+            "fixed_zero_indices",
+            "fixed_positive_indices",
+        )
+        missing = [name for name in required if name not in payload]
+        if missing:
+            raise ValueError(
+                "OD parameter layout is missing required field(s): "
+                + ", ".join(missing)
+                + "."
+            )
+
+        def sequence(name: str) -> Sequence[object]:
+            value = payload[name]
+            if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+                raise ValueError(f"OD parameter layout field {name!r} must be an array.")
+            return value
+
+        def integer(value: object, *, field: str) -> int:
+            if isinstance(value, bool):
+                raise ValueError(f"OD parameter layout field {field!r} must contain integers.")
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"OD parameter layout field {field!r} must contain integers."
+                ) from error
+            if not math.isfinite(numeric) or not numeric.is_integer():
+                raise ValueError(
+                    f"OD parameter layout field {field!r} must contain integers."
+                )
+            return int(numeric)
+
+        def indices(name: str) -> tuple[int, ...]:
+            return tuple(integer(value, field=name) for value in sequence(name))
+
+        def values(name: str) -> tuple[float, ...]:
+            result: list[float] = []
+            for value in sequence(name):
+                try:
+                    result.append(float(value))
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        f"OD parameter layout field {name!r} must contain numbers."
+                    ) from error
+            return tuple(result)
+
+        raw_num_total = payload["num_od_total"]
+        num_od_total = integer(raw_num_total, field="num_od_total")
+        raw_keys = sequence("od_keys")
+        od_keys: list[FixedODKey] = []
+        for index, raw_key in enumerate(raw_keys):
+            if isinstance(raw_key, (str, bytes)) or not isinstance(raw_key, Sequence):
+                raise ValueError(f"od_keys[{index}] must be a three-item array.")
+            if len(raw_key) != 3:
+                raise ValueError(f"od_keys[{index}] must be a three-item array.")
+            od_keys.append((str(raw_key[0]), str(raw_key[1]), str(raw_key[2])))
+
+        layout = cls(
+            num_od_total=num_od_total,
+            od_keys=tuple(od_keys),
+            free_od_indices=indices("free_od_indices"),
+            fixed_od_indices=indices("fixed_od_indices"),
+            fixed_od_values=values("fixed_od_values"),
+            free_baseline_values=values("free_baseline_values"),
+            fixed_zero_indices=indices("fixed_zero_indices"),
+            fixed_positive_indices=indices("fixed_positive_indices"),
+        )
+        persisted_fingerprint = payload.get("fingerprint")
+        if persisted_fingerprint is not None and str(persisted_fingerprint) != layout.fingerprint:
+            raise ValueError(
+                "OD parameter layout fingerprint mismatch during deserialization: "
+                f"persisted={persisted_fingerprint!r}, computed={layout.fingerprint!r}."
+            )
+        return layout
 
     def reconstruct_jax(self, free_log_deviation: object) -> jnp.ndarray:
         """Reconstruct full OD demand from free deviations and fixed constants.

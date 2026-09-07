@@ -184,6 +184,10 @@ from .validation import (
 )
 from .reporting import (
     GRAVITY_DETAILED_REPORT_SCHEMA_VERSION,
+    GRAVITY_REPORT_PROVENANCE_FIELDS,
     GravityDetailedReport,
+    PersistedGravityReportInputs,
+    validate_gravity_report_provenance,
     write_gravity_detailed_report,
+    write_persisted_gravity_detailed_report,
 )

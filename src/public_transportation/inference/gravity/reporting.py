@@ -5,9 +5,9 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Mapping
 
 import numpy as np
 
@@ -24,6 +24,17 @@ from .validation import (
 
 
 GRAVITY_DETAILED_REPORT_SCHEMA_VERSION = 1
+GRAVITY_REPORT_PROVENANCE_FIELDS = (
+    "artifact_identity_fingerprint",
+    "assignment_fingerprint",
+    "binding_fingerprint",
+    "canonical_index_fingerprint",
+    "compact_layout_fingerprint",
+    "gravity_features_fingerprint",
+    "mapping_fingerprint",
+    "od_layout_fingerprint",
+    "package_revision",
+)
 _REPORT_FILES = (
     "parameters.csv",
     "full_od.csv",
@@ -65,6 +76,229 @@ _OD_FIELDS = (
     "prior_demand",
     "estimated_to_prior_ratio",
 )
+_MISSING = object()
+_PREDICTION_RTOL = 5.0e-6
+_PREDICTION_ATOL = 5.0e-6
+
+
+def _immutable_vector(value: object) -> np.ndarray:
+    array = np.array(value, dtype=np.float64, copy=True)
+    if array.ndim != 1:
+        raise ValueError("persisted vectors must be one-dimensional.")
+    array.setflags(write=False)
+    return array
+
+
+def _validate_prediction_agreement(
+    fit_predictions: object, validation_predictions: object
+) -> None:
+    fit = np.asarray(fit_predictions, dtype=np.float64)
+    validation = np.asarray(validation_predictions, dtype=np.float64)
+    if fit.ndim != 1 or validation.ndim != 1:
+        raise ValueError("fit and validation predictions must be one-dimensional.")
+    if fit.shape != validation.shape:
+        raise ValueError(
+            "persisted fit and validation predictions have different lengths: "
+            f"{fit.size} != {validation.size}."
+        )
+    if not np.all(np.isfinite(fit)) or not np.all(np.isfinite(validation)):
+        raise ValueError("persisted fit and validation predictions must be finite.")
+    if not np.allclose(
+        fit,
+        validation,
+        rtol=_PREDICTION_RTOL,
+        atol=_PREDICTION_ATOL,
+    ):
+        raise ValueError(
+            "persisted fit and validation predictions differ beyond the allowed "
+            f"tolerance (rtol={_PREDICTION_RTOL:g}, atol={_PREDICTION_ATOL:g})."
+        )
+
+
+def _validation_predictions(manifest: Mapping[str, object]) -> object:
+    """Return persisted validation predictions from supported manifest shapes."""
+    direct = manifest.get("predicted_measurements", _MISSING)
+    if direct is not _MISSING:
+        return direct
+    nested = manifest.get("result")
+    if isinstance(nested, Mapping):
+        nested_value = nested.get("predicted_measurements", _MISSING)
+        if nested_value is not _MISSING:
+            return nested_value
+    return _MISSING
+
+
+def _manifest_value(
+    manifest: Mapping[str, object], field: str
+) -> object:
+    """Find a canonical field in supported persisted manifest locations."""
+    direct = manifest.get(field, _MISSING)
+    if direct is not _MISSING and direct is not None:
+        return direct
+
+    nested_names = ("fingerprints", "provenance", "result")
+    for nested_name in nested_names:
+        nested = manifest.get(nested_name)
+        if not isinstance(nested, Mapping):
+            continue
+        value = nested.get(field, _MISSING)
+        if value is not _MISSING and value is not None:
+            return value
+        nested_fingerprints = nested.get("fingerprints")
+        if isinstance(nested_fingerprints, Mapping):
+            value = nested_fingerprints.get(field, _MISSING)
+            if value is not _MISSING and value is not None:
+                return value
+
+    # Gravity run manifests historically called this field
+    # ``repository_revision``.  It has the same identity meaning here.
+    if field == "package_revision":
+        legacy = manifest.get("repository_revision", _MISSING)
+        if legacy is not _MISSING and legacy is not None:
+            return legacy
+    return _MISSING
+
+
+def _manifest_status(manifest: Mapping[str, object], name: str) -> None:
+    status = manifest.get("status", _MISSING)
+    if status != "completed":
+        raise ValueError(
+            f"{name} manifest is not completed: status={status!r}; "
+            "portable report generation requires completed fit and validation manifests."
+        )
+
+
+def validate_gravity_report_provenance(
+    *,
+    fit_manifest: Mapping[str, object],
+    validation_manifest: Mapping[str, object],
+    od_layout: ODParameterLayout,
+    supplied_provenance: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Validate persisted report identity before any output is created."""
+    if not isinstance(fit_manifest, Mapping):
+        raise TypeError("fit_manifest must be a mapping.")
+    if not isinstance(validation_manifest, Mapping):
+        raise TypeError("validation_manifest must be a mapping.")
+    if not isinstance(od_layout, ODParameterLayout):
+        raise TypeError("od_layout must be an ODParameterLayout.")
+    result = fit_manifest.get("result")
+    if not isinstance(result, Mapping):
+        raise ValueError("fit_manifest['result'] must be a mapping.")
+    validation_predictions = _validation_predictions(validation_manifest)
+    if validation_predictions is _MISSING:
+        raise ValueError(
+            "validation_manifest is missing predicted_measurements."
+        )
+    _manifest_status(fit_manifest, "fit")
+    _manifest_status(validation_manifest, "validation")
+    fit_predictions = result.get("predicted_measurements", _MISSING)
+    if fit_predictions is _MISSING:
+        raise ValueError(
+            "fit_manifest['result'] is missing predicted_measurements."
+        )
+    _validate_prediction_agreement(fit_predictions, validation_predictions)
+
+    persisted: dict[str, object] = {}
+    for field in GRAVITY_REPORT_PROVENANCE_FIELDS:
+        fit_value = _manifest_value(fit_manifest, field)
+        validation_value = _manifest_value(validation_manifest, field)
+        if fit_value is _MISSING or validation_value is _MISSING:
+            raise ValueError(
+                f"required provenance field {field!r} is missing: "
+                f"fit={None if fit_value is _MISSING else fit_value!r}, "
+                f"validation={None if validation_value is _MISSING else validation_value!r}."
+            )
+        if fit_value != validation_value:
+            raise ValueError(
+                f"provenance field {field!r} differs between fit and validation: "
+                f"fit={fit_value!r}, validation={validation_value!r}."
+            )
+        persisted[field] = fit_value
+
+    if persisted["od_layout_fingerprint"] != od_layout.fingerprint:
+        raise ValueError(
+            "provenance field 'od_layout_fingerprint' differs from the supplied "
+            f"OD layout: persisted={persisted['od_layout_fingerprint']!r}, "
+            f"layout={od_layout.fingerprint!r}."
+        )
+
+    if supplied_provenance is not None:
+        if not isinstance(supplied_provenance, Mapping):
+            raise TypeError("supplied_provenance must be a mapping or None.")
+        for field in GRAVITY_REPORT_PROVENANCE_FIELDS:
+            supplied = supplied_provenance.get(field, _MISSING)
+            if supplied is _MISSING or supplied != persisted[field]:
+                raise ValueError(
+                    f"supplied provenance field {field!r} differs from persisted "
+                    f"value: supplied={None if supplied is _MISSING else supplied!r}, "
+                    f"persisted={persisted[field]!r}."
+                )
+    return persisted
+
+
+def _validate_expected_provenance(
+    provenance: Mapping[str, object] | None,
+    expected: Mapping[str, object],
+) -> None:
+    if not isinstance(expected, Mapping):
+        raise TypeError("expected_provenance must be a mapping or None.")
+    if not isinstance(provenance, Mapping):
+        raise ValueError(
+            "expected persisted provenance was supplied, but report provenance is missing."
+        )
+    for field in GRAVITY_REPORT_PROVENANCE_FIELDS:
+        expected_value = expected.get(field, _MISSING)
+        actual_value = provenance.get(field, _MISSING)
+        if expected_value is _MISSING or actual_value is _MISSING:
+            raise ValueError(
+                f"required provenance field {field!r} is missing from the report "
+                f"provenance: expected={None if expected_value is _MISSING else expected_value!r}, "
+                f"actual={None if actual_value is _MISSING else actual_value!r}."
+            )
+        if expected_value != actual_value:
+            raise ValueError(
+                f"report provenance field {field!r} differs from the persisted "
+                f"value: expected={expected_value!r}, actual={actual_value!r}."
+            )
+
+
+def _validate_restored_result(
+    result: GravityEstimationResult, od_layout: ODParameterLayout
+) -> None:
+    """Validate typed result vectors before portable report output is created."""
+    vectors: dict[str, np.ndarray] = {}
+    for name in (
+        "raw_parameters",
+        "physical_parameters",
+        "free_od_demand",
+        "active_od_demand",
+        "full_od_demand",
+        "predicted_measurements",
+        "gradient",
+    ):
+        array = np.asarray(getattr(result, name), dtype=np.float64)
+        if array.ndim != 1:
+            raise ValueError(f"persisted result field {name!r} must be one-dimensional.")
+        if not np.all(np.isfinite(array)):
+            raise ValueError(f"persisted result field {name!r} must be finite.")
+        vectors[name] = array
+    if vectors["raw_parameters"].shape != vectors["physical_parameters"].shape:
+        raise ValueError(
+            "persisted raw_parameters and physical_parameters have different lengths."
+        )
+    if vectors["gradient"].shape != vectors["raw_parameters"].shape:
+        raise ValueError("persisted gradient length does not match raw_parameters.")
+    if vectors["full_od_demand"].size != od_layout.num_od_total:
+        raise ValueError(
+            "persisted full_od_demand length does not match the supplied OD layout: "
+            f"{vectors['full_od_demand'].size} != {od_layout.num_od_total}."
+        )
+    if vectors["free_od_demand"].size != od_layout.num_free:
+        raise ValueError(
+            "persisted free_od_demand length does not match the supplied OD layout: "
+            f"{vectors['free_od_demand'].size} != {od_layout.num_free}."
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +314,82 @@ class GravityDetailedReport:
     fixed_od_cells: int
     structural_zero_cells: int
     executive_messages: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedGravityReportInputs:
+    """Validated fit, validation, and metadata inputs for portable reports."""
+
+    fit_manifest: Mapping[str, object]
+    validation_manifest: Mapping[str, object]
+    observations: np.ndarray
+    od_layout: ODParameterLayout
+    metadata: GravityValidationMetadata | None
+    likelihood: GravityLikelihood | str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.fit_manifest, Mapping):
+            raise TypeError("fit_manifest must be a mapping.")
+        if not isinstance(self.validation_manifest, Mapping):
+            raise TypeError("validation_manifest must be a mapping.")
+        result = self.fit_manifest.get("result")
+        if not isinstance(result, Mapping):
+            raise ValueError("fit_manifest['result'] must be a mapping.")
+        validation_predictions = _validation_predictions(self.validation_manifest)
+        if validation_predictions is _MISSING:
+            raise ValueError(
+                "validation_manifest must contain predicted_measurements."
+            )
+
+        observed = np.asarray(self.observations, dtype=np.float64)
+        if observed.ndim != 1:
+            raise ValueError("observations must be one-dimensional.")
+        if not np.all(np.isfinite(observed)):
+            raise ValueError("observations must contain finite values.")
+        object.__setattr__(self, "observations", _immutable_vector(observed))
+
+        predicted = np.asarray(
+            validation_predictions, dtype=np.float64
+        )
+        if predicted.ndim != 1:
+            raise ValueError("persisted predictions must be one-dimensional.")
+        if not np.all(np.isfinite(predicted)):
+            raise ValueError("persisted predictions must contain finite values.")
+        if observed.shape != predicted.shape:
+            raise ValueError(
+                "observations and persisted predictions have different lengths: "
+                f"{observed.size} != {predicted.size}."
+            )
+        persisted_fit_predictions = result.get("predicted_measurements")
+        if persisted_fit_predictions is None:
+            raise ValueError(
+                "fit_manifest['result'] must contain predicted_measurements."
+            )
+        fit_predicted = np.asarray(persisted_fit_predictions, dtype=np.float64)
+        _validate_prediction_agreement(fit_predicted, predicted)
+
+        if self.metadata is not None:
+            if not isinstance(self.metadata, GravityValidationMetadata):
+                raise TypeError(
+                    "metadata must be GravityValidationMetadata or None."
+                )
+            if self.metadata.num_measurements != observed.size:
+                raise ValueError(
+                    "metadata length does not match observations: "
+                    f"{self.metadata.num_measurements} != {observed.size}."
+                )
+        validate_gravity_report_provenance(
+            fit_manifest=self.fit_manifest,
+            validation_manifest=self.validation_manifest,
+            od_layout=self.od_layout,
+        )
+
+    @property
+    def predicted_measurements(self) -> np.ndarray:
+        """Return the validated persisted validation predictions."""
+        return np.asarray(
+            _validation_predictions(self.validation_manifest), dtype=np.float64
+        )
 
 
 def _write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, object]]) -> None:
@@ -366,6 +676,7 @@ def write_gravity_detailed_report(
     output_directory: str | Path,
     adequacy_config: GravityAdequacyConfig = GravityAdequacyConfig(),
     provenance: Mapping[str, object] | None = None,
+    expected_provenance: Mapping[str, object] | None = None,
     force: bool = False,
 ) -> GravityDetailedReport:
     """Write CSV, JSON, Markdown, and executive reports for a gravity fit.
@@ -374,6 +685,34 @@ def write_gravity_detailed_report(
     activate an assignment operator, rerun an optimizer, or change the
     objective function.
     """
+    observed = np.asarray(observations, dtype=np.float64)
+    if observed.ndim != 1:
+        raise ValueError("observations must be one-dimensional.")
+    if not np.all(np.isfinite(observed)):
+        raise ValueError("observations must contain finite values.")
+    modeled = np.asarray(predicted_measurements, dtype=np.float64)
+    if modeled.ndim != 1:
+        raise ValueError("predicted_measurements must be one-dimensional.")
+    if not np.all(np.isfinite(modeled)):
+        raise ValueError("predicted_measurements must contain finite values.")
+    if observed.shape != modeled.shape:
+        raise ValueError(
+            "observations and predicted_measurements have different lengths: "
+            f"{observed.size} != {modeled.size}."
+        )
+    persisted_modeled = np.asarray(result.predicted_measurements, dtype=np.float64)
+    _validate_prediction_agreement(persisted_modeled, modeled)
+    selected_metadata = metadata or GravityValidationMetadata(observed.size)
+    if not isinstance(selected_metadata, GravityValidationMetadata):
+        raise TypeError("metadata must be GravityValidationMetadata or None.")
+    if selected_metadata.num_measurements != observed.size:
+        raise ValueError(
+            "metadata length does not match observations: "
+            f"{selected_metadata.num_measurements} != {observed.size}."
+        )
+    if expected_provenance is not None:
+        _validate_expected_provenance(provenance, expected_provenance)
+
     output = Path(output_directory).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     existing = [output / name for name in _REPORT_FILES if (output / name).exists()]
@@ -383,21 +722,6 @@ def write_gravity_detailed_report(
             + ", ".join(str(path) for path in existing)
         )
 
-    observed = np.asarray(observations, dtype=np.float64)
-    modeled = np.asarray(predicted_measurements, dtype=np.float64)
-    persisted_modeled = np.asarray(result.predicted_measurements, dtype=np.float64)
-    if persisted_modeled.shape != modeled.shape:
-        raise ValueError(
-            "predicted_measurements does not match the fit result dimension."
-        )
-    np.testing.assert_allclose(
-        persisted_modeled,
-        modeled,
-        rtol=5.0e-6,
-        atol=5.0e-6,
-        err_msg="persisted validation predictions do not match the persisted fit result",
-    )
-    selected_metadata = metadata or GravityValidationMetadata(observed.size)
     try:
         likelihood_value = str(likelihood.value)
     except AttributeError:
@@ -533,4 +857,65 @@ def write_gravity_detailed_report(
         fixed_cells,
         structural_zero_cells,
         executive_messages,
+    )
+
+
+def write_persisted_gravity_detailed_report(
+    *,
+    fit_manifest: Mapping[str, object],
+    validation_manifest: Mapping[str, object],
+    observations: object,
+    od_layout: ODParameterLayout,
+    metadata: GravityValidationMetadata | None = None,
+    likelihood: GravityLikelihood | str = GravityLikelihood.NEGATIVE_BINOMIAL,
+    output_directory: str | Path,
+    adequacy_config: GravityAdequacyConfig = GravityAdequacyConfig(),
+    force: bool = False,
+) -> GravityDetailedReport:
+    """Generate a detailed report using only persisted fit/validation data.
+
+    This entry point deliberately does not load a case context, scenario,
+    routing operator, or cache.  All identity and prediction checks complete
+    before the lower-level writer is allowed to create the output directory.
+    """
+    if not isinstance(fit_manifest, Mapping):
+        raise TypeError("fit_manifest must be a mapping.")
+    if not isinstance(validation_manifest, Mapping):
+        raise TypeError("validation_manifest must be a mapping.")
+    if not isinstance(od_layout, ODParameterLayout):
+        raise TypeError("od_layout must be an ODParameterLayout.")
+    raw_result = fit_manifest.get("result")
+    if not isinstance(raw_result, Mapping):
+        raise ValueError("fit_manifest['result'] must be a mapping.")
+    result = GravityEstimationResult.from_dict(raw_result)
+    _validate_restored_result(result, od_layout)
+    inputs = PersistedGravityReportInputs(
+        fit_manifest=fit_manifest,
+        validation_manifest=validation_manifest,
+        observations=np.asarray(observations),
+        od_layout=od_layout,
+        metadata=metadata,
+        likelihood=likelihood,
+    )
+    persisted_provenance = validate_gravity_report_provenance(
+        fit_manifest=fit_manifest,
+        validation_manifest=validation_manifest,
+        od_layout=od_layout,
+    )
+    report_provenance = {
+        "source": "persisted_fit_validation",
+        **persisted_provenance,
+    }
+    return write_gravity_detailed_report(
+        result=result,
+        observations=inputs.observations,
+        predicted_measurements=inputs.predicted_measurements,
+        od_layout=od_layout,
+        metadata=inputs.metadata,
+        likelihood=likelihood,
+        output_directory=output_directory,
+        adequacy_config=adequacy_config,
+        provenance=report_provenance,
+        expected_provenance=persisted_provenance,
+        force=force,
     )
