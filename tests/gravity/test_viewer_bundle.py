@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 import numpy as np
 import pytest
@@ -19,6 +19,7 @@ from public_transportation.inference.gravity import (
     read_gravity_viewer_bundle,
     write_gravity_detailed_report,
     write_gravity_viewer_bundle,
+    write_persisted_gravity_viewer_bundle,
 )
 from public_transportation.inference.od_parameter_layout import ODParameterLayout
 
@@ -172,6 +173,70 @@ def test_bundle_round_trips_identifiability_payload(tmp_path):
         round_trip.count_information_share, diagnostic.count_information_share
     )
     assert loaded.manifest["identifiability"]["provenance"]["model_fingerprint"] == result.model_fingerprint
+
+
+def test_persisted_bundle_export_restores_report_and_cleans_staging(tmp_path):
+    result, _report, provenance = _inputs(tmp_path)
+    layout = ODParameterLayout(
+        num_od_total=2,
+        od_keys=(("o1", "d1", "am"), ("o1", "d2", "am")),
+        free_od_indices=(0, 1),
+        fixed_od_indices=(),
+        fixed_od_values=(),
+        free_baseline_values=(1.0, 2.0),
+        fixed_zero_indices=(),
+        fixed_positive_indices=(),
+    )
+    metadata = GravityValidationMetadata(
+        3,
+        measurement_type=np.asarray(("boarding", "boarding", "alighting")),
+        line=np.asarray(("L1", "L1", "L1")),
+        stop=np.asarray(("o1", "d1", "d2")),
+        time_period=np.asarray(("am", "am", "am")),
+    )
+    validation_manifest = {
+        "stage": "validate",
+        "status": "completed",
+        "fit_status": "converged",
+        "predicted_measurements": result.predicted_measurements.tolist(),
+        **provenance,
+    }
+    result_payload = asdict(result)
+    for name in (
+        "raw_parameters",
+        "physical_parameters",
+        "free_od_demand",
+        "active_od_demand",
+        "full_od_demand",
+        "predicted_measurements",
+        "gradient",
+    ):
+        result_payload[name] = result_payload[name].tolist()
+    fit_manifest = {
+        "stage": "fit",
+        "status": "completed",
+        "result": result_payload,
+        **provenance,
+    }
+
+    bundle = write_persisted_gravity_viewer_bundle(
+        output_directory=tmp_path / "bundle",
+        fit_manifest=fit_manifest,
+        validation_manifest=validation_manifest,
+        observations=np.asarray((3.0, 5.0, 7.0)),
+        od_layout=layout,
+        metadata=metadata,
+        likelihood="poisson",
+        network_files=_network_files(tmp_path),
+        bundle_metadata={"time_zone": "Europe/Zurich"},
+    )
+
+    assert bundle.path.is_dir()
+    assert not list(tmp_path.glob(".bundle.report-*"))
+    assert (
+        read_gravity_viewer_bundle(bundle.path).manifest["bundle_type"]
+        == "gravity_viewer_bundle"
+    )
 
 
 def test_bundle_reader_rejects_checksum_tampering(tmp_path):

@@ -21,18 +21,21 @@ from typing import Any
 
 import numpy as np
 
+from public_transportation.inference.od_parameter_layout import ODParameterLayout
+
 from .estimator import GravityEstimationResult
 from .identifiability import (
     GravityODIdentifiability,
     read_gravity_od_identifiability,
     write_gravity_od_identifiability,
 )
+from .objective import GravityLikelihood
 from .reporting import (
     GRAVITY_REPORT_PROVENANCE_FIELDS,
     GravityDetailedReport,
 )
 from .specification import GravityModelSpecification
-from .validation import GravityAdequacyReport
+from .validation import GravityAdequacyReport, GravityValidationMetadata
 
 
 GRAVITY_VIEWER_BUNDLE_SCHEMA_VERSION = 1
@@ -944,6 +947,84 @@ def write_gravity_viewer_bundle(
         raise
 
 
+def write_persisted_gravity_viewer_bundle(
+    *,
+    output_directory: str | Path,
+    fit_manifest: Mapping[str, object],
+    validation_manifest: Mapping[str, object],
+    observations: object,
+    od_layout: ODParameterLayout,
+    metadata: GravityValidationMetadata | None = None,
+    likelihood: GravityLikelihood | str = "negative_binomial",
+    identifiability: GravityODIdentifiability | None = None,
+    network_files: Mapping[str, str | Path] | None = None,
+    bundle_metadata: Mapping[str, object] | None = None,
+    require_identifiability: bool = False,
+    model_specification: GravityModelSpecification | Mapping[str, object] | None = None,
+    report_output_directory: str | Path | None = None,
+) -> GravityViewerBundle:
+    """Export a viewer bundle directly from persisted fit/validation artifacts.
+
+    This convenience entry point restores the typed fit result, generates the
+    detailed report through the persisted-data reporting contract, and passes
+    the report to :func:`write_gravity_viewer_bundle`. It never loads a case
+    context, activates routing, evaluates an objective, or invokes an
+    optimizer. Unless ``report_output_directory`` is supplied, the temporary
+    detailed report is removed after the bundle is written.
+    """
+    if not isinstance(fit_manifest, Mapping):
+        raise TypeError("fit_manifest must be a mapping.")
+    if not isinstance(validation_manifest, Mapping):
+        raise TypeError("validation_manifest must be a mapping.")
+    raw_result = fit_manifest.get("result")
+    if not isinstance(raw_result, Mapping):
+        raise ValueError("fit_manifest['result'] must be a mapping.")
+
+    from .reporting import write_persisted_gravity_detailed_report
+
+    result = GravityEstimationResult.from_dict(raw_result)
+    destination = Path(output_directory).expanduser().resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_report: Path | None = None
+    if report_output_directory is None:
+        report_root = Path(
+            tempfile.mkdtemp(
+                prefix=f".{destination.name}.report-",
+                dir=destination.parent,
+            )
+        )
+        temporary_report = report_root
+    else:
+        report_root = Path(report_output_directory).expanduser().resolve()
+
+    try:
+        report = write_persisted_gravity_detailed_report(
+            fit_manifest=fit_manifest,
+            validation_manifest=validation_manifest,
+            observations=observations,
+            od_layout=od_layout,
+            metadata=metadata,
+            likelihood=likelihood,
+            output_directory=report_root,
+            identifiability=identifiability,
+            require_identifiability=require_identifiability,
+        )
+        return write_gravity_viewer_bundle(
+            output_directory=destination,
+            fit_result=result,
+            validation_result=validation_manifest,
+            report=report,
+            identifiability=identifiability,
+            network_files=network_files,
+            metadata=bundle_metadata,
+            require_identifiability=require_identifiability,
+            model_specification=model_specification,
+        )
+    finally:
+        if temporary_report is not None:
+            shutil.rmtree(temporary_report, ignore_errors=True)
+
+
 def read_gravity_viewer_bundle(path: str | Path) -> GravityViewerBundle:
     """Read and validate a self-contained gravity viewer bundle."""
     root = Path(path).expanduser().resolve()
@@ -964,4 +1045,5 @@ __all__ = [
     "GravityViewerBundle",
     "read_gravity_viewer_bundle",
     "write_gravity_viewer_bundle",
+    "write_persisted_gravity_viewer_bundle",
 ]

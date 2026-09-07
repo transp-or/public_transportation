@@ -170,6 +170,7 @@ from .gravity import (  # noqa: F401
     write_gravity_run_manifest,
     write_gravity_od_identifiability,
     write_gravity_viewer_bundle,
+    write_persisted_gravity_viewer_bundle,
 )
 from .block_coordinate import *  # noqa: F401,F403
 from .fixed_routing_measurement_operator import (  # noqa: F401

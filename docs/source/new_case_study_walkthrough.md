@@ -4061,6 +4061,44 @@ write_gravity_viewer_bundle(
 )
 ```
 
+For a completed case that already has fit and validation manifests, use the
+persisted-artifact convenience entry point instead of reconstructing typed
+results and a detailed report in the case driver:
+
+```python
+from public_transportation.inference.gravity import (
+    write_persisted_gravity_viewer_bundle,
+)
+
+write_persisted_gravity_viewer_bundle(
+    output_directory=results_root / "viewer_bundle",
+    fit_manifest=fit_manifest,
+    validation_manifest=validation_manifest,
+    observations=observations,
+    od_layout=od_layout,
+    metadata=validation_metadata,
+    likelihood="poisson",
+    network_files={
+        "stops.csv": network_dir / "stops.csv",
+        "lines.csv": network_dir / "lines.csv",
+        "trips.csv": network_dir / "trips.csv",
+        "stop_times.csv": network_dir / "stop_times.csv",
+    },
+    bundle_metadata={
+        "time_zone": "Europe/Zurich",
+        "coordinate_system": "latitude_longitude",
+        "x_column": "lon",
+        "y_column": "lat",
+    },
+)
+```
+
+This path only restores persisted data, writes the report needed by the
+bundle, and validates the final directory. It does not activate routing,
+recompute the objective, or rerun fitting. The case still owns the loading of
+its observed vector and canonical OD layout; those contracts must not be
+guessed from a generic manifest.
+
 The writer records the exact gravity model specification carried by the fit
 in `model_specification.json`, together with its specification fingerprint.
 This includes the likelihood family, component scopes, parameterizations,

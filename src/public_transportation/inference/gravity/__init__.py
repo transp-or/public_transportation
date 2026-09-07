@@ -197,6 +197,7 @@ from .viewer_bundle import (
     GravityViewerBundle,
     read_gravity_viewer_bundle,
     write_gravity_viewer_bundle,
+    write_persisted_gravity_viewer_bundle,
 )
 from .identifiability import (
     GravityIdentifiabilityConfig,

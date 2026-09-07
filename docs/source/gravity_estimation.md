@@ -1074,6 +1074,54 @@ gravity_viewer_bundle_v1/
     stop_times.csv
 ```
 
+### Exporting directly from persisted manifests
+
+For a completed case whose fit and validation outputs are already persisted,
+use `write_persisted_gravity_viewer_bundle`. It restores the typed fit result,
+creates the detailed report through the persisted-data contract, and exports
+the bundle in one call. It does not rebuild routing, load a case context,
+evaluate the objective, or fit the model. The temporary report directory is
+removed automatically unless `report_output_directory` is supplied.
+
+The case must supply the observed measurement vector and the canonical
+`ODParameterLayout` used by the fit; these are case-owned data contracts and
+cannot be inferred safely from a generic manifest. Network files and viewer
+metadata are explicit inputs.
+
+```python
+from public_transportation.inference.gravity import (
+    write_persisted_gravity_viewer_bundle,
+)
+
+bundle = write_persisted_gravity_viewer_bundle(
+    output_directory=results / "viewer_bundle",
+    fit_manifest=fit_manifest,
+    validation_manifest=validation_manifest,
+    observations=observations,
+    od_layout=od_layout,
+    metadata=validation_metadata,
+    likelihood="poisson",
+    network_files={
+        "stops.csv": network_dir / "stops.csv",
+        "lines.csv": network_dir / "lines.csv",
+        "trips.csv": network_dir / "trips.csv",
+        "stop_times.csv": network_dir / "stop_times.csv",
+    },
+    bundle_metadata={
+        "time_zone": "Europe/Zurich",
+        "coordinate_system": "latitude_longitude",
+        "x_column": "lon",
+        "y_column": "lat",
+    },
+)
+```
+
+The helper validates the same provenance, prediction, model-specification,
+report, network, and checksum contracts as the lower-level writer. A case
+driver may expose this call as an `export-viewer` stage after checking the
+existing manifests, without rerunning preparation or fit. It refuses to
+overwrite an existing bundle directory.
+
 `full_od.csv` retains the complete canonical OD schema, including structural
 fixed/free status and the local identifiability columns. The latter are
 linearized information diagnostics, not probabilities, standard errors, or
