@@ -24,9 +24,11 @@ from public_transportation.inference.gravity import (
     GravityModelSpecification,
     GravityObjectiveProblem,
     GravityParameterLayout,
+    GravityTimeSpecification,
     GravityValidationMetadata,
     build_gravity_adequacy_report,
     estimate_gravity_model,
+    gravity_model_fingerprint,
     predict_gravity_measurements,
     validate_full_data_gravity_adequacy,
     write_gravity_detailed_report,
@@ -145,6 +147,43 @@ def test_full_data_validation_rejects_missing_or_conflicting_specification():
             validate_full_data_gravity_adequacy(
                 result=conflicting, problem=problem, compact_layout=layout
             )
+
+
+def test_full_data_validation_accepts_json_normalized_tuple_specification():
+    with jax.enable_x64():
+        problem, layout, result = validation_case()
+        specification = GravityModelSpecification(
+            time=GravityTimeSpecification(bin_labels=("morning", "evening"))
+        )
+        # The typed result carries the canonical tuple representation. A
+        # persisted JSON result carries lists; validation should compare their
+        # canonical JSON meaning rather than Python container types.
+        json_specification = json.loads(json.dumps(specification.to_dict()))
+        json_problem = replace(
+            problem,
+            parameter_layout=GravityParameterLayout(specification),
+        )
+        typed_result = replace(
+            result,
+            model_fingerprint=gravity_model_fingerprint(json_problem, layout),
+            model_specification=specification.to_dict(),
+            specification_fingerprint=specification.fingerprint,
+        )
+        persisted_payload = json.loads(
+            json.dumps(
+                asdict(typed_result),
+                default=lambda value: value.tolist()
+                if isinstance(value, np.ndarray)
+                else value,
+            )
+        )
+        persisted_payload["model_specification"] = json_specification
+        restored = type(result).from_dict(persisted_payload)
+        report = validate_full_data_gravity_adequacy(
+            result=restored, problem=json_problem, compact_layout=layout
+        )
+        assert report.specification_fingerprint == specification.fingerprint
+        assert report.model_specification == specification.to_dict()
 
 
 def test_grouped_residuals_thresholds_and_journey_correlations_are_reported():

@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
+from public_transportation.inference.block_coordinate._canonical import canonical_json
 from public_transportation.inference.od_parameter_layout import ODParameterLayout
 
 from .estimator import GravityEstimationResult
@@ -109,7 +110,7 @@ def _validated_result_specification(
     except (TypeError, ValueError) as error:
         raise ValueError("gravity result model_specification is invalid.") from error
     serialized = specification.to_dict()
-    if dict(raw) != serialized:
+    if canonical_json(dict(raw)) != canonical_json(serialized):
         raise ValueError(
             "gravity result model_specification is not the canonical serialized specification."
         )
@@ -223,7 +224,7 @@ def _manifest_specification(
             except (TypeError, ValueError) as error:
                 raise ValueError(f"{name} manifest model_specification is invalid.") from error
             canonical = parsed.to_dict()
-            if dict(raw) != canonical:
+            if canonical_json(dict(raw)) != canonical_json(canonical):
                 raise ValueError(
                     f"{name} manifest model_specification is not canonical."
                 )

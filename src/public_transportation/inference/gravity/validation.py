@@ -9,7 +9,10 @@ from typing import Any
 import numpy as np
 from scipy.special import gammaln, xlogy  # type: ignore[import-untyped]
 
-from public_transportation.inference.block_coordinate._canonical import fingerprint
+from public_transportation.inference.block_coordinate._canonical import (
+    canonical_json,
+    fingerprint,
+)
 from public_transportation.inference.compact_od_assignment_layout import (
     CompactODAssignmentLayout,
 )
@@ -520,7 +523,11 @@ def _result_specification(
     except (TypeError, ValueError) as error:
         raise ValueError("gravity result model_specification is invalid.") from error
     serialized = parsed.to_dict()
-    if serialized != specification.to_dict() or dict(raw) != specification.to_dict():
+    expected = specification.to_dict()
+    if (
+        canonical_json(serialized) != canonical_json(expected)
+        or canonical_json(dict(raw)) != canonical_json(expected)
+    ):
         raise ValueError(
             "gravity result model_specification differs from the validation problem."
         )

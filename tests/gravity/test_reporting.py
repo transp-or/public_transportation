@@ -13,6 +13,7 @@ from public_transportation.inference.gravity import (
     GravityLikelihood,
     GravityModelSpecification,
     GravityStrategySelection,
+    GravityTimeSpecification,
     GravityValidationMetadata,
     PersistedGravityReportInputs,
     validate_gravity_report_provenance,
@@ -32,7 +33,9 @@ def _jsonable(value: object) -> object:
     return value
 
 
-def _portable_inputs() -> tuple[dict[str, object], dict[str, object], ODParameterLayout]:
+def _portable_inputs(
+    specification: GravityModelSpecification | None = None,
+) -> tuple[dict[str, object], dict[str, object], ODParameterLayout]:
     layout = ODParameterLayout(
         num_od_total=2,
         od_keys=(("o1", "d1", "am"), ("o1", "d2", "am")),
@@ -43,7 +46,7 @@ def _portable_inputs() -> tuple[dict[str, object], dict[str, object], ODParamete
         fixed_zero_indices=(),
         fixed_positive_indices=(),
     )
-    specification = GravityModelSpecification()
+    specification = specification or GravityModelSpecification()
     result = GravityEstimationResult(
         schema_version=GRAVITY_RESULT_SCHEMA_VERSION,
         status="converged",
@@ -147,6 +150,35 @@ def test_persisted_report_is_portable_and_records_canonical_provenance(tmp_path)
     } == {
         key: fit[key] for key in GRAVITY_REPORT_PROVENANCE_FIELDS
     }
+
+
+def test_persisted_report_accepts_json_normalized_tuple_specification(tmp_path):
+    specification = GravityModelSpecification(
+        time=GravityTimeSpecification(bin_labels=("morning", "evening"))
+    )
+    fit, validation, layout = _portable_inputs(specification)
+    # Simulate a JSON round trip: tuple-valued time-bin labels become lists,
+    # including inside the nested persisted result payload.
+    fit = _jsonable(fit)
+    validation = _jsonable(validation)
+    assert isinstance(fit["result"], dict)
+    assert fit["result"]["model_specification"]["time"]["bin_labels"] == [
+        "morning",
+        "evening",
+    ]
+
+    report = write_persisted_gravity_detailed_report(
+        fit_manifest=fit,
+        validation_manifest=validation,
+        observations=[3.0, 5.0, 7.0],
+        od_layout=layout,
+        likelihood="poisson",
+        output_directory=tmp_path / "json-normalized",
+    )
+    payload = json.loads((report.output_directory / "report.json").read_text())
+    assert payload["specification_fingerprint"] == specification.fingerprint
+    assert payload["model_specification"] == _jsonable(specification.to_dict())
+    assert payload["provenance"]["specification_fingerprint"] == specification.fingerprint
 
 
 def test_portable_report_does_not_require_case_context(tmp_path):
