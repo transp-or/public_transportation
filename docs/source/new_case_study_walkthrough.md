@@ -4063,7 +4063,131 @@ write_gravity_viewer_bundle(
 
 For a completed case that already has fit and validation manifests, use the
 persisted-artifact convenience entry point instead of reconstructing typed
-results and a detailed report in the case driver:
+results and a detailed report in the case driver. The following recipe shows
+the complete loading sequence. Run it from the case-study root, after
+`fit` and `validate` have completed successfully (or have been deliberately
+retained as diagnostic artifacts).
+
+First resolve the durable results root and load the two JSON manifests. Do not
+guess a results path from the repository layout: a case may point `results` at
+JED scratch or another absolute location.
+
+```python
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+
+from adapter import CaseSettings, load_persisted_viewer_inputs
+from public_transportation.inference.gravity import (
+    write_persisted_gravity_viewer_bundle,
+)
+
+
+case_root = Path.cwd().resolve()
+settings = CaseSettings.load(case_root)
+results_root = settings.results.expanduser().resolve()
+
+
+def read_manifest(stage: str) -> dict[str, object]:
+    path = results_root / "manifests" / f"{stage}.json"
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"{stage} manifest is missing: {path}; run {stage} first."
+        )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"{stage} manifest must contain a JSON object: {path}")
+    if payload.get("status") != "completed":
+        raise RuntimeError(
+            f"{stage} manifest is not completed: {payload.get('status')!r}"
+        )
+    return payload
+
+
+fit_manifest = read_manifest("fit")
+validation_manifest = read_manifest("validate")
+
+# This is a case-owned, lightweight adapter hook. It must read the original
+# mapped observations and the canonical ODParameterLayout (and optionally
+# aligned GravityValidationMetadata) without calling routing, activation,
+# objective evaluation, or fitting. Its implementation must verify that the
+# returned OD-layout and mapping fingerprints agree with the manifests.
+viewer_inputs = load_persisted_viewer_inputs(
+    case_root=case_root,
+    results_root=results_root,
+)
+observations = np.asarray(viewer_inputs.observations)
+od_layout = viewer_inputs.od_layout
+validation_metadata = viewer_inputs.metadata
+
+if observations.ndim != 1:
+    raise ValueError("viewer observations must be a one-dimensional vector")
+if observations.size != int(
+    validation_manifest.get("number_of_measurements", observations.size)
+):
+    raise ValueError("viewer observations do not match the validation manifest")
+
+network_dir = settings.scenario
+bundle = write_persisted_gravity_viewer_bundle(
+    output_directory=results_root / "viewer_bundle",
+    fit_manifest=fit_manifest,
+    validation_manifest=validation_manifest,
+    observations=observations,
+    od_layout=od_layout,
+    metadata=validation_metadata,
+    likelihood=str(settings.model.get("likelihood", "negative_binomial")),
+    network_files={
+        "stops.csv": network_dir / "stops.csv",
+        "lines.csv": network_dir / "lines.csv",
+        "trips.csv": network_dir / "trips.csv",
+        "stop_times.csv": network_dir / "stop_times.csv",
+    },
+    bundle_metadata={
+        "time_zone": "Europe/Zurich",          # case-owned; do not guess
+        "coordinate_system": "latitude_longitude",
+        "x_column": "lon",
+        "y_column": "lat",
+    },
+)
+print(f"viewer bundle written to {bundle.path}")
+```
+
+`load_persisted_viewer_inputs` above is an explicitly case-owned adapter hook,
+not a public-package function with a fixed name. The hook must return the
+mapped observation vector in exactly the order used by the fit and validation
+manifests, the same `ODParameterLayout` (including its free/fixed partition),
+and either `None` or a `GravityValidationMetadata` object aligned with the
+measurement rows. A typical implementation may read a case-persisted mapping
+table and layout JSON, or reconstruct those two contracts from the case inputs
+without activating routing; it must then compare their fingerprints with the
+persisted manifests and stop on any mismatch. If the adapter currently only
+offers an expensive `load_context` function, add this lightweight export hook
+before using the recipe rather than silently rebuilding the routing operator.
+
+The exact input paths and the network snapshot are case-owned. Replace
+`settings.scenario` and the metadata values with the paths and coordinate
+conventions declared by the case. Do not copy the example time zone or column
+names unless they are correct for that case.
+
+If the case already has these typed objects in memory, they may be passed
+directly; the manifest-loading and fingerprint checks above still apply.
+
+Save the recipe as a case-owned script (for example,
+`scripts/export_viewer_bundle.py`) and invoke it from the case-study root:
+
+```bash
+uv run --frozen python scripts/export_viewer_bundle.py
+```
+
+The script should stop if either manifest is missing or incomplete, if the
+adapter cannot provide the persisted observation/layout contracts, or if any
+fingerprint check fails. It must never rebuild the operator merely to obtain
+inputs for this report-only export.
+
+The lower-level call used by the recipe is:
 
 ```python
 from public_transportation.inference.gravity import (
@@ -4110,7 +4234,14 @@ it must not infer the model from plotted values or from the case directory.
 The bundle also contains `bundle_manifest.json`, the existing report tables
 (`full_od.csv`, `predicted_measurements.csv`, `residuals.csv`,
 `grouped_residuals.csv`, and `parameters.csv`), the report summaries, and an
-optional `identifiability/` directory. The manifest stores checksums, file
+optional `identifiability/` directory. When the source data are sufficient,
+the writer additionally creates the optional display tables
+`od_map.csv` and `stop_summary.csv`. `od_map.csv` has one row per displayable
+OD/time pair with observed (when an OD-level observed vector was supplied),
+modeled, residual, fixed/free, and identifiability fields. `stop_summary.csv`
+has observed/modelled totals, residuals, and incoming/outgoing totals per
+stop. These are display-oriented aggregations, not independent diagnostics;
+they are never used to rerun or alter estimation. The manifest stores checksums, file
 sizes, row counts, all fit/validation/report/diagnostic provenance, operator
 and layout fingerprints, package revision, time zone, and coordinate
 convention. Network files are copied only from explicit paths supplied by the
@@ -4118,7 +4249,33 @@ case owner; `stops.csv` must contain `stop_id,name,lat,lon`, and all report
 stop/line/trip references are checked against the snapshot.
 
 The independent viewer loads and validates the bundle without recomputing the
-model:
+model. Open the viewer's `index.html`, choose the directory containing
+`bundle_manifest.json`, and follow this short workflow:
+
+1. Select **Stops** to inspect stop markers. Choose the marker-size and
+   marker-colour metrics, search by stop name or ID, and click a marker to see
+   observed/modelled totals, residual, incoming/outgoing totals, and top
+   incoming/outgoing OD pairs.
+2. Select **OD pairs** to choose an origin and destination by name or ID, or
+   click two stops on the map. Use the departure-bin, minimum-demand,
+   residual-direction/magnitude, and maximum-pair filters. Select a row in the
+   ranked top-pairs list to highlight its curved line and open its detail
+   panel.
+3. Use **Selected stop only** to restrict the OD list to pairs involving the
+   selected stop, and **Reset selection** to clear the map and filters.
+
+The map draws only the selected or filtered top-N OD pairs; it never draws the
+complete OD table. Marker size and line width use logarithmic scaling where
+appropriate. Blue denotes underprediction, red overprediction, and neutral
+gray an approximately zero signed residual. The bundled network routes remain
+visible as context. OpenStreetMap background tiles require internet access;
+the bundle itself stays local and read-only.
+
+For bundles created before `od_map.csv` and `stop_summary.csv` were added, the
+viewer keeps the ordinary tables and network map available and shows a clear
+notice that interactive summaries are unavailable.
+
+The programmatic reader is also available without a browser:
 
 ```python
 from public_transportation.inference.gravity import read_gravity_viewer_bundle

@@ -16,6 +16,7 @@ from public_transportation.inference.od_parameter_layout import ODParameterLayou
 from .estimator import GravityEstimationResult
 from .identifiability import GravityODIdentifiability
 from .objective import GravityLikelihood
+from .specification import GravityModelSpecification
 from .validation import (
     GravityAdequacyConfig,
     GravityAdequacyReport,
@@ -86,6 +87,38 @@ _OD_FIELDS = (
 _MISSING = object()
 _PREDICTION_RTOL = 5.0e-6
 _PREDICTION_ATOL = 5.0e-6
+
+
+def _validated_result_specification(
+    result: GravityEstimationResult,
+) -> tuple[dict[str, object], str]:
+    """Return the exact specification carried by a fit result.
+
+    Reports must never infer a model from a human-readable name.  The result
+    must contain the canonical serialization produced by
+    :class:`GravityModelSpecification` and its matching fingerprint.
+    """
+    raw = result.model_specification
+    if raw is None or not isinstance(raw, Mapping):
+        raise ValueError(
+            "gravity result is missing model_specification; regenerate the fit "
+            "before generating a detailed report."
+        )
+    try:
+        specification = GravityModelSpecification.from_dict(dict(raw))
+    except (TypeError, ValueError) as error:
+        raise ValueError("gravity result model_specification is invalid.") from error
+    serialized = specification.to_dict()
+    if dict(raw) != serialized:
+        raise ValueError(
+            "gravity result model_specification is not the canonical serialized specification."
+        )
+    if result.specification_fingerprint != specification.fingerprint:
+        raise ValueError(
+            "gravity result specification_fingerprint does not match its "
+            "serialized model_specification."
+        )
+    return serialized, specification.fingerprint
 
 
 def _immutable_vector(value: object) -> np.ndarray:
@@ -166,6 +199,57 @@ def _manifest_value(
     return _MISSING
 
 
+def _manifest_specification(
+    manifest: Mapping[str, object], name: str
+) -> tuple[dict[str, object], str]:
+    """Recover and validate an exact specification from a stage manifest."""
+    roots: list[Mapping[str, object]] = [manifest]
+    for key in ("result", "adequacy", "validation_result", "provenance"):
+        value = manifest.get(key)
+        if isinstance(value, Mapping):
+            roots.append(value)
+
+    serialized_candidates: list[dict[str, object]] = []
+    fingerprint_candidates: list[str] = []
+    for root in roots:
+        raw = root.get("model_specification", _MISSING)
+        if isinstance(raw, Mapping) and isinstance(raw.get("specification"), Mapping):
+            raw = raw["specification"]
+        if raw is not _MISSING and raw is not None:
+            if not isinstance(raw, Mapping):
+                raise ValueError(f"{name} manifest model_specification must be a mapping.")
+            try:
+                parsed = GravityModelSpecification.from_dict(dict(raw))
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"{name} manifest model_specification is invalid.") from error
+            canonical = parsed.to_dict()
+            if dict(raw) != canonical:
+                raise ValueError(
+                    f"{name} manifest model_specification is not canonical."
+                )
+            serialized_candidates.append(canonical)
+            fingerprint_candidates.append(parsed.fingerprint)
+        raw_fingerprint = root.get("specification_fingerprint", _MISSING)
+        if raw_fingerprint is not _MISSING and raw_fingerprint is not None:
+            fingerprint_candidates.append(str(raw_fingerprint))
+
+    if not serialized_candidates:
+        raise ValueError(
+            f"{name} manifest is missing model_specification; regenerate the stage "
+            "with a package version that persists the exact specification."
+        )
+    specification = serialized_candidates[0]
+    if any(candidate != specification for candidate in serialized_candidates[1:]):
+        raise ValueError(f"{name} manifest contains conflicting model specifications.")
+    computed = GravityModelSpecification.from_dict(specification).fingerprint
+    if any(candidate != computed for candidate in fingerprint_candidates):
+        raise ValueError(
+            f"{name} manifest specification_fingerprint does not match its "
+            "serialized model_specification."
+        )
+    return specification, computed
+
+
 def _manifest_status(manifest: Mapping[str, object], name: str) -> None:
     status = manifest.get("status", _MISSING)
     if status != "completed":
@@ -206,6 +290,38 @@ def validate_gravity_report_provenance(
         )
     _validate_prediction_agreement(fit_predictions, validation_predictions)
 
+    fit_specification, fit_specification_fingerprint = _manifest_specification(
+        fit_manifest, "fit"
+    )
+    validation_specification, validation_specification_fingerprint = (
+        _manifest_specification(validation_manifest, "validation")
+    )
+    if fit_specification_fingerprint != validation_specification_fingerprint:
+        raise ValueError(
+            "specification_fingerprint differs between fit and validation: "
+            f"fit={fit_specification_fingerprint!r}, "
+            f"validation={validation_specification_fingerprint!r}."
+        )
+    if fit_specification != validation_specification:
+        raise ValueError(
+            "model_specification differs between fit and validation manifests."
+        )
+
+    fit_model_fingerprint = _manifest_value(fit_manifest, "model_fingerprint")
+    validation_model_fingerprint = _manifest_value(
+        validation_manifest, "model_fingerprint"
+    )
+    if fit_model_fingerprint is _MISSING or validation_model_fingerprint is _MISSING:
+        raise ValueError(
+            "model_fingerprint is required in both fit and validation manifests."
+        )
+    if fit_model_fingerprint != validation_model_fingerprint:
+        raise ValueError(
+            "model_fingerprint differs between fit and validation: "
+            f"fit={fit_model_fingerprint!r}, "
+            f"validation={validation_model_fingerprint!r}."
+        )
+
     persisted: dict[str, object] = {}
     for field in GRAVITY_REPORT_PROVENANCE_FIELDS:
         fit_value = _manifest_value(fit_manifest, field)
@@ -222,6 +338,10 @@ def validate_gravity_report_provenance(
                 f"fit={fit_value!r}, validation={validation_value!r}."
             )
         persisted[field] = fit_value
+
+    persisted["model_fingerprint"] = fit_model_fingerprint
+    persisted["specification_fingerprint"] = fit_specification_fingerprint
+    persisted["model_specification"] = fit_specification
 
     if persisted["od_layout_fingerprint"] != od_layout.fingerprint:
         raise ValueError(
@@ -241,6 +361,19 @@ def validate_gravity_report_provenance(
                     f"value: supplied={None if supplied is _MISSING else supplied!r}, "
                     f"persisted={persisted[field]!r}."
                 )
+        for field in (
+            "model_fingerprint",
+            "specification_fingerprint",
+            "model_specification",
+        ):
+            supplied = supplied_provenance.get(field, _MISSING)
+            if supplied is _MISSING:
+                continue
+            if supplied != persisted[field]:
+                raise ValueError(
+                    f"supplied provenance field {field!r} differs from persisted "
+                    f"value: supplied={supplied!r}, persisted={persisted[field]!r}."
+                )
     return persisted
 
 
@@ -254,7 +387,12 @@ def _validate_expected_provenance(
         raise ValueError(
             "expected persisted provenance was supplied, but report provenance is missing."
         )
-    for field in GRAVITY_REPORT_PROVENANCE_FIELDS:
+    for field in (
+        *GRAVITY_REPORT_PROVENANCE_FIELDS,
+        "model_fingerprint",
+        "specification_fingerprint",
+        "model_specification",
+    ):
         expected_value = expected.get(field, _MISSING)
         actual_value = provenance.get(field, _MISSING)
         if expected_value is _MISSING or actual_value is _MISSING:
@@ -274,6 +412,7 @@ def _validate_restored_result(
     result: GravityEstimationResult, od_layout: ODParameterLayout
 ) -> None:
     """Validate typed result vectors before portable report output is created."""
+    _validated_result_specification(result)
     vectors: dict[str, np.ndarray] = {}
     for name in (
         "raw_parameters",
@@ -649,6 +788,8 @@ def _adequacy_json(report: GravityAdequacyReport) -> dict[str, object]:
     return {
         "schema_version": report.schema_version,
         "model_fingerprint": report.model_fingerprint,
+        "specification_fingerprint": report.specification_fingerprint,
+        "model_specification": report.model_specification,
         "report_fingerprint": report.report_fingerprint,
         "measurements": report.measurements,
         "observed_total": report.observed_total,
@@ -785,6 +926,13 @@ def _executive_markdown(
     adequacy: GravityAdequacyReport,
     messages: tuple[str, ...],
 ) -> str:
+    specification = result.model_specification or {}
+    likelihood = specification.get("likelihood", {})
+    likelihood_family = (
+        likelihood.get("family", "unknown")
+        if isinstance(likelihood, Mapping)
+        else "unknown"
+    )
     lines = [
         "# Executive summary",
         "",
@@ -799,6 +947,11 @@ def _executive_markdown(
             "",
             "| Figure | Value |",
             "|---|---:|",
+            f"| Model name | `{specification.get('model_name', 'unknown')}` |",
+            f"| Likelihood family | `{likelihood_family}` |",
+            f"| Estimated parameters | {result.raw_parameters.size} |",
+            f"| Specification fingerprint | `{result.specification_fingerprint}` |",
+            f"| Model fingerprint | `{result.model_fingerprint}` |",
             f"| Fit status | `{result.status}` |",
             f"| Acceptance | `{result.acceptance}` |",
             f"| Objective | {result.objective:.9g} |",
@@ -821,6 +974,13 @@ def _detailed_markdown(
     adequacy: GravityAdequacyReport,
     summary: Mapping[str, object],
 ) -> str:
+    specification = result.model_specification or {}
+    likelihood = specification.get("likelihood", {})
+    likelihood_family = (
+        likelihood.get("family", "unknown")
+        if isinstance(likelihood, Mapping)
+        else "unknown"
+    )
     lines = [
         "# Detailed gravity-fit report",
         "",
@@ -831,6 +991,8 @@ def _detailed_markdown(
         f"- Status: `{result.status}`; success: `{result.success}`; acceptance: `{result.acceptance}`.",
         f"- Optimizer: `{result.optimizer}`; iterations: `{result.iterations}`; evaluations: `{result.optimizer_evaluations}`.",
         f"- Objective: `{result.objective:.9g}`; scaled gradient infinity norm: `{result.scaled_gradient_inf_norm}`.",
+        f"- Model name: `{specification.get('model_name', 'unknown')}`; likelihood family: `{likelihood_family}`; estimated parameters: `{result.raw_parameters.size}`.",
+        f"- Specification fingerprint: `{result.specification_fingerprint}`.",
         f"- Model fingerprint: `{result.model_fingerprint}`.",
         "",
         "## Adequacy metrics",
@@ -926,6 +1088,19 @@ def write_gravity_detailed_report(
         )
     persisted_modeled = np.asarray(result.predicted_measurements, dtype=np.float64)
     _validate_prediction_agreement(persisted_modeled, modeled)
+    model_specification, specification_fingerprint = _validated_result_specification(
+        result
+    )
+    supplied = {} if provenance is None else dict(provenance)
+    for field, expected in (
+        ("model_fingerprint", result.model_fingerprint),
+        ("specification_fingerprint", specification_fingerprint),
+        ("model_specification", model_specification),
+    ):
+        if field in supplied and supplied[field] != expected:
+            raise ValueError(
+                f"report provenance field {field!r} differs from the fitted result."
+            )
     selected_metadata = metadata or GravityValidationMetadata(observed.size)
     if not isinstance(selected_metadata, GravityValidationMetadata):
         raise TypeError("metadata must be GravityValidationMetadata or None.")
@@ -969,6 +1144,7 @@ def write_gravity_detailed_report(
         dispersion=_dispersion(result, likelihood_value),
         metadata=selected_metadata,
         config=adequacy_config,
+        specification=GravityModelSpecification.from_dict(model_specification),
     )
 
     od_rows = _od_rows(result, od_layout, identifiability)
@@ -1047,6 +1223,8 @@ def write_gravity_detailed_report(
         "schema_version": GRAVITY_DETAILED_REPORT_SCHEMA_VERSION,
         "status": "completed",
         "model_fingerprint": result.model_fingerprint,
+        "specification_fingerprint": specification_fingerprint,
+        "model_specification": model_specification,
         "fit": {
             "status": result.status,
             "success": result.success,
@@ -1057,6 +1235,7 @@ def write_gravity_detailed_report(
             "evaluations": result.optimizer_evaluations,
             "objective": result.objective,
             "scaled_gradient_inf_norm": result.scaled_gradient_inf_norm,
+            "specification_fingerprint": specification_fingerprint,
         },
         "od": {
             "total_cells": od_layout.num_od_total,
@@ -1071,7 +1250,12 @@ def write_gravity_detailed_report(
         "adequacy": _adequacy_json(adequacy),
         "identifiability": _identifiability_json(identifiability),
         "executive_messages": list(executive_messages),
-        "provenance": dict(provenance or {}),
+        "provenance": {
+            **supplied,
+            "model_fingerprint": result.model_fingerprint,
+            "specification_fingerprint": specification_fingerprint,
+            "model_specification": model_specification,
+        },
         "files": {name: str(output / name) for name in _REPORT_FILES},
     }
     report_hash = hashlib.sha256(
@@ -1134,6 +1318,8 @@ def write_persisted_gravity_detailed_report(
         raise TypeError("validation_manifest must be a mapping.")
     if not isinstance(od_layout, ODParameterLayout):
         raise TypeError("od_layout must be an ODParameterLayout.")
+    _manifest_status(fit_manifest, "fit")
+    _manifest_status(validation_manifest, "validation")
     raw_result = fit_manifest.get("result")
     if not isinstance(raw_result, Mapping):
         raise ValueError("fit_manifest['result'] must be a mapping.")

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -16,6 +16,7 @@ from public_transportation.inference.compact_od_assignment_layout import (
 
 from .estimator import GravityEstimationResult, gravity_model_fingerprint
 from .objective import GravityObjectiveProblem, predict_gravity_measurements
+from .specification import GravityModelSpecification
 
 
 def _immutable(value: object, *, name: str, length: int) -> np.ndarray:
@@ -206,6 +207,8 @@ class GravityAdequacyReport:
     grouped_summaries: tuple[GravityGroupedResidualSummary, ...]
     journey_correlations: tuple[GravityJourneyCorrelationSummary, ...]
     findings: GravityAdequacyFindings
+    specification_fingerprint: str = ""
+    model_specification: dict[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.schema_version != 1:
@@ -214,6 +217,15 @@ class GravityAdequacyReport:
             value = np.array(getattr(self, name), copy=True)
             value.setflags(write=False)
             object.__setattr__(self, name, value)
+        if not isinstance(self.specification_fingerprint, str):
+            raise ValueError("specification_fingerprint must be a string.")
+        if not isinstance(self.model_specification, dict):
+            raise ValueError("model_specification must be a dictionary.")
+        object.__setattr__(
+            self,
+            "model_specification",
+            dict(self.model_specification),
+        )
 
 
 def _nb_logpmf(y: np.ndarray, mu: np.ndarray, dispersion: float) -> np.ndarray:
@@ -341,6 +353,7 @@ def build_gravity_adequacy_report(
     dispersion: float | None = None,
     metadata: GravityValidationMetadata | None = None,
     config: GravityAdequacyConfig = GravityAdequacyConfig(),
+    specification: GravityModelSpecification | None = None,
 ) -> GravityAdequacyReport:
     """Build adequacy diagnostics from already computed observations and means.
 
@@ -463,6 +476,10 @@ def build_gravity_adequacy_report(
         },
         "config": config,
     }
+    specification_fingerprint = "" if specification is None else specification.fingerprint
+    model_specification = {} if specification is None else specification.to_dict()
+    report_payload["specification_fingerprint"] = specification_fingerprint
+    report_payload["model_specification"] = model_specification
     return GravityAdequacyReport(
         1,
         model_fingerprint,
@@ -482,7 +499,41 @@ def build_gravity_adequacy_report(
         grouped,
         journeys,
         findings,
+        specification_fingerprint,
+        model_specification,
     )
+
+
+def _result_specification(
+    result: GravityEstimationResult,
+    specification: GravityModelSpecification,
+) -> None:
+    """Require a fitted result to carry the exact problem specification."""
+    raw = result.model_specification
+    if raw is None or not isinstance(raw, Mapping):
+        raise ValueError(
+            "gravity result is missing model_specification; regenerate the fit "
+            "with a package version that persists the exact specification."
+        )
+    try:
+        parsed = GravityModelSpecification.from_dict(dict(raw))
+    except (TypeError, ValueError) as error:
+        raise ValueError("gravity result model_specification is invalid.") from error
+    serialized = parsed.to_dict()
+    if serialized != specification.to_dict() or dict(raw) != specification.to_dict():
+        raise ValueError(
+            "gravity result model_specification differs from the validation problem."
+        )
+    if result.specification_fingerprint != specification.fingerprint:
+        raise ValueError(
+            "gravity result specification_fingerprint differs from the validation "
+            "problem specification."
+        )
+    if parsed.fingerprint != result.specification_fingerprint:
+        raise ValueError(
+            "gravity result specification_fingerprint does not match its "
+            "serialized model_specification."
+        )
 
 
 def validate_full_data_gravity_adequacy(
@@ -502,6 +553,8 @@ def validate_full_data_gravity_adequacy(
         )
     if result.model_fingerprint != gravity_model_fingerprint(problem, compact_layout):
         raise ValueError("gravity result and validation problem fingerprints differ.")
+    specification = problem.parameter_layout.specification
+    _result_specification(result, specification)
     predicted, demand = predict_gravity_measurements(
         result.raw_parameters, problem=problem
     )
@@ -531,4 +584,5 @@ def validate_full_data_gravity_adequacy(
         dispersion=dispersion,
         metadata=selected_metadata,
         config=config,
+        specification=specification,
     )

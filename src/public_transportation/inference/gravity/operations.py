@@ -28,6 +28,7 @@ from .estimator import (
     gravity_model_fingerprint,
 )
 from .objective import GravityObjectiveProblem
+from .specification import GravityModelSpecification
 from public_transportation.inference.block_coordinate._canonical import fingerprint
 from public_transportation.inference.construction_control import (
     normalize_progress_event,
@@ -118,6 +119,30 @@ def build_gravity_run_manifest(
 ) -> dict[str, object]:
     """Build a serializable immutable-identity and execution record."""
     operator = problem.operator
+    specification = problem.parameter_layout.specification
+    if result is not None:
+        raw_specification = result.model_specification
+        if raw_specification is None or not isinstance(raw_specification, Mapping):
+            raise ValueError(
+                "gravity result is missing model_specification; cannot build a fit manifest."
+            )
+        try:
+            parsed_specification = GravityModelSpecification.from_dict(
+                dict(raw_specification)
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("gravity result model_specification is invalid.") from error
+        if dict(raw_specification) != specification.to_dict():
+            raise ValueError(
+                "gravity result model_specification differs from the run problem."
+            )
+        if (
+            result.specification_fingerprint != specification.fingerprint
+            or parsed_specification.fingerprint != result.specification_fingerprint
+        ):
+            raise ValueError(
+                "gravity result specification_fingerprint differs from the run problem."
+            )
     environment_names = (
         "JAX_ENABLE_X64",
         "JAX_PLATFORM_NAME",
@@ -155,7 +180,6 @@ def build_gravity_run_manifest(
             "dtype": str(operator.dtype),
         }
     )
-    specification = problem.parameter_layout.specification
     manifest: dict[str, object] = {
         "schema_version": GRAVITY_RUN_MANIFEST_SCHEMA_VERSION,
         "created_at_utc": _utc_now(),

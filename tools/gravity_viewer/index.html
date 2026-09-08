@@ -1,0 +1,462 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gravity Viewer Bundle</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
+  <style>
+    :root { color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 0; color: #172033; background: #f4f6fa; }
+    header { padding: 28px clamp(20px, 5vw, 72px); color: white; background: #18243b; }
+    header h1 { margin: 0 0 8px; font-size: clamp(24px, 4vw, 38px); }
+    header p { margin: 0; color: #cbd5e8; }
+    main { width: min(1400px, calc(100% - 40px)); margin: 24px auto 60px; }
+    .panel { margin: 18px 0; padding: 20px; border: 1px solid #dce2ed; border-radius: 14px; background: white; box-shadow: 0 3px 14px #1926420d; }
+    .drop { display: grid; gap: 10px; place-items: center; min-height: 130px; border: 2px dashed #9aabc7; border-radius: 12px; background: #f9fbff; text-align: center; }
+    .drop strong { font-size: 18px; }
+    input[type=file] { max-width: 100%; }
+    .status { margin-top: 12px; padding: 10px 12px; border-radius: 8px; background: #eef2f8; color: #42516a; white-space: pre-wrap; }
+    .status.ok { background: #e9f8ef; color: #17663a; }
+    .status.bad { background: #fff0f0; color: #9c2525; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+    .metric { padding: 14px; border-radius: 10px; background: #f5f7fb; }
+    .metric label { display: block; margin-bottom: 5px; color: #69758a; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+    .metric strong { display: block; overflow-wrap: anywhere; font-size: 18px; }
+    h2 { margin: 0 0 14px; font-size: 20px; }
+    h3 { margin: 22px 0 10px; font-size: 15px; }
+    .two { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 18px; }
+    .table-wrap { overflow: auto; max-height: 430px; border: 1px solid #e1e6ef; border-radius: 8px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; white-space: nowrap; }
+    th, td { padding: 8px 10px; border-bottom: 1px solid #edf0f5; text-align: left; }
+    th { position: sticky; top: 0; color: #4b5b75; background: #f5f7fb; }
+    .muted { color: #69758a; }
+    .fingerprint { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; word-break: break-all; }
+    #map { height: 620px; border-radius: 10px; background: #e9eef5; }
+    .toolbar { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; margin-bottom: 14px; }
+    .toolbar label { display: grid; gap: 4px; color: #4b5b75; font-size: 12px; }
+    .toolbar input, .toolbar select, .toolbar button { min-height: 34px; box-sizing: border-box; border: 1px solid #cbd5e5; border-radius: 6px; background: white; color: #172033; padding: 6px 9px; }
+    .toolbar button { cursor: pointer; font-weight: 600; }
+    .toolbar button.active { color: white; border-color: #235aa6; background: #235aa6; }
+    .toolbar button:disabled { cursor: not-allowed; opacity: .5; }
+    .notice { margin: 10px 0; padding: 9px 11px; border-radius: 7px; background: #fff7df; color: #765b00; }
+    .detail { min-height: 80px; padding: 12px; border: 1px solid #e1e6ef; border-radius: 8px; background: #fafcff; }
+    .detail dl { display: grid; grid-template-columns: max-content 1fr; gap: 5px 14px; margin: 0; font-size: 13px; }
+    .detail dt { color: #69758a; }
+    .detail dd { margin: 0; overflow-wrap: anywhere; }
+    .legend { display: flex; flex-wrap: wrap; gap: 12px; margin: 8px 0 0; color: #69758a; font-size: 12px; }
+    .legend span::before { content: ''; display: inline-block; width: 11px; height: 11px; margin-right: 5px; border-radius: 50%; vertical-align: -1px; background: #9aa3b2; }
+    .legend .under::before { background: #2b78c5; }
+    .legend .over::before { background: #d14b4b; }
+    .legend .neutral::before { background: #9099a8; }
+    .map-list { max-height: 330px; }
+    .map-list tr { cursor: pointer; }
+    .map-list tr:hover { background: #eef4ff; }
+    .small { font-size: 12px; }
+    .markdown h1, .markdown h2, .markdown h3 { margin: 18px 0 8px; }
+    .markdown h1 { font-size: 22px; }
+    .markdown h2 { font-size: 19px; }
+    .markdown h3 { font-size: 16px; }
+    .markdown p { margin: 8px 0; line-height: 1.5; }
+    .markdown ul, .markdown ol { margin: 8px 0; padding-left: 24px; }
+    .markdown code { padding: 2px 4px; border-radius: 4px; background: #eef2f8; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9em; }
+    .markdown pre { overflow: auto; padding: 12px; border-radius: 8px; background: #172033; color: #f5f7fb; }
+    .markdown pre code { padding: 0; background: transparent; color: inherit; }
+    .hidden { display: none; }
+    @media (max-width: 600px) { main { width: min(100% - 24px, 1400px); } .panel { padding: 14px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Gravity Viewer Bundle</h1>
+    <p>Portable, read-only inspection of a <code>gravity_viewer_bundle_v1</code>.</p>
+  </header>
+  <main>
+    <section class="panel">
+      <div class="drop">
+        <strong>Select a viewer-bundle directory</strong>
+        <span class="muted">Choose the folder containing <code>bundle_manifest.json</code>.</span>
+        <input id="folder" type="file" webkitdirectory directory multiple>
+      </div>
+      <div id="status" class="status">No bundle loaded.</div>
+    </section>
+
+    <section id="summary" class="panel hidden">
+      <h2>Bundle summary</h2>
+      <div id="metrics" class="grid"></div>
+      <div class="two">
+        <div><h3>Model specification</h3><div id="model" class="muted"></div></div>
+        <div><h3>Provenance</h3><div id="provenance" class="muted"></div></div>
+      </div>
+    </section>
+
+    <section id="diagnostics" class="panel hidden">
+      <h2>Diagnostics</h2>
+      <div id="diagnostic-metrics" class="grid"></div>
+      <h3>Executive summary</h3>
+      <div id="executive" class="markdown muted"></div>
+    </section>
+
+    <section id="network-map" class="panel hidden">
+      <h2>Network map</h2>
+      <p class="muted">Bundled stops and approximate route paths over an OpenStreetMap background.</p>
+      <div id="interactive-notice" class="notice hidden"></div>
+      <div id="map-toolbar" class="toolbar hidden">
+        <button id="stops-mode" type="button" class="active">Stops</button>
+        <button id="od-mode" type="button">OD pairs</button>
+        <label id="stop-search-label">Stop search
+          <input id="stop-search" type="search" placeholder="Name or ID">
+        </label>
+        <label id="stop-size-label">Marker size
+          <select id="stop-size"><option value="observed_total">Observed total</option><option value="modeled_total">Modeled total</option><option value="residual">Residual</option></select>
+        </label>
+        <label id="stop-color-label">Marker color
+          <select id="stop-color"><option value="observed_total">Observed total</option><option value="modeled_total">Modeled total</option><option value="residual">Residual</option></select>
+        </label>
+        <label id="od-origin-label" class="hidden">Origin
+          <select id="od-origin"></select>
+        </label>
+        <label id="od-destination-label" class="hidden">Destination
+          <select id="od-destination"></select>
+        </label>
+        <label id="od-bin-label" class="hidden">Departure bin
+          <select id="od-bin"></select>
+        </label>
+        <label id="od-min-label" class="hidden">Minimum demand
+          <input id="od-min" type="number" min="0" step="any" value="0">
+        </label>
+        <label id="od-limit-label" class="hidden">Maximum pairs
+          <input id="od-limit" type="number" min="1" step="1" value="25">
+        </label>
+        <label id="od-residual-label" class="hidden">Residual filter
+          <select id="od-residual"><option value="all">All</option><option value="under">Underprediction</option><option value="over">Overprediction</option><option value="nonzero">Non-zero magnitude</option></select>
+        </label>
+        <label id="od-residual-min-label" class="hidden">Minimum residual magnitude
+          <input id="od-residual-min" type="number" min="0" step="any" value="0">
+        </label>
+        <label id="od-stop-filter-label" class="hidden"><span>Selected stop only</span><input id="od-stop-filter" type="checkbox"></label>
+        <button id="reset-selection" type="button">Reset selection</button>
+      </div>
+      <div id="map"></div>
+      <div class="legend"><span class="under">Underprediction</span><span class="over">Overprediction</span><span class="neutral">Approximately zero</span></div>
+      <div id="stop-detail" class="detail hidden"></div>
+      <div id="od-detail" class="detail hidden"></div>
+      <div id="od-list-wrap" class="hidden"><h3>Top OD pairs</h3><div class="table-wrap map-list"><table id="od-list"><thead></thead><tbody></tbody></table></div></div>
+    </section>
+
+    <section id="tables" class="panel hidden">
+      <h2>Data preview</h2>
+      <p class="muted">Showing up to 100 rows per table. The bundle remains on disk and is never modified.</p>
+      <div id="table-content"></div>
+    </section>
+  </main>
+  <script>
+    /* Leaflet is used only for display; the bundle itself remains local and read-only. */
+    const leafletScript = document.createElement('script');
+    leafletScript.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+    leafletScript.integrity = 'sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=';
+    leafletScript.crossOrigin = '';
+    document.head.appendChild(leafletScript);
+    const $ = (id) => document.getElementById(id);
+    const status = $('status');
+    const required = ['bundle_manifest.json', 'model_specification.json', 'report.json', 'full_od.csv', 'predicted_measurements.csv', 'residuals.csv'];
+
+    function esc(value) {
+      return String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[char]));
+    }
+    function setStatus(message, kind = '') { status.className = `status ${kind}`; status.textContent = message; }
+    function fileName(path) { return path.split('/').pop(); }
+    function findFile(files, name) {
+      return files.find((file) => file.name === name || file.webkitRelativePath.endsWith(`/${name}`));
+    }
+    async function text(files, name) {
+      const file = findFile(files, name);
+      if (!file) throw new Error(`Missing ${name}`);
+      return file.text();
+    }
+    async function json(files, name) { return JSON.parse(await text(files, name)); }
+    function parseCsv(source) {
+      const rows = []; let row = []; let cell = ''; let quoted = false;
+      for (let i = 0; i < source.length; i += 1) {
+        const char = source[i];
+        if (char === '"') {
+          if (quoted && source[i + 1] === '"') { cell += '"'; i += 1; }
+          else quoted = !quoted;
+        } else if (char === ',' && !quoted) { row.push(cell); cell = ''; }
+        else if ((char === '\n' || char === '\r') && !quoted) {
+          if (char === '\r' && source[i + 1] === '\n') i += 1;
+          row.push(cell); cell = '';
+          if (row.some((value) => value !== '')) rows.push(row);
+          row = [];
+        } else cell += char;
+      }
+      if (cell || row.length) { row.push(cell); rows.push(row); }
+      const headers = rows.shift() || [];
+      return rows.map((values) => Object.fromEntries(headers.map((header, i) => [header, values[i] ?? ''])));
+    }
+    function metric(label, value, extra = '') { return `<div class="metric"><label>${esc(label)}</label><strong class="${extra}">${esc(value)}</strong></div>`; }
+    function table(title, rows) {
+      if (!rows.length) return `<h3>${esc(title)}</h3><p class="muted">No rows.</p>`;
+      const headers = Object.keys(rows[0]);
+      const body = rows.slice(0, 100).map((row) => `<tr>${headers.map((h) => `<td>${esc(row[h])}</td>`).join('')}</tr>`).join('');
+      return `<h3>${esc(title)} <span class="muted">(${rows.length} rows)</span></h3><div class="table-wrap"><table><thead><tr>${headers.map((h) => `<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${body}</tbody></table></div>`;
+    }
+    async function sha256(file) {
+      const buffer = await file.arrayBuffer();
+      const digest = await crypto.subtle.digest('SHA-256', buffer);
+      return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+    }
+    async function validateManifest(files, manifest) {
+      const problems = [];
+      for (const name of required) if (!findFile(files, name)) problems.push(`missing required file: ${name}`);
+      for (const [name, descriptor] of Object.entries(manifest.files || {})) {
+        const file = findFile(files, fileName(name));
+        if (!file) { problems.push(`missing manifest file: ${name}`); continue; }
+        if (descriptor.size !== undefined && file.size !== descriptor.size) problems.push(`size mismatch: ${name}`);
+        if (descriptor.sha256) {
+          const actual = await sha256(file);
+          if (actual !== descriptor.sha256) problems.push(`checksum mismatch: ${name}`);
+        }
+      }
+      return problems;
+    }
+    function renderKeyValue(value) {
+      if (!value || typeof value !== 'object') return `<p>${esc(value)}</p>`;
+      return `<div class="fingerprint">${Object.entries(value).map(([key, item]) => `<div><b>${esc(key)}:</b> ${esc(typeof item === 'object' ? JSON.stringify(item) : item)}</div>`).join('')}</div>`;
+    }
+    function renderMarkdown(source) {
+      const escaped = esc(source);
+      const blocks = escaped.split(/\n\s*\n/).map((block) => {
+        if (/^```/.test(block)) {
+          return `<pre><code>${block.replace(/^```[^\n]*\n?/, '').replace(/\n?```$/, '')}</code></pre>`;
+        }
+        const lines = block.split('\n');
+        if (lines.length >= 2 && lines.every((line) => /^\s*\|.*\|\s*$/.test(line))) {
+          const cells = (line) => line.trim().replace(/^\||\|$/g, '').split('|').map((value) => value.trim());
+          const header = cells(lines[0]);
+          const hasSeparator = /^\s*\|?(?:\s*:?-+:?\s*\|)+\s*$/.test(lines[1]);
+          const bodyLines = hasSeparator ? lines.slice(2) : lines.slice(1);
+          return `<div class="table-wrap markdown-table"><table><thead><tr>${header.map((cell) => `<th>${inlineMarkdown(cell)}</th>`).join('')}</tr></thead><tbody>${bodyLines.map((line) => `<tr>${cells(line).map((cell) => `<td>${inlineMarkdown(cell)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+        }
+        if (lines.every((line) => /^\s*[-*] /.test(line))) {
+          return `<ul>${lines.map((line) => `<li>${inlineMarkdown(line.replace(/^\s*[-*] /, ''))}</li>`).join('')}</ul>`;
+        }
+        if (lines.every((line) => /^\s*\d+\. /.test(line))) {
+          return `<ol>${lines.map((line) => `<li>${inlineMarkdown(line.replace(/^\s*\d+\. /, ''))}</li>`).join('')}</ol>`;
+        }
+        const heading = block.match(/^(#{1,3})\s+(.+)$/);
+        if (heading) return `<h${heading[1].length}>${inlineMarkdown(heading[2])}</h${heading[1].length}>`;
+        return `<p>${lines.map(inlineMarkdown).join('<br>')}</p>`;
+      });
+      return blocks.join('');
+    }
+    function inlineMarkdown(value) {
+      return value.replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>').replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+    }
+    async function waitForLeaflet() {
+      for (let i = 0; i < 100 && !window.L; i += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+      if (!window.L) throw new Error('Map library could not be loaded. Check internet access and reload the viewer.');
+    }
+    const viewer = { files: [], map: null, stops: [], stopsById: new Map(), stopTimes: [], odMap: [], stopSummary: [], stopSummaryById: new Map(), markers: new Map(), routeLayer: null, odLayer: null, mode: 'stops', selectedStop: null, selectedOd: null };
+    const number = (value) => { if (value === null || value === undefined || String(value).trim() === '') return null; const parsed = Number(value); return Number.isFinite(parsed) ? parsed : null; };
+    const displayNumber = (value) => { const parsed = number(value); return parsed === null ? '—' : parsed.toLocaleString(undefined, { maximumFractionDigits: 2 }); };
+    const stopById = (id) => viewer.stopsById.get(id);
+    const summaryById = (id) => viewer.stopSummaryById.get(id);
+    function residualColor(value) {
+      const residual = number(value) || 0;
+      if (Math.abs(residual) < 1e-9) return '#9099a8';
+      return residual > 0 ? '#2b78c5' : '#d14b4b';
+    }
+    function markerRadius(value, maximum) {
+      const magnitude = Math.abs(number(value) || 0);
+      const scale = Math.log1p(magnitude) / Math.max(1, Math.log1p(maximum));
+      return 4 + 12 * scale;
+    }
+    function clearLayer(layer) { if (layer) layer.clearLayers(); }
+    function valueForStop(stop, field) { return number(summaryById(stop.stop_id)?.[field]) || 0; }
+    function setControlVisibility() {
+      const od = viewer.mode === 'od';
+      ['od-origin-label', 'od-destination-label', 'od-bin-label', 'od-min-label', 'od-limit-label', 'od-residual-label', 'od-residual-min-label', 'od-stop-filter-label'].forEach((id) => $(id).classList.toggle('hidden', !od));
+      ['stop-search-label', 'stop-size-label', 'stop-color-label'].forEach((id) => $(id).classList.toggle('hidden', od));
+      $('stop-detail').classList.toggle('hidden', od || !viewer.selectedStop);
+      $('od-detail').classList.toggle('hidden', !od || !viewer.selectedOd);
+      $('od-list-wrap').classList.toggle('hidden', !od || !viewer.odMap.length);
+    }
+    function renderStopMarkers() {
+      if (!viewer.map) return;
+      clearLayer(viewer.markerLayer);
+      viewer.markers.clear();
+      const metricField = $('stop-size').value;
+      const colorField = $('stop-color').value;
+      const maximum = Math.max(1, ...viewer.stops.map((stop) => Math.abs(valueForStop(stop, metricField))));
+      const search = $('stop-search').value.trim().toLowerCase();
+      viewer.stops.forEach((stop) => {
+        const haystack = `${stop.stop_id} ${stop.name || ''}`.toLowerCase();
+        if (search && !haystack.includes(search)) return;
+        const lat = number(stop.lat); const lon = number(stop.lon);
+        if (lat === null || lon === null) return;
+        const summary = summaryById(stop.stop_id) || {};
+        const marker = L.circleMarker([lat, lon], {
+          radius: markerRadius(summary[metricField], maximum), weight: viewer.selectedStop === stop.stop_id ? 3 : 1,
+          color: viewer.selectedStop === stop.stop_id ? '#18243b' : residualColor(summary[colorField]),
+          fillColor: residualColor(summary[colorField]), fillOpacity: 0.78,
+        }).bindTooltip(`${esc(stop.stop_id)}: ${esc(stop.name || '')}`);
+        marker.on('click', () => viewer.mode === 'od' ? chooseOdStop(stop.stop_id) : selectStop(stop.stop_id));
+        marker.addTo(viewer.markerLayer); viewer.markers.set(stop.stop_id, marker);
+      });
+    }
+    function topPairs(stopId, incoming) {
+      return viewer.odMap.filter((row) => (incoming ? row.destination_stop_id : row.origin_stop_id) === stopId)
+        .sort((a, b) => (number(b.modeled_demand) || 0) - (number(a.modeled_demand) || 0)).slice(0, 5);
+    }
+    function pairLabel(row) { return `${row.origin_stop_id} → ${row.destination_stop_id} (${row.departure_time_bin || '—'})`; }
+    function renderStopDetail() {
+      const stop = viewer.selectedStop && stopById(viewer.selectedStop);
+      if (!stop) { $('stop-detail').innerHTML = ''; return; }
+      const summary = summaryById(stop.stop_id) || {};
+      const list = (rows) => rows.length ? `<ol>${rows.map((row) => `<li>${esc(pairLabel(row))}: ${displayNumber(row.modeled_demand)}</li>`).join('')}</ol>` : '<p class="muted">No OD rows available.</p>';
+      $('stop-detail').innerHTML = `<h3>${esc(stop.name || stop.stop_id)} <span class="muted">(${esc(stop.stop_id)})</span></h3><dl><dt>Observed total</dt><dd>${displayNumber(summary.observed_total)}</dd><dt>Modeled total</dt><dd>${displayNumber(summary.modeled_total)}</dd><dt>Residual</dt><dd>${displayNumber(summary.residual)}</dd><dt>Incoming total</dt><dd>${displayNumber(summary.incoming_total)}</dd><dt>Outgoing total</dt><dd>${displayNumber(summary.outgoing_total)}</dd></dl><div class="two"><div><h3>Top incoming OD pairs</h3>${list(topPairs(stop.stop_id, true))}</div><div><h3>Top outgoing OD pairs</h3>${list(topPairs(stop.stop_id, false))}</div></div>`;
+    }
+    function filteredOdRows() {
+      const minimum = Math.max(0, number($('od-min').value) || 0);
+      const selectedStopOnly = $('od-stop-filter').checked && viewer.selectedStop;
+      const bin = $('od-bin').value;
+      const residualMode = $('od-residual').value;
+      const minimumResidual = Math.max(0, number($('od-residual-min').value) || 0);
+      let rows = viewer.odMap.filter((row) => {
+        const modeled = number(row.modeled_demand) || 0; const observed = number(row.observed_demand);
+        const residual = number(row.residual);
+        if ($('od-origin').value && row.origin_stop_id !== $('od-origin').value) return false;
+        if ($('od-destination').value && row.destination_stop_id !== $('od-destination').value) return false;
+        if (bin !== 'all' && row.departure_time_bin !== bin) return false;
+        if (modeled < minimum) return false;
+        if (selectedStopOnly && row.origin_stop_id !== viewer.selectedStop && row.destination_stop_id !== viewer.selectedStop) return false;
+        if (residualMode === 'under' && !(residual !== null && residual > 0)) return false;
+        if (residualMode === 'over' && !(residual !== null && residual < 0)) return false;
+        if (residualMode === 'nonzero' && !(residual !== null && Math.abs(residual) > 1e-9)) return false;
+        if (minimumResidual > 0 && !(residual !== null && Math.abs(residual) >= minimumResidual)) return false;
+        return observed === null || Number.isFinite(observed);
+      });
+      rows.sort((a, b) => (number(b.modeled_demand) || 0) - (number(a.modeled_demand) || 0));
+      return rows.slice(0, Math.max(1, Math.floor(number($('od-limit').value) || 25)));
+    }
+    function curvedPath(origin, destination) {
+      const a = [number(origin.lat), number(origin.lon)]; const b = [number(destination.lat), number(destination.lon)];
+      const midpoint = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+      const dx = b[1] - a[1]; const dy = b[0] - a[0];
+      const length = Math.max(1e-6, Math.hypot(dx, dy)); const offset = Math.min(.08, length * .22);
+      const control = [midpoint[0] - (dx / length) * offset, midpoint[1] + (dy / length) * offset];
+      return [a, [a[0] * .75 + control[0] * .25, a[1] * .75 + control[1] * .25], [a[0] * .5 + control[0] * .5, a[1] * .5 + control[1] * .5], [a[0] * .25 + control[0] * .75, a[1] * .25 + control[1] * .75], b];
+    }
+    function drawOdLines(rows) {
+      if (!viewer.odLayer || !window.L) return;
+      clearLayer(viewer.odLayer);
+      rows.forEach((row) => {
+        const origin = stopById(row.origin_stop_id); const destination = stopById(row.destination_stop_id);
+        if (!origin || !destination || number(origin.lat) === null || number(destination.lat) === null) return;
+        const selected = viewer.selectedOd === row;
+        L.polyline(curvedPath(origin, destination), { color: residualColor(row.residual), weight: selected ? 6 : 1.5, opacity: selected ? .95 : .32 }).bindTooltip(pairLabel(row)).on('click', () => selectOd(row)).addTo(viewer.odLayer);
+      });
+    }
+    function renderOdDetail() {
+      const row = viewer.selectedOd;
+      if (!row) { $('od-detail').innerHTML = ''; return; }
+      $('od-detail').innerHTML = `<h3>${esc(row.origin_stop_id)} → ${esc(row.destination_stop_id)}</h3><dl><dt>Departure-time bin</dt><dd>${esc(row.departure_time_bin || '—')}</dd><dt>Observed demand</dt><dd>${displayNumber(row.observed_demand)}</dd><dt>Modeled demand</dt><dd>${displayNumber(row.modeled_demand)}</dd><dt>Residual</dt><dd>${displayNumber(row.residual)}</dd><dt>Fixed/free status</dt><dd>${esc(row.fixed_free_status || '—')}</dd><dt>Identifiability class</dt><dd>${esc(row.identifiability_class || '—')}</dd></dl>`;
+    }
+    function renderOdList() {
+      const rows = filteredOdRows(); const headers = ['Origin', 'Destination', 'Bin', 'Observed', 'Modeled', 'Residual', 'Status', 'Identifiability'];
+      $('od-list').querySelector('thead').innerHTML = `<tr>${headers.map((header) => `<th>${header}</th>`).join('')}</tr>`;
+      $('od-list').querySelector('tbody').innerHTML = rows.map((row) => `<tr><td>${esc(row.origin_stop_id)}</td><td>${esc(row.destination_stop_id)}</td><td>${esc(row.departure_time_bin)}</td><td>${displayNumber(row.observed_demand)}</td><td>${displayNumber(row.modeled_demand)}</td><td>${displayNumber(row.residual)}</td><td>${esc(row.fixed_free_status)}</td><td>${esc(row.identifiability_class)}</td></tr>`).join('');
+      [...$('od-list').querySelector('tbody').rows].forEach((tr, index) => tr.addEventListener('click', () => selectOd(rows[index])));
+      drawOdLines(rows); renderOdDetail();
+    }
+    function selectStop(id) {
+      viewer.selectedStop = id; renderStopMarkers(); renderStopDetail();
+      if (viewer.mode === 'od') renderOdList();
+      const stop = stopById(id); if (stop && viewer.map) viewer.map.setView([number(stop.lat), number(stop.lon)], Math.max(viewer.map.getZoom(), 13));
+    }
+    function selectOd(row) {
+      viewer.selectedOd = row; $('od-origin').value = row.origin_stop_id; $('od-destination').value = row.destination_stop_id; $('od-bin').value = row.departure_time_bin || 'all'; renderOdList();
+    }
+    function chooseOdStop(id) {
+      if (!$('od-origin').value || ($('od-origin').value && $('od-destination').value)) {
+        $('od-origin').value = id; $('od-destination').value = '';
+      } else {
+        $('od-destination').value = id;
+      }
+      viewer.selectedOd = null; renderOdList();
+    }
+    function populateSelectors() {
+      const ids = [...new Set([...viewer.stops.map((stop) => stop.stop_id), ...viewer.odMap.flatMap((row) => [row.origin_stop_id, row.destination_stop_id])])].filter(Boolean).sort();
+      const option = (id) => { const stop = stopById(id); return `<option value="${esc(id)}">${esc(stop?.name ? `${stop.name} (${id})` : id)}</option>`; };
+      $('od-origin').innerHTML = `<option value="">Select origin</option>${ids.map(option).join('')}`; $('od-destination').innerHTML = `<option value="">Select destination</option>${ids.map(option).join('')}`;
+      const bins = [...new Set(viewer.odMap.map((row) => row.departure_time_bin).filter(Boolean))].sort(); $('od-bin').innerHTML = `<option value="all">All bins</option>${bins.map((bin) => `<option value="${esc(bin)}">${esc(bin)}</option>`).join('')}`;
+    }
+    function switchMode(mode) {
+      if (mode === 'od' && !viewer.odMap.length) return;
+      if (mode === 'stops' && !viewer.stopSummary.length) return;
+      viewer.mode = mode; $('stops-mode').classList.toggle('active', mode === 'stops'); $('od-mode').classList.toggle('active', mode === 'od'); setControlVisibility();
+      if (mode === 'stops') { clearLayer(viewer.odLayer); renderStopMarkers(); renderStopDetail(); }
+      else renderOdList();
+    }
+    async function renderNetworkMap(files) {
+      const stopsFile = findFile(files, 'stops.csv'); const stopTimesFile = findFile(files, 'stop_times.csv');
+      if (!stopsFile) return;
+      viewer.stops = parseCsv(await stopsFile.text()); viewer.stopsById = new Map(viewer.stops.map((stop) => [stop.stop_id, stop])); viewer.stopTimes = stopTimesFile ? parseCsv(await stopTimesFile.text()) : [];
+      const points = viewer.stops.map((stop) => [number(stop.lat), number(stop.lon)]).filter(([lat, lon]) => lat !== null && lon !== null); if (!points.length) return;
+      try {
+        await waitForLeaflet();
+      } catch (error) {
+        $('network-map').classList.remove('hidden');
+        $('map').textContent = `${error.message} The bundle tables remain available without map tiles.`;
+        $('map').classList.add('muted');
+        return;
+      }
+      $('network-map').classList.remove('hidden');
+      if (viewer.map) viewer.map.remove(); viewer.map = L.map('map'); window.viewerMap = viewer.map;
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap contributors' }).addTo(viewer.map);
+      viewer.map.fitBounds(L.latLngBounds(points).pad(0.08)); viewer.routeLayer = L.layerGroup().addTo(viewer.map); viewer.markerLayer = L.layerGroup().addTo(viewer.map); viewer.odLayer = L.layerGroup().addTo(viewer.map);
+      const byId = new Map(viewer.stops.map((stop) => [stop.stop_id, stop])); const grouped = new Map();
+      viewer.stopTimes.forEach((item) => { if (!grouped.has(item.trip_id)) grouped.set(item.trip_id, []); grouped.get(item.trip_id).push(item); });
+      grouped.forEach((items) => { items.sort((a, b) => Number(a.sequence) - Number(b.sequence)); const path = items.map((item) => byId.get(item.stop_id)).filter(Boolean).map((stop) => [number(stop.lat), number(stop.lon)]).filter(([lat, lon]) => lat !== null && lon !== null); if (path.length > 1) L.polyline(path, { color: '#d14b4b', weight: 1.2, opacity: .28 }).addTo(viewer.routeLayer); });
+      populateSelectors(); renderStopMarkers(); setTimeout(() => viewer.map.invalidateSize(), 0);
+    }
+    async function load(files) {
+      try {
+        viewer.files = files; setStatus('Reading and validating bundle…');
+        const manifest = await json(files, 'bundle_manifest.json'); if (manifest.bundle_type !== 'gravity_viewer_bundle') throw new Error(`Unexpected bundle type: ${manifest.bundle_type}`);
+        const problems = await validateManifest(files, manifest); const model = await json(files, 'model_specification.json'); const report = await json(files, 'report.json');
+        const fullOd = parseCsv(await text(files, 'full_od.csv')); const predicted = parseCsv(await text(files, 'predicted_measurements.csv')); const residuals = parseCsv(await text(files, 'residuals.csv'));
+        viewer.odMap = findFile(files, 'od_map.csv') ? parseCsv(await text(files, 'od_map.csv')) : []; viewer.stopSummary = findFile(files, 'stop_summary.csv') ? parseCsv(await text(files, 'stop_summary.csv')) : []; viewer.stopSummaryById = new Map(viewer.stopSummary.map((stop) => [stop.stop_id, stop]));
+        const executive = findFile(files, 'executive_summary.md'); const networkFiles = [...files].filter((file) => file.webkitRelativePath.includes('/network/')); const network = manifest.network?.files || manifest.network || {};
+        const modelLikelihood = model.likelihood || model.specification?.likelihood?.family || model.specification?.specification?.likelihood?.family;
+        $('summary').classList.remove('hidden'); $('diagnostics').classList.remove('hidden'); $('tables').classList.remove('hidden');
+        $('metrics').innerHTML = [metric('Bundle type', manifest.bundle_type), metric('Schema', manifest.schema_version), metric('OD rows', fullOd.length), metric('Measurements', predicted.length), metric('OD map rows', viewer.odMap.length || 'unavailable'), metric('Stop summaries', viewer.stopSummary.length || 'unavailable'), metric('Identifiability', manifest.identifiability?.available ? 'available' : 'not available'), metric('Network files', Object.keys(network).filter((key) => key.endsWith('.csv')).length)].join('');
+        $('model').innerHTML = renderKeyValue({fingerprint: model.fingerprint || model.specification_fingerprint || manifest.model_specification?.fingerprint, likelihood: modelLikelihood, model_name: model.model_name || model.specification?.model_name || model.specification?.specification?.model_name}); $('provenance').innerHTML = renderKeyValue(manifest.provenance || manifest.fit_provenance);
+        const adequacy = report.adequacy || {}; $('diagnostic-metrics').innerHTML = [metric('Observed total', adequacy.observed_total), metric('Modeled total', adequacy.modeled_total), metric('MAE', adequacy.mae), metric('RMSE', adequacy.rmse), metric('Poisson deviance', adequacy.poisson_deviance), metric('Report fingerprint', report.report_fingerprint, 'fingerprint')].join('');
+        $('executive').innerHTML = executive ? renderMarkdown(await executive.text()) : '<p>No executive summary supplied.</p>'; $('table-content').innerHTML = [table('OD demand', fullOd), table('Predicted measurements', predicted), table('Residuals', residuals), viewer.odMap.length ? table('Display OD map', viewer.odMap) : '', viewer.stopSummary.length ? table('Display stop summary', viewer.stopSummary) : ''].join('');
+        await renderNetworkMap(networkFiles); populateSelectors();
+        if (!viewer.map && (viewer.odMap.length || viewer.stopSummary.length)) {
+          $('network-map').classList.remove('hidden');
+          $('map').textContent = 'No network snapshot was supplied; use the interactive tables and selectors below.';
+          $('map').classList.add('muted');
+        }
+        const unavailable = []; if (!viewer.stopSummary.length) unavailable.push('stop_summary.csv'); if (!viewer.odMap.length) unavailable.push('od_map.csv');
+        if (unavailable.length) {
+          $('interactive-notice').textContent = `Interactive summaries unavailable: ${unavailable.join(' and ')} was not included. The validated tables and network map remain available.`;
+          $('interactive-notice').classList.remove('hidden');
+          $('network-map').classList.remove('hidden');
+          if (!viewer.map) $('map').textContent = 'No network snapshot was supplied; use the validated tables above.';
+        }
+        $('map-toolbar').classList.toggle('hidden', !viewer.stopSummary.length && !viewer.odMap.length); $('stops-mode').disabled = !viewer.stopSummary.length; $('od-mode').disabled = !viewer.odMap.length; switchMode(viewer.stopSummary.length ? 'stops' : 'od');
+        if (problems.length) setStatus(`Bundle loaded with validation problems:\n- ${problems.join('\n- ')}`, 'bad'); else setStatus('Bundle loaded and all manifest checks passed.', 'ok');
+      } catch (error) { $('summary').classList.add('hidden'); $('diagnostics').classList.add('hidden'); $('tables').classList.add('hidden'); setStatus(`Could not load bundle: ${error.message}`, 'bad'); }
+    }
+    $('folder').addEventListener('change', (event) => load([...event.target.files]));
+    $('stops-mode').addEventListener('click', () => switchMode('stops')); $('od-mode').addEventListener('click', () => switchMode('od'));
+    ['stop-search', 'stop-size', 'stop-color'].forEach((id) => $(id).addEventListener('input', () => { if (viewer.mode === 'stops') renderStopMarkers(); }));
+    ['od-origin', 'od-destination', 'od-bin', 'od-min', 'od-limit', 'od-residual', 'od-residual-min', 'od-stop-filter'].forEach((id) => $(id).addEventListener('input', () => { if (viewer.mode === 'od') { viewer.selectedOd = null; renderOdList(); } }));
+    $('reset-selection').addEventListener('click', () => { viewer.selectedStop = null; viewer.selectedOd = null; $('stop-search').value = ''; $('od-origin').value = ''; $('od-destination').value = ''; $('od-bin').value = 'all'; $('od-min').value = '0'; $('od-limit').value = '25'; $('od-residual').value = 'all'; $('od-residual-min').value = '0'; $('od-stop-filter').checked = false; renderStopMarkers(); renderStopDetail(); renderOdList(); setControlVisibility(); });
+  </script>
+</body>
+</html>

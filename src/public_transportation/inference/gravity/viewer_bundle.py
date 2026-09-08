@@ -53,6 +53,7 @@ _TABLE_FILES = (
     "grouped_residuals.csv",
     "parameters.csv",
 )
+_OPTIONAL_DERIVED_FILES = ("od_map.csv", "stop_summary.csv")
 _REPORT_FILES = ("report.json", "executive_summary.md")
 _OPTIONAL_REPORT_FILES = ("report.md",)
 _FULL_OD_COLUMNS = (
@@ -87,6 +88,24 @@ _PREDICTED_COLUMNS = (
 )
 _RESIDUAL_COLUMNS = (*_PREDICTED_COLUMNS, "residual", "variance", "standardized_residual")
 _PARAMETER_COLUMNS = ("parameter_index", "parameter_name", "raw_value", "physical_value")
+_OD_MAP_COLUMNS = (
+    "origin_stop_id",
+    "destination_stop_id",
+    "departure_time_bin",
+    "observed_demand",
+    "modeled_demand",
+    "residual",
+    "fixed_free_status",
+    "identifiability_class",
+)
+_STOP_SUMMARY_COLUMNS = (
+    "stop_id",
+    "observed_total",
+    "modeled_total",
+    "residual",
+    "incoming_total",
+    "outgoing_total",
+)
 _NETWORK_FILES = ("stops.csv", "lines.csv", "trips.csv", "stop_times.csv")
 _CANONICAL_PROVENANCE = tuple(GRAVITY_REPORT_PROVENANCE_FIELDS)
 
@@ -139,6 +158,164 @@ def _read_csv(path: Path) -> tuple[list[str], list[dict[str, str]]]:
         return list(reader.fieldnames), list(reader)
 
 
+def _write_csv(path: Path, fieldnames: Sequence[str], rows: Sequence[Mapping[str, object]]) -> None:
+    """Write a small deterministic CSV atomically."""
+    temporary = path.with_name(f".{path.name}.tmp")
+    with temporary.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(fieldnames), extrasaction="raise")
+        writer.writeheader()
+        writer.writerows(rows)
+    temporary.replace(path)
+
+
+def _csv_number(value: object) -> float | None:
+    """Parse an optional finite number used by display-only summaries."""
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if np.isfinite(number) else None
+
+
+def _csv_number_text(value: float | None) -> str:
+    """Return a deterministic CSV representation for an optional number."""
+    return "" if value is None else format(value, ".17g")
+
+
+def _observed_od_values(
+    full_od_rows: Sequence[Mapping[str, str]],
+    report_payload: Mapping[str, object],
+) -> list[float | None]:
+    """Return optional observed OD values without pretending counts are OD data.
+
+    The core reports normally contain only modeled OD demand.  A case-specific
+    report may additionally persist ``observed_demand`` (or ``observed``) in
+    ``full_od.csv`` or an aligned ``observed_od_demand`` array in ``report.json``.
+    When neither is present, the display field remains empty rather than
+    substituting modeled or prior demand.
+    """
+    report_values = report_payload.get("observed_od_demand")
+    if isinstance(report_values, Sequence) and not isinstance(report_values, (str, bytes)):
+        if len(report_values) == len(full_od_rows):
+            return [_csv_number(value) for value in report_values]
+    values: list[float | None] = []
+    for row in full_od_rows:
+        value = row.get("observed_demand")
+        if value is None or str(value).strip() == "":
+            value = row.get("observed")
+        values.append(_csv_number(value))
+    return values
+
+
+def _fixed_free_status(value: object) -> str:
+    """Normalize report cell status to the viewer's fixed/free vocabulary."""
+    status = str(value or "").strip()
+    if status.lower().startswith("fixed"):
+        return "fixed"
+    if status.lower() == "free" or status.lower().endswith("_free"):
+        return "free"
+    return status
+
+
+def _write_od_map(
+    destination: Path,
+    *,
+    full_od_rows: Sequence[Mapping[str, str]],
+    report_payload: Mapping[str, object],
+) -> int:
+    """Write the optional display-oriented OD aggregation."""
+    required = {"origin_stop_id", "destination_stop_id", "departure_time_bin", "estimated_demand"}
+    if not required.issubset(full_od_rows[0].keys() if full_od_rows else ()):
+        return 0
+    observed_values = _observed_od_values(full_od_rows, report_payload)
+    rows: list[dict[str, object]] = []
+    for index, source in enumerate(full_od_rows):
+        origin = str(source.get("origin_stop_id", ""))
+        destination_id = str(source.get("destination_stop_id", ""))
+        if not origin or not destination_id:
+            continue
+        modeled = _csv_number(source.get("estimated_demand"))
+        if modeled is None:
+            continue
+        observed = observed_values[index]
+        residual = None if observed is None else observed - modeled
+        rows.append(
+            {
+                "origin_stop_id": origin,
+                "destination_stop_id": destination_id,
+                "departure_time_bin": str(source.get("departure_time_bin", "")),
+                "observed_demand": _csv_number_text(observed),
+                "modeled_demand": _csv_number_text(modeled),
+                "residual": _csv_number_text(residual),
+                "fixed_free_status": _fixed_free_status(source.get("cell_status")),
+                "identifiability_class": str(source.get("identifiability_class", "")),
+            }
+        )
+    if not rows:
+        return 0
+    _write_csv(destination, list(_OD_MAP_COLUMNS), rows)
+    return len(rows)
+
+
+def _write_stop_summary(
+    destination: Path,
+    *,
+    predicted_fields: Sequence[str],
+    predicted_rows: Sequence[Mapping[str, str]],
+    network_stops: Sequence[Mapping[str, str]] = (),
+) -> int:
+    """Write display-oriented observed/modelled stop totals."""
+    stop_field = "stop" if "stop" in predicted_fields else "stop_id" if "stop_id" in predicted_fields else None
+    if stop_field is None:
+        return 0
+    totals: dict[str, dict[str, float]] = {}
+    for row in predicted_rows:
+        stop = str(row.get(stop_field, "")).strip()
+        if not stop:
+            continue
+        observed = _csv_number(row.get("observed"))
+        modeled = _csv_number(row.get("modeled"))
+        if observed is None or modeled is None:
+            continue
+        item = totals.setdefault(
+            stop,
+            {"observed_total": 0.0, "modeled_total": 0.0, "incoming_total": 0.0, "outgoing_total": 0.0},
+        )
+        item["observed_total"] += observed
+        item["modeled_total"] += modeled
+        measurement_type = str(row.get("measurement_type", "")).strip().lower()
+        if measurement_type in {"alighting", "incoming"}:
+            item["incoming_total"] += observed
+        elif measurement_type in {"boarding", "outgoing"}:
+            item["outgoing_total"] += observed
+    for stop in network_stops:
+        stop_id = str(stop.get("stop_id", "")).strip()
+        if stop_id:
+            totals.setdefault(
+                stop_id,
+                {"observed_total": 0.0, "modeled_total": 0.0, "incoming_total": 0.0, "outgoing_total": 0.0},
+            )
+    if not totals:
+        return 0
+    rows = []
+    for stop_id in sorted(totals):
+        item = totals[stop_id]
+        rows.append(
+            {
+                "stop_id": stop_id,
+                "observed_total": _csv_number_text(item["observed_total"]),
+                "modeled_total": _csv_number_text(item["modeled_total"]),
+                "residual": _csv_number_text(item["observed_total"] - item["modeled_total"]),
+                "incoming_total": _csv_number_text(item["incoming_total"]),
+                "outgoing_total": _csv_number_text(item["outgoing_total"]),
+            }
+        )
+    _write_csv(destination, list(_STOP_SUMMARY_COLUMNS), rows)
+    return len(rows)
+
+
 def _require_columns(path: Path, fieldnames: Sequence[str], required: Sequence[str]) -> None:
     missing = [name for name in required if name not in fieldnames]
     if missing:
@@ -189,7 +366,8 @@ def _result_specification(
     fit_result: GravityEstimationResult,
     explicit: GravityModelSpecification | Mapping[str, object] | None,
 ) -> tuple[dict[str, object], str]:
-    raw = explicit if explicit is not None else fit_result.model_specification
+    fit_raw = fit_result.model_specification
+    raw = explicit if explicit is not None else fit_raw
     if raw is None:
         raise ValueError(
             "fit_result does not contain an exact model specification; supply "
@@ -204,14 +382,40 @@ def _result_specification(
             parsed = GravityModelSpecification.from_dict(payload)
         except (TypeError, ValueError) as error:
             raise ValueError("model_specification is not a valid gravity specification.") from error
-        # Preserve the serialized form carried by the fit while validating it
-        # through the public specification contract.
-        specification = _json_safe(payload)
-        if not isinstance(specification, dict):
-            raise ValueError("model_specification must serialize to a JSON object.")
+        specification = parsed.to_dict()
+        if payload != specification:
+            raise ValueError(
+                "model_specification is not the canonical serialized specification."
+            )
         computed_fingerprint = parsed.fingerprint
     else:
         raise TypeError("model_specification must be a GravityModelSpecification or mapping.")
+    if explicit is not None and fit_raw is not None:
+        if isinstance(fit_raw, GravityModelSpecification):
+            fit_specification = fit_raw.to_dict()
+            fit_fingerprint = fit_raw.fingerprint
+        elif isinstance(fit_raw, Mapping):
+            fit_payload = dict(fit_raw)
+            try:
+                fit_parsed = GravityModelSpecification.from_dict(fit_payload)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "fit_result model_specification is not a valid gravity specification."
+                ) from error
+            fit_specification = fit_parsed.to_dict()
+            if fit_payload != fit_specification:
+                raise ValueError(
+                    "fit_result model_specification is not the canonical serialized specification."
+                )
+            fit_fingerprint = fit_parsed.fingerprint
+        else:
+            raise TypeError(
+                "fit_result model_specification must be a GravityModelSpecification or mapping."
+            )
+        if fit_specification != specification or fit_fingerprint != computed_fingerprint:
+            raise ValueError(
+                "explicit model_specification differs from the fitted result."
+            )
     stored = str(fit_result.specification_fingerprint or "")
     if stored and stored != computed_fingerprint:
         raise ValueError(
@@ -258,17 +462,38 @@ def _validation_provenance(validation_result: object) -> dict[str, object]:
     if isinstance(validation_result, GravityAdequacyReport):
         return {
             "model_fingerprint": validation_result.model_fingerprint,
+            "specification_fingerprint": validation_result.specification_fingerprint,
+            "model_specification": validation_result.model_specification,
             "report_fingerprint": validation_result.report_fingerprint,
         }
     if isinstance(validation_result, Mapping):
+        adequacy = validation_result.get("adequacy")
+        if isinstance(adequacy, Mapping):
+            merged = dict(validation_result)
+            merged.update(adequacy)
+            validation_result = merged
         provenance = validation_result.get("provenance", {})
         if provenance is None:
             provenance = {}
         if not isinstance(provenance, Mapping):
             raise ValueError("validation_result provenance must be a mapping.")
+        provenance = dict(provenance)
+        for name in (
+            "model_fingerprint",
+            "specification_fingerprint",
+            "model_specification",
+            "report_fingerprint",
+        ):
+            if name in validation_result:
+                provenance[name] = validation_result[name]
         return dict(provenance)
     values: dict[str, object] = {}
-    for name in ("model_fingerprint", "report_fingerprint"):
+    for name in (
+        "model_fingerprint",
+        "specification_fingerprint",
+        "model_specification",
+        "report_fingerprint",
+    ):
         value = getattr(validation_result, name, None)
         if value is not None:
             values[name] = value
@@ -349,6 +574,50 @@ def _validate_table_inputs(
         raise ValueError(
             "validation provenance model_fingerprint differs from the fitted result: "
             f"validation={validation_model!r}, fit={fit_result.model_fingerprint!r}."
+        )
+    fit_specification, fit_specification_fingerprint = _result_specification(
+        fit_result, None
+    )
+    report_specification = report_payload.get("model_specification")
+    if not isinstance(report_specification, Mapping):
+        raise ValueError("report.json is missing model_specification.")
+    try:
+        parsed_report_specification = GravityModelSpecification.from_dict(
+            dict(report_specification)
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("report.json model_specification is invalid.") from error
+    if dict(report_specification) != parsed_report_specification.to_dict():
+        raise ValueError("report.json model_specification is not canonical.")
+    report_specification_fingerprint = report_payload.get(
+        "specification_fingerprint"
+    )
+    if report_specification_fingerprint != parsed_report_specification.fingerprint:
+        raise ValueError(
+            "report.json specification_fingerprint does not match its "
+            "serialized model_specification."
+        )
+    if (
+        report_specification_fingerprint != fit_specification_fingerprint
+        or dict(report_specification) != fit_specification
+    ):
+        raise ValueError(
+            "report.json model specification differs from the fitted result."
+        )
+    validation_specification = validation_provenance.get("model_specification")
+    validation_specification_fingerprint = validation_provenance.get(
+        "specification_fingerprint"
+    )
+    if not isinstance(validation_specification, Mapping):
+        raise ValueError("validation provenance is missing model_specification.")
+    if validation_specification_fingerprint != fit_specification_fingerprint:
+        raise ValueError(
+            "validation provenance specification_fingerprint differs from the "
+            "fitted result."
+        )
+    if dict(validation_specification) != fit_specification:
+        raise ValueError(
+            "validation provenance model_specification differs from the fitted result."
         )
     return counts
 
@@ -533,6 +802,23 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
     manifest_spec = manifest.get("model_specification")
     if not isinstance(manifest_spec, Mapping) or manifest_spec.get("fingerprint") != spec_fingerprint:
         raise ValueError("bundle manifest model specification provenance mismatch.")
+    if manifest.get("specification_fingerprint") != spec_fingerprint:
+        raise ValueError("bundle specification_fingerprint does not match model specification.")
+    report_specification = report_payload.get("model_specification")
+    if not isinstance(report_specification, Mapping):
+        raise ValueError("bundle report.json is missing model_specification.")
+    try:
+        parsed_report_specification = GravityModelSpecification.from_dict(
+            dict(report_specification)
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("bundle report model specification is invalid.") from error
+    if dict(report_specification) != parsed_report_specification.to_dict():
+        raise ValueError("bundle report model specification is not canonical.")
+    if report_payload.get("specification_fingerprint") != spec_fingerprint:
+        raise ValueError("bundle report specification provenance mismatch.")
+    if parsed_report_specification.fingerprint != spec_fingerprint:
+        raise ValueError("bundle report model specification fingerprint mismatch.")
     provenance = manifest.get("provenance")
     if not isinstance(provenance, Mapping):
         raise ValueError("bundle provenance is missing or invalid.")
@@ -586,12 +872,30 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
             "bundle validation/model provenance mismatch: "
             f"validation={validation_model!r}, bundle={provenance.get('model_fingerprint')!r}."
         )
+    if validation_provenance.get("specification_fingerprint") != spec_fingerprint:
+        raise ValueError(
+            "bundle validation/specification provenance mismatch: "
+            f"validation={validation_provenance.get('specification_fingerprint')!r}, "
+            f"specification={spec_fingerprint!r}."
+        )
+    validation_specification = validation_provenance.get("model_specification")
+    if not isinstance(validation_specification, Mapping) or dict(
+        validation_specification
+    ) != dict(specification):
+        raise ValueError("bundle validation model specification provenance mismatch.")
     report_model_provenance = report_provenance.get("model_fingerprint")
     if report_model_provenance is not None and report_model_provenance != provenance.get("model_fingerprint"):
         raise ValueError(
             "bundle report/model provenance mismatch: "
             f"report={report_model_provenance!r}, bundle={provenance.get('model_fingerprint')!r}."
         )
+    if report_provenance.get("specification_fingerprint") != spec_fingerprint:
+        raise ValueError("bundle report/specification provenance mismatch.")
+    report_specification_provenance = report_provenance.get("model_specification")
+    if not isinstance(report_specification_provenance, Mapping) or dict(
+        report_specification_provenance
+    ) != dict(specification):
+        raise ValueError("bundle report model specification provenance mismatch.")
     counts = manifest.get("row_counts", {})
     if not isinstance(counts, Mapping):
         raise ValueError("bundle row_counts are missing or invalid.")
@@ -610,6 +914,20 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
             _require_columns(root / name, fields, _RESIDUAL_COLUMNS)
         elif name == "parameters.csv":
             _require_columns(root / name, fields, _PARAMETER_COLUMNS)
+    for name, columns in (
+        ("od_map.csv", _OD_MAP_COLUMNS),
+        ("stop_summary.csv", _STOP_SUMMARY_COLUMNS),
+    ):
+        if not (root / name).is_file():
+            continue
+        fields, rows = _read_csv(root / name)
+        expected = counts.get(name)
+        if expected != len(rows):
+            raise ValueError(
+                f"bundle row count mismatch for {name!r}: "
+                f"manifest={expected!r}, actual={len(rows)!r}."
+            )
+        _require_columns(root / name, fields, columns)
     identifiability = manifest.get("identifiability", {})
     if not isinstance(identifiability, Mapping):
         raise ValueError("bundle identifiability metadata is invalid.")
@@ -651,12 +969,15 @@ class GravityViewerBundle:
 
     @property
     def table_names(self) -> tuple[str, ...]:
-        return _TABLE_FILES
+        return (*_TABLE_FILES, *tuple(name for name in _OPTIONAL_DERIVED_FILES if (self.path / name).is_file()))
 
     def table_path(self, name: str) -> Path:
-        if name not in _TABLE_FILES:
+        if name not in _TABLE_FILES and name not in _OPTIONAL_DERIVED_FILES:
             raise KeyError(f"unknown gravity viewer table {name!r}.")
-        return self.path / name
+        path = self.path / name
+        if not path.is_file():
+            raise FileNotFoundError(f"bundle table is not present: {name}")
+        return path
 
     def network_path(self, name: str) -> Path:
         if name not in _NETWORK_FILES:
@@ -865,6 +1186,33 @@ def write_gravity_viewer_bundle(
             network_counts = _validate_network(staging, table_counts)
             table_counts.update(network_counts)
 
+        # These are intentionally derived, display-oriented summaries.  They
+        # never participate in model identity and are omitted when the source
+        # report does not contain enough information to construct them.
+        full_od_fields, full_od_rows = _read_csv(staging / "full_od.csv")
+        del full_od_fields
+        if _write_od_map(
+            staging / "od_map.csv",
+            full_od_rows=full_od_rows,
+            report_payload=report_payload,
+        ):
+            table_counts["od_map.csv"] = len(_read_csv(staging / "od_map.csv")[1])
+
+        predicted_fields, predicted_rows = _read_csv(staging / "predicted_measurements.csv")
+        network_stops: list[dict[str, str]] = []
+        stops_path = staging / "network" / "stops.csv"
+        if stops_path.is_file():
+            _, network_stops = _read_csv(stops_path)
+        if _write_stop_summary(
+            staging / "stop_summary.csv",
+            predicted_fields=predicted_fields,
+            predicted_rows=predicted_rows,
+            network_stops=network_stops,
+        ):
+            table_counts["stop_summary.csv"] = len(
+                _read_csv(staging / "stop_summary.csv")[1]
+            )
+
         provenance = _source_provenance(report_payload, fit_result, metadata)
         provenance["specification_fingerprint"] = specification_fingerprint
         validation_prov = _validation_provenance(validation_result)
@@ -908,6 +1256,8 @@ def write_gravity_viewer_bundle(
                 "fingerprint": specification_fingerprint,
             },
             "provenance": provenance,
+            "model_fingerprint": fit_result.model_fingerprint,
+            "specification_fingerprint": specification_fingerprint,
             "fit_provenance": {
                 "model_fingerprint": fit_result.model_fingerprint,
                 "specification_fingerprint": specification_fingerprint,
@@ -919,6 +1269,8 @@ def write_gravity_viewer_bundle(
             "report_provenance": {
                 "report_fingerprint": report_payload.get("report_fingerprint", report.report_fingerprint),
                 "model_fingerprint": report_payload.get("model_fingerprint"),
+                "specification_fingerprint": report_payload.get("specification_fingerprint"),
+                "model_specification": report_payload.get("model_specification"),
                 "provenance": report_payload.get("provenance", {}),
             },
             "identifiability": ident_summary,

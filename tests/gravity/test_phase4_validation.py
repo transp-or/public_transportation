@@ -117,8 +117,34 @@ def test_perfect_full_data_report_has_zero_residual_metrics():
         assert report.rmse == pytest.approx(0, abs=1e-10)
         assert report.poisson_deviance == pytest.approx(0, abs=1e-10)
         assert report.negative_binomial_deviance == pytest.approx(0, abs=1e-10)
+        assert report.specification_fingerprint == problem.parameter_layout.specification.fingerprint
+        assert report.model_specification == problem.parameter_layout.specification.to_dict()
         assert not report.residual.flags.writeable
         assert report.report_fingerprint
+
+
+def test_full_data_validation_rejects_missing_or_conflicting_specification():
+    with jax.enable_x64():
+        problem, layout, result = validation_case()
+        missing = replace(result, model_specification=None, specification_fingerprint="")
+        with pytest.raises(ValueError, match="model_specification"):
+            validate_full_data_gravity_adequacy(
+                result=missing, problem=problem, compact_layout=layout
+            )
+
+        wrong_fingerprint = replace(result, specification_fingerprint="wrong")
+        with pytest.raises(ValueError, match="specification_fingerprint"):
+            validate_full_data_gravity_adequacy(
+                result=wrong_fingerprint, problem=problem, compact_layout=layout
+            )
+
+        wrong_serialization = dict(result.model_specification or {})
+        wrong_serialization["model_name"] = "different"
+        conflicting = replace(result, model_specification=wrong_serialization)
+        with pytest.raises(ValueError, match="model_specification"):
+            validate_full_data_gravity_adequacy(
+                result=conflicting, problem=problem, compact_layout=layout
+            )
 
 
 def test_grouped_residuals_thresholds_and_journey_correlations_are_reported():

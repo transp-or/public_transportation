@@ -434,6 +434,8 @@ def _json_safe_result_payload(result: GravityEstimationResult) -> dict[str, obje
         "scaled_gradient_inf_norm": result.scaled_gradient_inf_norm,
         "scaled_gradient_tolerance": result.scaled_gradient_tolerance,
         "model_fingerprint": result.model_fingerprint,
+        "specification_fingerprint": result.specification_fingerprint,
+        "model_specification": result.model_specification,
         "direct_operator_artifact_fingerprint": result.direct_operator_artifact_fingerprint,
         "convergence_reclassification": result.convergence_reclassification,
     }

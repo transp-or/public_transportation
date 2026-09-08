@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 
 import numpy as np
@@ -11,10 +11,12 @@ from public_transportation.inference.gravity import (
     GRAVITY_RESULT_SCHEMA_VERSION,
     GravityEstimationResult,
     GravityLikelihood,
+    GravityModelSpecification,
     GravityStrategySelection,
     GravityValidationMetadata,
     PersistedGravityReportInputs,
     validate_gravity_report_provenance,
+    write_gravity_detailed_report,
     write_persisted_gravity_detailed_report,
 )
 from public_transportation.inference.od_parameter_layout import ODParameterLayout
@@ -41,6 +43,7 @@ def _portable_inputs() -> tuple[dict[str, object], dict[str, object], ODParamete
         fixed_zero_indices=(),
         fixed_positive_indices=(),
     )
+    specification = GravityModelSpecification()
     result = GravityEstimationResult(
         schema_version=GRAVITY_RESULT_SCHEMA_VERSION,
         status="converged",
@@ -68,6 +71,8 @@ def _portable_inputs() -> tuple[dict[str, object], dict[str, object], ODParamete
         ),
         resumed=False,
         checkpoint_path=None,
+        specification_fingerprint=specification.fingerprint,
+        model_specification=specification.to_dict(),
         parameter_names=("beta_time",),
     )
     provenance = {
@@ -80,11 +85,17 @@ def _portable_inputs() -> tuple[dict[str, object], dict[str, object], ODParamete
     fit_manifest = {
         "status": "completed",
         "result": result_payload,
+        "model_fingerprint": result.model_fingerprint,
+        "specification_fingerprint": specification.fingerprint,
+        "model_specification": specification.to_dict(),
         **provenance,
     }
     validation_manifest = {
         "status": "completed",
         "predicted_measurements": [4.0, 5.0, 6.0],
+        "model_fingerprint": result.model_fingerprint,
+        "specification_fingerprint": specification.fingerprint,
+        "model_specification": specification.to_dict(),
         **provenance,
     }
     return fit_manifest, validation_manifest, layout
@@ -119,6 +130,11 @@ def test_persisted_report_is_portable_and_records_canonical_provenance(tmp_path)
     )
     assert report.output_directory == output.resolve()
     payload = json.loads((output / "report.json").read_text())
+    assert payload["specification_fingerprint"] == fit["specification_fingerprint"]
+    assert payload["model_specification"] == fit["model_specification"]
+    assert payload["adequacy"]["specification_fingerprint"] == fit["specification_fingerprint"]
+    assert payload["adequacy"]["model_specification"] == fit["model_specification"]
+    assert payload["model_fingerprint"] == fit["model_fingerprint"]
     assert payload["provenance"]["source"] == "persisted_fit_validation"
     assert payload["identifiability"]["available"] is False
     assert (
@@ -221,6 +237,43 @@ def test_missing_provenance_and_predictions_are_rejected(tmp_path):
             od_layout=layout,
             likelihood="poisson",
             output_directory=tmp_path / "missing-predictions",
+        )
+
+
+def test_persisted_report_rejects_missing_or_mismatched_specification(tmp_path):
+    fit, validation, layout = _portable_inputs()
+    del validation["model_specification"]
+    with pytest.raises(ValueError, match="model_specification"):
+        validate_gravity_report_provenance(
+            fit_manifest=fit,
+            validation_manifest=validation,
+            od_layout=layout,
+        )
+
+    fit, validation, layout = _portable_inputs()
+    validation["specification_fingerprint"] = "wrong"
+    with pytest.raises(ValueError, match="specification_fingerprint"):
+        validate_gravity_report_provenance(
+            fit_manifest=fit,
+            validation_manifest=validation,
+            od_layout=layout,
+        )
+
+
+def test_direct_report_rejects_result_specification_fingerprint_mismatch(tmp_path):
+    fit, _validation, layout = _portable_inputs()
+    result_payload = fit["result"]
+    assert isinstance(result_payload, dict)
+    result = GravityEstimationResult.from_dict(result_payload)
+    result = replace(result, specification_fingerprint="wrong")
+    with pytest.raises(ValueError, match="specification_fingerprint"):
+        write_gravity_detailed_report(
+            result=result,
+            observations=[3.0, 5.0, 7.0],
+            predicted_measurements=[4.0, 5.0, 6.0],
+            od_layout=layout,
+            likelihood="poisson",
+            output_directory=tmp_path / "mismatch",
         )
 
 

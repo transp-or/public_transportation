@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 from dataclasses import asdict, replace
 
@@ -137,8 +138,26 @@ def test_viewer_bundle_contains_exact_model_specification_and_round_trips(tmp_pa
         metadata={"time_zone": "Europe/Zurich"},
     )
     assert bundle.manifest["model_specification"]["fingerprint"] == result.specification_fingerprint
+    assert bundle.manifest["specification_fingerprint"] == result.specification_fingerprint
+    assert bundle.manifest["model_fingerprint"] == result.model_fingerprint
     assert bundle.manifest["fit_provenance"]["specification_fingerprint"] == result.specification_fingerprint
+    assert bundle.manifest["validation_provenance"]["specification_fingerprint"] == result.specification_fingerprint
+    assert bundle.manifest["report_provenance"]["specification_fingerprint"] == result.specification_fingerprint
     assert bundle.manifest["files"]["full_od.csv"]["row_count"] == 2
+    assert bundle.manifest["files"]["od_map.csv"]["row_count"] == 2
+    assert bundle.manifest["files"]["stop_summary.csv"]["row_count"] == 3
+    assert set(
+        bundle.read_table("od_map.csv").columns
+    ) == {
+        "origin_stop_id",
+        "destination_stop_id",
+        "departure_time_bin",
+        "observed_demand",
+        "modeled_demand",
+        "residual",
+        "fixed_free_status",
+        "identifiability_class",
+    }
     assert bundle.model_specification == result.model_specification
     assert bundle.manifest["time_zone"] == "Europe/Zurich"
     loaded = read_gravity_viewer_bundle(tmp_path / "bundle")
@@ -150,6 +169,67 @@ def test_viewer_bundle_contains_exact_model_specification_and_round_trips(tmp_pa
     assert loaded.manifest["provenance"]["od_layout_fingerprint"] == provenance[
         "od_layout_fingerprint"
     ]
+
+
+def test_display_derived_files_aggregate_observations_and_preserve_status(tmp_path):
+    result, report, _ = _inputs(tmp_path)
+    full_od_path = report.files["full_od.csv"]
+    source = full_od_path.read_text(encoding="utf-8").splitlines()
+    source[0] = source[0] + ",observed_demand"
+    source[1] = source[1] + ",2.5"
+    source[2] = source[2] + ",4.0"
+    full_od_path.write_text("\n".join(source) + "\n", encoding="utf-8")
+    bundle = write_gravity_viewer_bundle(
+        output_directory=tmp_path / "bundle",
+        fit_result=result,
+        validation_result=report.adequacy,
+        report=report,
+        network_files=_network_files(tmp_path),
+    )
+    od_rows = list(csv.DictReader((bundle.path / "od_map.csv").open(encoding="utf-8")))
+    assert [row["observed_demand"] for row in od_rows] == ["2.5", "4"]
+    assert [row["modeled_demand"] for row in od_rows] == ["1", "2"]
+    assert [row["residual"] for row in od_rows] == ["1.5", "2"]
+    assert [row["fixed_free_status"] for row in od_rows] == ["free", "free"]
+
+    stop_rows = {
+        row["stop_id"]: row
+        for row in csv.DictReader((bundle.path / "stop_summary.csv").open(encoding="utf-8"))
+    }
+    assert stop_rows["o1"]["observed_total"] == "3"
+    assert stop_rows["o1"]["modeled_total"] == "4"
+    assert stop_rows["o1"]["residual"] == "-1"
+    assert stop_rows["o1"]["outgoing_total"] == "3"
+    assert stop_rows["d2"]["incoming_total"] == "7"
+    assert bundle.manifest["row_counts"]["od_map.csv"] == 2
+    assert bundle.manifest["row_counts"]["stop_summary.csv"] == 3
+    for name in ("od_map.csv", "stop_summary.csv"):
+        path = bundle.path / name
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        assert bundle.manifest["files"][name]["sha256"] == digest
+        assert bundle.manifest["files"][name]["size_bytes"] == path.stat().st_size
+    bundle.validate()
+
+
+def test_older_bundle_without_derived_files_remains_readable(tmp_path):
+    result, report, _ = _inputs(tmp_path)
+    bundle = write_gravity_viewer_bundle(
+        output_directory=tmp_path / "bundle",
+        fit_result=result,
+        validation_result=report.adequacy,
+        report=report,
+    )
+    manifest_path = bundle.path / "bundle_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for name in ("od_map.csv", "stop_summary.csv"):
+        (bundle.path / name).unlink()
+        manifest["files"].pop(name, None)
+        manifest["row_counts"].pop(name, None)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    restored = read_gravity_viewer_bundle(bundle.path)
+    assert "od_map.csv" not in restored.table_names
+    assert "stop_summary.csv" not in restored.table_names
+    assert restored.read_table("full_od.csv").shape[0] == 2
 
 
 def test_bundle_round_trips_identifiability_payload(tmp_path):
@@ -199,6 +279,9 @@ def test_persisted_bundle_export_restores_report_and_cleans_staging(tmp_path):
         "status": "completed",
         "fit_status": "converged",
         "predicted_measurements": result.predicted_measurements.tolist(),
+        "model_fingerprint": result.model_fingerprint,
+        "specification_fingerprint": result.specification_fingerprint,
+        "model_specification": result.model_specification,
         **provenance,
     }
     result_payload = asdict(result)
@@ -215,6 +298,9 @@ def test_persisted_bundle_export_restores_report_and_cleans_staging(tmp_path):
     fit_manifest = {
         "stage": "fit",
         "status": "completed",
+        "model_fingerprint": result.model_fingerprint,
+        "specification_fingerprint": result.specification_fingerprint,
+        "model_specification": result.model_specification,
         "result": result_payload,
         **provenance,
     }
@@ -266,6 +352,22 @@ def test_bundle_reader_rejects_manifest_provenance_mismatch(tmp_path):
     manifest["fit_provenance"]["model_fingerprint"] = "wrong-model"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="fit/model provenance"):
+        read_gravity_viewer_bundle(tmp_path / "bundle")
+
+
+def test_bundle_reader_rejects_validation_specification_mismatch(tmp_path):
+    result, report, _ = _inputs(tmp_path)
+    write_gravity_viewer_bundle(
+        output_directory=tmp_path / "bundle",
+        fit_result=result,
+        validation_result=report.adequacy,
+        report=report,
+    )
+    manifest_path = tmp_path / "bundle" / "bundle_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["validation_provenance"]["specification_fingerprint"] = "wrong"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="validation/specification"):
         read_gravity_viewer_bundle(tmp_path / "bundle")
 
 
