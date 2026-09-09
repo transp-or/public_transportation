@@ -643,12 +643,9 @@ def fit(root: Path, resume: bool = False) -> None:
         )
         config = GravityEstimatorConfig(
             maximum_iterations=int(model.get("maximum_iterations", 100)),
-            gradient_tolerance=float(model.get("gradient_tolerance", 1.0e-6)),
+            gradient_tolerance=float(model.get("gradient_tolerance", 1.0e-4)),
             objective_tolerance=float(model.get("objective_tolerance", 1.0e-9)),
             optimizer_maxls=int(model.get("optimizer_maxls", 20)),
-            scaled_gradient_tolerance=float(
-                model.get("scaled_gradient_tolerance", 1.0e-4)
-            ),
             typical_objective_scale=typical_objective_scale,
             typical_parameter_scales=typical_parameter_scales,
             optimizer=optimizer,
@@ -680,9 +677,6 @@ def fit(root: Path, resume: bool = False) -> None:
                 "gradient_inf_norm": float(getattr(event, "gradient_inf_norm")),
                 "scaled_gradient_inf_norm": getattr(
                     event, "scaled_gradient_inf_norm", None
-                ),
-                "scaled_gradient_tolerance": getattr(
-                    event, "scaled_gradient_tolerance", None
                 ),
                 "typical_objective_scale": getattr(
                     event, "typical_objective_scale", None

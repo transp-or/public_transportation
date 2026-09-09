@@ -277,8 +277,8 @@ the case environment before running `check`.
 raw optimizer coordinates (before positive transformations), while
 `gradient_strategy`, likelihood, ridge strength, tolerances, wall-time, JAX
 cache, and shard/memory limits are execution/model choices that the case owner
-must review. The estimator also supports `scaled_gradient_tolerance`,
-`typical_objective_scale`, scalar or per-parameter `typical_parameter_scales`,
+must review. The estimator also supports `typical_objective_scale`, scalar or
+per-parameter `typical_parameter_scales`,
 and `optimizer_maxls`. The optimizer selector is `optimizer = "scipy"` by
 default; `optimizer = "biogeme_tr_bfgs"` is an optional comparison path and
 requires a separately verified Biogeme environment. The case owner must pin
@@ -287,13 +287,15 @@ separate distribution) to an immutable Git revision in the case
 `pyproject.toml` and `uv.lock`. Do not copy versions from an older pilot or
 rely on a moving branch; verify pandas 3 and both imports before selecting the
 optional optimizer. Both algorithms receive the same objective-and-gradient
-callback and must use separate checkpoints and result locations. The template
+callback and must use separate checkpoints and result locations. The only
+convergence and acceptance criterion is the relative-gradient test against
+`gradient_tolerance`; `scaled_gradient_inf_norm` is diagnostic output. The template
 contains syntactically valid illustrative
 values for `typical_objective_scale` and `typical_parameter_scales`; they are
 required case-owned inputs and must be replaced or justified before a
 scientific fit. The scaled-gradient values use Dennis--Schnabel
-parameter/objective scaling; optimizer success is accepted only when the
-scaled-gradient tolerance is met. These settings and their provenance should
+parameter/objective scaling; a fit is accepted exactly when the relative
+gradient is no larger than `gradient_tolerance`. These settings and their provenance should
 be recorded with the fit manifest.
 
 For a production case, first evaluate the objective at the exact initial raw

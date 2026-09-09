@@ -1182,10 +1182,11 @@ common activation time separately. Pass it as `operator_activation_seconds` to
 `compare_gravity_optimizers`; both optimizer summaries then include the same
 activation time in `elapsed_total_seconds` and report their optimizer times
 separately. Use distinct optimizer checkpoints and result files. If only the
-convergence threshold changes, `reclassify_gravity_result` can write a new
-result record from the stored final parameters, objective, and gradient after
-checking matching model/operator fingerprints; it never overwrites the
-original result or reruns the operator.
+the single convergence criterion needs to be applied to an older result,
+`reclassify_gravity_result` can write a new result record from the stored final
+parameters, objective, and gradient after checking the case's
+`gradient_tolerance` and matching model/operator fingerprints; it never
+overwrites the original result or reruns the operator.
 
 ### Current path/interface limitation
 
@@ -2951,8 +2952,8 @@ case-owned production configuration uses:
 
 ```toml
 maximum_iterations = 1000
-# The values below are case-specific convergence diagnostics.
-scaled_gradient_tolerance = 1.0e-4
+# Sole convergence and acceptance criterion: relative gradient <= this value.
+gradient_tolerance = 1.0e-4
 # Measure the initial objective first, then store the selected fixed scale.
 typical_objective_scale = <measured_initial_objective_scale>
 # Exactly one natural-unit scale per raw fitted parameter.
@@ -2982,9 +2983,10 @@ The estimator returns `GravityEstimationResult`. Interpret the status as:
 | `stopped_by_time_budget` | clean resumable stop; do not call it complete |
 | numerical/other failure | diagnose before changing the model |
 
-The estimator certifies `converged` only when the selected optimizer reports
-success **and** the Dennis--Schnabel scaled-gradient infinity norm is no larger than
-`scaled_gradient_tolerance`. The norm is computed per parameter as
+The estimator certifies `converged` when the Dennis--Schnabel scaled-gradient
+infinity norm is no larger than the single `gradient_tolerance`. The
+optimizer-native termination message is diagnostic and is not a second
+acceptance criterion. The norm is computed per parameter as
 
 ```text
 abs(gradient_i) * max(abs(parameter_i), typical_parameter_scale_i)
@@ -2994,9 +2996,8 @@ abs(gradient_i) * max(abs(parameter_i), typical_parameter_scale_i)
 `typical_parameter_scales` may be one scalar or one positive value per
 parameter. The result and fit progress report the raw and scaled gradient
 norms, the scale settings, the initial objective, scale-selection provenance,
-and the optimizer's termination message. A relative-
-objective termination with a large scaled gradient is therefore not an
-accepted fit, even when the optimizer's native success flag is true. The final diagnostics also
+and the optimizer's termination message. A result is accepted exactly when
+the relative-gradient inequality holds. The final diagnostics also
 record objective/gradient dtypes, `np.spacing(objective)`, the reduction between
 the last accepted iterates, and whether `objective_tolerance` is below the
 available floating-point resolution. Do not silently treat a float32 result as

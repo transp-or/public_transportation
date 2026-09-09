@@ -44,7 +44,6 @@ class GravityBiogemePilotResult:
     elapsed_seconds: float
     gradient_inf_norm: float
     scaled_gradient_inf_norm: float
-    scaled_gradient_tolerance: float
     typical_objective_scale: float
     typical_parameter_scales: tuple[float, ...]
     objective_dtype: str
@@ -329,9 +328,8 @@ def run_biogeme_tr_bfgs_pilot(
             "maxiter": config.maximum_iterations,
             "tolerance": config.gradient_tolerance,
             # The objective adapter sets Biogeme's relative-gradient epsilon
-            # explicitly. Keep both public tolerances in the parameter payload
-            # for an auditable pilot; current Biogeme TR-BFGS consumes maxiter
-            # but does not forward these tolerance entries itself.
+            # explicitly. Objective tolerance remains diagnostic metadata;
+            # the relative-gradient tolerance is the sole acceptance gate.
             "objective_tolerance": config.objective_tolerance,
         },
     )
@@ -340,14 +338,12 @@ def run_biogeme_tr_bfgs_pilot(
     if hasattr(optimization_result, "solution"):
         solution = np.asarray(optimization_result.solution, dtype=np.float64)
         messages = _messages_as_dict(getattr(optimization_result, "messages", None))
-        optimizer_success = bool(getattr(optimization_result, "convergence", False))
     else:
         try:
             solution = np.asarray(optimization_result[0], dtype=np.float64)
             messages = _messages_as_dict(optimization_result[1])
         except (IndexError, TypeError, ValueError) as error:
             raise RuntimeError("Biogeme TR-BFGS returned an unsupported result.") from error
-        optimizer_success = bool(messages.get("convergence", False))
     if solution.shape != initial.shape or not np.all(np.isfinite(solution)):
         raise RuntimeError("Biogeme TR-BFGS returned invalid parameters.")
 
@@ -365,7 +361,7 @@ def run_biogeme_tr_bfgs_pilot(
         typical_objective_scale=config.typical_objective_scale,
         typical_parameter_scales=parameter_scales,
     )
-    success = optimizer_success and scaled_gradient <= config.scaled_gradient_tolerance
+    success = bool(scaled_gradient <= config.gradient_tolerance)
     status = "converged" if success else "iteration_limit"
     termination_message = messages.get("Cause of termination", messages.get("message", ""))
     message = str(termination_message)
@@ -389,7 +385,6 @@ def run_biogeme_tr_bfgs_pilot(
         elapsed_seconds=elapsed,
         gradient_inf_norm=gradient_inf_norm,
         scaled_gradient_inf_norm=scaled_gradient,
-        scaled_gradient_tolerance=config.scaled_gradient_tolerance,
         typical_objective_scale=config.typical_objective_scale,
         typical_parameter_scales=tuple(float(value) for value in parameter_scales),
         objective_dtype=str(objective_array.dtype),
@@ -420,7 +415,6 @@ def run_biogeme_tr_bfgs_pilot(
                     elapsed_seconds=result.elapsed_seconds,
                     checkpoint_written=False,
                     scaled_gradient_inf_norm=result.scaled_gradient_inf_norm,
-                    scaled_gradient_tolerance=result.scaled_gradient_tolerance,
                     typical_objective_scale=result.typical_objective_scale,
                     typical_parameter_scales=result.typical_parameter_scales,
                     initial_objective=result.initial_objective,
@@ -459,7 +453,6 @@ class GravityOptimizerRunSummary:
     objective: float
     gradient_inf_norm: float
     scaled_gradient_inf_norm: float
-    scaled_gradient_tolerance: float
     iterations: int
     evaluations: int
     elapsed_optimizer_seconds: float
@@ -512,7 +505,6 @@ def _write_comparison_record(path: Path, summary: GravityOptimizerRunSummary) ->
         "objective": summary.objective,
         "gradient_inf_norm": summary.gradient_inf_norm,
         "scaled_gradient_inf_norm": summary.scaled_gradient_inf_norm,
-        "scaled_gradient_tolerance": summary.scaled_gradient_tolerance,
         "iterations": summary.iterations,
         "evaluations": summary.evaluations,
         "elapsed_optimizer_seconds": summary.elapsed_optimizer_seconds,
@@ -560,7 +552,6 @@ def _summary_from_biogeme(
         objective=result.objective,
         gradient_inf_norm=result.gradient_inf_norm,
         scaled_gradient_inf_norm=result.scaled_gradient_inf_norm,
-        scaled_gradient_tolerance=result.scaled_gradient_tolerance,
         iterations=result.iterations,
         evaluations=(
             len(result.optimizer_messages)
@@ -674,7 +665,7 @@ def compare_gravity_optimizers(
         typical_objective_scale=config.typical_objective_scale,
         typical_parameter_scales=scales,
     )
-    scipy_success = bool(scipy_result.success) and scipy_scaled <= config.scaled_gradient_tolerance
+    scipy_success = bool(scipy_scaled <= config.gradient_tolerance)
     scipy_summary = GravityOptimizerRunSummary(
         optimizer="scipy",
         status="converged" if scipy_success else "iteration_limit",
@@ -684,7 +675,6 @@ def compare_gravity_optimizers(
         objective=scipy_objective_value,
         gradient_inf_norm=float(np.max(np.abs(scipy_gradient), initial=0.0)),
         scaled_gradient_inf_norm=scipy_scaled,
-        scaled_gradient_tolerance=config.scaled_gradient_tolerance,
         iterations=int(getattr(scipy_result, "nit", 0) or 0),
         evaluations=len(scipy_evaluations),
         elapsed_optimizer_seconds=scipy_elapsed,

@@ -126,10 +126,9 @@ def scaled_gradient_inf_norm(
 @dataclass(frozen=True, slots=True)
 class GravityEstimatorConfig:
     maximum_iterations: int = 100
-    gradient_tolerance: float = 1.0e-6
+    gradient_tolerance: float = 1.0e-4
     objective_tolerance: float = 1.0e-9
     optimizer_maxls: int = 20
-    scaled_gradient_tolerance: float = 1.0e-4
     typical_objective_scale: float = 1.0
     typical_parameter_scales: float | tuple[float, ...] | None = None
     optimizer: Literal["scipy", "biogeme_tr_bfgs"] = "scipy"
@@ -140,7 +139,6 @@ class GravityEstimatorConfig:
         for name in (
             "gradient_tolerance",
             "objective_tolerance",
-            "scaled_gradient_tolerance",
             "typical_objective_scale",
         ):
             object.__setattr__(
@@ -228,7 +226,6 @@ class GravityEstimatorProgress:
     elapsed_seconds: float
     checkpoint_written: bool
     scaled_gradient_inf_norm: float | None = None
-    scaled_gradient_tolerance: float | None = None
     typical_objective_scale: float | None = None
     typical_parameter_scales: float | tuple[float, ...] | None = None
     status: str = "running"
@@ -312,7 +309,6 @@ class GravityEstimationResult:
     auxiliary_observations: dict[str, object] | None = None
     gradient_inf_norm: float | None = None
     scaled_gradient_inf_norm: float | None = None
-    scaled_gradient_tolerance: float | None = None
     typical_objective_scale: float | None = None
     typical_parameter_scales: float | tuple[float, ...] | None = None
     objective_dtype: str | None = None
@@ -432,7 +428,6 @@ def _json_safe_result_payload(result: GravityEstimationResult) -> dict[str, obje
         "objective": result.objective,
         "gradient": result.gradient.tolist(),
         "scaled_gradient_inf_norm": result.scaled_gradient_inf_norm,
-        "scaled_gradient_tolerance": result.scaled_gradient_tolerance,
         "model_fingerprint": result.model_fingerprint,
         "specification_fingerprint": result.specification_fingerprint,
         "model_specification": result.model_specification,
@@ -444,25 +439,28 @@ def _json_safe_result_payload(result: GravityEstimationResult) -> dict[str, obje
 def reclassify_gravity_result(
     result: GravityEstimationResult,
     *,
-    scaled_gradient_tolerance: float,
+    gradient_tolerance: float,
     expected_model_fingerprint: str,
     expected_operator_fingerprint: str,
     output_path: Path | None = None,
 ) -> GravityEstimationResult:
-    """Reclassify a completed fit using only a new convergence tolerance.
+    """Restore the optimizer's convergence status for a completed fit.
 
-    No objective, gradient, parameter, prediction, or scientific identity is
-    recomputed.  The caller must supply the model and operator fingerprints
-    from the run being reviewed.  If ``output_path`` is supplied it must not
-    already exist; the original result is therefore never overwritten.
+    This migration helper applies the same relative-gradient criterion as a
+    fresh fit. It is intended for results written by older versions of the
+    estimator that stored a separate post-fit threshold. The caller must
+    supply the case's single ``gradient_tolerance`` and the model/operator
+    fingerprints from the run being reviewed. If ``output_path`` is supplied
+    it must not already exist; the original result is therefore never
+    overwritten.
     """
-    tolerance = _validate_positive_finite_scale(
-        "scaled_gradient_tolerance", scaled_gradient_tolerance
-    )
     if not expected_model_fingerprint or expected_model_fingerprint != result.model_fingerprint:
         raise ValueError("model fingerprint does not match the stored gravity result.")
     if not expected_operator_fingerprint or expected_operator_fingerprint != result.direct_operator_artifact_fingerprint:
         raise ValueError("operator fingerprint does not match the stored gravity result.")
+    tolerance = _validate_positive_finite_scale(
+        "gradient_tolerance", gradient_tolerance
+    )
     if result.typical_objective_scale is None:
         raise ValueError("stored result has no typical objective scale.")
     scaled = scaled_gradient_inf_norm(
@@ -472,18 +470,12 @@ def reclassify_gravity_result(
         typical_objective_scale=result.typical_objective_scale,
         typical_parameter_scales=result.typical_parameter_scales,
     )
-    message_lower = result.message.lower()
-    optimizer_success = result.status == "converged" or (
-        result.optimizer in {"scipy", "biogeme_tr_bfgs"}
-        and any(token in message_lower for token in ("converg", "relative gradient"))
-        and "failed" not in message_lower
-    )
-    accepted = bool(optimizer_success and scaled <= tolerance)
+    accepted = bool(scaled <= tolerance)
     metadata = {
         "previous_status": result.status,
         "previous_success": result.success,
-        "previous_scaled_gradient_tolerance": result.scaled_gradient_tolerance,
-        "new_scaled_gradient_tolerance": tolerance,
+        "criterion": "relative_gradient <= gradient_tolerance",
+        "gradient_tolerance": tolerance,
         "scaled_gradient_inf_norm": scaled,
         "model_fingerprint": result.model_fingerprint,
         "operator_fingerprint": result.direct_operator_artifact_fingerprint,
@@ -493,7 +485,6 @@ def reclassify_gravity_result(
         status="converged" if accepted else "iteration_limit",
         success=accepted,
         scaled_gradient_inf_norm=scaled,
-        scaled_gradient_tolerance=tolerance,
         acceptance="accepted" if accepted else "not_accepted",
         convergence_reclassification=metadata,
     )
@@ -1101,7 +1092,6 @@ def estimate_gravity_model(
                     elapsed,
                     checkpoint is not None,
                     scaled_gradient_inf_norm=current_scaled_gradient,
-                    scaled_gradient_tolerance=config.scaled_gradient_tolerance,
                     typical_objective_scale=config.typical_objective_scale,
                     typical_parameter_scales=typical_parameter_scales_tuple,
                     initial_objective=initial_objective,
@@ -1201,7 +1191,6 @@ def estimate_gravity_model(
                     typical_objective_scale=config.typical_objective_scale,
                     typical_parameter_scales=typical_parameter_scales,
                 ),
-                scaled_gradient_tolerance=config.scaled_gradient_tolerance,
                 typical_objective_scale=config.typical_objective_scale,
                 typical_parameter_scales=typical_parameter_scales_tuple,
                 initial_objective=initial_objective,
@@ -1337,9 +1326,12 @@ def estimate_gravity_model(
         typical_objective_scale=config.typical_objective_scale,
         typical_parameter_scales=typical_parameter_scales,
     )
-    if status == "converged" and scaled_gradient > config.scaled_gradient_tolerance:
-        success = False
-        status = "iteration_limit"
+    if status != "stopped_by_time_budget":
+        # This is the sole convergence/acceptance gate. The optimizer-native
+        # flag remains available in optimizer diagnostics, but cannot create
+        # a second, conflicting case status.
+        success = bool(scaled_gradient <= config.gradient_tolerance)
+        status = "converged" if success else "iteration_limit"
     objective_array = np.asarray(latest_evaluation.objective)
     objective_spacing = float(
         np.spacing(objective_array.dtype.type(objective_value))
@@ -1368,7 +1360,6 @@ def estimate_gravity_model(
                 elapsed_seconds=final_elapsed,
                 checkpoint_written=checkpoint is not None,
                 scaled_gradient_inf_norm=scaled_gradient,
-                scaled_gradient_tolerance=config.scaled_gradient_tolerance,
                 typical_objective_scale=config.typical_objective_scale,
                 typical_parameter_scales=typical_parameter_scales_tuple,
                 initial_objective=initial_objective,
@@ -1477,7 +1468,6 @@ def estimate_gravity_model(
         auxiliary_observations=auxiliary_metadata,
         gradient_inf_norm=gradient_inf_norm,
         scaled_gradient_inf_norm=scaled_gradient,
-        scaled_gradient_tolerance=config.scaled_gradient_tolerance,
         typical_objective_scale=config.typical_objective_scale,
         typical_parameter_scales=typical_parameter_scales_tuple,
         objective_dtype=str(objective_array.dtype),

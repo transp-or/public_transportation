@@ -291,7 +291,10 @@ def build_gravity_run_manifest(
             "scaled_gradient_inf_norm": (
                 None if result is None else result.scaled_gradient_inf_norm
             ),
-            "scaled_gradient_tolerance": estimator_config.scaled_gradient_tolerance,
+            "convergence_criterion": (
+                "optimizer_relative_gradient <= gradient_tolerance"
+            ),
+            "gradient_tolerance": estimator_config.gradient_tolerance,
             "typical_objective_scale": estimator_config.typical_objective_scale,
             "typical_parameter_scales": _json_value(
                 result.typical_parameter_scales

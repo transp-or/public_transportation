@@ -174,11 +174,11 @@ else:
 
 Do not add Biogeme to the public package's default environment or relax its
 dependency bounds without repeating the compatibility and full-test checks.
-The adapter implements
-Biogeme's `FunctionToMinimize` protocol while retaining the public estimator's
-scaled-gradient acceptance audit. It sets Biogeme's relative-gradient epsilon
-and Dennis--Schnabel `typx`/`typf` explicitly; callers must not rely on the
-optional wrapper's tolerance payload alone.
+The adapter implements Biogeme's `FunctionToMinimize` protocol and uses the
+same relative-gradient acceptance criterion as the public estimator. It sets
+Biogeme's relative-gradient epsilon and Dennis--Schnabel `typx`/`typf`
+explicitly; callers must not rely on the optional wrapper's native convergence
+flag alone.
 
 `GravityEstimatorConfig` contains statistical stopping controls: maximum total
 iterations, gradient tolerance, and objective tolerance. It also records the
@@ -190,12 +190,12 @@ $\operatorname{typf}$, the reported infinity norm is
 max_i |g_i| max(|x_i|, typx_i) / max(|objective|, typf).
 ```
 
-`scaled_gradient_tolerance`, `typical_objective_scale`, and the optional scalar
-or per-parameter `typical_parameter_scales` are validated as finite positive
-values. The selected optimizer's success flag is accepted only when this scaled
-norm also meets the configured tolerance. A relative-objective termination with a large
-scaled gradient is therefore reported as not converged, while the original
-optimizer termination message is retained.
+`gradient_tolerance`, `typical_objective_scale`, and the optional scalar or
+per-parameter `typical_parameter_scales` are validated as finite positive
+values. The single convergence and acceptance criterion is the relative
+gradient inequality `scaled_gradient_inf_norm <= gradient_tolerance`. The
+optimizer-native termination message remains diagnostic; it does not
+introduce a second acceptance gate.
 The library defaults (`typical_objective_scale = 1.0` and unit `typx`) are
 generic fallbacks for library callers, not evidence that those scales are
 appropriate for a case study. A case-study driver should require explicit
@@ -259,11 +259,11 @@ metadata describing how `typf` and `typx` were selected. The same convergence
 diagnostics are included in the result-aware
 `convergence_diagnostics` section of `build_gravity_run_manifest`.
 
-Both production algorithms use the same convergence certificate: the optimizer
-must report success *and* the Dennis--Schnabel scaled-gradient infinity norm
-must be no larger than `scaled_gradient_tolerance`. A solver's native
-convergence flag, raw gradient norm, or relative-objective message alone is not
-sufficient. Results and manifests include `optimizer`, `optimizer_message`,
+Both production algorithms use the same convergence certificate: the
+Dennis--Schnabel scaled-gradient infinity norm must be no larger than
+`gradient_tolerance`. A solver's native convergence flag, raw gradient norm, or
+relative-objective message alone is not the acceptance criterion. Results and
+manifests include `optimizer`, `optimizer_message`,
 `optimizer_iterations`, `optimizer_evaluations`, and `optimizer_options`
 alongside the common scaled-gradient and precision diagnostics.
 
@@ -325,14 +325,15 @@ separately and include it equally in `elapsed_total_seconds`. The optional Bioge
 scaled-gradient and precision diagnostics and does not alter the default
 production path.
 
-When only the acceptance threshold is being reviewed, use
-`reclassify_gravity_result` instead of rerunning the operator or optimizer.
-The helper requires matching model and operator fingerprints, recomputes the
-Dennis--Schnabel audit from the stored final parameters/objective/gradient, and
-changes only status, acceptance, and tolerance metadata. Supplying an output
-path writes a new record and refuses to overwrite an existing result; the
-original result remains unchanged. It must not be used after any scientific
-input, operator, data, or scaling change.
+When reviewing a result written by an older version that used a second
+post-fit threshold, `reclassify_gravity_result` can migrate it without
+rerunning the operator or optimizer. Supply the case's single
+`gradient_tolerance` plus matching model and operator fingerprints. It
+recomputes the relative-gradient diagnostic from the stored final
+parameters/objective/gradient and changes only status and acceptance metadata.
+Supplying an output path writes a new record and refuses to overwrite an
+existing result; the original result remains unchanged. It must not be used
+after any scientific input, operator, data, or scaling change.
 
 Phase 3 does not implement spatial effects, model adequacy reporting, holdout
 validation, or relaxation recommendations.

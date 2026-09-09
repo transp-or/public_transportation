@@ -150,7 +150,7 @@ def test_optimizer_maxls_is_passed_to_lbfgsb(monkeypatch):
             config=GravityEstimatorConfig(
                 maximum_iterations=4,
                 optimizer_maxls=100,
-                scaled_gradient_tolerance=1.0,
+                gradient_tolerance=1.0,
             ),
             execution=GravityExecutionPolicy(gradient_strategy="adjoint"),
         )
@@ -206,8 +206,8 @@ def test_dennis_schnabel_scaled_gradient_uses_typf_near_zero_objective():
 @pytest.mark.parametrize(
     ("field", "value"),
     (
-        ("scaled_gradient_tolerance", 0.0),
-        ("scaled_gradient_tolerance", np.inf),
+        ("gradient_tolerance", 0.0),
+        ("gradient_tolerance", np.inf),
         ("typical_objective_scale", 0.0),
         ("typical_objective_scale", np.nan),
         ("typical_parameter_scales", 0.0),
@@ -235,7 +235,7 @@ def test_estimator_rejects_typx_vector_with_wrong_parameter_count():
             )
 
 
-def _run_with_patched_scaled_gradient(monkeypatch, value):
+def _run_with_patched_scaled_gradient(monkeypatch, value, *, optimizer_success=True):
     with jax.enable_x64():
         problem, layout, _ = setup_problem()
         monkeypatch.setattr(
@@ -247,7 +247,7 @@ def _run_with_patched_scaled_gradient(monkeypatch, value):
             fun(np.asarray(x0, dtype=float))
             return SimpleNamespace(
                 x=np.asarray(x0, dtype=float),
-                success=True,
+                success=optimizer_success,
                 message="stub optimizer success",
             )
 
@@ -258,13 +258,13 @@ def _run_with_patched_scaled_gradient(monkeypatch, value):
             initial_raw_parameters=np.zeros(3),
             config=GravityEstimatorConfig(
                 maximum_iterations=4,
-                scaled_gradient_tolerance=1.0,
+                gradient_tolerance=1.0,
             ),
             execution=GravityExecutionPolicy(gradient_strategy="adjoint"),
         )
 
 
-def test_scipy_success_is_rejected_when_scaled_gradient_is_too_large(monkeypatch):
+def test_relative_gradient_is_rejected_when_too_large(monkeypatch):
     result = _run_with_patched_scaled_gradient(monkeypatch, value=2.0)
     assert result.status == "iteration_limit"
     assert not result.success
@@ -272,11 +272,19 @@ def test_scipy_success_is_rejected_when_scaled_gradient_is_too_large(monkeypatch
     assert result.scaled_gradient_inf_norm == pytest.approx(2.0)
 
 
-def test_scipy_success_is_accepted_when_scaled_gradient_meets_tolerance(monkeypatch):
+def test_relative_gradient_is_accepted_when_within_tolerance(monkeypatch):
     result = _run_with_patched_scaled_gradient(monkeypatch, value=0.5)
     assert result.status == "converged"
     assert result.success
     assert result.scaled_gradient_inf_norm == pytest.approx(0.5)
+
+
+def test_relative_gradient_is_the_sole_acceptance_criterion(monkeypatch):
+    result = _run_with_patched_scaled_gradient(
+        monkeypatch, value=0.5, optimizer_success=False
+    )
+    assert result.status == "converged"
+    assert result.success
 
 
 def test_reclassify_gravity_result_changes_only_acceptance_metadata(tmp_path):
@@ -295,12 +303,11 @@ def test_reclassify_gravity_result_changes_only_acceptance_metadata(tmp_path):
         success=False,
         acceptance="not_accepted",
         message="CONVERGENCE: REL_REDUCTION_OF_F_<=_FACTR*EPSMCH",
-        scaled_gradient_tolerance=1.0e-12,
     )
     destination = tmp_path / "reclassified.json"
     reviewed = reclassify_gravity_result(
         candidate,
-        scaled_gradient_tolerance=1.0,
+        gradient_tolerance=1.0,
         expected_model_fingerprint=candidate.model_fingerprint,
         expected_operator_fingerprint=candidate.direct_operator_artifact_fingerprint,
         output_path=destination,
@@ -323,14 +330,14 @@ def test_reclassify_gravity_result_changes_only_acceptance_metadata(tmp_path):
     )
     assert reviewed.convergence_reclassification is not None
     assert reviewed.convergence_reclassification["previous_status"] == "iteration_limit"
-    assert reviewed.convergence_reclassification["new_scaled_gradient_tolerance"] == 1.0
+    assert reviewed.convergence_reclassification["gradient_tolerance"] == 1.0
     payload = json.loads(destination.read_text(encoding="utf-8"))
     assert payload["acceptance"] == "accepted"
     assert payload["model_fingerprint"] == candidate.model_fingerprint
     with pytest.raises(FileExistsError, match="refusing to overwrite"):
         reclassify_gravity_result(
             candidate,
-            scaled_gradient_tolerance=1.0,
+            gradient_tolerance=1.0,
             expected_model_fingerprint=candidate.model_fingerprint,
             expected_operator_fingerprint=candidate.direct_operator_artifact_fingerprint,
             output_path=destination,
@@ -338,7 +345,7 @@ def test_reclassify_gravity_result_changes_only_acceptance_metadata(tmp_path):
     with pytest.raises(ValueError, match="model fingerprint"):
         reclassify_gravity_result(
             candidate,
-            scaled_gradient_tolerance=1.0,
+            gradient_tolerance=1.0,
             expected_model_fingerprint="different",
             expected_operator_fingerprint=candidate.direct_operator_artifact_fingerprint,
         )
@@ -382,7 +389,7 @@ def test_estimator_records_scaled_gradient_and_precision_diagnostics():
             initial_raw_parameters=np.zeros(3),
             config=GravityEstimatorConfig(
                 maximum_iterations=20,
-                scaled_gradient_tolerance=1.0e-4,
+                gradient_tolerance=1.0e-4,
                 typical_objective_scale=10.0,
                 typical_parameter_scales=(1.0, 2.0, 3.0),
             ),
@@ -447,7 +454,7 @@ def test_estimator_reports_reduction_between_accepted_iterates(monkeypatch):
             initial_raw_parameters=np.zeros(3),
             config=GravityEstimatorConfig(
                 maximum_iterations=4,
-                scaled_gradient_tolerance=1.0e6,
+                gradient_tolerance=1.0e6,
             ),
             execution=GravityExecutionPolicy(gradient_strategy="adjoint"),
         )
@@ -499,7 +506,7 @@ def test_optional_biogeme_tr_bfgs_pilot_uses_same_convergence_audit(monkeypatch)
 
     def fake_tr_bfgs(function, initial, bounds, variable_names, parameters):
         assert parameters["maxiter"] == 12
-        assert parameters["tolerance"] == pytest.approx(1.0e-6)
+        assert parameters["tolerance"] == pytest.approx(10.0)
         assert parameters["objective_tolerance"] == pytest.approx(1.0e-9)
         candidate = np.asarray(initial, dtype=float).copy()
         candidate[0] = 0.5
@@ -529,7 +536,7 @@ def test_optional_biogeme_tr_bfgs_pilot_uses_same_convergence_audit(monkeypatch)
         initial_raw_parameters=np.zeros(2),
         config=GravityEstimatorConfig(
             maximum_iterations=12,
-            scaled_gradient_tolerance=10.0,
+            gradient_tolerance=10.0,
             typical_objective_scale=2.0,
             typical_parameter_scales=(1.0, 2.0),
         ),
@@ -566,7 +573,6 @@ def test_optional_biogeme_tr_bfgs_pilot_real_interface_when_available():
         config=GravityEstimatorConfig(
             maximum_iterations=100,
             gradient_tolerance=1.0e-8,
-            scaled_gradient_tolerance=1.0e-6,
             typical_objective_scale=1.0,
             typical_parameter_scales=1.0,
         ),
@@ -578,7 +584,7 @@ def test_optional_biogeme_tr_bfgs_pilot_real_interface_when_available():
     assert result.status == "converged"
     np.testing.assert_allclose(result.raw_parameters, target, atol=1.0e-10)
     assert result.objective == pytest.approx(0.0, abs=1.0e-18)
-    assert result.scaled_gradient_inf_norm <= 1.0e-6
+    assert result.scaled_gradient_inf_norm <= 1.0e-8
     assert result.message
 
 
@@ -619,7 +625,7 @@ def test_estimator_biogeme_selector_uses_common_callback_and_metadata(monkeypatc
             config=GravityEstimatorConfig(
                 optimizer="biogeme_tr_bfgs",
                 maximum_iterations=12,
-                scaled_gradient_tolerance=1.0e9,
+                gradient_tolerance=1.0e9,
             ),
             execution=GravityExecutionPolicy(gradient_strategy="adjoint"),
             progress=progress.append,
@@ -664,7 +670,7 @@ def test_optimizer_comparison_uses_independent_checkpoints(monkeypatch, tmp_path
         initial_raw_parameters=np.zeros(2),
         config=GravityEstimatorConfig(
             maximum_iterations=25,
-            scaled_gradient_tolerance=1.0e-8,
+            gradient_tolerance=1.0e-8,
         ),
         variable_names=("a", "b"),
         scipy_checkpoint_path=tmp_path / "scipy.json",
@@ -850,7 +856,7 @@ def test_deadline_after_valid_iteration_resumes_to_uninterrupted_result(tmp_path
         np.testing.assert_allclose(
             resumed.predicted_measurements,
             uninterrupted.predicted_measurements,
-            atol=1e-4,
+            atol=2e-4,
         )
 
 
@@ -969,8 +975,11 @@ def test_run_manifest_and_progress_log_are_durable_and_serializable(tmp_path):
     assert diagnostics["typical_parameter_scales_provenance"] == (
         result.typical_parameter_scales_provenance
     )
-    assert diagnostics["scaled_gradient_tolerance"] == pytest.approx(
-        config.scaled_gradient_tolerance
+    assert diagnostics["convergence_criterion"] == (
+        "optimizer_relative_gradient <= gradient_tolerance"
+    )
+    assert diagnostics["gradient_tolerance"] == pytest.approx(
+        config.gradient_tolerance
     )
     assert diagnostics["objective_spacing"] == pytest.approx(
         result.objective_spacing

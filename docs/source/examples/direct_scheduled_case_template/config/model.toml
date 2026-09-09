@@ -2,10 +2,9 @@ likelihood = "negative_binomial"
 optimizer = "scipy"
 gradient_strategy = "auto"
 maximum_iterations = 100
-gradient_tolerance = 1.0e-6
+gradient_tolerance = 1.0e-4
 objective_tolerance = 1.0e-9
 optimizer_maxls = 20
-scaled_gradient_tolerance = 1.0e-4
 # These are required case-owned values, not production defaults. Replace them
 # after measuring the initial objective and inspecting the fitted parameter
 # units/count before running a scientific fit.
