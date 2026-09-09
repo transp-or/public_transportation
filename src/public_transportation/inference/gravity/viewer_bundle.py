@@ -21,6 +21,7 @@ from typing import Any
 
 import numpy as np
 
+from public_transportation.inference.block_coordinate._canonical import canonical_json
 from public_transportation.inference.od_parameter_layout import ODParameterLayout
 
 from .estimator import GravityEstimationResult
@@ -383,7 +384,7 @@ def _result_specification(
         except (TypeError, ValueError) as error:
             raise ValueError("model_specification is not a valid gravity specification.") from error
         specification = parsed.to_dict()
-        if payload != specification:
+        if canonical_json(payload) != canonical_json(specification):
             raise ValueError(
                 "model_specification is not the canonical serialized specification."
             )
@@ -403,7 +404,7 @@ def _result_specification(
                     "fit_result model_specification is not a valid gravity specification."
                 ) from error
             fit_specification = fit_parsed.to_dict()
-            if fit_payload != fit_specification:
+            if canonical_json(fit_payload) != canonical_json(fit_specification):
                 raise ValueError(
                     "fit_result model_specification is not the canonical serialized specification."
                 )
@@ -587,7 +588,9 @@ def _validate_table_inputs(
         )
     except (TypeError, ValueError) as error:
         raise ValueError("report.json model_specification is invalid.") from error
-    if dict(report_specification) != parsed_report_specification.to_dict():
+    if canonical_json(dict(report_specification)) != canonical_json(
+        parsed_report_specification.to_dict()
+    ):
         raise ValueError("report.json model_specification is not canonical.")
     report_specification_fingerprint = report_payload.get(
         "specification_fingerprint"
@@ -599,7 +602,8 @@ def _validate_table_inputs(
         )
     if (
         report_specification_fingerprint != fit_specification_fingerprint
-        or dict(report_specification) != fit_specification
+        or canonical_json(dict(report_specification))
+        != canonical_json(fit_specification)
     ):
         raise ValueError(
             "report.json model specification differs from the fitted result."
@@ -615,7 +619,9 @@ def _validate_table_inputs(
             "validation provenance specification_fingerprint differs from the "
             "fitted result."
         )
-    if dict(validation_specification) != fit_specification:
+    if canonical_json(dict(validation_specification)) != canonical_json(
+        fit_specification
+    ):
         raise ValueError(
             "validation provenance model_specification differs from the fitted result."
         )
@@ -813,7 +819,9 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
         )
     except (TypeError, ValueError) as error:
         raise ValueError("bundle report model specification is invalid.") from error
-    if dict(report_specification) != parsed_report_specification.to_dict():
+    if canonical_json(dict(report_specification)) != canonical_json(
+        parsed_report_specification.to_dict()
+    ):
         raise ValueError("bundle report model specification is not canonical.")
     if report_payload.get("specification_fingerprint") != spec_fingerprint:
         raise ValueError("bundle report specification provenance mismatch.")
