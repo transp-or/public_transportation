@@ -77,3 +77,56 @@ class GravityMeasurementOperator(Protocol):
     def jax_rmatvec(self, vector: jax.Array) -> jax.Array: ...
 
     def jax_matmat(self, matrix: jax.Array) -> jax.Array: ...
+
+
+@runtime_checkable
+class GravityLinearMeasurementOperator(Protocol):
+    """Minimal linear measurement contract for non-OD additive blocks.
+
+    Unlike :class:`GravityMeasurementOperator`, this protocol deliberately
+    carries no routing, OD-layout, or assignment provenance.  It is suitable
+    for persisted companion matrices such as boundary-flow operators.
+    """
+
+    @property
+    def num_rows(self) -> int: ...
+
+    @property
+    def num_columns(self) -> int: ...
+
+    def jax_matvec(self, vector: jax.Array) -> jax.Array: ...
+
+    def jax_rmatvec(self, vector: jax.Array) -> jax.Array: ...
+
+    def jax_matmat(self, matrix: jax.Array) -> jax.Array: ...
+
+
+@dataclass(frozen=True, slots=True)
+class GravityMeasurementOperatorLinearAdapter:
+    """Expose an existing OD operator through the generic linear protocol."""
+
+    operator: GravityMeasurementOperator
+
+    @property
+    def num_rows(self) -> int:
+        return int(self.operator.num_measurements)
+
+    @property
+    def num_columns(self) -> int:
+        return int(self.operator.num_free_od)
+
+    @property
+    def fingerprint(self) -> str:
+        value = getattr(self.operator, "artifact_fingerprint", None)
+        if value is None:
+            value = getattr(self.operator, "assignment_fingerprint", "")
+        return str(value)
+
+    def jax_matvec(self, vector: jax.Array) -> jax.Array:
+        return self.operator.jax_matvec(vector)
+
+    def jax_rmatvec(self, vector: jax.Array) -> jax.Array:
+        return self.operator.jax_rmatvec(vector)
+
+    def jax_matmat(self, matrix: jax.Array) -> jax.Array:
+        return self.operator.jax_matmat(matrix)

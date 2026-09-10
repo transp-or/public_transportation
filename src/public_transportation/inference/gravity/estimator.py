@@ -47,6 +47,12 @@ def _validate_positive_finite_scale(name: str, value: object) -> float:
     return numeric
 
 
+def _readonly_array(value: object) -> np.ndarray:
+    array = np.array(value, copy=True)
+    array.setflags(write=False)
+    return array
+
+
 def _is_scalar_scale(value: object) -> bool:
     """Return whether a scale is scalar, including a zero-dimensional array."""
     if np.isscalar(value):
@@ -327,6 +333,11 @@ class GravityEstimationResult:
     optimizer_options: dict[str, object] | None = None
     acceptance: str | None = None
     convergence_reclassification: dict[str, object] | None = None
+    latent_measurements: np.ndarray | None = None
+    od_measurement_contribution: np.ndarray | None = None
+    additive_measurement_contributions: tuple[np.ndarray, ...] = ()
+    additive_flows: tuple[np.ndarray, ...] = ()
+    observation_scales: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != GRAVITY_RESULT_SCHEMA_VERSION:
@@ -351,6 +362,29 @@ class GravityEstimationResult:
             value = np.array(getattr(self, name), copy=True)
             value.setflags(write=False)
             object.__setattr__(self, name, value)
+        for name in (
+            "latent_measurements",
+            "od_measurement_contribution",
+            "observation_scales",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                array = np.array(value, copy=True)
+                array.setflags(write=False)
+                object.__setattr__(self, name, array)
+        object.__setattr__(
+            self,
+            "additive_measurement_contributions",
+            tuple(
+                _readonly_array(value)
+                for value in self.additive_measurement_contributions
+            ),
+        )
+        object.__setattr__(
+            self,
+            "additive_flows",
+            tuple(_readonly_array(value) for value in self.additive_flows),
+        )
         if (
             self.parameter_names
             and len(self.parameter_names) != self.raw_parameters.size
@@ -408,6 +442,16 @@ class GravityEstimationResult:
         for name in ("parameter_names", "auxiliary_channel_log_likelihoods"):
             if name in values and values[name] is not None:
                 values[name] = tuple(values[name])
+        for name in (
+            "latent_measurements",
+            "od_measurement_contribution",
+            "observation_scales",
+        ):
+            if name in values and values[name] is not None:
+                values[name] = np.asarray(values[name])
+        for name in ("additive_measurement_contributions", "additive_flows"):
+            if name in values and values[name] is not None:
+                values[name] = tuple(np.asarray(item) for item in values[name])
         if "parameter_blocks" in values and values["parameter_blocks"] is not None:
             values["parameter_blocks"] = tuple(values["parameter_blocks"])
         if values.get("checkpoint_path") is not None:
@@ -433,6 +477,23 @@ def _json_safe_result_payload(result: GravityEstimationResult) -> dict[str, obje
         "model_specification": result.model_specification,
         "direct_operator_artifact_fingerprint": result.direct_operator_artifact_fingerprint,
         "convergence_reclassification": result.convergence_reclassification,
+        "latent_measurements": (
+            None
+            if result.latent_measurements is None
+            else result.latent_measurements.tolist()
+        ),
+        "od_measurement_contribution": (
+            None
+            if result.od_measurement_contribution is None
+            else result.od_measurement_contribution.tolist()
+        ),
+        "additive_measurement_contributions": [
+            value.tolist() for value in result.additive_measurement_contributions
+        ],
+        "additive_flows": [value.tolist() for value in result.additive_flows],
+        "observation_scales": (
+            None if result.observation_scales is None else result.observation_scales.tolist()
+        ),
     }
 
 
@@ -522,6 +583,14 @@ def gravity_model_fingerprint(
     observations = problem.auxiliary_observations
     if observations is not None and observations.enabled:
         payload["auxiliary_observations"] = observations.identity_payload()
+    observation_model = problem.observation_model
+    if observation_model is not None:
+        payload["observation_model"] = observation_model.to_dict()
+    additive_blocks = getattr(problem.parameter_layout, "additive_flow_blocks", ())
+    if additive_blocks:
+        payload["additive_flow_operators"] = {
+            block.name: block.operator_fingerprint for block in additive_blocks
+        }
     return fingerprint(payload)
 
 
@@ -1488,4 +1557,25 @@ def estimate_gravity_model(
         optimizer_iterations=optimizer_iterations,
         optimizer_evaluations=optimizer_evaluations,
         optimizer_options=optimizer_options,
+        latent_measurements=(
+            None
+            if latest_evaluation.latent_measurement is None
+            else np.asarray(latest_evaluation.latent_measurement)
+        ),
+        od_measurement_contribution=(
+            None
+            if latest_evaluation.od_measurement is None
+            else np.asarray(latest_evaluation.od_measurement)
+        ),
+        additive_measurement_contributions=tuple(
+            np.asarray(value) for value in latest_evaluation.additive_measurements
+        ),
+        additive_flows=tuple(
+            np.asarray(value) for value in latest_evaluation.additive_flows
+        ),
+        observation_scales=(
+            None
+            if latest_evaluation.observation_scales is None
+            else np.asarray(latest_evaluation.observation_scales)
+        ),
     )

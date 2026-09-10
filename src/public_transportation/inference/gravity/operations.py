@@ -29,13 +29,40 @@ from .estimator import (
 )
 from .objective import GravityObjectiveProblem
 from .specification import GravityModelSpecification
-from public_transportation.inference.block_coordinate._canonical import fingerprint
+from public_transportation.inference.block_coordinate._canonical import (
+    canonical_json,
+    fingerprint,
+)
 from public_transportation.inference.construction_control import (
     normalize_progress_event,
 )
 
 GRAVITY_RUN_MANIFEST_SCHEMA_VERSION = 4
 GRAVITY_PROGRESS_SCHEMA_VERSION = 1
+
+
+def _operator_support_mask(operator: object, num_rows: int) -> np.ndarray:
+    """Return a conservative row-support mask without probing the operator."""
+    value = getattr(operator, "supported_rows", None)
+    if callable(value):
+        candidate = np.asarray(value(), dtype=bool)
+        if candidate.shape != (num_rows,):
+            raise ValueError("operator supported_rows has the wrong shape.")
+        return candidate
+    value = getattr(operator, "support_mask", None)
+    if value is not None:
+        candidate = np.asarray(value, dtype=bool)
+        if candidate.shape != (num_rows,):
+            raise ValueError("operator support_mask has the wrong shape.")
+        return candidate
+    matrix = getattr(operator, "matrix", None)
+    if matrix is not None:
+        candidate = np.asarray(matrix)
+        if candidate.ndim == 2 and candidate.shape[0] == num_rows:
+            return np.any(candidate != 0, axis=1)
+    # A matrix-free operator cannot be inspected without doing numerical work.
+    # Treat its declared rows as supported; adapters may provide an explicit mask.
+    return np.ones(num_rows, dtype=bool)
 
 
 def _append_progress_line(path: Path, rendered: str, *, durable: bool) -> None:
@@ -63,6 +90,10 @@ def _utc_now() -> str:
 def _json_value(value: object) -> object:
     if is_dataclass(value):
         return _json_value(asdict(value))
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
     if isinstance(value, Mapping):
         return {str(key): _json_value(item) for key, item in value.items()}
     if isinstance(value, (tuple, list)):
@@ -132,7 +163,9 @@ def build_gravity_run_manifest(
             )
         except (TypeError, ValueError) as error:
             raise ValueError("gravity result model_specification is invalid.") from error
-        if dict(raw_specification) != specification.to_dict():
+        if canonical_json(dict(raw_specification)) != canonical_json(
+            specification.to_dict()
+        ):
             raise ValueError(
                 "gravity result model_specification differs from the run problem."
             )
@@ -165,6 +198,25 @@ def build_gravity_run_manifest(
     if unsupported is not None and bool(jax.numpy.any(unsupported & calibration)):
         raise ValueError(
             "unsupported measurement rows must be excluded from calibration."
+        )
+    num_rows = int(operator.num_measurements)
+    od_support = _operator_support_mask(operator, num_rows)
+    additive_support: dict[str, np.ndarray] = {}
+    for block in getattr(problem.parameter_layout, "additive_flow_blocks", ()):
+        additive_support[block.name] = _operator_support_mask(block.operator, num_rows)
+    fixed_offset = np.asarray(operator.fixed_measurement_offset)
+    if fixed_offset.shape != (num_rows,):
+        raise ValueError("operator fixed_measurement_offset has the wrong shape.")
+    fixed_support = np.isfinite(fixed_offset) & (fixed_offset != 0)
+    active_support = od_support.copy()
+    for support in additive_support.values():
+        active_support |= support
+    active_support |= fixed_support
+    positive_without_support = (np.asarray(problem.observations) > 0) & ~active_support
+    mean_floor_rows = None
+    if result is not None:
+        mean_floor_rows = np.asarray(result.predicted_measurements) <= float(
+            problem.mean_floor
         )
     artifact_fingerprint = getattr(
         operator, "artifact_fingerprint", None
@@ -210,6 +262,11 @@ def build_gravity_run_manifest(
         "parameter_blocks": [
             block.to_dict() for block in problem.parameter_layout.blocks
         ],
+        "observation_model": (
+            None
+            if problem.observation_model is None
+            else problem.observation_model.to_dict()
+        ),
         "fingerprints": {
             "compact_layout": compact_layout.fingerprint,
             "assignment": operator.assignment_fingerprint,
@@ -218,6 +275,34 @@ def build_gravity_run_manifest(
             "features": problem.features.fingerprint,
             "direct_operator_artifact": artifact_fingerprint,
             "structural_zeros": structural_zero_fingerprint,
+            "calibration_mask": fingerprint(calibration),
+            "joint_parameter_layout": problem.parameter_layout.fingerprint,
+            "observation_model": (
+                None
+                if problem.observation_model is None
+                else problem.observation_model.fingerprint
+            ),
+            "additive_flow_operators": {
+                name: block.operator_fingerprint
+                for block in getattr(problem.parameter_layout, "additive_flow_blocks", ())
+                for name in (block.name,)
+            },
+            "initial_onboard_operator": next(
+                (
+                    block.operator_fingerprint
+                    for block in getattr(problem.parameter_layout, "additive_flow_blocks", ())
+                    if block.name == "initial_onboard"
+                ),
+                None,
+            ),
+            "terminal_outflow_operator": next(
+                (
+                    block.operator_fingerprint
+                    for block in getattr(problem.parameter_layout, "additive_flow_blocks", ())
+                    if block.name == "terminal_outflow"
+                ),
+                None,
+            ),
         },
         "observation_masks": {
             "calibration": {
@@ -234,6 +319,23 @@ def build_gravity_run_manifest(
                 "excluded": None if unsupported is None else int(unsupported.sum()),
                 "total": None if unsupported is None else int(unsupported.size),
             },
+        },
+        "measurement_support": {
+            "total_measurement_rows": num_rows,
+            "calibrated_rows": int(calibration.sum()),
+            "excluded_rows": int(calibration.size - calibration.sum()),
+            "rows_supported_by_od_flow": int(od_support.sum()),
+            "rows_supported_by_additive_flow": {
+                name: int(mask.sum()) for name, mask in additive_support.items()
+            },
+            "rows_supported_by_any_active_flow": int(active_support.sum()),
+            "rows_supported_by_fixed_offset": int(fixed_support.sum()),
+            "positive_rows_without_any_active_support": int(
+                positive_without_support.sum()
+            ),
+            "rows_at_mean_floor": (
+                None if mean_floor_rows is None else int(mean_floor_rows.sum())
+            ),
         },
         "regularization": [
             {

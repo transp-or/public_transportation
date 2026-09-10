@@ -27,6 +27,14 @@ from .diagnostics import (
     recommend_gravity_relaxations,
 )
 from .features import GravityFeatures
+from .additive import (
+    DirectNonnegativeFlowModel,
+    GravityAdditiveFlowBlock,
+    GravityDenseLinearMeasurementOperator,
+    GravityLatentFlowModel,
+    LinearNonnegativeFlowModel,
+    latent_flow_model_from_dict,
+)
 from .fidelity import (
     GravityApproximationQuality,
     GravityFidelityAnchor,
@@ -94,6 +102,7 @@ from .biogeme_pilot import (
     run_biogeme_tr_bfgs_pilot,
 )
 from .parameters import (
+    GravityJointParameterLayout,
     GravityParameterBlock,
     GravityParameterLayout,
     MinimalGravityParameters,
@@ -111,7 +120,18 @@ from .objective import (
     gravity_value_and_gradient_batched_forward,
     predict_gravity_measurements,
 )
-from .operator import GravityMeasurementOperator
+from .observation_model import GravityObservationModel
+from .boundary_artifact import (
+    GRAVITY_BOUNDARY_ARTIFACT_SCHEMA_VERSION,
+    GravityBoundaryArtifact,
+    load_gravity_boundary_artifact,
+    write_gravity_boundary_artifact,
+)
+from .operator import (
+    GravityLinearMeasurementOperator,
+    GravityMeasurementOperator,
+    GravityMeasurementOperatorLinearAdapter,
+)
 from .aggregate import (
     GRAVITY_AGGREGATE_SCHEMA_VERSION,
     SUPPORTED_AGGREGATE_LIKELIHOODS,

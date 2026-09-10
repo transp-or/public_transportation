@@ -18,8 +18,13 @@ from public_transportation.measurement.likelihood_jax import (
 from .demand import generate_gravity_demand
 from .features import GravityFeatures
 from .operator import GravityMeasurementOperator
+from .observation_model import GravityObservationModel
 from .observations import GravityObservationBundle
-from .parameters import GravityParameterLayout, validate_gravity_relaxation_features
+from .parameters import (
+    GravityJointParameterLayout,
+    GravityParameterLayout,
+    validate_gravity_relaxation_features,
+)
 from .specification import GravityEffectScope
 
 
@@ -36,7 +41,7 @@ class GravityGradientStrategy(str, Enum):
 @dataclass(frozen=True, slots=True)
 class GravityObjectiveProblem:
     features: GravityFeatures
-    parameter_layout: GravityParameterLayout
+    parameter_layout: GravityParameterLayout | GravityJointParameterLayout
     operator: GravityMeasurementOperator
     observations: np.ndarray
     likelihood: GravityLikelihood = GravityLikelihood.NEGATIVE_BINOMIAL
@@ -44,6 +49,7 @@ class GravityObjectiveProblem:
     calibration_mask: np.ndarray | None = None
     mean_floor: float = 1.0e-9
     auxiliary_observations: GravityObservationBundle | None = None
+    observation_model: GravityObservationModel | None = None
 
     def __post_init__(self) -> None:
         observations_bundle = (
@@ -60,9 +66,23 @@ class GravityObjectiveProblem:
             dtype=np.dtype(getattr(self.operator, "dtype", np.float64)),
         )
         object.__setattr__(self, "auxiliary_observations", observations_bundle)
+        if self.observation_model is not None:
+            if not isinstance(self.observation_model, GravityObservationModel):
+                raise TypeError(
+                    "observation_model must be a GravityObservationModel or None."
+                )
+            self.observation_model.scale_vector(
+                int(self.operator.num_measurements), dtype=np.float32
+            )
         validate_gravity_relaxation_features(
             self.features, self.parameter_layout.specification
         )
+        for block in getattr(self.parameter_layout, "additive_flow_blocks", ()):
+            if block.operator.num_rows != self.operator.num_measurements:
+                raise ValueError(
+                    f"additive flow block {block.name!r} has {block.operator.num_rows} rows; "
+                    "it must match the primary measurement dimension."
+                )
         specification = self.parameter_layout.specification
         if (
             specification.components
@@ -156,20 +176,93 @@ class GravityObjectiveEvaluation(NamedTuple):
     count_log_likelihood: jax.Array = 0.0
     auxiliary_log_likelihood: jax.Array = 0.0
     auxiliary_channel_log_likelihoods: tuple[jax.Array, ...] = ()
+    latent_measurement: jax.Array | None = None
+    od_measurement: jax.Array | None = None
+    additive_measurements: tuple[jax.Array, ...] = ()
+    additive_flows: tuple[jax.Array, ...] = ()
+    observation_scales: jax.Array | None = None
+
+
+def _has_additive_measurement_blocks(problem: GravityObjectiveProblem) -> bool:
+    return bool(getattr(problem.parameter_layout, "additive_flow_blocks", ()))
+
+
+def _measurement_components(
+    raw_parameters: object, *, problem: GravityObjectiveProblem
+) -> tuple[
+    jax.Array,
+    jax.Array,
+    tuple[jax.Array, ...],
+    tuple[jax.Array, ...],
+    jax.Array,
+]:
+    """Evaluate the opt-in additive measurement branch."""
+    raw = jnp.asarray(raw_parameters)
+    demand = generate_gravity_demand(
+        raw,
+        features=problem.features,
+        parameter_layout=problem.parameter_layout,
+    ).demand
+    od_measurement = problem.operator.jax_matvec(demand)
+    additive_measurements: list[jax.Array] = []
+    additive_flows: list[jax.Array] = []
+    for block in getattr(problem.parameter_layout, "additive_flow_blocks", ()):
+        flow = block.flow_from_raw(
+            problem.parameter_layout.block_raw(raw, block.name)
+        )
+        additive_flows.append(flow)
+        additive_measurements.append(block.operator.jax_matvec(flow))
+    latent = od_measurement
+    for contribution in additive_measurements:
+        latent = latent + contribution
+    offset = jnp.asarray(problem.operator.fixed_measurement_offset, dtype=raw.dtype)
+    latent = latent + offset
+    if problem.observation_model is None:
+        scales = jnp.full(
+            (int(problem.operator.num_measurements),),
+            jnp.asarray(problem.rho, dtype=raw.dtype),
+        )
+    else:
+        scales = jnp.asarray(problem.rho, dtype=raw.dtype) * problem.observation_model.scale_vector(
+            int(problem.operator.num_measurements), dtype=raw.dtype
+        )
+    return (
+        demand,
+        latent,
+        tuple(additive_measurements),
+        tuple(additive_flows),
+        scales,
+    )
+
+
+def _apply_mean_floor(mean_unfloored: jax.Array, floor: float) -> jax.Array:
+    """Apply the numerical mean floor with a zero derivative on floor rows."""
+    floor_value = jnp.asarray(floor, dtype=mean_unfloored.dtype)
+    # ``where`` keeps the floor branch constant when a row is at or below the
+    # floor.  ``maximum`` has an implementation-defined subgradient at exact
+    # equality (often one half), which would incorrectly let a floor-only row
+    # contribute to the additive-flow gradient.
+    return jnp.where(mean_unfloored > floor_value, mean_unfloored, floor_value)
 
 
 def predict_gravity_measurements(
     raw_parameters: object, *, problem: GravityObjectiveProblem
 ) -> tuple[jax.Array, jax.Array]:
-    demand = generate_gravity_demand(
-        raw_parameters,
-        features=problem.features,
-        parameter_layout=problem.parameter_layout,
-    ).demand
-    routed = problem.operator.jax_matvec(demand)
-    offset = jnp.asarray(problem.operator.fixed_measurement_offset, dtype=demand.dtype)
-    mean = jnp.asarray(problem.rho, dtype=demand.dtype) * (routed + offset)
-    mean = jnp.maximum(mean, jnp.asarray(problem.mean_floor, dtype=demand.dtype))
+    if not _has_additive_measurement_blocks(problem) and problem.observation_model is None:
+        demand = generate_gravity_demand(
+            raw_parameters,
+            features=problem.features,
+            parameter_layout=problem.parameter_layout,
+        ).demand
+        routed = problem.operator.jax_matvec(demand)
+        offset = jnp.asarray(problem.operator.fixed_measurement_offset, dtype=demand.dtype)
+        mean = jnp.asarray(problem.rho, dtype=demand.dtype) * (routed + offset)
+        mean = jnp.maximum(mean, jnp.asarray(problem.mean_floor, dtype=demand.dtype))
+        return mean, demand
+    demand, latent, _, _, scales = _measurement_components(
+        raw_parameters, problem=problem
+    )
+    mean = _apply_mean_floor(scales * latent, problem.mean_floor)
     return mean, demand
 
 
@@ -177,8 +270,24 @@ def evaluate_gravity_objective(
     raw_parameters: object, *, problem: GravityObjectiveProblem
 ) -> GravityObjectiveEvaluation:
     raw = jnp.asarray(raw_parameters)
-    mean, demand = predict_gravity_measurements(raw, problem=problem)
-    return _evaluation_from_mean(raw, mean=mean, demand=demand, problem=problem)
+    if not _has_additive_measurement_blocks(problem) and problem.observation_model is None:
+        mean, demand = predict_gravity_measurements(raw, problem=problem)
+        return _evaluation_from_mean(raw, mean=mean, demand=demand, problem=problem)
+    demand, latent, additive_measurements, additive_flows, scales = _measurement_components(
+        raw, problem=problem
+    )
+    mean = _apply_mean_floor(scales * latent, problem.mean_floor)
+    return _evaluation_from_mean(
+        raw,
+        mean=mean,
+        demand=demand,
+        problem=problem,
+        latent_measurement=latent,
+        od_measurement=problem.operator.jax_matvec(demand),
+        additive_measurements=additive_measurements,
+        additive_flows=additive_flows,
+        observation_scales=scales,
+    )
 
 
 def _evaluation_from_mean(
@@ -187,6 +296,11 @@ def _evaluation_from_mean(
     mean: jax.Array,
     demand: jax.Array,
     problem: GravityObjectiveProblem,
+    latent_measurement: jax.Array | None = None,
+    od_measurement: jax.Array | None = None,
+    additive_measurements: tuple[jax.Array, ...] = (),
+    additive_flows: tuple[jax.Array, ...] = (),
+    observation_scales: jax.Array | None = None,
 ) -> GravityObjectiveEvaluation:
     count_log_likelihood = _count_log_likelihood(mean, raw, problem)
     auxiliary_log_likelihood, auxiliary_channel_log_likelihoods = (
@@ -205,6 +319,11 @@ def _evaluation_from_mean(
         count_log_likelihood=count_log_likelihood,
         auxiliary_log_likelihood=auxiliary_log_likelihood,
         auxiliary_channel_log_likelihoods=auxiliary_channel_log_likelihoods,
+        latent_measurement=latent_measurement,
+        od_measurement=od_measurement,
+        additive_measurements=additive_measurements,
+        additive_flows=additive_flows,
+        observation_scales=observation_scales,
     )
 
 
@@ -247,6 +366,8 @@ def gravity_value_and_gradient_batched_forward(
     raw_parameters: object, *, problem: GravityObjectiveProblem
 ) -> tuple[GravityObjectiveEvaluation, jax.Array]:
     """Small-parameter gradient using a batched demand Jacobian."""
+    if _has_additive_measurement_blocks(problem) or problem.observation_model is not None:
+        return _gravity_value_and_gradient_additive(raw_parameters, problem=problem)
     raw = jnp.asarray(raw_parameters)
 
     def demand_function(value: jax.Array) -> jax.Array:
@@ -318,10 +439,31 @@ def _objective_from_mean_and_demand(
     )
 
 
+def _gravity_value_and_gradient_additive(
+    raw_parameters: object, *, problem: GravityObjectiveProblem
+) -> tuple[GravityObjectiveEvaluation, jax.Array]:
+    """Reference gradient for the opt-in additive-flow branch.
+
+    The branch is intentionally isolated from the legacy kernels.  It uses
+    JAX's reverse-mode differentiation through each declared linear operator,
+    which is exact for dense and matrix-free operators implementing the
+    generic protocol and provides a correctness baseline for later specialized
+    batched/adjoint kernels.
+    """
+    raw = jnp.asarray(raw_parameters)
+    evaluation = evaluate_gravity_objective(raw, problem=problem)
+    gradient = jax.grad(
+        lambda value: evaluate_gravity_objective(value, problem=problem).objective
+    )(raw)
+    return evaluation, gradient
+
+
 def gravity_value_and_gradient_adjoint(
     raw_parameters: object, *, problem: GravityObjectiveProblem
 ) -> tuple[GravityObjectiveEvaluation, jax.Array]:
     """Adjoint gradient using one routing transpose product and a demand VJP."""
+    if _has_additive_measurement_blocks(problem) or problem.observation_model is not None:
+        return _gravity_value_and_gradient_additive(raw_parameters, problem=problem)
     raw = jnp.asarray(raw_parameters)
 
     def demand_function(value: jax.Array) -> jax.Array:

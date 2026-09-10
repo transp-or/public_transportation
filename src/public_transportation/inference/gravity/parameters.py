@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Mapping, NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from public_transportation.inference.block_coordinate._canonical import fingerprint
+from public_transportation.inference.block_coordinate._canonical import (
+    canonical_json,
+    fingerprint,
+)
 
 from .features import GravityFeatures
+from .additive import GravityAdditiveFlowBlock
 from .specification import (
     GravityComponentSpecification,
     GravityConstraint,
@@ -547,6 +551,268 @@ class GravityParameterLayout:
                     raise ValueError("global production scale must be strictly positive.")
                 result[position] = np.log(scale)
         return result
+
+
+@dataclass(frozen=True, slots=True)
+class GravityJointParameterLayout:
+    """Flat layout combining gravity and additive-flow parameters.
+
+    The legacy :class:`GravityParameterLayout` remains the exact layout when
+    no additive blocks are supplied.  This wrapper delegates every gravity
+    transformation to that layout and appends deterministic slices for each
+    named flow block.
+    """
+
+    gravity_layout: GravityParameterLayout
+    additive_flow_blocks: tuple[GravityAdditiveFlowBlock, ...] = ()
+
+    def __post_init__(self) -> None:
+        names: list[str] = list(self.gravity_layout.names)
+        block_names: set[str] = set()
+        for block in self.additive_flow_blocks:
+            if block.name in block_names:
+                raise ValueError(f"duplicate additive flow block {block.name!r}.")
+            block_names.add(block.name)
+            overlap = set(block.parameter_names) & set(names)
+            if overlap:
+                raise ValueError(
+                    "additive-flow parameter names overlap gravity parameters: "
+                    + ", ".join(sorted(overlap))
+                )
+            names.extend(block.parameter_names)
+        desired = tuple(block.to_dict() for block in self.additive_flow_blocks)
+        existing = tuple(self.gravity_layout.specification.additive_flow_blocks)
+        if existing and not desired:
+            raise ValueError(
+                "gravity specification declares additive flow blocks, but none were configured."
+            )
+        if existing and canonical_json(existing) != canonical_json(desired):
+            raise ValueError(
+                "gravity specification additive_flow_blocks do not match the configured blocks."
+            )
+        if desired and not existing:
+            specification = replace(
+                self.gravity_layout.specification,
+                additive_flow_blocks=desired,
+            )
+            object.__setattr__(
+                self,
+                "gravity_layout",
+                GravityParameterLayout(
+                    specification,
+                    positivity_floor=self.gravity_layout.positivity_floor,
+                ),
+            )
+
+    @property
+    def specification(self) -> GravityModelSpecification:
+        return self.gravity_layout.specification
+
+    @property
+    def gravity_parameter_slice(self) -> slice:
+        return slice(0, self.gravity_layout.size)
+
+    @property
+    def block_slices(self) -> dict[str, slice]:
+        start = self.gravity_layout.size
+        result: dict[str, slice] = {}
+        for block in self.additive_flow_blocks:
+            result[block.name] = slice(start, start + block.num_parameters)
+            start += block.num_parameters
+        return result
+
+    @property
+    def size(self) -> int:
+        return self.gravity_layout.size + sum(
+            block.num_parameters for block in self.additive_flow_blocks
+        )
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return self.gravity_layout.names + tuple(
+            name for block in self.additive_flow_blocks for name in block.parameter_names
+        )
+
+    @property
+    def blocks(self) -> tuple[GravityParameterBlock, ...]:
+        result = list(self.gravity_layout.blocks)
+        for block in self.additive_flow_blocks:
+            parameter_slice = self.block_slices[block.name]
+            result.append(
+                GravityParameterBlock(
+                    component=block.name,
+                    scope=GravityEffectScope.GLOBAL,
+                    parameterization=GravityParameterization.ADDITIVE,
+                    constraint=GravityConstraint.NONE,
+                    mapping=None,
+                    group_count=0,
+                    reference_category=None,
+                    parameter_slice=parameter_slice,
+                    names=block.parameter_names,
+                    regularization_type=(
+                        GravityRegularizationType.RIDGE
+                        if block.regularization_strength > 0
+                        else GravityRegularizationType.NONE
+                    ),
+                    regularization_strength=block.regularization_strength,
+                )
+            )
+        return tuple(result)
+
+    @property
+    def slices(self) -> dict[str, slice]:
+        result = dict(self.gravity_layout.slices)
+        for block in self.additive_flow_blocks:
+            result[block.name] = self.block_slices[block.name]
+            for index, name in enumerate(block.parameter_names):
+                position = self.block_slices[block.name].start + index
+                result[name] = slice(position, position + 1)
+        return result
+
+    def block(self, component: str) -> GravityParameterBlock | None:
+        return next((item for item in self.blocks if item.component == component), None)
+
+    def deviation_block(self, component: str) -> GravityParameterBlock | None:
+        return self.gravity_layout.deviation_block(component)
+
+    def _raw(self, raw_parameters: object) -> jax.Array:
+        raw = jnp.asarray(raw_parameters)
+        if raw.ndim != 1 or raw.shape[0] != self.size:
+            raise ValueError(f"raw_parameters must have shape ({self.size},).")
+        return raw
+
+    def gravity_raw(self, raw_parameters: object) -> jax.Array:
+        return self._raw(raw_parameters)[self.gravity_parameter_slice]
+
+    def block_raw(self, raw_parameters: object, name: str) -> jax.Array:
+        try:
+            parameter_slice = self.block_slices[name]
+        except KeyError as error:
+            raise ValueError(f"unknown additive flow block {name!r}.") from error
+        return self._raw(raw_parameters)[parameter_slice]
+
+    def additive_flow(self, raw_parameters: object, name: str) -> jax.Array:
+        block = next(
+            (item for item in self.additive_flow_blocks if item.name == name), None
+        )
+        if block is None:
+            raise ValueError(f"unknown additive flow block {name!r}.")
+        return block.flow_from_raw(self.block_raw(raw_parameters, name))
+
+    def transform(self, raw_parameters: object) -> MinimalGravityParameters:
+        return self.gravity_layout.transform(self.gravity_raw(raw_parameters))
+
+    def constrained_deviations(self, raw_parameters: object, component: str) -> jax.Array:
+        return self.gravity_layout.constrained_deviations(self.gravity_raw(raw_parameters), component)
+
+    def scalar_or_base(self, raw_parameters: object, component: str) -> jax.Array:
+        return self.gravity_layout.scalar_or_base(self.gravity_raw(raw_parameters), component)
+
+    def cell_effect(
+        self, raw_parameters: object, component: str, features: GravityFeatures
+    ) -> jax.Array:
+        return self.gravity_layout.cell_effect(
+            self.gravity_raw(raw_parameters), component, features
+        )
+
+    def production_group_log_multiplier(
+        self, raw_parameters: object, features: GravityFeatures
+    ) -> jax.Array:
+        return self.gravity_layout.production_group_log_multiplier(
+            self.gravity_raw(raw_parameters), features
+        )
+
+    def production_log_scale(self, raw_parameters: object) -> jax.Array:
+        return self.gravity_layout.production_log_scale(self.gravity_raw(raw_parameters))
+
+    def centered_effect(self, raw_parameters: object, block: str) -> jax.Array:
+        return self.gravity_layout.centered_effect(self.gravity_raw(raw_parameters), block)
+
+    def regularization(self, raw_parameters: object) -> jax.Array:
+        raw = self._raw(raw_parameters)
+        result = self.gravity_layout.regularization(raw[self.gravity_parameter_slice])
+        for block in self.additive_flow_blocks:
+            result = result + block.regularization(self.block_raw(raw, block.name))
+        return result
+
+    def physical_vector(self, raw_parameters: object) -> jax.Array:
+        raw = self._raw(raw_parameters)
+        values = [self.gravity_layout.physical_vector(raw[self.gravity_parameter_slice])]
+        values.extend(
+            jnp.asarray(block.latent_flow_model.physical_parameters(self.block_raw(raw, block.name)), dtype=raw.dtype)
+            for block in self.additive_flow_blocks
+        )
+        return jnp.concatenate(values)
+
+    def raw_from_physical(self, physical_parameters: object) -> np.ndarray:
+        values = np.asarray(physical_parameters, dtype=np.float64)
+        if values.shape != (self.size,) or not np.all(np.isfinite(values)):
+            raise ValueError(f"physical_parameters must have shape ({self.size},).")
+        result = [
+            self.gravity_layout.raw_from_physical(
+                values[self.gravity_parameter_slice]
+            )
+        ]
+        for block in self.additive_flow_blocks:
+            result.append(
+                block.latent_flow_model.raw_from_physical(
+                    values[self.block_slices[block.name]]
+                )
+            )
+        return np.concatenate(result)
+
+    def to_dict(self) -> dict[str, object]:
+        payload = {
+            "schema_version": 1,
+            "gravity_layout": self.gravity_layout.to_dict(),
+            "additive_flow_blocks": [block.to_dict() for block in self.additive_flow_blocks],
+            "names": list(self.names),
+        }
+        payload["fingerprint"] = fingerprint(payload)
+        return payload
+
+    @property
+    def fingerprint(self) -> str:
+        payload = self.to_dict()
+        return str(payload["fingerprint"])
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: Mapping[str, object],
+        *,
+        operators: Mapping[str, object],
+    ) -> "GravityJointParameterLayout":
+        """Restore a joint layout using caller-supplied additive operators."""
+        gravity_payload = payload.get("gravity_layout")
+        block_payloads = payload.get("additive_flow_blocks", ())
+        if not isinstance(gravity_payload, Mapping):
+            raise ValueError("gravity_layout is missing or invalid.")
+        if not isinstance(block_payloads, (list, tuple)):
+            raise ValueError("additive_flow_blocks must be a sequence.")
+        gravity_layout = GravityParameterLayout.from_dict(gravity_payload)
+        blocks: list[GravityAdditiveFlowBlock] = []
+        for raw_block in block_payloads:
+            if not isinstance(raw_block, Mapping):
+                raise ValueError("additive flow block payload must be a mapping.")
+            name = str(raw_block.get("name", ""))
+            if name not in operators:
+                raise ValueError(f"no operator supplied for additive flow block {name!r}.")
+            blocks.append(
+                GravityAdditiveFlowBlock.from_dict(
+                    raw_block,
+                    operator=cast(object, operators[name]),
+                )
+            )
+        result = cls(gravity_layout, tuple(blocks))
+        names = payload.get("names")
+        if names is not None and tuple(str(item) for item in cast(list[object], names)) != result.names:
+            raise ValueError("joint parameter names do not match the restored layout.")
+        stored = payload.get("fingerprint")
+        if stored is not None and str(stored) != result.fingerprint:
+            raise ValueError("joint parameter-layout fingerprint mismatch.")
+        return result
+
 
 
 def warm_start_gravity_parameters(

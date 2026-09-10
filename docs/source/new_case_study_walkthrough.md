@@ -10,6 +10,14 @@ persistence APIs.
 
 This document describes only the current workflow.
 
+For the opt-in extension that models passengers already onboard or boarding at
+the end of the modeled window, see
+[`gravity_boundary_flows.md`](gravity_boundary_flows.md). It defines the
+generic additive measurement equation, separate boarding/alighting scales,
+boundary-artifact provenance, and the adapter responsibilities. The ordinary
+OD-only workflow below remains unchanged when no boundary blocks are
+configured.
+
 ## 0. Start here — required files and organization
 
 Before running a case, make a case-study root and check that the required

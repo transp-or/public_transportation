@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import warnings
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import ClassVar
@@ -397,6 +398,7 @@ class GravityModelSpecification:
     components: tuple[GravityComponentSpecification, ...] = ()
     likelihood: GravityLikelihoodSpecification = GravityLikelihoodSpecification()
     time: GravityTimeSpecification = GravityTimeSpecification()
+    additive_flow_blocks: tuple[dict[str, object], ...] = ()
     schema_version: int = 3
 
     SUPPORTED_SCHEMA_VERSIONS: ClassVar[tuple[int, ...]] = (1, 2, 3)
@@ -406,6 +408,20 @@ class GravityModelSpecification:
             raise ValueError("unsupported gravity specification schema version.")
         if not self.model_name:
             raise ValueError("gravity model_name must be nonempty.")
+        additive_blocks: list[dict[str, object]] = []
+        additive_names: set[str] = set()
+        for item in self.additive_flow_blocks:
+            if not isinstance(item, Mapping):
+                raise TypeError("additive_flow_blocks must contain mappings.")
+            block = dict(item)
+            name = str(block.get("name", ""))
+            if not name:
+                raise ValueError("additive flow block names must be non-empty.")
+            if name in additive_names:
+                raise ValueError(f"duplicate additive flow block {name!r}.")
+            additive_names.add(name)
+            additive_blocks.append(block)
+        object.__setattr__(self, "additive_flow_blocks", tuple(additive_blocks))
         scope_fields = (
             "origin_total_correction_scope",
             "destination_attractiveness_scope",
@@ -928,6 +944,7 @@ class GravityModelSpecification:
             and self.model_name == "minimal_three_parameter"
             and self.likelihood == GravityLikelihoodSpecification()
             and self.time == GravityTimeSpecification()
+            and not self.additive_flow_blocks
         ):
             return {
                 name: value.value if isinstance(value, GravityEffectScope) else value
@@ -938,6 +955,7 @@ class GravityModelSpecification:
                     "likelihood",
                     "time",
                     "model_name",
+                    "additive_flow_blocks",
                     "schema_version",
                 }
             } | {"schema_version": 2}
@@ -947,12 +965,19 @@ class GravityModelSpecification:
             "legacy": {
                 name: value.value if isinstance(value, GravityEffectScope) else value
                 for name, value in asdict(self).items()
-                if name
-                not in {"components", "likelihood", "time", "model_name", "schema_version"}
+                if name not in {
+                    "components",
+                    "likelihood",
+                    "time",
+                    "additive_flow_blocks",
+                    "model_name",
+                    "schema_version",
+                }
             },
             "components": [item.to_dict() for item in self.components],
             "likelihood": asdict(self.likelihood),
             "time": asdict(self.time),
+            "additive_flow_blocks": [dict(item) for item in self.additive_flow_blocks],
         }
 
     @classmethod
@@ -1012,6 +1037,10 @@ class GravityModelSpecification:
                     if time_payload.get("smooth_basis_name") is None
                     else str(time_payload["smooth_basis_name"])
                 ),
+            ),
+            additive_flow_blocks=tuple(
+                dict(item)
+                for item in payload.get("additive_flow_blocks", [])  # type: ignore[union-attr]
             ),
             schema_version=3,
         )

@@ -48,6 +48,7 @@ _REPORT_FILES = (
     "report.md",
     "executive_summary.md",
 )
+_OPTIONAL_REPORT_FILES = ("measurement_contributions.csv",)
 _METADATA_FIELDS = (
     "method_id",
     "measurement_type",
@@ -446,6 +447,38 @@ def _validate_restored_result(
             "persisted free_od_demand length does not match the supplied OD layout: "
             f"{vectors['free_od_demand'].size} != {od_layout.num_free}."
         )
+    contribution_vectors = (
+        "latent_measurements",
+        "od_measurement_contribution",
+        "observation_scales",
+    )
+    for name in contribution_vectors:
+        value = getattr(result, name)
+        if value is not None:
+            array = np.asarray(value, dtype=np.float64)
+            if array.ndim != 1:
+                raise ValueError(f"persisted result field {name!r} must be one-dimensional.")
+            if not np.all(np.isfinite(array)):
+                raise ValueError(f"persisted result field {name!r} must be finite.")
+            if array.size != result.predicted_measurements.size:
+                raise ValueError(
+                    f"persisted result field {name!r} does not match measurement length."
+                )
+    for name in ("additive_measurement_contributions",):
+        for index, value in enumerate(getattr(result, name)):
+            array = np.asarray(value, dtype=np.float64)
+            if array.ndim != 1 or array.size != result.predicted_measurements.size:
+                raise ValueError(
+                    f"persisted result field {name}[{index}] does not match measurement length."
+                )
+            if not np.all(np.isfinite(array)):
+                raise ValueError(f"persisted result field {name}[{index}] must be finite.")
+    for index, value in enumerate(result.additive_flows):
+        array = np.asarray(value, dtype=np.float64)
+        if array.ndim != 1 or not np.all(np.isfinite(array)):
+            raise ValueError(
+                f"persisted result field additive_flows[{index}] must be a finite vector."
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -575,6 +608,73 @@ def _metadata_rows(
             row[field] = "" if labels is None else str(labels[index])
         rows.append(row)
     return rows
+
+
+def _measurement_contribution_rows(
+    *,
+    result: GravityEstimationResult,
+    observations: np.ndarray,
+    modeled: np.ndarray,
+    metadata: GravityValidationMetadata,
+) -> tuple[list[dict[str, object]], dict[str, object]] | None:
+    """Build persisted contribution rows for an additive-flow result."""
+    if result.latent_measurements is None or result.od_measurement_contribution is None:
+        return None
+    latent = np.asarray(result.latent_measurements, dtype=np.float64)
+    od = np.asarray(result.od_measurement_contribution, dtype=np.float64)
+    contributions = tuple(
+        np.asarray(value, dtype=np.float64)
+        for value in result.additive_measurement_contributions
+    )
+    scales = (
+        np.ones(observations.size, dtype=np.float64)
+        if result.observation_scales is None
+        else np.asarray(result.observation_scales, dtype=np.float64)
+    )
+    if any(value.shape != observations.shape for value in (latent, od, scales)) or any(
+        value.shape != observations.shape for value in contributions
+    ):
+        raise ValueError("persisted additive contribution vectors have inconsistent lengths.")
+    if not all(np.all(np.isfinite(value)) for value in (latent, od, scales, *contributions)):
+        raise ValueError("persisted additive contribution vectors must be finite.")
+    fixed = latent - od - sum(contributions, start=np.zeros_like(latent))
+    raw_blocks = (result.model_specification or {}).get("additive_flow_blocks", [])
+    names = tuple(
+        str(item.get("name", f"additive_{index}"))
+        for index, item in enumerate(raw_blocks)
+        if isinstance(item, Mapping)
+    )
+    if len(names) != len(contributions):
+        names = tuple(f"additive_{index}" for index in range(len(contributions)))
+    rows: list[dict[str, object]] = []
+    groups: dict[str, dict[str, float | int]] = {}
+    for index, (observed, prediction) in enumerate(zip(observations, modeled, strict=True)):
+        row: dict[str, object] = {
+            "row_index": index,
+            "measurement_type": "" if metadata.measurement_type is None else str(metadata.measurement_type[index]),
+            "observed": float(observed),
+            "observation_scale": float(scales[index]),
+            "od_flow": float(od[index]),
+            "fixed_offset": float(fixed[index]),
+            "latent_total": float(latent[index]),
+            "modeled_mean": float(prediction),
+        }
+        for name, value in zip(names, contributions, strict=True):
+            row[f"{name}_flow"] = float(value[index])
+        active = ["od_flow"] if abs(od[index]) > 0 else []
+        active.extend(name for name, value in zip(names, contributions, strict=True) if abs(value[index]) > 0)
+        if abs(fixed[index]) > 0:
+            active.append("fixed_offset")
+        row["active_components"] = ",".join(active) if active else "none"
+        rows.append(row)
+        label = row["measurement_type"] or "untyped"
+        summary = groups.setdefault(
+            str(label), {"rows": 0, "observed_total": 0.0, "modeled_total": 0.0}
+        )
+        summary["rows"] += 1
+        summary["observed_total"] += float(observed)
+        summary["modeled_total"] += float(prediction)
+    return rows, {"available": True, "by_measurement_type": groups}
 
 
 def _parameter_rows(result: GravityEstimationResult) -> list[dict[str, object]]:
@@ -1033,20 +1133,40 @@ def _detailed_markdown(
                 + json.dumps(ident_summary.get("classification_counts", {}), sort_keys=True)
                 + "."
             )
-    lines.extend(
-        [
-            "",
-            "## Output files",
-            "",
-            "- `parameters.csv`: fitted raw and physical values for every model parameter.",
-            "- `full_od.csv`: every canonical origin/destination/departure-time cell.",
-            "- `predicted_measurements.csv`: observed and modeled value for every measurement.",
-            "- `residuals.csv`: residual, variance, standardized residual, and relative residual.",
-            "- `grouped_residuals.csv`: residual diagnostics by measurement attribute.",
-            "- `executive_summary.md`: short decision-oriented summary.",
-            "- `report.json`: machine-readable comprehensive summary.",
-        ]
-    )
+    contribution_summary = summary.get("measurement_contributions")
+    if isinstance(contribution_summary, Mapping):
+        lines.extend(["", "## Measurement-flow contributions", ""])
+        if not contribution_summary.get("available", False):
+            lines.append(str(contribution_summary.get("message", "")))
+        else:
+            lines.append(
+                "The optional `measurement_contributions.csv` table separates OD, "
+                "additive boundary-flow, fixed-offset, and scaled mean contributions."
+            )
+            by_type = contribution_summary.get("by_measurement_type", {})
+            if isinstance(by_type, Mapping):
+                for label, values in by_type.items():
+                    lines.append(f"- `{label}`: {json.dumps(values, sort_keys=True)}")
+    output_lines = [
+        "",
+        "## Output files",
+        "",
+        "- `parameters.csv`: fitted raw and physical values for every model parameter.",
+        "- `full_od.csv`: every canonical origin/destination/departure-time cell.",
+        "- `predicted_measurements.csv`: observed and modeled value for every measurement.",
+        "- `residuals.csv`: residual, variance, standardized residual, and relative residual.",
+        "- `grouped_residuals.csv`: residual diagnostics by measurement attribute.",
+        "- `executive_summary.md`: short decision-oriented summary.",
+        "- `report.json`: machine-readable comprehensive summary.",
+    ]
+    if isinstance(contribution_summary, Mapping) and contribution_summary.get(
+        "available", False
+    ):
+        output_lines.insert(
+            -2,
+            "- `measurement_contributions.csv`: additive-flow contributions when boundary blocks are active.",
+        )
+    lines.extend(output_lines)
     return "\n".join(lines) + "\n"
 
 
@@ -1126,7 +1246,11 @@ def write_gravity_detailed_report(
 
     output = Path(output_directory).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
-    existing = [output / name for name in _REPORT_FILES if (output / name).exists()]
+    existing = [
+        output / name
+        for name in (*_REPORT_FILES, *_OPTIONAL_REPORT_FILES)
+        if (output / name).exists()
+    ]
     if existing and not force:
         raise FileExistsError(
             "report output already exists; choose a new directory or use force=True: "
@@ -1208,6 +1332,28 @@ def write_gravity_detailed_report(
         list(grouped_rows[0]) if grouped_rows else ["grouping", "label"],
         grouped_rows,
     )
+    contribution_result = _measurement_contribution_rows(
+        result=result,
+        observations=observed,
+        modeled=modeled,
+        metadata=selected_metadata,
+    )
+    contribution_summary: dict[str, object] = {
+        "available": False,
+        "message": "No additive boundary-flow blocks were active in this result.",
+    }
+    optional_files: dict[str, Path] = {}
+    if contribution_result is not None:
+        contribution_rows, contribution_summary = contribution_result
+        fields = list(contribution_rows[0]) if contribution_rows else ["row_index"]
+        _write_csv(
+            output / "measurement_contributions.csv",
+            fields,
+            contribution_rows,
+        )
+        optional_files["measurement_contributions.csv"] = (
+            output / "measurement_contributions.csv"
+        )
 
     free_cells = len(od_layout.free_od_indices)
     fixed_cells = len(od_layout.fixed_od_indices)
@@ -1249,6 +1395,7 @@ def write_gravity_detailed_report(
             },
         },
         "adequacy": _adequacy_json(adequacy),
+        "measurement_contributions": contribution_summary,
         "identifiability": _identifiability_json(identifiability),
         "executive_messages": list(executive_messages),
         "provenance": {
@@ -1257,7 +1404,10 @@ def write_gravity_detailed_report(
             "specification_fingerprint": specification_fingerprint,
             "model_specification": model_specification,
         },
-        "files": {name: str(output / name) for name in _REPORT_FILES},
+        "files": {
+            **{name: str(output / name) for name in _REPORT_FILES},
+            **{name: str(path) for name, path in optional_files.items()},
+        },
     }
     report_hash = hashlib.sha256(
         json.dumps(summary, sort_keys=True, allow_nan=False).encode("utf-8")
@@ -1276,6 +1426,7 @@ def write_gravity_detailed_report(
             summary={
                 "executive_messages": executive_messages,
                 "identifiability": _identifiability_json(identifiability),
+                "measurement_contributions": contribution_summary,
             },
         ),
     )
@@ -1283,7 +1434,7 @@ def write_gravity_detailed_report(
         GRAVITY_DETAILED_REPORT_SCHEMA_VERSION,
         report_hash,
         output,
-        {name: output / name for name in _REPORT_FILES},
+        {name: output / name for name in _REPORT_FILES} | optional_files,
         adequacy,
         free_cells,
         fixed_cells,

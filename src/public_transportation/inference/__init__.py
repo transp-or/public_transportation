@@ -72,6 +72,7 @@ from .gravity import (  # noqa: F401
     GravityAdequacyFindings,
     GravityAdequacyReport,
     GravityAssignedCountDiagnostics,
+    GravityAdditiveFlowBlock,
     GravityChildWarmStart,
     GravityDemandResult,
     GravityDeviationSpecification,
@@ -80,6 +81,7 @@ from .gravity import (  # noqa: F401
     GravityEstimatorProgress,
     GravityEffectScope,
     GravityFeatures,
+    GravityDenseLinearMeasurementOperator,
     GravityGradientStrategy,
     GravityGroupedResidualSummary,
     GravityHoldoutSplit,
@@ -96,6 +98,10 @@ from .gravity import (  # noqa: F401
     GravityModelNode,
     GravityObjectiveEvaluation,
     GravityObjectiveProblem,
+    GravityJointParameterLayout,
+    GravityObservationModel,
+    GravityBoundaryArtifact,
+    GRAVITY_BOUNDARY_ARTIFACT_SCHEMA_VERSION,
     GravityParameterLayout,
     GravityPreflightPhase,
     GravityPreflightRecommendation,
@@ -128,6 +134,10 @@ from .gravity import (  # noqa: F401
     GRAVITY_VIEWER_BUNDLE_SCHEMA_VERSION,
     GRAVITY_VIEWER_BUNDLE_TYPE,
     MinimalGravityParameters,
+    DirectNonnegativeFlowModel,
+    LinearNonnegativeFlowModel,
+    GravityLatentFlowModel,
+    latent_flow_model_from_dict,
     add_gravity_relaxation,
     build_gravity_holdout_split,
     build_gravity_aggregate_observation_bundle,
@@ -171,6 +181,8 @@ from .gravity import (  # noqa: F401
     write_gravity_od_identifiability,
     write_gravity_viewer_bundle,
     write_persisted_gravity_viewer_bundle,
+    load_gravity_boundary_artifact,
+    write_gravity_boundary_artifact,
 )
 from .block_coordinate import *  # noqa: F401,F403
 from .fixed_routing_measurement_operator import (  # noqa: F401
@@ -264,7 +276,9 @@ from .stochastic_gravity import (  # noqa: F401
     stochastic_gravity_value_and_gradient,
 )
 from .measurement_operator_protocol import (  # noqa: F401
+    GravityLinearMeasurementOperator,
     GravityMeasurementOperator,
+    GravityMeasurementOperatorLinearAdapter,
     GravityOperatorCapabilities,
     GravityOperatorMetrics,
 )

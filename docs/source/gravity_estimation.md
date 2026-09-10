@@ -10,6 +10,16 @@ replacement for exact optimization gradients. See the
 [2026-08-05 validation report](../reports/full_network_stochastic_gravity_validation_2026-08-05.md)
 before using sub-100% effort.
 
+## Boundary-flow extension
+
+The opt-in boundary-flow and separate boarding/alighting observation-process
+contracts are described in [`gravity_boundary_flows.md`](gravity_boundary_flows.md).
+They add named linear measurement blocks for initial onboard and terminal
+outflow cohorts while preserving the existing OD-only path and assignment
+artifact. The case adapter supplies the matrices, row-order identity, and
+scientific interpretation; the public package validates their dimensions,
+fingerprints, joint parameter layout, and contribution reporting.
+
 ## Phase 1: demand contracts
 
 The gravity package represents a complete dynamic OD table as a sparse
