@@ -46,6 +46,10 @@ The operational runbook for a new case study—including current
 direct-scheduled preparation, preflight, checkpointed fitting, Jed scheduling,
 and progress logs—is
 [new_case_study_walkthrough.md](docs/source/new_case_study_walkthrough.md).
+The generic persisted-artifact residual audit is documented in
+[residual_audit.md](docs/source/residual_audit.md); it supports grouped
+residuals, support-failure diagnostics, contribution accounting, and
+cross-run comparison without rerunning a model.
 The matching TPG-agnostic driver skeleton and Slurm wrappers are in
 [direct_scheduled_case_template](docs/source/examples/direct_scheduled_case_template/).
 Reuse and migration rules for results produced by the former workflow are

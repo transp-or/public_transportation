@@ -197,6 +197,25 @@ from .fixed_routing_measurement_operator import (  # noqa: F401
     save_fixed_routing_measurement_operator,
     validate_fixed_routing_measurement_operator,
 )
+from .residual_audit import (  # noqa: F401
+    GROUP_METRIC_COLUMNS,
+    RESIDUAL_AUDIT_SCHEMA_VERSION,
+    ResidualAuditConfig,
+    ResidualAuditResult,
+    ResidualAuditRun,
+    ResidualRunComparison,
+    audit_residuals,
+    audit_run,
+    compare_runs,
+    compute_residual_diagnostics,
+    compute_residual_metrics,
+    load_run,
+    poisson_deviance_residual,
+    summarize_by,
+    summarize_comparison_by,
+    write_residual_audit,
+    write_audit,
+)
 from .support_discovery_profile import (  # noqa: F401
     SUPPORT_DISCOVERY_PROFILE_SCHEMA_VERSION,
     SupportDiscoveryProfileRecorder,

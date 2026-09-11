@@ -8,3 +8,40 @@
 \input{traffic_assignment/preserved/026_0995_1003_implementation_note_on_departure_intervals.tex}
 \input{traffic_assignment/preserved/049_1378_1401_separation_of_routing_preparation_and_demand_loa.tex}
 \input{traffic_assignment/preserved/057_1542_1550_activation_policy.tex}
+
+\subsection{Boundary-flow implementation contract}
+
+The public gravity package implements the mathematical extension in
+Section~\ref{sec:boundary-flow-observation-processes} through a deliberately
+generic interface.  A case adapter may provide a
+\path{GravityLinearMeasurementOperator} for each non-OD response block and
+combine it with a \path{GravityAdditiveFlowBlock}.  The supplied direct and
+linear non-negative flow models support, respectively, one grouped latent
+parameter per flow and a lower-dimensional fixed basis.  A
+\path{GravityJointParameterLayout} appends these parameters after the
+ordinary gravity parameters with deterministic names, slices, transformations,
+regularization, and a complete model fingerprint.
+
+The primary OD operator remains the existing assignment operator.  Consequently
+an OD-only case follows the legacy objective and result path byte-for-byte in
+its mathematical inputs; boundary blocks are opt-in and change the model
+identity only when they are configured.  Fixed boarding and alighting scales
+are supplied by the observation-model contract and are aligned with the
+canonical measurement-row order.  Event scales are not estimated in the
+current implementation, avoiding their confounding with a global production
+or detection scale.
+
+Boundary matrices can be persisted as named companion artifacts.  Each artifact
+stores its shape and numeric type, matrix/content hash, canonical row-order
+fingerprint, boundary-group identifiers, parameter-layout and model
+fingerprints, construction settings, schema version, and completion marker.
+An unchanged OD artifact can therefore be reused when a boundary block is
+added, while a changed boundary matrix, grouping, or row order fails closed
+and requires a new joint fit.  Fit manifests and detailed reports retain the
+OD, initial-onboard, terminal-outflow, fixed-offset, latent-total, and scaled
+mean contributions separately.
+
+The interpretation of a boundary cohort and the construction of its matrix
+remain responsibilities of the case-specific adapter.  Estimated event
+scales, type-specific dispersions, and route-wide survival or hazard models
+are reserved for future extensions.

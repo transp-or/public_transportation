@@ -20,6 +20,12 @@ artifact. The case adapter supplies the matrices, row-order identity, and
 scientific interpretation; the public package validates their dimensions,
 fingerprints, joint parameter layout, and contribution reporting.
 
+Residual diagnostics for persisted fit artifacts are available through the
+generic [residual-audit tool](residual_audit.md). It reports ordinary residuals,
+near-zero-support failures, arbitrary metadata groupings, contribution
+accounting, and optional row-by-row comparison of two runs without rerunning
+the model.
+
 ## Phase 1: demand contracts
 
 The gravity package represents a complete dynamic OD table as a sparse
