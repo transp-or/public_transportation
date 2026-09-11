@@ -3,7 +3,9 @@
 from .comparison import ResidualRunComparison, compare_runs
 from .grouping import GROUP_METRIC_COLUMNS, summarize_by, summarize_comparison_by
 from .io import (
+    contribution_component_columns,
     join_metadata,
+    likelihood_family_from_provenance,
     load_run,
     normalize_contribution_table,
     normalize_metadata_table,
@@ -37,8 +39,10 @@ __all__ = [
     "compare_runs",
     "compute_residual_diagnostics",
     "compute_residual_metrics",
+    "contribution_component_columns",
     "join_metadata",
     "load_run",
+    "likelihood_family_from_provenance",
     "normalize_contribution_table",
     "normalize_metadata_table",
     "normalize_observation_table",

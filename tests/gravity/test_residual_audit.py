@@ -12,8 +12,10 @@ from public_transportation.inference.residual_audit import (
     ResidualAuditRun,
     audit_run,
     compare_runs,
+    contribution_component_columns,
     compute_residual_diagnostics,
     load_run,
+    normalize_contribution_table,
     poisson_deviance_residual,
     summarize_by,
     write_residual_audit,
@@ -43,6 +45,24 @@ def _contributions() -> pd.DataFrame:
             "terminal_outflow_contribution": [0.0, 0.0, 0.0, 0.0],
             "fixed_offset": [0.0, 0.0, 0.0, 0.0],
             "scaled_mean": [9.0, 0.0, 2.0, 1.0],
+        }
+    )
+
+
+def _gravity_contribution_fixture() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "row_index": [0],
+            "measurement_type": ["alighting"],
+            "observed": [0.0],
+            "observation_scale": [2.0],
+            "od_flow": [0.0],
+            "fixed_offset": [0.0],
+            "latent_total": [2.5],
+            "modeled_mean": [5.0],
+            "initial_onboard_flow": [2.5],
+            "terminal_outflow_flow": [0.0],
+            "active_components": ["initial_onboard"],
         }
     )
 
@@ -142,6 +162,110 @@ def test_contribution_totals_are_checked() -> None:
         "initial_onboard_contribution",
     }
     assert "measurement_type=boarding" in set(result.contribution_summary["scope"])
+
+
+def test_existing_gravity_schema_uses_only_explicit_components_and_two_checks() -> None:
+    contributions = _gravity_contribution_fixture()
+    normalized = normalize_contribution_table(contributions)
+    assert contribution_component_columns(normalized) == [
+        "od_contribution",
+        "fixed_offset",
+        "initial_onboard_contribution",
+        "terminal_outflow_contribution",
+    ]
+    result = audit_run(
+        ResidualAuditRun(
+            pd.DataFrame(
+                {
+                    "row_index": [0],
+                    "observed": [0.0],
+                    "modeled": [5.0],
+                }
+            ),
+            contributions=contributions,
+        )
+    )
+    info = result.manifest["contribution_analysis"]
+    assert info["latent_component_check"]["rows_not_matching"] == 0
+    assert info["scaled_prediction_check"]["rows_not_matching"] == 0
+    assert "source_row_index" not in set(info["component_columns"])
+    assert "observed" not in set(info["component_columns"])
+
+
+def test_inconsistent_latent_and_scaled_contributions_are_reported() -> None:
+    contributions = _gravity_contribution_fixture()
+    contributions.loc[0, "latent_total"] = 3.0
+    result = audit_run(
+        ResidualAuditRun(
+            pd.DataFrame({"observation_id": [0], "observed_value": [0.0], "predicted_value": [5.0]}),
+            contributions=contributions,
+        )
+    )
+    info = result.manifest["contribution_analysis"]
+    assert info["latent_component_check"]["rows_not_matching"] == 1
+    assert info["scaled_prediction_check"]["rows_not_matching"] == 1
+
+
+def test_weighted_metrics_report_all_and_support_failure_excluded() -> None:
+    result = audit_run(ResidualAuditRun(_observations()))
+    row = result.grouped_metrics.iloc[0]
+    assert "weighted_rmse_all" in result.grouped_metrics.columns
+    assert "weighted_rmse_excluding_support_failures" in result.grouped_metrics.columns
+    assert row["weighted_rmse_all"] > row["weighted_rmse_excluding_support_failures"]
+    assert row["support_failure_count"] == 1
+    assert result.manifest["weighted_metric_policy"]["support_failures_excluded_metric_reported"] is True
+    assert "weighted_rmse_all" in result.summary_markdown
+    assert "weighted_rmse_excluding_support_failures" in result.summary_markdown
+
+
+def test_nested_run_directory_and_poisson_family_verification(tmp_path: Path) -> None:
+    report = tmp_path / "run" / "report"
+    report.mkdir(parents=True)
+    _observations().to_csv(report / "predicted_measurements.csv", index=False)
+    (report / "report.json").write_text(
+        json.dumps({"model_specification": {"likelihood": {"family": "poisson"}}}),
+        encoding="utf-8",
+    )
+    output = tmp_path / "audit"
+    assert main(
+        [
+            "--run-a",
+            str(tmp_path / "run"),
+            "--run-b",
+            str(tmp_path / "run"),
+            "--expected-likelihood-family",
+            "poisson",
+            "--output",
+            str(output),
+        ]
+    ) == 0
+    manifest = json.loads((output / "audit_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["likelihood_family"] == "poisson"
+    assert manifest["expected_likelihood_family"] == "poisson"
+    assert manifest["resolved_artifact_paths"]["predicted_measurements"].endswith(
+        "run/report/predicted_measurements.csv"
+    )
+
+
+def test_expected_poisson_rejects_other_or_missing_family(tmp_path: Path) -> None:
+    predicted = tmp_path / "predicted.csv"
+    _observations().to_csv(predicted, index=False)
+    manifest = tmp_path / "report.json"
+    manifest.write_text(
+        json.dumps({"likelihood": {"family": "negative_binomial"}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="likelihood family mismatch"):
+        audit_run(
+            load_run(predicted_measurements=predicted, model_manifest=manifest),
+            config=ResidualAuditConfig(expected_likelihood_family="poisson"),
+        )
+    manifest.write_text(json.dumps({}), encoding="utf-8")
+    with pytest.raises(ValueError, match="does not declare one"):
+        audit_run(
+            load_run(predicted_measurements=predicted, model_manifest=manifest),
+            config=ResidualAuditConfig(expected_likelihood_family="poisson"),
+        )
 
 
 def test_cross_run_rejects_mismatched_observation_sets() -> None:

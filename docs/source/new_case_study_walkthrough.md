@@ -3212,6 +3212,110 @@ Only after accepting a fit:
 Never reconstruct a full OD vector before fit acceptance merely for convenience:
 the estimator should operate only on free/compact cells.
 
+### Residual audit of persisted fit artifacts (report-only)
+
+After validation or report generation, use the generic residual-audit tool to
+investigate systematic model--data mismatches without rerunning preparation,
+routing, assignment, or fitting. This is a post-processing diagnostic, not a
+new estimation stage and not independent validation unless the inputs are an
+explicit holdout set.
+
+**Inputs.** The required generated inputs are the persisted
+`predicted_measurements.csv` and, when available, `residuals.csv` under the
+case's validation/report directory. The prediction table must identify each
+row and contain observed and predicted values; the package's persisted aliases
+`row_index`, `observed`, and `modeled` are accepted. The optional
+`measurement_contributions.csv` is the generated additive-component table.
+Case-specific observation metadata is an **owner-supplied input**, joined by
+`observation_id`; it may contain `line`, `direction`, `stop`, `trip`,
+`time_bin`, `time_regime`, `journey_position`, or `boundary_role`. A second
+run may be supplied for comparison, but both runs must use the same observation
+IDs and observed values unless an explicit subset comparison is documented.
+
+**Outputs.** Write the audit below the durable results root, for example
+`results/validation/residual_audit/` (this is an example path, not a package
+hardcode):
+
+```text
+audit_manifest.json
+summary.md
+row_diagnostics.csv
+grouped_metrics.csv
+support_failures.csv
+contribution_summary.csv
+run_comparison.csv
+comparison_grouped_metrics.csv
+```
+
+`audit_manifest.json` records resolved input paths and SHA-256 fingerprints,
+model and specification fingerprints when available, likelihood-family
+verification, support-failure and weighted-metric policies, thresholds,
+groupings, and the holdout flag. `summary.md` has dedicated sections for
+likelihood family, support failures, weighted residual metrics, contribution
+consistency, and artifact provenance. The grouped tables always report both
+`weighted_rmse_all` and `weighted_rmse_excluding_support_failures`; the latter
+is an in-sample diagnostic, not a validation metric.
+
+Run it from the case-study root after the validation/report artifacts are
+complete:
+
+```bash
+uv run --frozen python -m public_transportation.inference.residual_audit \
+  --predicted-measurements "$RESULTS_ROOT/validation/predicted_measurements.csv" \
+  --residuals "$RESULTS_ROOT/validation/residuals.csv" \
+  --contributions "$RESULTS_ROOT/validation/measurement_contributions.csv" \
+  --metadata inputs/observation_metadata.csv \
+  --group-by measurement_type \
+  --group-by line \
+  --group-by journey_position \
+  --output "$RESULTS_ROOT/validation/residual_audit"
+```
+
+The contribution and metadata arguments are optional when those files are not
+available. The command never removes rows automatically. Positive
+observations with predictions at or below `predicted_mean_floor` are marked as
+`support_failure` and written separately to `support_failures.csv`; investigate
+the source data and mapping contract rather than interpreting them as ordinary
+large residuals. For a Poisson-only audit, add the model manifest and family
+verification explicitly:
+
+```bash
+--model-manifest "$RESULTS_ROOT/validation/report.json" \
+--expected-likelihood-family poisson
+```
+
+The manifest must declare `model_specification.likelihood.family` (or
+`likelihood.family`) as `poisson`; a missing or different family is a hard
+failure. Do not add this constraint to a case using another declared
+likelihood family.
+
+Gravity reports may be supplied either as a flat run directory or below a
+`run/report/` subdirectory. Direct files take precedence, and the resolved
+location is retained in the audit manifest. Contribution columns are selected
+only from the documented component allowlist and `_contribution`/`_flow`
+suffixes: numeric identifiers, observed values, scales, latent totals, and
+predicted means are never treated as components. The audit checks component
+sum against `latent_total` and checks the scaled prediction separately, so an
+unscaled sum is not compared directly with a scaled mean.
+
+To compare two completed runs, each run directory must contain
+`predicted_measurements.csv`:
+
+```bash
+uv run --frozen python -m public_transportation.inference.residual_audit \
+  --run-a "$RESULTS_ROOT/validation/run_a" \
+  --run-b "$RESULTS_ROOT/validation/run_b" \
+  --metadata inputs/observation_metadata.csv \
+  --group-by measurement_type \
+  --output "$RESULTS_ROOT/validation/comparison_audit"
+```
+
+Comparison fails closed when observation IDs or observed values differ. Use
+`--allow-subset-comparison` only for a deliberate, documented subset analysis.
+Boundary contributions are additive measurement components; the audit does not
+interpret them as conserved OD flows or automatically decide that a model is
+acceptable. Preserve the audit manifest and tables with the case results.
+
 ## 14. Observations that do not match a modeled path
 
 For each observation, distinguish:
@@ -3927,6 +4031,7 @@ by the stage and must be fingerprinted before a later stage consumes it.
 | `benchmark` | **Generated:** the exact artifact/problem used for the fit and preflight recommendation; **example:** benchmark repetitions and tolerances | `results/manifests/benchmark.json`, `results/logs/benchmark.jsonl`, and optional **example** benchmark JSON under `results/preflight/` | finite timings and gradient agreement within the declared tolerance | no |
 | `fit` | **Generated:** complete artifact, preflight, benchmark; **convention:** `results/checkpoints/`; **example:** model/optimizer settings and fit ID | `results/manifests/fit.json`, `results/fits/result.json` (or `.npz`), identity-bound checkpoint, `results/logs/fit.jsonl` | optimizer status is explicit; `success` must be checked separately from stage completion | yes for a valid time-budget checkpoint |
 | `validate` | **Generated:** accepted fit result and matching artifact; **convention:** scenario/timetable; **example:** observation path and reporting choices | `results/manifests/validate.json`, `results/logs/validate.jsonl`; **example:** `results/validation/full_od.csv`, `predicted_measurements.csv`, `residuals.csv` | identity matches fit/operator; `acceptance = "accepted"` only for a converged successful fit, otherwise `diagnostic_only` | no |
+| `residual-audit` | **Generated:** completed validation/report tables; **owner-supplied example:** observation metadata and optional second run | `results/validation/residual_audit/audit_manifest.json`, `summary.md`, `row_diagnostics.csv`, `grouped_metrics.csv`, `support_failures.csv`, `contribution_summary.csv`, and optional comparison tables | audit manifest exists, input/model fingerprints are recorded when available, and no automatic exclusions occurred | no |
 
 An artifact filename or a zero exit code without the durable summary is never
 enough. Keep output roots outside temporary storage and never overwrite a

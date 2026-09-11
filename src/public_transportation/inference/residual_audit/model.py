@@ -29,6 +29,8 @@ class ResidualAuditConfig:
     pearson_threshold: float = 3.0
     variance_floor: float = 1.0e-8
     relative_observation_threshold: float = 1.0e-8
+    include_support_failures_in_weighted_metrics: bool = False
+    expected_likelihood_family: str | None = None
 
     def __post_init__(self) -> None:
         positive = (
@@ -46,8 +48,13 @@ class ResidualAuditConfig:
             raise ValueError("predicted_mean_floor must be strictly positive.")
         if self.variance_floor <= 0.0:
             raise ValueError("variance_floor must be strictly positive.")
+        if self.expected_likelihood_family is not None:
+            family = str(self.expected_likelihood_family).strip().lower()
+            if not family:
+                raise ValueError("expected_likelihood_family must be non-empty when supplied.")
+            object.__setattr__(self, "expected_likelihood_family", family)
 
-    def to_dict(self) -> dict[str, float]:
+    def to_dict(self) -> dict[str, object]:
         """Return deterministic JSON-compatible threshold metadata."""
         return {
             "positive_observation_threshold": float(self.positive_observation_threshold),
@@ -55,6 +62,10 @@ class ResidualAuditConfig:
             "pearson_threshold": float(self.pearson_threshold),
             "variance_floor": float(self.variance_floor),
             "relative_observation_threshold": float(self.relative_observation_threshold),
+            "include_support_failures_in_weighted_metrics": bool(
+                self.include_support_failures_in_weighted_metrics
+            ),
+            "expected_likelihood_family": self.expected_likelihood_family,
         }
 
 

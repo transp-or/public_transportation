@@ -14,7 +14,9 @@ from public_transportation.version import __version__
 from .comparison import ResidualRunComparison, compare_runs
 from .grouping import summarize_by
 from .io import (
+    contribution_component_columns,
     join_metadata,
+    likelihood_family_from_provenance,
     normalize_contribution_table,
     normalize_metadata_table,
     normalize_observation_table,
@@ -88,21 +90,8 @@ def _write_json(path: Path, payload: Mapping[str, object]) -> None:
 
 
 def _numeric_component_columns(contributions: pd.DataFrame) -> list[str]:
-    excluded = {
-        "observation_id",
-        "__audit_id",
-        "observation_scale",
-        "scaled_mean",
-        "modeled_mean",
-        "latent_total",
-        "active_components",
-    }
     columns: list[str] = []
-    for column in contributions.columns:
-        if column in excluded:
-            continue
-        if column == "measurement_type" or contributions[column].dtype == object:
-            continue
+    for column in contribution_component_columns(contributions):
         try:
             values = pd.to_numeric(contributions[column], errors="raise").to_numpy(dtype=np.float64)
         except (TypeError, ValueError):
@@ -122,6 +111,21 @@ def _contribution_analysis(
         return pd.DataFrame(), {
             "available": False,
             "message": "No contribution table was supplied.",
+            "latent_component_check": {
+                "performed": False,
+                "component_columns": [],
+                "expected_column": None,
+                "rows_checked": 0,
+                "rows_not_matching": 0,
+                "maximum_absolute_difference": 0.0,
+            },
+            "scaled_prediction_check": {
+                "performed": False,
+                "expected_column": None,
+                "rows_checked": 0,
+                "rows_not_matching": 0,
+                "maximum_absolute_difference": 0.0,
+            },
         }
     contribution_ids = set(contributions["__audit_id"])
     observation_ids = set(diagnostics["__audit_id"])
@@ -132,6 +136,21 @@ def _contribution_analysis(
         return pd.DataFrame(), {
             "available": False,
             "message": "Contribution table contains no numeric contribution columns.",
+            "latent_component_check": {
+                "performed": False,
+                "component_columns": [],
+                "expected_column": "latent_total" if "latent_total" in contributions.columns else None,
+                "rows_checked": 0,
+                "rows_not_matching": 0,
+                "maximum_absolute_difference": 0.0,
+            },
+            "scaled_prediction_check": {
+                "performed": False,
+                "expected_column": None,
+                "rows_checked": 0,
+                "rows_not_matching": 0,
+                "maximum_absolute_difference": 0.0,
+            },
         }
     diagnostic_columns = ["__audit_id", "observation_id", "predicted_value"]
     diagnostic_columns.extend(
@@ -150,20 +169,51 @@ def _contribution_analysis(
         if column not in diagnostics.columns:
             raise ValueError(f"grouping column(s) are missing: {column}")
         merged[column] = diagnostics.set_index("__audit_id").loc[merged["__audit_id"], column].to_numpy()
-    expected_column = "scaled_mean" if "scaled_mean" in merged.columns else (
-        "modeled_mean" if "modeled_mean" in merged.columns else None
-    )
     component_sum = merged[components].sum(axis=1)
-    expected = merged[expected_column] if expected_column is not None else merged["predicted_value"]
-    difference = expected.to_numpy(dtype=np.float64) - component_sum.to_numpy(dtype=np.float64)
-    check = {
-        "performed": True,
-        "component_columns": components,
-        "expected_column": expected_column or "predicted_value",
-        "rows_checked": int(len(merged)),
-        "rows_not_matching": int(np.sum(~np.isclose(difference, 0.0, rtol=1.0e-6, atol=1.0e-8))),
-        "maximum_absolute_difference": float(np.max(np.abs(difference))) if len(difference) else 0.0,
-    }
+
+    def consistency_check(
+        actual: pd.Series | None,
+        expected: pd.Series | None,
+        *,
+        expected_column: str | None,
+        component_columns: list[str] | None = None,
+    ) -> dict[str, object]:
+        if actual is None or expected is None:
+            return {
+                "performed": False,
+                "component_columns": components if component_columns is None else component_columns,
+                "expected_column": expected_column,
+                "rows_checked": 0,
+                "rows_not_matching": 0,
+                "maximum_absolute_difference": 0.0,
+            }
+        difference = actual.to_numpy(dtype=np.float64) - expected.to_numpy(dtype=np.float64)
+        finite = np.isfinite(difference)
+        mismatch = finite & ~np.isclose(difference, 0.0, rtol=1.0e-6, atol=1.0e-8)
+        return {
+            "performed": True,
+            "component_columns": components if component_columns is None else component_columns,
+            "expected_column": expected_column,
+            "rows_checked": int(np.sum(finite)),
+            "rows_not_matching": int(np.sum(mismatch)),
+            "maximum_absolute_difference": float(np.max(np.abs(difference[finite]))) if np.any(finite) else 0.0,
+        }
+
+    latent_check = consistency_check(
+        component_sum,
+        merged["latent_total"] if "latent_total" in merged.columns else None,
+        expected_column="latent_total" if "latent_total" in merged.columns else None,
+    )
+    base_total = merged["latent_total"] if "latent_total" in merged.columns else component_sum
+    scale = merged["observation_scale"] if "observation_scale" in merged.columns else pd.Series(1.0, index=merged.index)
+    expected_scaled = base_total * pd.to_numeric(scale, errors="raise")
+    scaled_column = "scaled_mean" if "scaled_mean" in merged.columns else None
+    scaled_actual = merged[scaled_column] if scaled_column is not None else merged["predicted_value"]
+    scaled_check = consistency_check(
+        scaled_actual,
+        expected_scaled,
+        expected_column=scaled_column or "predicted_value",
+    )
     boundary_columns = [
         column
         for column in components
@@ -209,7 +259,9 @@ def _contribution_analysis(
         "available": True,
         "component_columns": components,
         "boundary_component_columns": boundary_columns,
-        "contribution_check": check,
+        "contribution_check": scaled_check,
+        "latent_component_check": latent_check,
+        "scaled_prediction_check": scaled_check,
     }
 
 
@@ -220,6 +272,11 @@ def _summary_markdown(
     contribution_info: Mapping[str, object],
     comparison: pd.DataFrame,
     *,
+    config: ResidualAuditConfig,
+    likelihood_family: str | None,
+    expected_likelihood_family: str | None,
+    input_paths: Mapping[str, str],
+    input_fingerprints: Mapping[str, str],
     is_holdout_evaluation: bool,
 ) -> str:
     observed = diagnostics["observed_value"].to_numpy(dtype=np.float64)
@@ -229,9 +286,20 @@ def _summary_markdown(
     mae = float(np.mean(np.abs(finite_raw))) if finite_raw.size else None
     rmse = float(np.sqrt(np.mean(finite_raw * finite_raw))) if finite_raw.size else None
     variance = diagnostics["variance"].to_numpy(dtype=np.float64)
-    valid = np.isfinite(raw) & np.isfinite(variance)
-    weighted = raw[valid] / np.sqrt(np.maximum(variance[valid], 1.0e-8))
-    weighted_rmse = float(np.sqrt(np.mean(weighted * weighted))) if weighted.size else None
+    support_flags = diagnostics["support_failure"].to_numpy(dtype=bool)
+    valid = np.isfinite(raw) & np.isfinite(variance) & (variance >= 0.0)
+    weighted_all_values = raw[valid] / np.sqrt(np.maximum(variance[valid], config.variance_floor))
+    weighted_without_support_mask = valid & ~support_flags
+    weighted_excluding_values = raw[weighted_without_support_mask] / np.sqrt(
+        np.maximum(variance[weighted_without_support_mask], config.variance_floor)
+    )
+    weighted_all = float(np.sqrt(np.mean(weighted_all_values * weighted_all_values))) if weighted_all_values.size else None
+    weighted_excluding = (
+        float(np.sqrt(np.mean(weighted_excluding_values * weighted_excluding_values)))
+        if weighted_excluding_values.size
+        else None
+    )
+    family_text = "unknown" if likelihood_family is None else likelihood_family
     lines = [
         "# Residual audit",
         "",
@@ -240,25 +308,36 @@ def _summary_markdown(
         f"- Predicted total: {float(np.sum(predicted)):g}",
         f"- MAE: {'' if mae is None else f'{mae:.6g}'}",
         f"- RMSE: {'' if rmse is None else f'{rmse:.6g}'}",
-        f"- Weighted RMSE: {'' if weighted_rmse is None else f'{weighted_rmse:.6g}'}",
-        f"- Support failures: {len(support):,}",
-        f"- Support-failure share: {len(support) / len(diagnostics):.6%}" if len(diagnostics) else "- Support-failure share: 0%",
         "",
         "## Interpretation",
         "",
         "No observations were automatically removed by this audit.",
         "Analysis of fit observations is not independent validation unless an explicit holdout was supplied.",
         f"This run was marked as an independent holdout evaluation: {bool(is_holdout_evaluation)}.",
+        "",
+        "## Likelihood family",
+        "",
+        f"- Declared likelihood family: `{family_text}`.",
+        f"- Expected likelihood family: `{expected_likelihood_family or 'not constrained'}`.",
+        "Poisson-specific residual quantities are not reinterpreted as a different likelihood family.",
+        "",
+        "## Support failures",
+        "",
+        f"- Support failures: {len(support):,}.",
+        f"- Support-failure share: {len(support) / len(diagnostics):.6%}." if len(diagnostics) else "- Support-failure share: 0%.",
+        "Positive observations with near-zero predictions are retained in every row-level output and reported separately; they are support/data-contract diagnostics, not ordinary outliers.",
     ]
-    if len(support):
-        lines.extend(
-            [
-                "",
-                "## Support failures",
-                "",
-                "Positive observations with near-zero predictions are reported separately and should not be interpreted as ordinary residuals.",
-            ]
-        )
+    lines.extend(
+        [
+            "",
+            "## Weighted residual metrics",
+            "",
+            f"- weighted_rmse_all: {'' if weighted_all is None else f'{weighted_all:.6g}'}.",
+            f"- weighted_rmse_excluding_support_failures: {'' if weighted_excluding is None else f'{weighted_excluding:.6g}'}.",
+            f"- Support failures included in legacy weighted_rmse: {bool(config.include_support_failures_in_weighted_metrics)}.",
+            "The all-row Pearson RMSE can be dominated by support-failure rows. The support-failure-excluded value describes ordinary weighted residual behavior; it remains an in-sample residual diagnostic unless an explicit holdout flag is supplied.",
+        ]
+    )
     if not grouped.empty:
         largest_positive = grouped.sort_values("raw_residual_total", ascending=False).iloc[0]
         largest_negative = grouped.sort_values("raw_residual_total", ascending=True).iloc[0]
@@ -273,12 +352,21 @@ def _summary_markdown(
                 f"- Highest support-failure fraction: {highest_support['group_key']} ({highest_support['support_failure_fraction']:.6%}).",
             ]
         )
-    lines.extend(["", "## Contribution analysis", ""])
+    lines.extend(["", "## Contribution consistency", ""])
     if contribution_info.get("available"):
         lines.append(f"Contribution components: {', '.join(map(str, contribution_info.get('component_columns', [])))}.")
-        check = contribution_info.get("contribution_check", {})
-        if isinstance(check, Mapping):
-            lines.append(f"Rows failing contribution-total check: {int(check.get('rows_not_matching', 0)):,}.")
+        latent_check = contribution_info.get("latent_component_check", {})
+        scaled_check = contribution_info.get("scaled_prediction_check", {})
+        if isinstance(latent_check, Mapping):
+            lines.append(
+                f"Latent component check ({latent_check.get('expected_column', 'unavailable')}): "
+                f"{int(latent_check.get('rows_not_matching', 0)):,} rows failed."
+            )
+        if isinstance(scaled_check, Mapping):
+            lines.append(
+                f"Scaled prediction check ({scaled_check.get('expected_column', 'unavailable')}): "
+                f"{int(scaled_check.get('rows_not_matching', 0)):,} rows failed."
+            )
         lines.append("Boundary contributions are additive measurement components; they are not interpreted as conserved OD flows.")
     else:
         lines.append(str(contribution_info.get("message", "No contribution analysis was available.")))
@@ -296,6 +384,17 @@ def _summary_markdown(
         )
     else:
         lines.extend(["", "## Cross-run comparison", "", "No second run was supplied."])
+    lines.extend(
+        [
+            "",
+            "## Artifact provenance",
+            "",
+            "Resolved input paths and SHA-256 fingerprints are recorded in `audit_manifest.json`.",
+            f"- Resolved inputs: {len(input_paths)}.",
+            f"- Fingerprinted inputs: {len(input_fingerprints)}.",
+            "No observations were removed; model/report metadata are not a substitute for an explicitly marked holdout evaluation.",
+        ]
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -309,6 +408,29 @@ def audit_run(
     is_holdout_evaluation: bool = False,
 ) -> ResidualAuditResult:
     """Analyze one run and optionally compare it with a second run."""
+    likelihood_family = likelihood_family_from_provenance(run.provenance)
+    if likelihood_family is None:
+        candidate = run.provenance.get("likelihood_family")
+        if candidate is not None:
+            likelihood_family = str(candidate).strip().lower() or None
+    if config.expected_likelihood_family is not None:
+        if likelihood_family is None:
+            raise ValueError(
+                "expected likelihood family was requested, but the model manifest "
+                "does not declare one."
+            )
+        if likelihood_family != config.expected_likelihood_family:
+            raise ValueError(
+                "likelihood family mismatch: expected "
+                f"{config.expected_likelihood_family!r}, found {likelihood_family!r}."
+            )
+        if comparison_run is not None:
+            comparison_family = likelihood_family_from_provenance(comparison_run.provenance)
+            if comparison_family != config.expected_likelihood_family:
+                raise ValueError(
+                    "comparison run likelihood family mismatch: expected "
+                    f"{config.expected_likelihood_family!r}, found {comparison_family!r}."
+                )
     observations = (
         run.observations
         if "__audit_id" in run.observations.columns
@@ -378,10 +500,15 @@ def audit_run(
             "specification_fingerprints_b": list(comparison_run.specification_fingerprints),
         }
     public_diagnostics = diagnostics.drop(columns=["__audit_id"], errors="ignore")
+    overall_metrics = summarize_by(diagnostics, (), config=config).iloc[0]
     manifest: dict[str, object] = {
         "schema_version": RESIDUAL_AUDIT_SCHEMA_VERSION,
         "tool_version": __version__,
         "input_paths": {
+            **run.input_paths,
+            **({f"run_b_{key}": value for key, value in comparison_run.input_paths.items()} if comparison_run is not None else {}),
+        },
+        "resolved_artifact_paths": {
             **run.input_paths,
             **({f"run_b_{key}": value for key, value in comparison_run.input_paths.items()} if comparison_run is not None else {}),
         },
@@ -392,8 +519,30 @@ def audit_run(
         "model_fingerprints": list(dict.fromkeys((*run.model_fingerprints, *(comparison_run.model_fingerprints if comparison_run else ())))),
         "specification_fingerprints": list(dict.fromkeys((*run.specification_fingerprints, *(comparison_run.specification_fingerprints if comparison_run else ())))),
         "observation_count": int(len(diagnostics)),
+        "support_failure_count": int(len(support)),
+        "support_failure_fraction": (
+            float(len(support) / len(diagnostics)) if len(diagnostics) else 0.0
+        ),
+        "weighted_rmse_all": overall_metrics["weighted_rmse_all"],
+        "weighted_rmse_excluding_support_failures": overall_metrics[
+            "weighted_rmse_excluding_support_failures"
+        ],
         "groupings": [str(value) for value in group_by],
         "thresholds": config.to_dict(),
+        "likelihood_family": likelihood_family,
+        "expected_likelihood_family": config.expected_likelihood_family,
+        "support_failure_policy": {
+            "positive_observation_threshold": float(config.positive_observation_threshold),
+            "predicted_mean_floor": float(config.predicted_mean_floor),
+            "support_failures_removed": False,
+        },
+        "weighted_metric_policy": {
+            "all_rows_reported": True,
+            "support_failures_excluded_metric_reported": True,
+            "include_support_failures_in_legacy_weighted_rmse": bool(
+                config.include_support_failures_in_weighted_metrics
+            ),
+        },
         "is_holdout_evaluation": bool(is_holdout_evaluation),
         "contribution_analysis": contribution_info,
         "comparison": comparison_info,
@@ -408,6 +557,11 @@ def audit_run(
         support,
         contribution_info,
         comparison_frame,
+        config=config,
+        likelihood_family=likelihood_family,
+        expected_likelihood_family=config.expected_likelihood_family,
+        input_paths=run.input_paths,
+        input_fingerprints=run.input_fingerprints,
         is_holdout_evaluation=is_holdout_evaluation,
     )
     return ResidualAuditResult(

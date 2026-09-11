@@ -21,6 +21,8 @@ GROUP_METRIC_COLUMNS = (
     "mae",
     "rmse",
     "weighted_rmse",
+    "weighted_rmse_all",
+    "weighted_rmse_excluding_support_failures",
     "mean_pearson_residual",
     "fraction_abs_pearson_above_threshold",
     "support_failure_count",
@@ -63,9 +65,24 @@ def _metric_row(frame: pd.DataFrame, *, config: ResidualAuditConfig, group_value
         weighted = raw[weighted_valid] / np.sqrt(
             np.maximum(variance[weighted_valid], config.variance_floor)
         )
-        row["weighted_rmse"] = metric_value(weighted, reducer="rmse")
+        weighted_all = metric_value(weighted, reducer="rmse")
     else:
-        row["weighted_rmse"] = None
+        weighted_all = None
+    weighted_without_support = weighted_valid & ~support
+    if np.any(weighted_without_support):
+        weighted_excluding = raw[weighted_without_support] / np.sqrt(
+            np.maximum(variance[weighted_without_support], config.variance_floor)
+        )
+        weighted_excluding_support = metric_value(weighted_excluding, reducer="rmse")
+    else:
+        weighted_excluding_support = None
+    row["weighted_rmse_all"] = weighted_all
+    row["weighted_rmse_excluding_support_failures"] = weighted_excluding_support
+    # Keep the original field for callers of the first report schema.  Its
+    # default now follows the explicit support-aware policy.
+    row["weighted_rmse"] = (
+        weighted_all if config.include_support_failures_in_weighted_metrics else weighted_excluding_support
+    )
     row["mean_pearson_residual"] = metric_value(pearson, reducer="mean")
     finite_pearson = pearson[np.isfinite(pearson)]
     row["fraction_abs_pearson_above_threshold"] = (

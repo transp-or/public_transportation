@@ -45,3 +45,45 @@ The interpretation of a boundary cohort and the construction of its matrix
 remain responsibilities of the case-specific adapter.  Estimated event
 scales, type-specific dispersions, and route-wide survival or hazard models
 are reserved for future extensions.
+
+\subsection{Persisted residual audits}
+
+Residual analysis is implemented as a report-only layer over persisted fit
+artifacts.  The reusable API accepts a prediction table, an optional residual
+table, an optional additive-contribution table, and case-owned metadata joined
+by a stable observation identifier.  It does not activate preparation,
+routing, an assignment operator, or an optimizer.  The command-line entry
+point is
+\path{python -m public_transportation.inference.residual_audit}; its output
+contains deterministic JSON, CSV, and Markdown files together with SHA-256
+input fingerprints and any available model and specification fingerprints.
+
+For observation $r$, the audit recomputes the raw residual
+$y_r-\widehat{y}_r$, a thresholded relative residual, the Pearson residual
+
+\[
+  \frac{y_r-\widehat{y}_r}
+       {\sqrt{\max\{v_r,v_{\min}\}}},
+\]
+
+and the signed Poisson deviance residual.  A positive observation whose
+predicted mean is at or below the declared floor is marked as a support
+failure, near-zero prediction, and positive observation.  Such rows are
+reported separately: they are not treated as ordinary large residuals and are
+never removed automatically.
+
+Any supplied metadata columns may define a grouping, including line, stop,
+time regime, journey position, or boundary role.  Group summaries retain
+explicit nulls when a denominator is unavailable.  When additive components
+are present, the audit checks their total against the persisted predicted
+value and reports OD, initial-onboard, terminal-outflow, fixed-offset, and
+other declared contributions separately.  Boundary contributions are
+measurement components, not conserved OD flows.
+
+Two runs may be compared row by row only when their observation identifiers
+and observed values agree; a subset comparison requires an explicit opt-in.
+The comparison records prediction and residual differences, support-failure
+changes, and grouped comparison metrics.  Fit-observation audits are not
+independent validation.  A holdout interpretation is valid only when the
+case owner supplies a genuinely independent observation set and records that
+fact in the audit manifest.

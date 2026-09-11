@@ -14,6 +14,55 @@ import pandas as pd
 from .model import ResidualAuditRun
 
 
+# These are the component names emitted by the gravity report writer.  The
+# suffix rules allow case-specific future components without treating every
+# numeric metadata column as a model contribution.
+_EXPLICIT_COMPONENT_COLUMNS = frozenset(
+    {
+        "od_contribution",
+        "fixed_offset",
+        "initial_onboard_contribution",
+        "terminal_outflow_contribution",
+    }
+)
+_NON_COMPONENT_COLUMNS = frozenset(
+    {
+        "observation_id",
+        "row_index",
+        "source_row_index",
+        "__audit_id",
+        "observed",
+        "observed_value",
+        "measurement_type",
+        "observation_scale",
+        "latent_total",
+        "modeled_mean",
+        "scaled_mean",
+        "predicted",
+        "predicted_value",
+        "active_components",
+    }
+)
+
+
+def contribution_component_columns(frame: pd.DataFrame) -> list[str]:
+    """Return the explicitly recognized numeric contribution columns.
+
+    Persisted gravity tables also contain numeric identifiers, observed values,
+    scaling factors, and totals.  Those fields describe the model output but
+    are not additive components and must never be inferred as such merely from
+    their dtype.
+    """
+    columns: list[str] = []
+    for column in frame.columns:
+        name = str(column)
+        if name in _NON_COMPONENT_COLUMNS:
+            continue
+        if name in _EXPLICIT_COMPONENT_COLUMNS or name.endswith(("_contribution", "_flow")):
+            columns.append(name)
+    return columns
+
+
 def sha256_file(path: str | Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
@@ -90,7 +139,6 @@ def normalize_contribution_table(table: pd.DataFrame) -> pd.DataFrame:
     frame = _check_unique_ids(table, table_name="contribution table")
     if len(frame) == 0:
         return frame
-    known = {"od_contribution", "initial_onboard_contribution", "terminal_outflow_contribution", "fixed_offset", "scaled_mean"}
     aliases = {
         "od_flow": "od_contribution",
         "initial_onboard_flow": "initial_onboard_contribution",
@@ -98,9 +146,14 @@ def normalize_contribution_table(table: pd.DataFrame) -> pd.DataFrame:
         "modeled_mean": "scaled_mean",
     }
     for source, target in aliases.items():
-        if target not in frame.columns and source in frame.columns:
-            frame = frame.rename(columns={source: target})
-    numeric = [column for column in frame.columns if column in known or column.endswith("_flow")]
+        if source in frame.columns:
+            if target not in frame.columns:
+                frame = frame.rename(columns={source: target})
+            elif source != target:
+                # Prefer the already-canonical field when a persisted table
+                # contains both spellings; never count the alias twice.
+                frame = frame.drop(columns=[source])
+    numeric = contribution_component_columns(frame)
     for column in numeric:
         try:
             values = pd.to_numeric(frame[column], errors="raise").to_numpy(dtype=np.float64)
@@ -153,6 +206,30 @@ def _merge_optional_table(observations: pd.DataFrame, table: pd.DataFrame, *, ta
         # been checked, while genuinely new residual columns are retained.
         values = values.drop(columns=sorted(overlapping))
     return observations.merge(values, on="__audit_id", how="left", sort=False, validate="one_to_one")
+
+
+def likelihood_family_from_provenance(payload: Mapping[str, Any]) -> str | None:
+    """Extract a declared likelihood family from common persisted report paths."""
+    candidates: list[object] = [payload.get("likelihood_family")]
+    model_specification = payload.get("model_specification")
+    if isinstance(model_specification, Mapping):
+        likelihood = model_specification.get("likelihood")
+        if isinstance(likelihood, Mapping):
+            candidates.append(likelihood.get("family"))
+    likelihood = payload.get("likelihood")
+    if isinstance(likelihood, Mapping):
+        candidates.append(likelihood.get("family"))
+    nested_provenance = payload.get("provenance")
+    if isinstance(nested_provenance, Mapping) and nested_provenance is not payload:
+        nested = likelihood_family_from_provenance(nested_provenance)
+        if nested is not None:
+            candidates.append(nested)
+    for candidate in candidates:
+        if candidate is not None:
+            value = str(candidate).strip().lower()
+            if value:
+                return value
+    return None
 
 
 def load_run(
@@ -224,6 +301,9 @@ def load_run(
             input_paths["model_manifest"] = str(Path(manifest_path).resolve())
             input_fingerprints["model_manifest"] = sha256_file(manifest_path)
             provenance = dict(payload)
+            family = likelihood_family_from_provenance(provenance)
+            if family is not None:
+                provenance["likelihood_family"] = family
     return ResidualAuditRun(
         observations=observations,
         contributions=contribution_table,

@@ -36,6 +36,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--pearson-threshold", type=float, default=None)
     parser.add_argument("--variance-floor", type=float, default=None)
     parser.add_argument("--relative-observation-threshold", type=float, default=None)
+    parser.add_argument("--expected-likelihood-family", type=str, default=None)
+    parser.add_argument(
+        "--include-support-failures-in-weighted-metrics",
+        action="store_true",
+        help="use all rows for the legacy weighted_rmse field (all-row and excluded metrics are always reported)",
+    )
     parser.add_argument("--is-holdout-evaluation", action="store_true")
     parser.add_argument("--force", action="store_true")
     return parser
@@ -57,12 +63,16 @@ def _config_payload(path: Path | None) -> dict[str, Any]:
 def _run_directory(path: Path, *, metadata: Path | None = None) -> dict[str, Path | None]:
     if not path.is_dir():
         raise ValueError(f"run directory does not exist: {path}")
+    roots = (path, path / "report")
+    root = next((candidate for candidate in roots if (candidate / "predicted_measurements.csv").is_file()), None)
+    if root is None:
+        checked = ", ".join(str(candidate / "predicted_measurements.csv") for candidate in roots)
+        raise ValueError(f"run directory is missing predicted_measurements.csv; checked: {checked}")
+
     def optional(name: str) -> Path | None:
-        candidate = path / name
+        candidate = root / name
         return candidate if candidate.is_file() else None
-    predicted = path / "predicted_measurements.csv"
-    if not predicted.is_file():
-        raise ValueError(f"run directory is missing {predicted}")
+    predicted = root / "predicted_measurements.csv"
     return {
         "predicted_measurements": predicted,
         "residuals": optional("residuals.csv"),
@@ -92,6 +102,13 @@ def main(argv: list[str] | None = None) -> int:
             cli_value = getattr(args, name)
             if cli_value is not None:
                 values[name] = cli_value
+        for name in ("expected_likelihood_family", "include_support_failures_in_weighted_metrics"):
+            if name in config_payload:
+                values[name] = config_payload[name]
+        if args.include_support_failures_in_weighted_metrics:
+            values["include_support_failures_in_weighted_metrics"] = True
+        if args.expected_likelihood_family is not None:
+            values["expected_likelihood_family"] = args.expected_likelihood_family
         config = ResidualAuditConfig(**values)
         if args.run_a is not None or args.run_b is not None:
             if args.run_a is None or args.run_b is None:
