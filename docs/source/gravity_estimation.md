@@ -6,9 +6,9 @@ execution, is documented in
 [`progressive_fidelity_gravity.md`](progressive_fidelity_gravity.md).
 Full-network validation found that its streaming implementation bounds memory
 successfully, but uniform persisted-shard sampling is not a validated faster
-replacement for exact optimization gradients. See the
-[2026-08-05 validation report](../reports/full_network_stochastic_gravity_validation_2026-08-05.md)
-before using sub-100% effort.
+replacement for exact optimization gradients. The full-network measurements
+and the resulting restrictions on sub-100% effort are summarized in the
+progressive-fidelity guide before using sub-100% effort.
 
 ## Boundary-flow extension
 
@@ -159,42 +159,32 @@ phases.
 L-BFGS-B by default, using an explicitly traced, lowered, compiled, and
 synchronized JAX objective-and-gradient kernel. Smooth softplus
 transformations enforce positive time, transfer, and negative-binomial
-dispersion parameters; optimizer bounds are unnecessary. The optional
+dispersion parameters; optimizer bounds are unnecessary. The explicit
 `optimizer = "biogeme_tr_bfgs"` selector uses Biogeme's trust-region BFGS
-implementation against that same compiled `raw_parameters -> (objective,
-gradient)` callback. It does not rebuild the objective, demand model, routing
-operator, likelihood, or derivatives. Biogeme is imported lazily and remains
-outside the default dependency set; selecting it without the optional
-environment produces an actionable import error.
+against the same compiled `raw_parameters -> (objective, gradient)` callback.
+Both methods do not rebuild the objective, demand model, routing operator,
+likelihood, or derivatives.
 
-The optional path must be installed in a separate environment from the public
-package's default dependencies. For a case study, pin the revised Biogeme
-source (and `biogeme_optimization` separately when it is a separate
-distribution) to immutable Git revisions in the case `pyproject.toml` and
-`uv.lock`. Do not rely on a moving branch or on the older pilot versions. Verify
-the resolved imports and pandas 3 before selecting the optional optimizer:
+The public package depends directly on the published optimizer-only
+`biogeme-optimization` distribution. The full `biogeme` modeling package is
+not required. Verify the resolved optimizer-only import and pandas version in
+the case environment before selecting the comparison optimizer:
 
 ```bash
 uv run --frozen python -c '
-import pandas, biogeme
+import pandas, biogeme_optimization
 print("pandas:", pandas.__version__)
-print("biogeme:", biogeme.__file__)
-try:
-    import biogeme_optimization
-except ImportError:
-    print("biogeme_optimization: not a separate installed distribution")
-else:
-    print("biogeme_optimization:", biogeme_optimization.__file__)
+print("biogeme_optimization:", biogeme_optimization.__file__)
+from biogeme_optimization.optimization import bfgs_trust_region_for_biogeme
+print("TR-BFGS API:", bfgs_trust_region_for_biogeme.__module__)
 '
 ```
 
-Do not add Biogeme to the public package's default environment or relax its
-dependency bounds without repeating the compatibility and full-test checks.
 The adapter implements Biogeme's `FunctionToMinimize` protocol and uses the
 same relative-gradient acceptance criterion as the public estimator. It sets
 Biogeme's relative-gradient epsilon and Dennis--Schnabel `typx`/`typf`
-explicitly; callers must not rely on the optional wrapper's native convergence
-flag alone.
+explicitly; callers must not rely on the optimizer's native convergence flag
+alone.
 
 `GravityEstimatorConfig` contains statistical stopping controls: maximum total
 iterations, gradient tolerance, and objective tolerance. It also records the
@@ -224,8 +214,9 @@ objective. Choose `typx` from natural parameter units or prior scales and
 provide exactly one value per raw parameter unless one scalar genuinely applies
 to all parameters.
 `GravityEstimatorConfig.optimizer` accepts only `scipy` and `biogeme_tr_bfgs`;
-omission selects SciPy and preserves the historical L-BFGS-B behavior. The
-optimizer choice is execution metadata, not part of the scientific model
+omission selects the optimizer-only `biogeme_tr_bfgs` trust-region BFGS
+implementation. SciPy L-BFGS-B remains available by selecting it explicitly.
+The optimizer choice is execution metadata, not part of the scientific model
 fingerprint. `GravityExecutionPolicy` separately controls the derivative strategy, bounded
 automatic-strategy threshold, wall-time allowance, progress interval,
 checkpoint path, and optional persistent JAX compilation-cache directory. The
@@ -328,7 +319,7 @@ This check is useful before generating reports or exporting a bundle: the
 specification fingerprint should agree across every stage, while the model
 fingerprint continues to certify the complete data/operator identity.
 
-For a controlled pilot, `compare_gravity_optimizers` runs SciPy and Biogeme
+For a controlled comparison, `compare_gravity_optimizers` runs SciPy and Biogeme
 independently from the same initial raw vector, callback, parameter names,
 unconstrained bounds, tolerances, and maximum iteration count. It never
 warm-starts one method from the other. Supply separate checkpoint/result paths
@@ -337,9 +328,10 @@ termination reasons, and dtypes. Report elapsed optimizer time separately
 from any common model construction or JAX compilation time; a comparison that
 includes compilation should say so. If a common operator activation is timed,
 pass it once as `operator_activation_seconds`; both summaries then report it
-separately and include it equally in `elapsed_total_seconds`. The optional Biogeme pilot reports the same
-scaled-gradient and precision diagnostics and does not alter the default
-production path.
+separately and include it equally in `elapsed_total_seconds`. The Biogeme pilot
+reports the same scaled-gradient and precision diagnostics. The optimizer-only
+trust-region implementation is the production default; select SciPy explicitly
+for a comparison or a separately reviewed compatibility run.
 
 When reviewing a result written by an older version that used a second
 post-fit threshold, `reclassify_gravity_result` can migrate it without

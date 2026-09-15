@@ -1,5 +1,5 @@
 likelihood = "negative_binomial"
-optimizer = "scipy"
+optimizer = "biogeme_tr_bfgs"
 gradient_strategy = "auto"
 maximum_iterations = 100
 gradient_tolerance = 1.0e-4

@@ -33,6 +33,7 @@ from .objective import (
 )
 
 GRAVITY_CHECKPOINT_SCHEMA_VERSION = 1
+GRAVITY_BIOGEME_CHECKPOINT_SCHEMA_VERSION = 2
 GRAVITY_RESULT_SCHEMA_VERSION = 4
 
 
@@ -137,7 +138,7 @@ class GravityEstimatorConfig:
     optimizer_maxls: int = 20
     typical_objective_scale: float = 1.0
     typical_parameter_scales: float | tuple[float, ...] | None = None
-    optimizer: Literal["scipy", "biogeme_tr_bfgs"] = "scipy"
+    optimizer: Literal["scipy", "biogeme_tr_bfgs"] = "biogeme_tr_bfgs"
 
     def __post_init__(self) -> None:
         if self.maximum_iterations <= 0:
@@ -620,16 +621,31 @@ def _write_checkpoint(
     iterations: int,
     elapsed_seconds: float,
     auxiliary_observations: dict[str, object] | None = None,
+    # Preserve the low-level helper's historical default for callers that
+    # write or inspect legacy checkpoints directly.  The estimator always
+    # passes the configured optimizer explicitly.
     optimizer: Literal["scipy", "biogeme_tr_bfgs"] = "scipy",
+    optimizer_state: dict[str, object] | None = None,
+    optimizer_package_version: str | None = None,
 ) -> None:
+    is_biogeme_state = optimizer == "biogeme_tr_bfgs" and optimizer_state is not None
     payload: dict[str, object] = {
-        "schema_version": GRAVITY_CHECKPOINT_SCHEMA_VERSION,
+        "schema_version": (
+            GRAVITY_BIOGEME_CHECKPOINT_SCHEMA_VERSION
+            if is_biogeme_state
+            else GRAVITY_CHECKPOINT_SCHEMA_VERSION
+        ),
         "model_fingerprint": model_fingerprint,
         "raw_parameters": raw_parameters.tolist(),
         "iterations": iterations,
         "elapsed_seconds": elapsed_seconds,
         "optimizer": optimizer,
     }
+    if is_biogeme_state:
+        if optimizer_package_version is None:
+            raise ValueError("Biogeme checkpoints require the optimizer package version.")
+        payload["optimizer_package_version"] = optimizer_package_version
+        payload["optimizer_state"] = optimizer_state
     if auxiliary_observations is not None:
         payload["auxiliary_observations"] = auxiliary_observations
     _atomic_checkpoint(path, payload)
@@ -639,14 +655,15 @@ def _load_checkpoint(
     path: Path,
     model_fingerprint: str,
     parameter_count: int = 3,
+    # Preserve the low-level loader's historical default for unconfigured
+    # callers; estimate_gravity_model passes config.optimizer explicitly.
     expected_optimizer: Literal["scipy", "biogeme_tr_bfgs"] = "scipy",
-) -> tuple[np.ndarray, int, float]:
+    return_optimizer_state: bool = False,
+) -> tuple[np.ndarray, int, float] | tuple[np.ndarray, int, float, object | None]:
     try:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError(f"cannot read gravity checkpoint {path}.") from error
-    if payload.get("schema_version") != GRAVITY_CHECKPOINT_SCHEMA_VERSION:
-        raise ValueError("incompatible gravity checkpoint schema.")
     if payload.get("model_fingerprint") != model_fingerprint:
         raise ValueError("gravity checkpoint model fingerprint mismatch.")
     checkpoint_optimizer = payload.get("optimizer")
@@ -660,9 +677,38 @@ def _load_checkpoint(
             "gravity checkpoint does not identify an optimizer; "
             "start a separate Biogeme checkpoint."
         )
+    schema_version = payload.get("schema_version")
+    if expected_optimizer == "biogeme_tr_bfgs":
+        if schema_version != GRAVITY_BIOGEME_CHECKPOINT_SCHEMA_VERSION:
+            raise ValueError("incompatible Biogeme gravity checkpoint schema.")
+    elif schema_version != GRAVITY_CHECKPOINT_SCHEMA_VERSION:
+        raise ValueError("incompatible gravity checkpoint schema.")
     raw = np.asarray(payload.get("raw_parameters"), dtype=np.float64)
     if raw.shape != (parameter_count,) or not np.all(np.isfinite(raw)):
         raise ValueError("gravity checkpoint parameters are invalid.")
+    optimizer_state = None
+    if expected_optimizer == "biogeme_tr_bfgs":
+        package_version = payload.get("optimizer_package_version")
+        try:
+            from biogeme_optimization.version import __version__
+            from biogeme_optimization.state import TrustRegionBFGSState
+        except ImportError as error:  # pragma: no cover - selected dependency is missing
+            raise ImportError(
+                "Biogeme TR-BFGS resume requires the 'biogeme-optimization' package."
+            ) from error
+        if package_version != __version__:
+            raise ValueError(
+                "gravity checkpoint optimizer package version mismatch: "
+                f"checkpoint={package_version!r}, expected={__version__!r}."
+            )
+        serialized_state = payload.get("optimizer_state")
+        if not isinstance(serialized_state, dict):
+            raise ValueError("Biogeme gravity checkpoint has no optimizer state.")
+        optimizer_state = TrustRegionBFGSState.from_dict(serialized_state)
+        if not np.array_equal(raw, optimizer_state.x):
+            raise ValueError("gravity checkpoint parameters disagree with optimizer state.")
+    if return_optimizer_state:
+        return raw, int(payload.get("iterations", 0)), float(payload.get("elapsed_seconds", 0)), optimizer_state
     return (
         raw,
         int(payload.get("iterations", 0)),
@@ -808,6 +854,7 @@ class _OptimizerRun:
     iterations: int
     evaluations: int
     options: dict[str, object]
+    state: object | None = None
 
 
 def _run_scipy_lbfgsb(
@@ -881,20 +928,25 @@ def _run_biogeme_tr_bfgs(
     config: GravityEstimatorConfig,
     typical_parameter_scales: np.ndarray | None = None,
     on_evaluation: Callable[[int, float, np.ndarray], None] | None = None,
+    optimizer_state: object | None = None,
+    on_checkpoint: Callable[[object], None] | None = None,
+    model_fingerprint: str | None = None,
+    stop_requested: Callable[[], bool] | None = None,
 ) -> _OptimizerRun:
     """Run Biogeme TR-BFGS against the already compiled common callback."""
     try:
-        from biogeme.optimization import bfgs_trust_region_for_biogeme
-    except ImportError as error:  # pragma: no cover - depends on optional extra
+        from biogeme_optimization.optimization import (
+            bfgs_trust_region_for_biogeme,
+        )
+    except ImportError as error:  # pragma: no cover - depends on installation
         raise ImportError(
-            "The Biogeme optimizer requires a separately installed, verified "
-            "Biogeme environment. Install the optional 'biogeme' and "
-            "'biogeme-optimization' packages before selecting "
+            "The Biogeme optimizer requires the 'biogeme-optimization' "
+            "package. Install a compatible version before selecting "
             "optimizer = 'biogeme_tr_bfgs'."
         ) from error
 
     # Reuse the adapter from the isolated pilot.  Importing this module does
-    # not import Biogeme; only the optimizer selection above is optional.
+    # not import the optimizer until this path is selected.
     from .biogeme_pilot import _BiogemeObjective
 
     resolved_parameter_scales = (
@@ -917,14 +969,29 @@ def _run_biogeme_tr_bfgs(
         "tolerance": config.gradient_tolerance,
         "objective_tolerance": config.objective_tolerance,
     }
+    if model_fingerprint is not None:
+        options["model_fingerprint"] = model_fingerprint
     bounds = [(None, None) for _ in range(initial.size)]
-    optimization_result = bfgs_trust_region_for_biogeme(
-        objective,
-        initial,
-        bounds,
-        list(parameter_names),
-        options,
-    )
+    optional_arguments: dict[str, object] = {}
+    if optimizer_state is not None:
+        optional_arguments["state"] = optimizer_state
+    if on_checkpoint is not None:
+        optional_arguments["checkpoint_callback"] = on_checkpoint
+    if stop_requested is not None:
+        optional_arguments["stop_requested"] = stop_requested
+    if optional_arguments:
+        optimization_result = bfgs_trust_region_for_biogeme(
+            objective,
+            initial,
+            bounds,
+            list(parameter_names),
+            options,
+            **optional_arguments,
+        )
+    else:
+        optimization_result = bfgs_trust_region_for_biogeme(
+            objective, initial, bounds, list(parameter_names), options
+        )
     if hasattr(optimization_result, "solution"):
         solution = np.asarray(optimization_result.solution, dtype=np.float64)
         messages = _biogeme_messages(
@@ -952,13 +1019,20 @@ def _run_biogeme_tr_bfgs(
     iterations = _biogeme_iteration_count(
         messages, configured_limit=remaining_iterations
     )
+    final_state = getattr(optimization_result, "state", None)
+    if final_state is not None:
+        iterations = int(final_state.iteration)
+        evaluation_count = int(final_state.function_evaluations)
+    else:
+        evaluation_count = len(objective.evaluations)
     return _OptimizerRun(
         raw_parameters=solution,
         success=optimizer_success,
         message=str(message),
         iterations=iterations,
-        evaluations=len(objective.evaluations),
+        evaluations=evaluation_count,
         options=options,
+        state=final_state,
     )
 
 
@@ -993,14 +1067,19 @@ def estimate_gravity_model(
     checkpoint = execution.checkpoint_path
     resumed_elapsed = 0.0
     completed_iterations = 0
+    optimizer_state: object | None = None
     if resume:
         if checkpoint is None:
             raise ValueError("resume requires checkpoint_path.")
-        raw_numpy, completed_iterations, resumed_elapsed = _load_checkpoint(
+        loaded_checkpoint = _load_checkpoint(
             checkpoint,
             model_fingerprint,
             problem.parameter_layout.size,
             expected_optimizer=config.optimizer,
+            return_optimizer_state=True,
+        )
+        raw_numpy, completed_iterations, resumed_elapsed, optimizer_state = (
+            loaded_checkpoint
         )
         resumed = True
     else:
@@ -1016,15 +1095,16 @@ def estimate_gravity_model(
                     f"gravity checkpoint already exists at {checkpoint}; "
                     "resume it or choose another path."
                 )
-            _write_checkpoint(
-                checkpoint,
-                model_fingerprint=model_fingerprint,
-                raw_parameters=raw_numpy,
-                iterations=0,
-                elapsed_seconds=0.0,
-                auxiliary_observations=auxiliary_metadata,
-                optimizer=config.optimizer,
-            )
+            if config.optimizer == "scipy":
+                _write_checkpoint(
+                    checkpoint,
+                    model_fingerprint=model_fingerprint,
+                    raw_parameters=raw_numpy,
+                    iterations=0,
+                    elapsed_seconds=0.0,
+                    auxiliary_observations=auxiliary_metadata,
+                    optimizer=config.optimizer,
+                )
     deadline = (
         None
         if execution.wall_time_seconds is None
@@ -1283,6 +1363,30 @@ def estimate_gravity_model(
             )
         )
 
+    def biogeme_checkpoint(state: object) -> None:
+        """Persist every stable TR-BFGS boundary in the gravity checkpoint."""
+        if checkpoint is None:
+            return
+        try:
+            serialized_state = state.to_dict()
+        except AttributeError as error:  # pragma: no cover - old optimizer package
+            raise RuntimeError(
+                "the installed Biogeme optimizer does not expose resumable state."
+            ) from error
+        from biogeme_optimization.version import __version__
+
+        _write_checkpoint(
+            checkpoint,
+            model_fingerprint=model_fingerprint,
+            raw_parameters=np.asarray(state.x, dtype=np.float64),
+            iterations=int(state.iteration),
+            elapsed_seconds=resumed_elapsed + clock() - started,
+            auxiliary_observations=auxiliary_metadata,
+            optimizer="biogeme_tr_bfgs",
+            optimizer_state=serialized_state,
+            optimizer_package_version=__version__,
+        )
+
     status = "completed"
     success = False
     message = ""
@@ -1328,6 +1432,16 @@ def estimate_gravity_model(
                         config=config,
                         typical_parameter_scales=typical_parameter_scales,
                         on_evaluation=biogeme_evaluation_progress,
+                        optimizer_state=optimizer_state,
+                        on_checkpoint=(
+                            biogeme_checkpoint if checkpoint is not None else None
+                        ),
+                        model_fingerprint=model_fingerprint,
+                        stop_requested=(
+                            None
+                            if deadline is None
+                            else lambda: clock() >= deadline
+                        ),
                     )
             except _DeadlineStop as stop:
                 deadline_phase = stop.phase
@@ -1347,14 +1461,18 @@ def estimate_gravity_model(
             else:
                 assert optimizer_run is not None
                 solver_raw = optimizer_run.raw_parameters
-                if not np.array_equal(latest_raw, solver_raw):
+                if latest_evaluation is None or not np.array_equal(latest_raw, solver_raw):
                     evaluate(solver_raw)
                     assert latest_evaluation is not None
                     accepted_objectives.append(float(latest_evaluation.objective))
                 latest_raw = solver_raw
                 if config.optimizer == "biogeme_tr_bfgs":
-                    completed_iterations += optimizer_run.iterations
-                    if checkpoint is not None:
+                    completed_iterations = (
+                        optimizer_run.iterations
+                        if optimizer_run.state is not None
+                        else completed_iterations + optimizer_run.iterations
+                    )
+                    if checkpoint is not None and optimizer_run.state is None:
                         _write_checkpoint(
                             checkpoint,
                             model_fingerprint=model_fingerprint,

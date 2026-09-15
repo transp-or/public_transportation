@@ -9,21 +9,23 @@
 \label{sec:reduced-od-numerical-contract}
 
 The current gravity estimator evaluates a JAX value-and-gradient kernel and
-uses SciPy L--BFGS--B by default.  The execution setting
+uses the optimizer-only Biogeme TR--BFGS trust-region method by default.  The
+explicit SciPy L--BFGS--B comparison or compatibility path remains available.
+The execution setting
 \texttt{optimizer\_maxls} controls the maximum number of line-search steps
-(20 by default).  An optional Biogeme TR--BFGS pilot is selected explicitly
-through the gravity optimizer-comparison interface; it is not a default
-dependency or a replacement for the SciPy estimator.  Optimizer and progress
+(20 by default).  The optimizer-only
+\texttt{biogeme-optimization} distribution provides the comparison API; the
+full Biogeme modeling package is not required.  Optimizer and progress
 settings are execution metadata and are excluded from the scientific model
 fingerprint.
 
 The raw parameter vector is mapped to physical demand and likelihood
 parameters by the declared \texttt{GravityModelSpecification}.  Positive
 quantities and other domain restrictions are represented by those transforms.
-The default SciPy gravity fit is not a bounded optimization in raw
-coordinates.  The isolated Biogeme pilot can receive explicit bounds, but
-those bounds must be treated as part of that pilot's declared configuration,
-not assumed to apply to the default estimator.
+The default Biogeme TR--BFGS gravity fit is not a bounded optimization in raw
+coordinates.  The SciPy L--BFGS--B comparison path also does not enforce
+bounds; its settings must be treated as part of that comparison's declared
+configuration, not assumed to apply to the default estimator.
 
 Convergence certification uses a scale-aware Dennis--Schnabel gradient rather
 than SciPy's success flag alone.  For raw parameter $\eta_i$, objective $Q$,

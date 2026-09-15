@@ -1,4 +1,4 @@
-"""Compare sparse prediction kernels on the cached TPG MAP problem."""
+"""Compare sparse prediction kernels on an external cached MAP problem."""
 
 from __future__ import annotations
 
@@ -9,18 +9,20 @@ import sys
 from pathlib import Path
 from time import perf_counter
 
-ROOT = Path(__file__).resolve().parents[1]
-TPG_MODEL = ROOT.parent / "public_transport_TPG/models/two_lines_morning_time"
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--model-root",
+        type=Path,
+        required=True,
+        help="Case-model directory containing map_profile.py.",
+    )
     parser.add_argument("--operator-cache", type=Path, required=True)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--warm-evaluations", type=int, default=10)
     args = parser.parse_args()
     os.environ["PUBLIC_TRANSPORTATION_OPERATOR_CACHE_DIR"] = str(args.operator_cache)
-    sys.path.insert(0, str(TPG_MODEL))
+    sys.path.insert(0, str(args.model_root.resolve()))
 
     from map_profile import MapSettings, prepare_map_problem
 

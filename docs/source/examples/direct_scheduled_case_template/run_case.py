@@ -625,7 +625,7 @@ def fit(root: Path, resume: bool = False) -> None:
         typical_objective_scale, typical_parameter_scales = (
             _explicit_convergence_scales(model)
         )
-        optimizer = str(model.get("optimizer", "scipy"))
+        optimizer = str(model.get("optimizer", "biogeme_tr_bfgs"))
         initial_parameters = initial_raw_parameters(parameters, model)
         checkpoint_name = (
             "gravity.json"

@@ -41,7 +41,7 @@
   "fixed_routing_shard_preparation_seconds": 0.15462279203347862,
   "od_time_expansion_seconds": 38.329780583968386,
   "peak_rss_bytes": 517095424,
-  "scenario_directory": "/Users/bierlair/MyFiles/github/public_transportation/docs/source/examples/geneva_gtfs/data",
+  "scenario_directory": "docs/source/examples/geneva_gtfs/data",
   "scenario_loading_and_validation_seconds": 0.29697845806367695,
   "schema_version": 1,
   "scientific_provenance": {

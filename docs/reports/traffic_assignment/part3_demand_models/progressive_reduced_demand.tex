@@ -118,8 +118,9 @@ and identification constraints remain explicit assumptions.
 The generic optimizer applies the same operational contract as the minimal
 reduced-OD fitter.  Maximum likelihood and Gaussian-prior MAP are distinct
 modes.  GravityModelSpecification transforms raw parameters to their physical
-domain; the default SciPy gravity fit is unbounded in raw coordinates, while
-the optional Biogeme pilot may receive explicit bounds.  An absolute time
+domain; the default Biogeme TR--BFGS gravity fit is unbounded in raw
+coordinates, while the SciPy L--BFGS--B comparison path uses the same
+objective callback.  An absolute time
 budget requires an atomic checkpoint.  A stopped run records the latest
 accepted iterate and resumes only when the complete model identity
 (specification, layout, features, grouping, response operator, observations,

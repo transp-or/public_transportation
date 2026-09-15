@@ -70,13 +70,14 @@
   cannot change support sets, numerical values, checkpoints, scheduling, or
   computational fingerprints.
 
-- Documented the 2026-08-05 full-network stochastic-gravity validation. The
-  sequential streaming evaluator reduced internal peak RSS from 98.67 GiB
-  exact to about 8.5 GiB, validating its memory bound. Uniform persisted-shard
-  sampling did not provide an optimization-quality tradeoff: 10% effort had
-  19.2% relative gradient error, while 25% effort was slower than exact and
-  still had 17.2% gradient error. Sub-100% uniform evaluation remains an
-  experimental diagnostic capability; quality indicators are not error bounds.
+- The progressive-fidelity guide now records the 2026-08-05 full-network
+  stochastic-gravity validation. Sequential streaming reduced internal peak
+  RSS from 98.67 GiB exact to about 8.5 GiB, validating the memory bound, but
+  uniform persisted-shard sampling did not provide an optimization-quality
+  tradeoff: 10% effort had 19.2% relative gradient error, while 25% effort was
+  slower than exact and still had 17.2% gradient error. Sub-100% uniform
+  evaluation remains an experimental diagnostic capability; quality indicators
+  are not error bounds.
 
 ### Parallel partial-routing foundation
 

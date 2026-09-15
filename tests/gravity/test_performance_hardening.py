@@ -145,6 +145,7 @@ def test_relaxed_deadline_preserves_checkpoint_and_reports_cache(tmp_path):
             problem=dense,
             compact_layout=compact,
             initial_raw_parameters=raw,
+            config=GravityEstimatorConfig(optimizer="scipy"),
             execution=GravityExecutionPolicy(
                 gradient_strategy="adjoint",
                 wall_time_seconds=0.5,

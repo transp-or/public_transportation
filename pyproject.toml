@@ -6,9 +6,21 @@ build-backend = "setuptools.build_meta"
 name = "public_transportation"
 dynamic = ["version"]
 description = "Tools for public transportation modeling and analysis"
-authors = [{name = "Michel Bierlaire"}]
+authors = [{name = "Michel Bierlaire", email = "michel.bierlaire@epfl.ch"}]
 readme = "README.md"
-requires-python = ">=3.14,<3.15"
+license = {file = "LICENSE"}
+requires-python = ">=3.12,<3.15"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
 
 dependencies = [
     "numpy",
@@ -20,6 +32,7 @@ dependencies = [
     "scipy",
     "threadpoolctl",
     "pyyaml",
+    "biogeme-optimization>=0.0.13,<0.1",
 ]
 
 
@@ -28,7 +41,8 @@ dev = [
     "pytest",
     "black",
     "ruff",
-    "mypy"
+    "mypy",
+    "tox"
 ]
 
 [tool.setuptools]

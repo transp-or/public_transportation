@@ -20,7 +20,6 @@ Notes
 -----
 - Measurement mapping uses the *new* mapping subpackage:
     public_transportation.measurement.mapping
-  (the legacy `measurement.mapper` API is deprecated).
 """
 
 from __future__ import annotations

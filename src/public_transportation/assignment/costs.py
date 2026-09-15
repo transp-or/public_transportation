@@ -34,8 +34,6 @@ zero penalties.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
-
 import jax
 import jax.numpy as jnp
 
@@ -176,63 +174,6 @@ def link_costs(
         cost_parts=cost_parts,
         config=config,
     )
-    return cost_parts.base_cost + access_pen
-
-
-def link_costs_for_group(
-    *,
-    graph: JaxGraph,
-    cost_parts: CostParts,
-    config: AssignmentConfig,
-    od_groups: Any,
-    group_index: int,
-) -> Array:
-    """
-    [DEPRECATED] Compute effective link costs for one OD group.
-    This function is deprecated now that centroid-in nodes are duplicated per time bin.
-    Group-dependent costs are no longer needed; use `link_costs()` instead.
-    """
-    # Ignore od_groups and group_index, call group-independent version.
-    return link_costs(graph=graph, cost_parts=cost_parts, config=config)
-
-
-# Backward compatibility shim for interval-based API
-def link_costs_for_interval(
-    *,
-    graph: JaxGraph,
-    cost_parts: CostParts,
-    config: AssignmentConfig,
-    bin_start_min: float,
-    bin_end_min: float,
-) -> Array:
-    """
-    Legacy helper: prefer `link_costs()` (group-independent).
-    If the graph exposes node_bin_start_min/node_bin_end_min, interval is encoded on centroid-in nodes.
-    Otherwise, falls back to legacy computation with explicit interval.
-    """
-    config.validate()
-    if hasattr(graph, "node_bin_start_min") and hasattr(graph, "node_bin_end_min"):
-        # Interval is encoded per centroid-in node; use group-independent costs
-        return link_costs(graph=graph, cost_parts=cost_parts, config=config)
-    # Legacy fallback: compute access penalties for the provided interval
-    access_link_idx = jnp.where(cost_parts.is_access, size=graph.num_links, fill_value=-1)[0]
-    access_link_idx = access_link_idx[access_link_idx >= 0]
-    pen_all = jnp.zeros((graph.num_links,), dtype=graph.node_time.dtype)
-    def _compute_and_scatter(pen_vec: Array) -> Array:
-        tau = graph.node_time[graph.head[access_link_idx]]  # minutes at head node for access links
-        a = float(bin_start_min)
-        b = float(bin_end_min)
-        early = jnp.maximum(0.0, a - tau)
-        late = jnp.maximum(0.0, tau - b)
-        pen = config.beta_early * early + config.beta_late * late
-        return pen_vec.at[access_link_idx].set(pen)
-    pen_all = jax.lax.cond(
-        access_link_idx.size > 0,
-        _compute_and_scatter,
-        lambda p: p,
-        pen_all,
-    )
-    access_pen = pen_all
     return cost_parts.base_cost + access_pen
 
 

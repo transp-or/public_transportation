@@ -279,14 +279,12 @@ raw optimizer coordinates (before positive transformations), while
 cache, and shard/memory limits are execution/model choices that the case owner
 must review. The estimator also supports `typical_objective_scale`, scalar or
 per-parameter `typical_parameter_scales`,
-and `optimizer_maxls`. The optimizer selector is `optimizer = "scipy"` by
-default; `optimizer = "biogeme_tr_bfgs"` is an optional comparison path and
-requires a separately verified Biogeme environment. The case owner must pin
-the revised Biogeme source (and `biogeme_optimization` separately when it is a
-separate distribution) to an immutable Git revision in the case
-`pyproject.toml` and `uv.lock`. Do not copy versions from an older pilot or
-rely on a moving branch; verify pandas 3 and both imports before selecting the
-optional optimizer. Both algorithms receive the same objective-and-gradient
+and `optimizer_maxls`. The optimizer selector is `optimizer = "biogeme_tr_bfgs"`
+by default; `optimizer = "scipy"` remains available as an explicit alternative.
+The public package depends on the published optimizer-only
+`biogeme-optimization` distribution; the full `biogeme` modeling package is
+not required. Verify pandas and the optimizer-only import before running the
+fit. Both algorithms receive the same objective-and-gradient
 callback and must use separate checkpoints and result locations. The only
 convergence and acceptance criterion is the relative-gradient test against
 `gradient_tolerance`; `scaled_gradient_inf_norm` is diagnostic output. The template
@@ -476,7 +474,7 @@ fingerprints.
 ## Scheduler scripts
 
 The `scripts/*.sbatch` files are examples only. Review the requested memory,
-CPU, wall time, account, and partition with the local Jed policy. They write
+CPU, wall time, account, and partition with the local Slurm policy. They write
 stdout and stderr below `results/logs/` and call the same stage commands as the
 interactive workflow. Submit the dependency chain with:
 
@@ -487,7 +485,7 @@ bash scripts/submit_chain.sh
 The bootstrap wrapper requests 24 hours, 8 CPUs, and 32 GB of memory by
 default because prior expansion can be the longest preprocessing stage. These
 are case-owned scheduler settings, not scientific or package defaults; review
-them against the Jed partition. The chain is
+them against the selected Slurm partition. The chain is
 `bootstrap-prior → check → structural-zeros → prepare → preflight → benchmark
 → fit → validate`. Never start two writers against one checkpoint or artifact
 root; resume a time-budget stop as a new dependent job after the predecessor

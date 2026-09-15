@@ -7,7 +7,6 @@ ROOT = Path(__file__).resolve().parents[2]
 EXAMPLES = ROOT / "docs/source/examples"
 
 PUBLIC_EXAMPLE_APPLICABILITY = {
-    "bayesian_estimation": "generic_dense_gaussian_map",
     "network_model": "loading_partitioning_and_missing_measurement_rejection",
     "simple_example_01": "complete_fixed_routing_block_map",
     "simple_example_02": "complete_regularized_fixed_routing_block_map",

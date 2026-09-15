@@ -14,7 +14,7 @@ or for the validation and fit reports.
 Obtain a completed viewer-bundle directory produced by
 `write_gravity_viewer_bundle` or `write_persisted_gravity_viewer_bundle`.
 The bundle can be copied from the case-study results root to the computer on
-which the browser will run. A JED scratch path is not directly visible to a
+which the browser will run. A cluster scratch path is not directly visible to a
 browser running on a laptop, so copy or archive the bundle first when needed.
 
 At its root, a complete bundle normally looks like this:
@@ -65,7 +65,7 @@ repository root, the simplest option is to open the file in the default
 browser:
 
 ```bash
-cd /Users/bierlair/MyFiles/github/public_transportation
+cd /path/to/public_transportation
 open tools/gravity_viewer/index.html
 ```
 
@@ -73,7 +73,7 @@ If the browser blocks local-file resources, or if the page does not behave as
 expected when opened directly, serve the static directory locally instead:
 
 ```bash
-cd /Users/bierlair/MyFiles/github/public_transportation
+cd /path/to/public_transportation
 uv run --no-project python -m http.server 8765 --directory tools/gravity_viewer
 ```
 

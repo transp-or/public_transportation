@@ -7,8 +7,8 @@
 > error was 19.2%; at 25% effort runtime exceeded the exact reference while
 > gradient error remained 17.2%. Treat sub-100% uniform shard evaluation as an
 > experimental diagnostic capability, not a faster drop-in optimization
-> backend. Independently validate gradient accuracy for every application. See
-> the [full-network validation report](../reports/full_network_stochastic_gravity_validation_2026-08-05.md).
+> backend. Independently validate gradient accuracy for every application. The
+> full-network measurements are summarized below.
 
 Progressive fidelity reduces the routing work used by one gravity-model
 objective and gradient evaluation. It is retained for diagnostics and research
@@ -446,9 +446,27 @@ relative error was 19.2%. At 25.214% realized effort, internal peak RSS remained
 about 8.58 GiB, confirming bounded memory, while runtime rose to 3,475.87
 seconds versus 3,176.25 seconds exact and gradient error remained 17.2%.
 
+The full-network reference objective was 13,361,880 and required 3,176.25
+seconds with 98.67 GiB peak RSS. The sampled results were:
+
+| Requested effort | Realized shards | Objective relative error | Gradient relative error | Gradient cosine | Quality |
+|---:|---:|---:|---:|---:|:---|
+| 10% | 24/234 (10.256%) | 0.0002245% | 19.20% | 0.998700 | poor |
+| 25% | 59/234 (25.214%) | 0.001519% | 17.21% | 0.999234 | poor |
+
+The 24-shard selection was a strict prefix of the 59-shard selection. The
+sampled objective values were close to exact, but gradient magnitude errors
+remained material; high gradient cosine was not sufficient evidence of an
+optimization-quality gradient. Increasing selected work by a factor of 2.46
+increased runtime by about 2.44 while reducing gradient error by only about two
+percentage points. Measurement and gradient dispersion indicators were
+diagnostic only, not confidence intervals or certified error bounds.
+
 Accordingly, the favorable public anchored microbenchmark does not validate
 the uniform persisted-shard evaluator as an optimizer backend on the full
 network. The result is retained for experimentation and future estimator
 research; it should not be enabled as a transparent substitute for exact
-gradients. Complete provenance and error measurements are in the
-[2026-08-05 validation report](../reports/full_network_stochastic_gravity_validation_2026-08-05.md).
+gradients. Effort 100 remains required for exact evaluation and final
+convergence checks. This conclusion is specific to sequential deterministic
+uniform sampling and does not rule out future stratified, influence-aware, or
+noise-aware optimization methods.

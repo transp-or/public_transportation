@@ -14,7 +14,9 @@ adequacy.
 The current public gravity entry point is
 \texttt{public\_transportation.inference.gravity.estimate\_gravity\_model}.
 The estimator is configured with \texttt{GravityEstimatorConfig}; its default
-optimizer is SciPy L--BFGS--B.  A gravity ML fit is obtained by omitting the
+optimizer is the optimizer-only Biogeme TR--BFGS trust-region method.  SciPy
+L--BFGS--B is available as an explicit comparison or compatibility path.  A
+gravity ML fit is obtained by omitting the
 prior or setting the declared prior contribution to zero, while keeping every
 other input identical to the MAP fit.  The general-purpose
 \texttt{public\_transportation.estimation.maximum\_likelihood.run\_ml} engine
@@ -32,12 +34,12 @@ overdispersion relative to the Poisson mean--variance relationship; it does
 not by itself validate the gravity form.
 
 The current optimizer comparison is exposed by
-\texttt{compare\_gravity\_optimizers}.  It runs SciPy L--BFGS--B and, when the
-optional Biogeme dependencies are installed, the isolated TR--BFGS pilot on
-the same objective, initial vector, scaling, and tolerances.  Each optimizer
-has its own execution checkpoint, and the comparison reports termination,
-objective, raw and scaled gradients, and precision diagnostics.  Biogeme is
-optional and is not part of the default dependency set; an unavailable pilot
-must therefore fail explicitly rather than silently changing the estimator.
+\texttt{compare\_gravity\_optimizers}.  It runs Biogeme TR--BFGS and SciPy
+L--BFGS--B independently on the same objective, initial vector, scaling, and
+tolerances.  Each optimizer has its own execution checkpoint, and the
+comparison reports termination, objective, raw and scaled gradients, and
+precision diagnostics.  The public package depends on the optimizer-only
+\texttt{biogeme-optimization} distribution; the full Biogeme modeling package
+is not required.
 
 \input{traffic_assignment/preserved/086_2814_2851_maximum_likelihood_estimation.tex}

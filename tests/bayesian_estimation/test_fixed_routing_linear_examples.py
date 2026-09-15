@@ -697,7 +697,8 @@ def test_matrix_free_gravity_auto_selects_only_adjoint(prepared_example, tmp_pat
         metadata=GravityValidationMetadata(operator.num_measurements),
     )
     assert adequacy.measurements == operator.num_measurements
-    assert np.isfinite(adequacy.negative_binomial_deviance)
+    assert adequacy.negative_binomial_deviance is None
+    assert np.isfinite(adequacy.poisson_deviance)
     identity = gravity_measurement_identity(
         measurement_indices=np.arange(operator.num_measurements),
         label=f"{example.name} matrix-free gravity test",

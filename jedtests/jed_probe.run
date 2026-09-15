@@ -1,13 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=pt-jed-probe
-#SBATCH --partition=standard
-#SBATCH --qos=serial
+#SBATCH --job-name=pt-cluster-probe
+# Add the account, partition, and QoS required by the target cluster locally.
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=4G
 #SBATCH --time=00:05:00
-#SBATCH --output=jed-probe-%j.out
+#SBATCH --output=cluster-probe-%j.out
 
 set -eu
 

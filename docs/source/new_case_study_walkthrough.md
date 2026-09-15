@@ -86,8 +86,8 @@ case_studies/<case_name>/                 # case-owned example root
     └── validation/
 ```
 
-The `results/` tree shown here is a logical layout. For a medium or large JED
-case it must be materialized at the explicit absolute scratch path described
+The `results/` tree shown here is a logical layout. For a medium or large
+cluster case it must be materialized at the explicit absolute scratch path described
 in **Large outputs, scratch storage, and archival**, not inside the Git working
 tree.
 
@@ -137,20 +137,20 @@ and model assumptions.
 
 Read this section before starting every potentially long phase. The repository
 is the home for source code, configuration, `pyproject.toml`, `uv.lock`, and
-small manifests or status reports. JED scratch is the working home for large
+small manifests or status reports. Cluster scratch is the working home for large
 generated data: checkpoints, generated OD/time inputs, exclusion and audit
 tables, routing and preparation artifacts, linear-operator blocks, logs, and
 intermediate files. Large generated outputs must not be committed to GitHub.
 
 ### Configure one persistent scratch results root
 
-For a JED case, set the results root to an explicit absolute path in the
+For a cluster run, set the results root to an explicit absolute path in the
 case-owned TOML configuration. Do not put shell variables such as
 `$RESULTS_ROOT` in TOML; replace `<username>` with the actual account name:
 
 ```toml
-results = "/scratch/<username>/tpg-medium-network/results"
-scenario_demand = "/scratch/<username>/tpg-medium-network/results/inputs/scenario/prior_demand.csv"
+results = "/scratch/<username>/<case-name>/results"
+scenario_demand = "/scratch/<username>/<case-name>/results/inputs/scenario/prior_demand.csv"
 ```
 
 The second line is important for the generated OD/time prior: the network
@@ -162,11 +162,11 @@ example:
 
 ```toml
 [scenario]
-folder = "/home/<username>/github/public_transport_TPG/case_studies/medium_network/inputs/scenario"
-demand_file = "/scratch/<username>/tpg-medium-network/results/inputs/scenario/prior_demand.csv"
+folder = "/path/to/<case-repository>/case_studies/<case-name>/inputs/scenario"
+demand_file = "/scratch/<username>/<case-name>/results/inputs/scenario/prior_demand.csv"
 
 [output]
-folder = "/scratch/<username>/tpg-medium-network/results/structural_zeros"
+folder = "/scratch/<username>/<case-name>/results/structural_zeros"
 ```
 
 Every generated output path must be derived from this same results root. All
@@ -174,18 +174,18 @@ stages must reuse exactly the same absolute results root, input fingerprints,
 and identity fingerprints. A resumed job must never silently create a second
 results tree. In the remainder of this document, a logical path such as
 `results/audit/` means the corresponding directory below this concrete
-`$RESULTS_ROOT`; commands for JED must use the absolute root rather than a
+`$RESULTS_ROOT`; commands for a cluster must use the absolute root rather than a
 repository-relative `results/` directory. Python API snippets later in this
 document use `Path("results/...")` only as logical example notation; a case
 driver must derive those paths from its configured `settings.results` (which
-is `$RESULTS_ROOT` for JED).
+is `$RESULTS_ROOT` for the cluster).
 
 Prepare the scratch tree before submitting any long stage. Run this from the
-login node or an interactive JED shell:
+cluster login node or an interactive shell:
 
 ```bash
-CASE_ROOT=/home/<username>/github/public_transport_TPG/case_studies/medium_network
-SCRATCH_CASE=/scratch/<username>/tpg-medium-network
+CASE_ROOT=/path/to/<case-repository>/case_studies/<case-name>
+SCRATCH_CASE=/scratch/<username>/<case-name>
 RESULTS_ROOT="$SCRATCH_CASE/results"
 
 cd "$CASE_ROOT"
@@ -946,7 +946,7 @@ config = ShardedConstructionConfig(
 All values are case-specific. Select them from the observed construction plan,
 worker-memory budget, filesystem capacity, and wall-time allocation; never
 copy a large-network example blindly to another case. After changing
-`config/model.toml`, commit and push the change, pull the new revision on JED,
+`config/model.toml`, commit and push the change, pull the new revision on the cluster,
 and verify the effective values from the case-study root before submitting a
 job:
 
@@ -1202,7 +1202,7 @@ The current template has relative defaults in `config/case.toml`,
 `config/structural_zeros.toml`, and the `#SBATCH --output/--error` directives.
 They are suitable for a local case tree, not for the absolute scratch policy
 above. The configuration accepts absolute paths, so the case owner must edit
-those TOML values before a JED run. The explicit `sbatch --output/--error`
+those TOML values before a cluster run. The explicit `sbatch --output/--error`
 arguments above override the wrapper log defaults. `scripts/submit_chain.sh`
 does not accept a scratch results root and should not be used unchanged for
 this policy; submit the jobs individually (or update that wrapper in the
@@ -1214,14 +1214,14 @@ workflow change.
 Before scratch cleanup or expiry, archive the required outputs:
 
 ```bash
-ARCHIVE_ROOT=/scratch/<username>/tpg-medium-network-archives
+ARCHIVE_ROOT=/scratch/<username>/<case-name>-archives
 mkdir -p "$ARCHIVE_ROOT"
 
 tar -C "$SCRATCH_CASE" \
-  -cf "$ARCHIVE_ROOT/tpg-medium-network-results.tar" \
+  -cf "$ARCHIVE_ROOT/<case-name>-results.tar" \
   results
 
-tar -tf "$ARCHIVE_ROOT/tpg-medium-network-results.tar" >/dev/null
+tar -tf "$ARCHIVE_ROOT/<case-name>-results.tar" >/dev/null
 ```
 
 Move the archive itself to persistent project storage or another approved
@@ -1234,12 +1234,12 @@ large checkpoints, generated OD/time tables, exclusion/audit tables, routing
 artifacts, operator blocks, logs, and intermediate files in the archive rather
 than committing them to GitHub.
 
-## Moving a case study between JED and a local computer
+## Moving a case study between a cluster and a local computer
 
 Git synchronizes the program and the tracked scientific configuration. A
 separate runtime archive synchronizes generated state. Neither mechanism
 replaces the other. This section is the complete procedure for moving a case
-between JED and a laptop without rebuilding an expensive routing or temporal
+between a cluster and a local computer without rebuilding an expensive routing or temporal
 operator.
 
 ### Files controlled by Git
@@ -1251,7 +1251,7 @@ files normally on each machine:
 
 ```bash
 git pull
-UV_CACHE_DIR=/tmp/tpg-medium-uv-cache uv sync --frozen
+UV_CACHE_DIR=/tmp/public-transportation-uv-cache uv sync --frozen
 ```
 
 Do not transfer `.venv`, UV caches, generated results, Slurm `.out`/`.err`
@@ -1265,7 +1265,7 @@ measurements = "results/inputs/filtered/measurements_boarding_alighting.csv"
 results = "results"
 ```
 
-On JED, the same local file may use absolute paths below `/scratch`. The
+On a cluster, the same local file may use absolute paths below `/scratch`. The
 case-owned driver must explicitly load the local override; the public package
 does not discover `case.local.toml` automatically. If a driver only reads
 `config/case.toml`, report that as a case-driver interface issue rather than
@@ -1299,17 +1299,17 @@ Normally exclude `.git/`, `.venv/`, UV caches, temporary staging directories,
 large Slurm `.out` and `.err` files, and the machine-specific
 `config/case.local.toml` from the runtime archive.
 
-### Create the archive on JED
+### Create the archive on the cluster
 
 The following commands are independent of the current working directory.
 Replace the example account, case, results, and identity values with the
 values recorded by the completed run:
 
 ```bash
-export CASE_ROOT="/home/bierlair/github/public_transport_TPG/case_studies/medium_network"
-export RESULTS_ROOT="/scratch/bierlair/tpg-medium-network-20260817-feasibility-fix/results"
-export IDENTITY="219c55205b90403d7003a0694325c788678f7b79170bd42b7d3145ff6a69607e"
-export ARCHIVE="/scratch/bierlair/tpg-medium-network-20260817-feasibility-fix/tpg-medium-network-runtime-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+export CASE_ROOT="/path/to/<case-repository>/case_studies/<case-name>"
+export RESULTS_ROOT="/scratch/<username>/<case-name>/results"
+export IDENTITY="<identity-fingerprint>"
+export ARCHIVE="/scratch/<username>/<case-name>/<case-name>-runtime-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
 ```
 
 Before archiving, verify that the source data and durable outputs exist:
@@ -1369,17 +1369,17 @@ not create it before the archive is complete.
 
 ### Transfer the archive
 
-From the laptop, create or select the case-study destination and transfer both
+From the local computer, create or select the case-study destination and transfer both
 the archive and its checksum:
 
 ```bash
-export CASE_ROOT="/Users/bierlair/MyFiles/github/public_transport_TPG/case_studies/medium_network"
-export ARCHIVE_NAME="tpg-medium-network-runtime-YYYYMMDDTHHMMSSZ.tar.gz"
+export CASE_ROOT="/path/to/<case-repository>/case_studies/<case-name>"
+export ARCHIVE_NAME="<case-name>-runtime-YYYYMMDDTHHMMSSZ.tar.gz"
 
-scp "bierlair@jed.epfl.ch:/scratch/bierlair/tpg-medium-network-20260817-feasibility-fix/$ARCHIVE_NAME" \
+scp "<username>@<cluster-host>:/scratch/<username>/<case-name>/$ARCHIVE_NAME" \
   "$CASE_ROOT/"
 
-scp "bierlair@jed.epfl.ch:/scratch/bierlair/tpg-medium-network-20260817-feasibility-fix/$ARCHIVE_NAME.sha256" \
+scp "<username>@<cluster-host>:/scratch/<username>/<case-name>/$ARCHIVE_NAME.sha256" \
   "$CASE_ROOT/"
 ```
 
@@ -1388,11 +1388,11 @@ transfer:
 
 ```bash
 rsync -avP \
-  "bierlair@jed.epfl.ch:/scratch/bierlair/tpg-medium-network-20260817-feasibility-fix/$ARCHIVE_NAME" \
+  "<username>@<cluster-host>:/scratch/<username>/<case-name>/$ARCHIVE_NAME" \
   "$CASE_ROOT/"
 
 rsync -avP \
-  "bierlair@jed.epfl.ch:/scratch/bierlair/tpg-medium-network-20260817-feasibility-fix/$ARCHIVE_NAME.sha256" \
+  "<username>@<cluster-host>:/scratch/<username>/<case-name>/$ARCHIVE_NAME.sha256" \
   "$CASE_ROOT/"
 ```
 
@@ -1432,7 +1432,7 @@ tar -xzf "$CASE_ROOT/$ARCHIVE_NAME" -C "$CASE_ROOT"
 The resulting layout must be:
 
 ```text
-case_studies/medium_network/
+case_studies/<case-name>/
 ├── adapter.py
 ├── run_case.py
 ├── config/
@@ -1471,7 +1471,7 @@ resolved inputs and results root are the extracted local files:
 
 ```bash
 cd "$CASE_ROOT"
-export UV_CACHE_DIR=/tmp/tpg-medium-uv-cache
+export UV_CACHE_DIR=/tmp/public-transportation-uv-cache
 
 UV_CACHE_DIR="$UV_CACHE_DIR" uv sync --frozen
 
@@ -1532,7 +1532,7 @@ following:
 - the artifact manifest hash agrees with the hash recorded in the
   operator-cache manifest;
 - the imported results use the same model configuration, time bins, timetable,
-  measurements, fixed demand, and input fingerprints as the completed JED run.
+  measurements, fixed demand, and input fingerprints as the completed cluster run.
 
 Only after these checks pass may the case run `fit --resume`, validation, or
 reporting. A successful transfer must reuse the transferred artifact and
@@ -1734,7 +1734,7 @@ uv run --frozen python run_case.py report \
 ### 0.1 Determine time bins from the count data before the audit
 
 Before starting this potentially long diagnostic, read **Large outputs, scratch
-storage, and archival** and prepare the JED results root if the case is not a
+storage, and archival** and prepare the cluster results root if the case is not a
 small local pilot.
 
 For a new case, do not choose time-bin edges only because they are convenient.
@@ -1807,7 +1807,7 @@ bin-file checksum.
 ### 0.2 Generate the candidate OD universe and prior demand
 
 Before starting this potentially long expansion, read **Large outputs, scratch
-storage, and archival**. Medium and large cases should use the JED submission,
+storage, and archival**. Medium and large cases should use the cluster submission,
 persistent checkpoint, and monitoring procedure there.
 
 The scenario demand file is not an unexplained pre-existing case-owner input.
@@ -1930,13 +1930,13 @@ The adapter emits durable JSONL progress while the universe, each expansion
 chunk, and the final materialization are processed. Monitor the persistent log
 and checkpoint `manifest.json`; do not infer completion from a partial CSV or
 from the existence of a directory alone.
-For medium or large cases, submit this stage on Jed rather than tying up a
+For medium or large cases, submit this stage on the cluster rather than tying up a
 laptop; the local laptop run is appropriate for a bounded fixture or pilot.
 
 Classify failures before changing the case: inability of the checkpoint engine
 to resume or validate is a **public-package issue**; a template that still
 calls the in-memory expansion or emits no durable progress is a **public-template
-issue**; and an unsuitable Jed time, memory, partition, or account request is a
+issue**; and an unsuitable cluster time, memory, partition, or account request is a
 **case-owned scheduler configuration issue**. Never silently fall back to
 `expand_candidate_od_time_cells` for a long case.
 
@@ -2499,7 +2499,7 @@ These scripts exercise public fixtures and are not private-case drivers. The
 private driver should write its own benchmark JSON with scientific and
 execution fingerprints. Reject the fit if the benchmark is non-finite, if
 gradient agreement fails, or if the projected runtime/memory is incompatible
-with the selected machine or Jed allocation.
+with the selected machine or cluster allocation.
 
 ## 11. Progress reporting and durable logs
 
@@ -3038,53 +3038,50 @@ convergence certificate.
 
 ### Selecting and comparing optimizers
 
-SciPy L-BFGS-B remains the default and should be selected explicitly in the
-case-owned `config/model.toml` when reproducibility is important:
-
-```toml
-optimizer = "scipy"
-```
-
-An optional Biogeme TR-BFGS path is available for a controlled comparison:
+The optimizer-only `biogeme_tr_bfgs` trust-region BFGS implementation is now
+the default gravity optimizer. It is provided by the published
+`biogeme-optimization` package; the full `biogeme` modeling package is not
+required. Select it explicitly in the case-owned `config/model.toml` when you
+want the configuration to be self-documenting:
 
 ```toml
 optimizer = "biogeme_tr_bfgs"
 ```
 
-Biogeme is not installed by the default public package. The case owner must
-install the revised Biogeme source in a separate, explicitly pinned
-environment. Pin both the public package and the Biogeme source(s) to
-immutable Git revisions in the private case's `pyproject.toml` and `uv.lock`;
-do not document a moving branch or copy a version number from an older pilot.
-If `biogeme_optimization` is a separate distribution, pin and record its
-revision separately. Verify the resolved imports and pandas 3 in that
-environment before selecting `biogeme_tr_bfgs`:
+SciPy L-BFGS-B remains available as an explicit alternative or comparison path:
+
+```toml
+optimizer = "scipy"
+```
+
+The public package depends on the published optimizer-only
+`biogeme-optimization` distribution. The full `biogeme` modeling package is
+not required. Verify the resolved imports and pandas version in the case
+environment before running the fit:
 
 ```bash
 uv run --frozen python -c '
-import pandas, public_transportation, biogeme
+import pandas, public_transportation, biogeme_optimization
 print("pandas:", pandas.__version__)
 print("public_transportation:", public_transportation.__file__)
-print("biogeme:", biogeme.__file__)
-try:
-    import biogeme_optimization
-except ImportError:
-    print("biogeme_optimization: not a separate installed distribution")
-else:
-    print("biogeme_optimization:", biogeme_optimization.__file__)
+print("biogeme_optimization:", biogeme_optimization.__file__)
+from biogeme_optimization.optimization import bfgs_trust_region_for_biogeme
+print("TR-BFGS API:", bfgs_trust_region_for_biogeme.__module__)
 '
 ```
 
-Selecting Biogeme without this verified environment produces an actionable
-error. Do not add it to the public package's default dependencies or change
-the public NumPy/pandas bounds merely to make the optional pilot resolve.
+Selecting the optimizer-only trust-region implementation is the normal
+production path. Select SciPy explicitly when a comparison or compatibility
+run is required.
 Both algorithms consume the same compiled objective-and-gradient callback,
 initial raw vector, unconstrained bounds, parameter names, scales, tolerances,
 and iteration limit. They do not rebuild the scientific model or warm-start
 one method from the other. Use distinct checkpoint and result locations, and
 compare final objective, parameter distance, raw/scaled gradient norms, dtypes,
 termination messages, and optimizer time. Separate common JAX compilation and
-model setup time from optimizer time whenever possible.
+model setup time from optimizer time whenever possible. The trust-region run is
+the production default; report any explicit SciPy comparison or compatibility
+run separately.
 
 For a fair comparison, the private case driver should activate the prepared
 operator once, construct one objective-and-gradient callback, and call
@@ -3098,9 +3095,9 @@ other. Pass the measured common activation time as
 optimizer-only time separate from common activation/compilation time and must
 record each optimizer's objective, parameters, raw and scaled gradients,
 precision diagnostics, iterations, evaluations, termination message, status,
-success, acceptance, and checkpoint path. A Biogeme run is a pilot result; the
-normal production setting remains `optimizer = "scipy"` until the comparison
-has been reviewed.
+success, acceptance, and checkpoint path. A SciPy run is a comparison or
+compatibility result when the default trust-region optimizer is used for
+production.
 
 The optimizer name and termination metadata are execution records, not part of
 the scientific model or operator fingerprints. A checkpoint tagged `scipy`
@@ -3424,7 +3421,7 @@ Do not invent a route, replace an event by a nearby timestamp, or reuse a prior
 after changing the feasibility or measurement-support semantics. A changed
 support contract requires a fresh identity-specific prior and preparation.
 
-## 15. Jed scheduling and restartable long runs
+## 15. Cluster scheduling and restartable long runs
 
 Read **Large outputs, scratch storage, and archival** before scheduling. It
 defines the absolute results root, per-phase submissions, monitoring, and
@@ -3444,7 +3441,7 @@ case-owned wrapper to provide those paths:
 
 ```bash
 mkdir -p "$RESULTS_ROOT"/{logs,manifests,checkpoints,artifacts}
-# Do not run scripts/submit_chain.sh unchanged on JED: its #SBATCH log paths
+# Do not run scripts/submit_chain.sh unchanged on a cluster: its #SBATCH log paths
 # are relative to the case repository. Use the per-phase submissions above.
 ```
 
@@ -3459,7 +3456,7 @@ order; adjust resources only after the warm benchmark justifies the change.
 
 `00_bootstrap_prior.sbatch` is intentionally a long-run job: its example
 requests 24 hours, 8 CPUs, and 32 GB of memory. Review those requests against
-the local Jed partition and the candidate-pair count before submission. Its
+the local cluster partition and the candidate-pair count before submission. Its
 checkpoint and JSONL log must be on persistent case storage, never in a node
 temporary directory. Monitor them while the job runs:
 
@@ -4184,7 +4181,7 @@ retained as diagnostic artifacts).
 
 First resolve the durable results root and load the two JSON manifests. Do not
 guess a results path from the repository layout: a case may point `results` at
-JED scratch or another absolute location.
+cluster scratch or another absolute location.
 
 ```python
 from __future__ import annotations

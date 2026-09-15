@@ -1,14 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=pt-validation
-#SBATCH --account=transpor
-#SBATCH --partition=standard
-#SBATCH --qos=serial
+# Add the account, partition, and QoS required by the target cluster locally.
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=00:30:00
-#SBATCH --output=jedtests/jed-validation-%j.out
+#SBATCH --output=jedtests/cluster-validation-%j.out
 
 set -euo pipefail
 
@@ -46,14 +44,6 @@ echo "tmpdir=${TMPDIR:-not-set}"
 echo "=== Revisions ==="
 git status --short
 git log -1 --oneline
-if [[ -d ../public_transport_TPG/.git ]]; then
-    git -C ../public_transport_TPG status --short
-    git -C ../public_transport_TPG log -1 --oneline
-else
-    echo "ERROR: sibling public_transport_TPG repository not found." >&2
-    exit 2
-fi
-
 echo "=== Runtime ==="
 "$UV_EXECUTABLE" run --frozen python - <<'PY'
 import platform

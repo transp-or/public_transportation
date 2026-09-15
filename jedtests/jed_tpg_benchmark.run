@@ -1,30 +1,27 @@
 #!/bin/bash
-#SBATCH --job-name=pt-tpg-operator
-#SBATCH --account=transpor
-#SBATCH --partition=bigmem
-#SBATCH --qos=serial
+#SBATCH --job-name=pt-external-case-operator
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=10
 #SBATCH --mem=128G
 #SBATCH --time=02:00:00
-#SBATCH --output=jedtests/jed-tpg-benchmark-%j.out
+#SBATCH --output=jedtests/external-case-benchmark-%j.out
 
 set -euo pipefail
 
 PUBLIC_REPOSITORY="${SLURM_SUBMIT_DIR:-$HOME/github/public_transportation}"
-TPG_REPOSITORY="$PUBLIC_REPOSITORY/../public_transport_TPG"
-TPG_HARNESS="$TPG_REPOSITORY/models/two_lines_morning_time/profile_map.py"
+CASE_REPOSITORY="${CASE_REPOSITORY:?Set CASE_REPOSITORY to the external case repository}"
+CASE_HARNESS="${CASE_HARNESS:?Set CASE_HARNESS to the case profiling script}"
 UV_EXECUTABLE="$HOME/.local/bin/uv"
-RESULT_DIRECTORY="$PUBLIC_REPOSITORY/jedtests/tpg-benchmark-$SLURM_JOB_ID"
-CACHE_ROOT="${TMPDIR:-/tmp}/tpg-operator-cache-$SLURM_JOB_ID"
+RESULT_DIRECTORY="${RESULT_DIRECTORY:-$PUBLIC_REPOSITORY/jedtests/external-case-benchmark-$SLURM_JOB_ID}"
+CACHE_ROOT="${TMPDIR:-/tmp}/operator-cache-$SLURM_JOB_ID"
 
 if [[ ! -f "$PUBLIC_REPOSITORY/pyproject.toml" ]]; then
     echo "ERROR: submit this job from the public_transportation repository root." >&2
     exit 2
 fi
-if [[ ! -f "$TPG_HARNESS" ]]; then
-    echo "ERROR: TPG harness not found at $TPG_HARNESS" >&2
+if [[ ! -f "$CASE_HARNESS" ]]; then
+    echo "ERROR: case harness not found at $CASE_HARNESS" >&2
     exit 2
 fi
 if [[ ! -x "$UV_EXECUTABLE" ]]; then
@@ -55,8 +52,8 @@ mkdir -p "$RESULT_DIRECTORY" "$CACHE_ROOT" "$MPLCONFIGDIR" "$XDG_CACHE_HOME"
     echo "tmpdir=${TMPDIR:-not-set}"
     echo "public_repository=$PUBLIC_REPOSITORY"
     echo "public_revision=$(git rev-parse HEAD)"
-    echo "tpg_repository=$TPG_REPOSITORY"
-    echo "tpg_revision=$(git -C "$TPG_REPOSITORY" rev-parse HEAD)"
+    echo "case_repository=$CASE_REPOSITORY"
+    echo "case_revision=$(git -C "$CASE_REPOSITORY" rev-parse HEAD)"
     "$UV_EXECUTABLE" run --frozen python --version
     "$UV_EXECUTABLE" run --frozen python - <<'PY'
 import jax
@@ -87,7 +84,7 @@ run_profile() {
 
     /usr/bin/time -v \
         -o "$output_directory/time.txt" \
-        "$UV_EXECUTABLE" run --frozen python "$TPG_HARNESS" \
+        "$UV_EXECUTABLE" run --frozen python "$CASE_HARNESS" \
         --max-iterations "$iterations" \
         --warm-evaluations "$warm_evaluations" \
         --fixed-measurement-operator "$mode" \
@@ -154,4 +151,4 @@ echo "=== Slurm resource snapshot ==="
 sstat --jobs="${SLURM_JOB_ID}.batch" \
     --format=JobID,AveCPU,MaxRSS,MaxVMSize 2>/dev/null || true
 
-echo "TPG benchmark complete: $RESULT_DIRECTORY"
+echo "External-case benchmark complete: $RESULT_DIRECTORY"

@@ -1,10 +1,10 @@
-"""Optional Biogeme TR-BFGS comparison pilot.
+"""Biogeme TR-BFGS comparison pilot.
 
 This module is deliberately isolated from the production estimator.  Biogeme
-is imported only when :func:`run_biogeme_tr_bfgs_pilot` is called, so the
-default package has no Biogeme dependency and importing the gravity API stays
-cheap.  The pilot accepts the same objective/gradient callback used by the
-production estimator and applies the same Dennis--Schnabel convergence audit.
+optimization is imported only when :func:`run_biogeme_tr_bfgs_pilot` is called,
+so importing the gravity API stays cheap.  The pilot accepts the same
+objective/gradient callback used by the production estimator and applies the
+same Dennis--Schnabel convergence audit.
 """
 
 from __future__ import annotations
@@ -261,7 +261,7 @@ def run_biogeme_tr_bfgs_pilot(
     bounds: Sequence[tuple[float | None, float | None]] | None = None,
     progress: Callable[[GravityEstimatorProgress], None] | None = None,
 ) -> GravityBiogemePilotResult:
-    """Run Biogeme's optional trust-region BFGS algorithm on one objective.
+    """Run Biogeme's trust-region BFGS algorithm on one objective.
 
     ``objective_and_gradient`` must return ``(objective, gradient)`` for the
     supplied NumPy parameter vector.  No model or data are recreated here: a
@@ -270,15 +270,17 @@ def run_biogeme_tr_bfgs_pilot(
     status is certified with the same scaled-gradient rule as
     :func:`estimate_gravity_model`.
 
-    Biogeme is an optional dependency.  Calling this function without the
-    optional package installed raises an actionable :class:`ImportError`.
+    Calling this function without the optimizer-only package installed raises
+    an actionable :class:`ImportError`.
     """
     try:
-        from biogeme.optimization import bfgs_trust_region_for_biogeme
-    except ImportError as error:  # pragma: no cover - exercised without extra
+        from biogeme_optimization.optimization import (
+            bfgs_trust_region_for_biogeme,
+        )
+    except ImportError as error:  # pragma: no cover - exercised without package
         raise ImportError(
-            "The Biogeme TR-BFGS pilot requires the optional 'biogeme' "
-            "and 'biogeme-optimization' packages."
+            "The Biogeme TR-BFGS pilot requires the 'biogeme-optimization' "
+            "package."
         ) from error
 
     initial = np.asarray(initial_raw_parameters, dtype=np.float64)

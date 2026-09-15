@@ -151,6 +151,7 @@ def test_optimizer_maxls_is_passed_to_lbfgsb(monkeypatch):
                 maximum_iterations=4,
                 optimizer_maxls=100,
                 gradient_tolerance=1.0,
+                optimizer="scipy",
             ),
             execution=GravityExecutionPolicy(gradient_strategy="adjoint"),
         )
@@ -455,6 +456,7 @@ def test_estimator_reports_reduction_between_accepted_iterates(monkeypatch):
             config=GravityEstimatorConfig(
                 maximum_iterations=4,
                 gradient_tolerance=1.0e6,
+                optimizer="scipy",
             ),
             execution=GravityExecutionPolicy(gradient_strategy="adjoint"),
         )
@@ -501,8 +503,8 @@ def test_float32_and_float64_diagnostic_pilot_is_comparable():
     assert float64_result.message
 
 
-def test_optional_biogeme_tr_bfgs_pilot_uses_same_convergence_audit(monkeypatch):
-    optimization_module = ModuleType("biogeme.optimization")
+def test_biogeme_tr_bfgs_pilot_uses_same_convergence_audit(monkeypatch):
+    optimization_module = ModuleType("biogeme_optimization.optimization")
 
     def fake_tr_bfgs(function, initial, bounds, variable_names, parameters):
         assert parameters["maxiter"] == 12
@@ -522,10 +524,13 @@ def test_optional_biogeme_tr_bfgs_pilot_uses_same_convergence_audit(monkeypatch)
         )
 
     optimization_module.bfgs_trust_region_for_biogeme = fake_tr_bfgs
-    biogeme_module = ModuleType("biogeme")
-    biogeme_module.optimization = optimization_module
-    monkeypatch.setitem(sys.modules, "biogeme", biogeme_module)
-    monkeypatch.setitem(sys.modules, "biogeme.optimization", optimization_module)
+    biogeme_optimization_module = ModuleType("biogeme_optimization")
+    biogeme_optimization_module.__path__ = []
+    biogeme_optimization_module.optimization = optimization_module
+    monkeypatch.setitem(sys.modules, "biogeme_optimization", biogeme_optimization_module)
+    monkeypatch.setitem(
+        sys.modules, "biogeme_optimization.optimization", optimization_module
+    )
 
     progress: list[GravityEstimatorProgress] = []
     result = run_biogeme_tr_bfgs_pilot(
@@ -557,9 +562,9 @@ def test_optional_biogeme_tr_bfgs_pilot_uses_same_convergence_audit(monkeypatch)
     assert progress and progress[-1].scaled_gradient_inf_norm == pytest.approx(2.0)
 
 
-def test_optional_biogeme_tr_bfgs_pilot_real_interface_when_available():
-    """Exercise the current Biogeme ``FunctionToMinimize`` protocol when installed."""
-    pytest.importorskip("biogeme.optimization")
+def test_biogeme_tr_bfgs_pilot_real_interface():
+    """Exercise the published optimizer-only ``FunctionToMinimize`` protocol."""
+    pytest.importorskip("biogeme_optimization.optimization")
 
     target = np.asarray((3.0, -2.0), dtype=np.float64)
 
@@ -589,7 +594,7 @@ def test_optional_biogeme_tr_bfgs_pilot_real_interface_when_available():
 
 
 def test_estimator_biogeme_selector_uses_common_callback_and_metadata(monkeypatch):
-    optimization_module = ModuleType("biogeme.optimization")
+    optimization_module = ModuleType("biogeme_optimization.optimization")
     observed: dict[str, object] = {}
 
     def fake_tr_bfgs(function, initial, bounds, variable_names, parameters):
@@ -609,10 +614,13 @@ def test_estimator_biogeme_selector_uses_common_callback_and_metadata(monkeypatc
         )
 
     optimization_module.bfgs_trust_region_for_biogeme = fake_tr_bfgs
-    biogeme_module = ModuleType("biogeme")
-    biogeme_module.optimization = optimization_module
-    monkeypatch.setitem(sys.modules, "biogeme", biogeme_module)
-    monkeypatch.setitem(sys.modules, "biogeme.optimization", optimization_module)
+    biogeme_optimization_module = ModuleType("biogeme_optimization")
+    biogeme_optimization_module.__path__ = []
+    biogeme_optimization_module.optimization = optimization_module
+    monkeypatch.setitem(sys.modules, "biogeme_optimization", biogeme_optimization_module)
+    monkeypatch.setitem(
+        sys.modules, "biogeme_optimization.optimization", optimization_module
+    )
 
     with jax.enable_x64():
         problem, layout, _ = setup_problem()
@@ -644,7 +652,7 @@ def test_estimator_biogeme_selector_uses_common_callback_and_metadata(monkeypatc
 
 
 def test_optimizer_comparison_uses_independent_checkpoints(monkeypatch, tmp_path):
-    optimization_module = ModuleType("biogeme.optimization")
+    optimization_module = ModuleType("biogeme_optimization.optimization")
 
     def fake_tr_bfgs(function, initial, bounds, variable_names, parameters):
         candidate = np.ones_like(np.asarray(initial, dtype=float))
@@ -657,10 +665,13 @@ def test_optimizer_comparison_uses_independent_checkpoints(monkeypatch, tmp_path
         )
 
     optimization_module.bfgs_trust_region_for_biogeme = fake_tr_bfgs
-    biogeme_module = ModuleType("biogeme")
-    biogeme_module.optimization = optimization_module
-    monkeypatch.setitem(sys.modules, "biogeme", biogeme_module)
-    monkeypatch.setitem(sys.modules, "biogeme.optimization", optimization_module)
+    biogeme_optimization_module = ModuleType("biogeme_optimization")
+    biogeme_optimization_module.__path__ = []
+    biogeme_optimization_module.optimization = optimization_module
+    monkeypatch.setitem(sys.modules, "biogeme_optimization", biogeme_optimization_module)
+    monkeypatch.setitem(
+        sys.modules, "biogeme_optimization.optimization", optimization_module
+    )
 
     result = compare_gravity_optimizers(
         objective_and_gradient=lambda value: (
@@ -691,7 +702,8 @@ def test_optimizer_comparison_uses_independent_checkpoints(monkeypatch, tmp_path
 
 
 def test_optimizer_selector_defaults_and_rejects_unknown_value():
-    assert GravityEstimatorConfig().optimizer == "scipy"
+    assert GravityEstimatorConfig().optimizer == "biogeme_tr_bfgs"
+    assert GravityEstimatorConfig(optimizer="scipy").optimizer == "scipy"
     with pytest.raises(ValueError, match="optimizer must be"):
         GravityEstimatorConfig(optimizer="not-an-optimizer")
 
@@ -702,12 +714,12 @@ def test_biogeme_selection_reports_actionable_missing_dependency(monkeypatch):
     original_import = builtins.__import__
 
     def blocked_import(name, *args, **kwargs):
-        if name == "biogeme" or name.startswith("biogeme."):
+        if name == "biogeme_optimization" or name.startswith("biogeme_optimization."):
             raise ImportError("blocked for test")
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", blocked_import)
-    with pytest.raises(ImportError, match="optional.*Biogeme|optional.*biogeme"):
+    with pytest.raises(ImportError, match="biogeme-optimization"):
         run_biogeme_tr_bfgs_pilot(
             objective_and_gradient=lambda value: (
                 np.sum(value**2),
@@ -744,20 +756,20 @@ def test_resume_reaches_same_solution_as_uninterrupted(tmp_path):
         )
         uninterrupted = estimate_gravity_model(
             **common,
-            config=GravityEstimatorConfig(maximum_iterations=80),
+            config=GravityEstimatorConfig(maximum_iterations=80, optimizer="scipy"),
             execution=GravityExecutionPolicy(gradient_strategy="adjoint"),
         )
         checkpoint = tmp_path / "resume.json"
         estimate_gravity_model(
             **common,
-            config=GravityEstimatorConfig(maximum_iterations=2),
+            config=GravityEstimatorConfig(maximum_iterations=2, optimizer="scipy"),
             execution=GravityExecutionPolicy(
                 gradient_strategy="adjoint", checkpoint_path=checkpoint
             ),
         )
         resumed = estimate_gravity_model(
             **common,
-            config=GravityEstimatorConfig(maximum_iterations=80),
+            config=GravityEstimatorConfig(maximum_iterations=80, optimizer="scipy"),
             execution=GravityExecutionPolicy(
                 gradient_strategy="adjoint", checkpoint_path=checkpoint
             ),
@@ -795,6 +807,7 @@ def test_deadline_preserves_valid_initial_checkpoint(tmp_path):
                 checkpoint_path=checkpoint,
                 wall_time_seconds=0.5,
             ),
+            config=GravityEstimatorConfig(optimizer="scipy"),
             clock=Clock(),
         )
         assert result.status == "stopped_by_time_budget"
@@ -818,7 +831,7 @@ def test_deadline_after_valid_iteration_resumes_to_uninterrupted_result(tmp_path
             problem=problem,
             compact_layout=layout,
             initial_raw_parameters=np.zeros(3),
-            config=GravityEstimatorConfig(maximum_iterations=80),
+            config=GravityEstimatorConfig(maximum_iterations=80, optimizer="scipy"),
         )
         uninterrupted = estimate_gravity_model(
             **common,
@@ -918,7 +931,9 @@ def test_public_preflight_stops_at_boundaries_and_recommends_measured_strategy()
 def test_run_manifest_and_progress_log_are_durable_and_serializable(tmp_path):
     with jax.enable_x64():
         problem, layout, _ = setup_problem()
-        config = GravityEstimatorConfig(maximum_iterations=7, optimizer_maxls=100)
+        config = GravityEstimatorConfig(
+            maximum_iterations=7, optimizer_maxls=100, optimizer="scipy"
+        )
         result = estimate_gravity_model(
             problem=problem,
             compact_layout=layout,
@@ -1058,7 +1073,7 @@ def test_negative_binomial_synthetic_fit_recovers_all_minimal_parameters():
             problem=nb_problem,
             compact_layout=layout,
             initial_raw_parameters=np.zeros(3),
-            config=GravityEstimatorConfig(maximum_iterations=100),
+            config=GravityEstimatorConfig(maximum_iterations=100, optimizer="scipy"),
             execution=GravityExecutionPolicy(gradient_strategy="adjoint"),
         )
         assert result.success

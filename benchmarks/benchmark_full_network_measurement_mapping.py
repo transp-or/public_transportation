@@ -1,4 +1,4 @@
-"""Profile event-indexed strict measurement mapping on the TPG full network."""
+"""Profile event-indexed strict measurement mapping on an external scenario."""
 
 from __future__ import annotations
 
@@ -13,9 +13,6 @@ from time import perf_counter
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SCENARIO = ROOT.parent / "public_transport_TPG/processed_data_for_models/full_network"
-
-
 def _compile_and_time(kernel, argument):
     import jax
     import numpy as np
@@ -46,7 +43,12 @@ def _compile_and_time(kernel, argument):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scenario-folder", type=Path, default=DEFAULT_SCENARIO)
+    parser.add_argument(
+        "--scenario-folder",
+        type=Path,
+        required=True,
+        help="Scenario directory supplied by the case owner.",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     source = str(ROOT / "src")

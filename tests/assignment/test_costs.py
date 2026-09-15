@@ -11,8 +11,6 @@ from public_transportation.assignment.config import AssignmentConfig
 from public_transportation.assignment.costs import (
     CostParts,
     link_costs,
-    link_costs_for_group,
-    link_costs_for_interval,
     precompute_base_costs,
     stable_logit_transition_logits,
     typical_cost_scale_from_assignment,
@@ -225,63 +223,6 @@ def test_link_costs_validates_config():
 
     with pytest.raises(ValueError, match="beta_late"):
         link_costs(graph=graph, cost_parts=parts, config=cfg)
-
-
-def test_link_costs_for_group_is_backward_compatible_alias():
-    cfg = AssignmentConfig(beta_transfer=2.5, beta_early=2.0, beta_late=3.0)
-    graph = _mk_graph_with_all_link_types()
-    parts = precompute_base_costs(graph, cfg)
-
-    direct = link_costs(graph=graph, cost_parts=parts, config=cfg)
-    alias = link_costs_for_group(
-        graph=graph,
-        cost_parts=parts,
-        config=cfg,
-        od_groups=object(),
-        group_index=0,
-    )
-
-    assert np.allclose(_as_np(alias), _as_np(direct))
-
-
-def test_link_costs_for_interval_uses_encoded_node_bins_when_present():
-    cfg = AssignmentConfig(beta_transfer=2.5, beta_early=2.0, beta_late=3.0)
-    graph = _mk_graph_with_all_link_types()
-    parts = precompute_base_costs(graph, cfg)
-
-    direct = link_costs(graph=graph, cost_parts=parts, config=cfg)
-    interval = link_costs_for_interval(
-        graph=graph,
-        cost_parts=parts,
-        config=cfg,
-        bin_start_min=999.0,
-        bin_end_min=1000.0,
-    )
-
-    assert np.allclose(_as_np(interval), _as_np(direct))
-
-
-def test_link_costs_for_interval_requires_encoded_node_bins_for_access_links():
-    cfg = AssignmentConfig(beta_early=2.0, beta_late=3.0)
-    graph = _Graph(
-        num_nodes=3,
-        num_links=2,
-        tail=jnp.asarray([0, 0], dtype=jnp.int32),
-        head=jnp.asarray([1, 2], dtype=jnp.int32),
-        link_type=jnp.asarray([LINK_TYPE_ACCESS, LINK_TYPE_ACCESS], dtype=jnp.int32),
-        travel_time=jnp.asarray([0.0, 0.0], dtype=jnp.float32),
-        node_time=jnp.asarray([0.0, 5.0, 25.0], dtype=jnp.float32),
-    )
-    parts = precompute_base_costs(graph, cfg)
-
-    with pytest.raises(TypeError):
-        link_costs_for_interval(
-            graph=graph,
-            cost_parts=parts,
-            config=cfg,
-            bin_start_min=10.0,
-            bin_end_min=20.0,
-        )
 
 
 # ---------------------------------------------------------------------
