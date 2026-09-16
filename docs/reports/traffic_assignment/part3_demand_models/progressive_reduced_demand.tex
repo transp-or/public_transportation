@@ -21,6 +21,28 @@ residuals can otherwise be aliased into every spatial component.  Origin-group
 effects modify productions, whereas destination-group effects modify relative
 attractiveness; they are not interchangeable.
 
+The distinction between baseline, correction, effective attractiveness, and
+production is developed in Section~\ref{sec:destination-attractiveness}.  The
+notation above uses $A^{(0)}_{dt}$ for the positive baseline supplied in
+\texttt{features.destination\_attractiveness}; it is not estimated from the
+count observations by the package.  For a destination-only component,
+$Z^A_{dt}\theta_A$ is the correction $\eta_d$, shared over all time bins.  A
+destination--time component instead supplies $\eta_{dt}$.  In the cell notation
+of the conditional-gravity section, this is the destination contribution
+\[
+    \log A^{(0)}_{d(c),t(c)}+\eta_{d(c)}
+    \quad\text{or}\quad
+    \log A^{(0)}_{d(c),t(c)}+\eta_{d(c),t(c)},
+\]
+with any separate temporal utility written as $\tau_{t(c)}$ (or its declared
+cell-specific extension).  The indices are provided by
+\texttt{destination\_index} and \texttt{time\_period\_index}, and the active
+\texttt{GravityComponentSpecification} is evaluated by
+\texttt{GravityParameterLayout.cell\_effect}.  Writing $P_g=Q_{ot}$ makes the
+production distinction explicit: $Q_{ot}$ sets the total produced by an
+origin--time group, while $A^{(0)}$, $\eta$, and the journey attributes divide
+that total among the feasible cells $C_g$.
+
 The current production implementation includes a deliberately low-dimensional
 time-regime option.  For a case-supplied mapping $r(t)$ from detailed bins to
 regimes, it uses

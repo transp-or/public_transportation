@@ -7,14 +7,16 @@
 \paragraph{Formulation and dimension.}
 Within each origin--departure-time production group, the model distributes a
 declared journey total across feasible destinations through a conditional
-logit expression based on attractiveness, scheduled travel time, transfers,
+logit expression based on supplied destination attractiveness
+(Section~\ref{sec:destination-attractiveness}), scheduled travel time, transfers,
 and any explicitly introduced extensions.  Its dimension is the number of
 shared behavioral coefficients plus the dimension of a declared production
 basis, rather than the number of OD cells.
 
 \paragraph{Required information and identifying assumptions.}
 The minimal model requires feasible journey alternatives, their fixed routing
-shares and attributes, positive destination attractiveness, and either
+shares and attributes, a positive destination-attractiveness baseline and
+correction (Section~\ref{sec:destination-attractiveness}), and either
 externally justified journey productions or a low-dimensional production
 basis.  It assumes a common parametric response to the included attributes and
 conditional independence from omitted attributes.  The normalization within
@@ -25,28 +27,156 @@ unconstrained common additive utility is not identified.
 The shared parameters can be identified from count patterns even when
 individual OD cells cannot, and the fitted OD table follows from the estimated
 parameters and declared productions.  However, this apparent precision is
-conditional on the gravity form, attractiveness values, feasible-set
+conditional on the gravity form, destination-attractiveness baseline and
+correction, feasible-set
 construction, fixed routing, and production assumptions.  Omitted spatial or
 temporal heterogeneity can create systematic residuals.  Because its parameter
 dimension remains small, this is the preferred primary demand model for the
 full-network MAP estimator, subject to adequacy and sensitivity checks.
 
+
+\subsection{Destination Attractiveness: Baseline, Correction, and Effective Value}
+\label{sec:destination-attractiveness}
+
+Destination attractiveness is a supplied input to the public gravity package,
+not a quantity that the package infers directly from observed counts.  Let
+$g=(o,t)$ denote an origin--departure-time production group and let
+$c=(o,d,t)$ denote one OD--time cell.  The set $C_g$ contains the feasible free
+cells in group $g$.  The feature provider supplies a strictly positive baseline
+destination attractiveness $A^{(0)}_{dt}>0$.  An optional estimated
+destination correction is denoted by $\eta_d$; it is shared by all departure
+times for destination $d$.  If a destination--time correction is selected, the
+correction is instead written $\eta_{dt}$.
+
+For the destination-only case, the effective attractiveness is
+\begin{equation}
+    A^{\mathrm{eff}}_{dt}
+    = A^{(0)}_{dt}\exp(\eta_d).
+\end{equation}
+With $T_{odt}$ denoting expected scheduled travel time, $K_{odt}$ expected
+transfers, and $I_{odt}$ any explicitly declared interaction, the conditional
+utility is
+\begin{equation}
+    V_{odt}
+    = \log A^{(0)}_{dt} + \eta_d
+      -\beta_T\frac{T_{odt}}{T_{\mathrm{scale}}}
+      -\beta_K K_{odt} + I_{odt}.
+\end{equation}
+The corresponding within-origin--time probability and OD demand are
+\begin{equation}
+    p_{odt}
+    = \frac{\exp(V_{odt})}
+      {\displaystyle\sum_{(o,d',t)\in C_{(o,t)}}\exp(V_{od't})},
+    \qquad
+    x_{odt}=Q_{ot}p_{odt}.
+\end{equation}
+Here $Q_{ot}$ controls the total demand produced by origin $o$ in time bin
+$t$.  Attractiveness and journey attributes control how that total is divided
+among feasible destinations; destination attractiveness does not create
+additional production.  A destination correction is therefore not
+interchangeable with a production correction.
+
+\paragraph{Construction of the baseline.}
+The public package receives the positive cell-level vector through
+\texttt{GravityFeatures.destination\_attractiveness}.  The feature provider or
+case adapter constructs this vector and records its provenance; there is no
+universal package-side calculation from observations.  In the current
+medium-network adapter, the baseline is constructed as
+\begin{equation}
+    A^{(0)}_{dt}
+      = \sum_{o:(o,d,t)\in C_{\mathrm{free}}}q^{(0)}_{odt},
+\end{equation}
+where $q^{(0)}_{odt}$ is the baseline flow for a free OD--time cell.  The sum
+is over free cells only.  Frozen cells contribute through the separate frozen-
+demand offset and are not folded into this baseline.  The resulting value is
+copied to every free cell with destination $d$ and time bin $t$.  With the
+neutral all-ones seed, this construction is simply the number of eligible free
+origins for $(d,t)$.  It is a model input or prior construction, not an
+observed destination-demand total, and should not be called ``measured
+attractiveness'' unless an external data source actually supplies it.
+
+\paragraph{Fixed and estimated modes.}
+The baseline remains supplied in every mode; what changes is whether an
+additional correction is estimated:
+\begin{table}[htbp]
+\centering\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{p{0.18\linewidth}p{0.22\linewidth}p{0.24\linewidth}p{0.27\linewidth}}
+\hline
+Mode & Baseline offset & Estimated correction & Interpretation\\
+\hline
+Fixed & supplied $A^{(0)}_{dt}$ & none & Destination allocation is determined by the baseline and behavioral attributes\\
+Estimated & supplied $A^{(0)}_{dt}$ & $\eta_d$ & Counts may adjust relative destination attractiveness\\
+Destination--time estimated & supplied $A^{(0)}_{dt}$ & $\eta_{dt}$ & Allows time-varying destination corrections\\
+\hline
+\end{tabular}
+\caption{Destination-attractiveness modes.}
+\end{table}
+Thus \texttt{mode = "fixed"} does not mean that all destinations have
+attractiveness one.  It means that no additional destination correction is
+estimated.  The baseline, correction, and their product have distinct roles:
+$A^{(0)}_{dt}$ is a supplied multiplicative offset, $\eta_d$ is an estimated
+additive utility correction, and $A^{\mathrm{eff}}_{dt}$ is the resulting
+effective attractiveness.
+
+\paragraph{Normalization and regularization.}
+For a destination correction with a sum-to-zero constraint,
+\begin{equation}
+    \sum_{d=1}^{D}\eta_d=0.
+\end{equation}
+Only $D-1$ corrections are stored; the last is reconstructed as the negative
+sum of the others.  Without this constraint, adding a common constant to all
+$\eta_d$ would leave every conditional probability unchanged because the
+constant cancels in the softmax denominator.  The implemented ridge penalty is
+\begin{equation}
+    R_A(\boldsymbol\eta)
+      = \frac{\lambda_A}{2}\sum_{d=1}^{D}\eta_d^2.
+\end{equation}
+The current case adapter specifies $\lambda_A$ directly through the
+\texttt{destination\_ridge} setting in \texttt{GravityRegularization}.  Its
+\texttt{prior\_scale} setting is not consumed by this adapter and must not be
+described as active.  If a future interface instead specifies a Gaussian prior
+standard deviation $\sigma_A$, the equivalent ridge strength is
+$\lambda_A=1/\sigma_A^2$, unless that model defines the prior differently.
+
+\paragraph{A small numerical example.}
+Suppose $A^{(0)}_{d_1,t}=4$, $A^{(0)}_{d_2,t}=2$,
+$\eta_{d_1}=0.1$, and $\eta_{d_2}=-0.1$.  Then
+\begin{equation}
+    A^{\mathrm{eff}}_{d_1,t}=4e^{0.1},
+    \qquad
+    A^{\mathrm{eff}}_{d_2,t}=2e^{-0.1}.
+\end{equation}
+These effective values are combined with the travel-time and transfer
+penalties (and any declared interaction) before the within-origin--time
+normalization.
+
+\paragraph{Public and case-specific responsibilities.}
+The public gravity package defines the mathematical contract and consumes the
+feature vector.  The case adapter constructs the baseline vector, the
+free/frozen mask, destination and time indices, and provenance from
+case-specific OD inputs.  Different cases may therefore use different
+positive baseline constructions, provided that they are explicitly documented
+and included in model provenance.
+
 \subsection{Minimal Conditional Model}
 
-For feasible cell $c$ in production group $g$, let $a_c>0$ be attractiveness,
-$T_c$ expected scheduled travel time, and $K_c$ expected transfers. The minimal
-utility, conditional share, and demand are
+For feasible cell $c=(o,d,t)$ in production group $g=(o,t)$, let
+$d(c)=d$ and $t(c)=t$.  Write $a_c=A^{\mathrm{eff}}_{d(c),t(c)}>0$ for the
+effective attractiveness defined above, and let $T_c$ and $K_c$ be expected
+scheduled travel time and transfers.  With no estimated destination correction
+($\eta_d=0$), the minimal utility, conditional share, and demand are
 \[
  V_c=\log a_c-\beta_T T_c/T_{\mathrm{scale}}-\beta_KK_c,
  \qquad
- p_c=\frac{\exp(V_c)}{\sum_{k\in g}\exp(V_k)},
+ p_c=\frac{\exp(V_c)}{\sum_{k\in C_g}\exp(V_k)},
  \qquad
- x_c=q_gp_c.
+ x_c=Q_{ot}p_c.
 \]
-Externally supplied $q_g$ gives the smallest model. If productions are
+Externally supplied $Q_{ot}$ gives the smallest model. If productions are
 estimated through a declared basis $Z$, a low-dimensional alternative is
 \[
- q_g=q_g^{(0)}\exp((Z\bm\gamma)_g).
+ Q_{ot}=Q_{ot}^{(0)}\exp((Z\bm\gamma)_{ot}).
 \]
 Structural-zero and frozen cells do not receive free gravity-response rows.
 The count mean is obtained by applying the response operator to $\bm x$ and
@@ -61,9 +191,9 @@ departure-time bin to one of $R$ regimes.  The production multiplier is
 \[
     \log m_{o,t}=\alpha+\delta_{r(t)},
     \qquad
-    q_{o,t}=q^{(0)}_{o,t}\,m_{o,t},
+    Q_{ot}=Q^{(0)}_{ot}\,m_{o,t},
     \qquad
-    x_{o,d,t}=q_{o,t}p_{o,d,t}.
+    x_{odt}=Q_{ot}p_{odt}.
 \]
 Here $\alpha$ is the existing global log production scale and $\delta_r$ is a
 regime deviation.  The mapping is supplied by the case adapter through the
@@ -131,6 +261,21 @@ For a general declared model, cell utility and production are
  & x_c & =q_{g(c)}p_c.
 \end{aligned}
 \]
+In this abstract form, $a_c$ is the effective attractiveness
+$A^{\mathrm{eff}}_{d(c),t(c)}$ supplied by the baseline and any selected
+correction.  More explicitly, the destination contribution is
+$\log A^{(0)}_{d(c),t(c)}+\eta_{d(c)}$ for a destination correction, or
+$\log A^{(0)}_{d(c),t(c)}+\eta_{d(c),t(c)}$ for a destination--time correction;
+$\tau_c$ denotes a separate temporal utility contribution.  The feature cache
+provides $A^{(0)}$ through
+\texttt{features.destination\_attractiveness}, while
+\texttt{destination\_index} and \texttt{time\_period\_index} provide the
+grouping used by the declared
+\texttt{GravityComponent\allowbreak{}Specification} and
+\texttt{GravityParameter\allowbreak{}Layout.cell\_effect}.  Thus production corrections
+change $q_g$, whereas destination corrections change relative shares within
+$g$.
+
 Positive behavioral coefficients use a softplus transformation with a small
 strictly positive floor. Production corrections are log multipliers;
 attractiveness and temporal corrections are additive utilities. Categorical
