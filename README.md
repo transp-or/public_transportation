@@ -53,6 +53,11 @@ cross-run comparison without rerunning a model.
 The matching TPG-agnostic driver skeleton and Slurm wrappers are in
 [direct_scheduled_case_template](docs/source/examples/direct_scheduled_case_template/).
 
+Named gravity production/destination specifications, including models that
+estimate production from neutral unit exposure without an observed OD matrix,
+are described in
+[gravity_model_specifications.md](docs/source/gravity_model_specifications.md).
+
 Topology-driven structural-zero detection is configured entirely through TOML.
 Its rules, valid parameter values, conflict policy, audit artifacts, and Python
 workflow are documented in

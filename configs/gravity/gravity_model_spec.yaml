@@ -1,4 +1,12 @@
 # General gravity-model specification (schema 1).
+# For a ready-made model, replace the component blocks with e.g.
+#   preset: zone_time
+#   production_source: unit_exposure
+# See docs/source/gravity_model_specifications.md for the expanded term API.
+# Named preset example (use as a replacement for the legacy blocks below):
+# preset: zone_time
+# production:
+#   baseline: unit_exposure
 # Every estimated degree of freedom is declared below and appears by name in
 # validation output and run manifests. Scopes: none/fixed add no parameter;
 # global adds one; categorical scopes add K-1 normalized parameters; smooth_basis
@@ -36,7 +44,9 @@ time:
   # smooth_basis_name: smooth_time_basis
 
 production:
-  baseline: origin_time_totals
+  # The active template deliberately estimates production from neutral unit
+  # exposure. A priori OD matrices are obsolete and are not accepted.
+  baseline: unit_exposure
   correction:
     scope: global                 # one log scale; conservative active alternative
     parameterization: log_multiplier

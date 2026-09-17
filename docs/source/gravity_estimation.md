@@ -1,5 +1,9 @@
 # Reduced-dimensional gravity estimation
 
+The general production/destination specification interface, named presets, and
+identification rules are documented in
+[`gravity_model_specifications.md`](gravity_model_specifications.md).
+
 Progressive-fidelity objective and gradient evaluation, including deterministic
 shard sampling, quality diagnostics, control-variate anchors, and resumable
 execution, is documented in
@@ -32,10 +36,13 @@ The gravity package represents a complete dynamic OD table as a sparse
 one-dimensional list of canonical OD-time cells. It does not create a dense
 origin-by-destination-by-time tensor. `GravityFeatures` stores immutable cell
 indices, journey times, transfer counts, structural feasibility, externally
-prepared origin-time production totals, and externally prepared positive
-destination-attractiveness offsets. Applications decide how those totals and
-offsets are prepared; the public library performs no geographic downloads or
-smoothing.
+prepared one-dimensional origin-time production totals, and externally
+prepared positive destination-attractiveness offsets. Applications decide how
+those totals and offsets are prepared; the public library performs no
+geographic downloads or smoothing. A priori OD matrices are intentionally
+unsupported and matrix-valued inputs are rejected. Named presets can instead
+use neutral unit exposure and estimate production directly; see
+[`gravity_model_specifications.md`](gravity_model_specifications.md).
 
 Each feature set carries the authoritative OD-layout fingerprint and canonical
 full-OD indices. `validate_compact_layout` verifies both the fingerprint and

@@ -162,7 +162,9 @@ def build_gravity_run_manifest(
                 dict(raw_specification)
             )
         except (TypeError, ValueError) as error:
-            raise ValueError("gravity result model_specification is invalid.") from error
+            raise ValueError(
+                "gravity result model_specification is invalid."
+            ) from error
         if canonical_json(dict(raw_specification)) != canonical_json(
             specification.to_dict()
         ):
@@ -251,12 +253,27 @@ def build_gravity_run_manifest(
         ),
         "acceptance": None if result is None else result.acceptance,
         "convergence_reclassification": (
-            None
-            if result is None
-            else _json_value(result.convergence_reclassification)
+            None if result is None else _json_value(result.convergence_reclassification)
         ),
         "model_specification": specification.to_dict(),
         "specification_fingerprint": specification.fingerprint,
+        "gravity_specification": {
+            "preset": specification.preset,
+            "production_source": specification.production_source,
+            "uses_external_od_matrix": specification.uses_external_od_matrix,
+            "uses_external_production_totals": specification.uses_external_production_totals,
+            "expanded_specification": specification.expanded_specification,
+            "production_terms": [
+                item.to_dict() for item in specification.production_terms
+            ],
+            "destination_attractiveness_terms": [
+                item.to_dict()
+                for item in specification.destination_attractiveness_terms
+            ],
+            "required_feature_mappings": list(specification.required_feature_mappings),
+            "parameter_names": list(problem.parameter_layout.names),
+            "parameter_layout_fingerprint": problem.parameter_layout.fingerprint,
+        },
         "parameter_layout": problem.parameter_layout.to_dict(),
         "parameter_names": list(problem.parameter_layout.names),
         "parameter_blocks": [
@@ -284,13 +301,17 @@ def build_gravity_run_manifest(
             ),
             "additive_flow_operators": {
                 name: block.operator_fingerprint
-                for block in getattr(problem.parameter_layout, "additive_flow_blocks", ())
+                for block in getattr(
+                    problem.parameter_layout, "additive_flow_blocks", ()
+                )
                 for name in (block.name,)
             },
             "initial_onboard_operator": next(
                 (
                     block.operator_fingerprint
-                    for block in getattr(problem.parameter_layout, "additive_flow_blocks", ())
+                    for block in getattr(
+                        problem.parameter_layout, "additive_flow_blocks", ()
+                    )
                     if block.name == "initial_onboard"
                 ),
                 None,
@@ -298,7 +319,9 @@ def build_gravity_run_manifest(
             "terminal_outflow_operator": next(
                 (
                     block.operator_fingerprint
-                    for block in getattr(problem.parameter_layout, "additive_flow_blocks", ())
+                    for block in getattr(
+                        problem.parameter_layout, "additive_flow_blocks", ()
+                    )
                     if block.name == "terminal_outflow"
                 ),
                 None,
@@ -347,9 +370,11 @@ def build_gravity_run_manifest(
             if block.regularization_strength > 0
         ],
         "time_discretization": asdict(specification.time),
-        "destination_attractiveness_provenance": specification.component(
-            "destination_attractiveness"
-        ).source,
+        "destination_attractiveness_provenance": (
+            specification.destination_attractiveness_source
+            if specification.terms
+            else specification.component("destination_attractiveness").source
+        ),
         "operator": {
             "representation": operator.representation,
             "num_free_od": operator.num_free_od,
@@ -383,13 +408,9 @@ def build_gravity_run_manifest(
         "estimator_config": _json_value(estimator_config),
         "execution": _json_value(execution),
         "convergence_diagnostics": {
-            "initial_objective": (
-                None if result is None else result.initial_objective
-            ),
+            "initial_objective": (None if result is None else result.initial_objective),
             "objective": None if result is None else result.objective,
-            "gradient_inf_norm": (
-                None if result is None else result.gradient_inf_norm
-            ),
+            "gradient_inf_norm": (None if result is None else result.gradient_inf_norm),
             "scaled_gradient_inf_norm": (
                 None if result is None else result.scaled_gradient_inf_norm
             ),
@@ -429,26 +450,18 @@ def build_gravity_run_manifest(
             ),
             "objective_dtype": None if result is None else result.objective_dtype,
             "gradient_dtype": None if result is None else result.gradient_dtype,
-            "objective_spacing": (
-                None if result is None else result.objective_spacing
-            ),
+            "objective_spacing": (None if result is None else result.objective_spacing),
             "objective_reduction": (
                 None if result is None else result.objective_reduction
             ),
             "objective_tolerance_below_precision": (
-                None
-                if result is None
-                else result.objective_tolerance_below_precision
+                None if result is None else result.objective_tolerance_below_precision
             ),
             "termination_message": None if result is None else result.message,
             "optimizer": (
-                estimator_config.optimizer
-                if result is None
-                else result.optimizer
+                estimator_config.optimizer if result is None else result.optimizer
             ),
-            "optimizer_message": (
-                None if result is None else result.optimizer_message
-            ),
+            "optimizer_message": (None if result is None else result.optimizer_message),
             "optimizer_iterations": (
                 None if result is None else result.optimizer_iterations
             ),

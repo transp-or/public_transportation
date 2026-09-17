@@ -71,9 +71,7 @@ def _resolve_typical_parameter_scales(
     if scales is None:
         return np.ones(parameter_count, dtype=np.float64)
     if _is_scalar_scale(scales):
-        value = _validate_positive_finite_scale(
-            "typical_parameter_scales", scales
-        )
+        value = _validate_positive_finite_scale("typical_parameter_scales", scales)
         return np.full(parameter_count, value, dtype=np.float64)
     try:
         resolved = np.asarray(tuple(scales), dtype=np.float64)
@@ -82,9 +80,7 @@ def _resolve_typical_parameter_scales(
             "typical_parameter_scales must contain finite positive values."
         ) from error
     if resolved.shape != (parameter_count,):
-        raise ValueError(
-            "typical_parameter_scales must have one value per parameter."
-        )
+        raise ValueError("typical_parameter_scales must have one value per parameter.")
     if not np.all(np.isfinite(resolved)) or np.any(resolved <= 0.0):
         raise ValueError(
             "typical_parameter_scales must contain finite positive values."
@@ -123,9 +119,7 @@ def scaled_gradient_inf_norm(
         raise ValueError("objective must be finite.")
     denominator = max(abs(objective_value), typf)
     components = (
-        np.abs(gradient_array)
-        * np.maximum(np.abs(parameter_array), typx)
-        / denominator
+        np.abs(gradient_array) * np.maximum(np.abs(parameter_array), typx) / denominator
     )
     return float(np.max(components, initial=0.0))
 
@@ -156,9 +150,7 @@ class GravityEstimatorConfig:
         if self.optimizer_maxls <= 0:
             raise ValueError("optimizer_maxls must be positive.")
         if self.optimizer not in ("scipy", "biogeme_tr_bfgs"):
-            raise ValueError(
-                "optimizer must be 'scipy' or 'biogeme_tr_bfgs'."
-            )
+            raise ValueError("optimizer must be 'scipy' or 'biogeme_tr_bfgs'.")
         if self.typical_parameter_scales is not None:
             if _is_scalar_scale(self.typical_parameter_scales):
                 object.__setattr__(
@@ -493,7 +485,9 @@ def _json_safe_result_payload(result: GravityEstimationResult) -> dict[str, obje
         ],
         "additive_flows": [value.tolist() for value in result.additive_flows],
         "observation_scales": (
-            None if result.observation_scales is None else result.observation_scales.tolist()
+            None
+            if result.observation_scales is None
+            else result.observation_scales.tolist()
         ),
     }
 
@@ -516,10 +510,18 @@ def reclassify_gravity_result(
     it must not already exist; the original result is therefore never
     overwritten.
     """
-    if not expected_model_fingerprint or expected_model_fingerprint != result.model_fingerprint:
+    if (
+        not expected_model_fingerprint
+        or expected_model_fingerprint != result.model_fingerprint
+    ):
         raise ValueError("model fingerprint does not match the stored gravity result.")
-    if not expected_operator_fingerprint or expected_operator_fingerprint != result.direct_operator_artifact_fingerprint:
-        raise ValueError("operator fingerprint does not match the stored gravity result.")
+    if (
+        not expected_operator_fingerprint
+        or expected_operator_fingerprint != result.direct_operator_artifact_fingerprint
+    ):
+        raise ValueError(
+            "operator fingerprint does not match the stored gravity result."
+        )
     tolerance = _validate_positive_finite_scale(
         "gradient_tolerance", gradient_tolerance
     )
@@ -643,7 +645,9 @@ def _write_checkpoint(
     }
     if is_biogeme_state:
         if optimizer_package_version is None:
-            raise ValueError("Biogeme checkpoints require the optimizer package version.")
+            raise ValueError(
+                "Biogeme checkpoints require the optimizer package version."
+            )
         payload["optimizer_package_version"] = optimizer_package_version
         payload["optimizer_state"] = optimizer_state
     if auxiliary_observations is not None:
@@ -692,7 +696,9 @@ def _load_checkpoint(
         try:
             from biogeme_optimization.version import __version__
             from biogeme_optimization.state import TrustRegionBFGSState
-        except ImportError as error:  # pragma: no cover - selected dependency is missing
+        except (
+            ImportError
+        ) as error:  # pragma: no cover - selected dependency is missing
             raise ImportError(
                 "Biogeme TR-BFGS resume requires the 'biogeme-optimization' package."
             ) from error
@@ -706,9 +712,16 @@ def _load_checkpoint(
             raise ValueError("Biogeme gravity checkpoint has no optimizer state.")
         optimizer_state = TrustRegionBFGSState.from_dict(serialized_state)
         if not np.array_equal(raw, optimizer_state.x):
-            raise ValueError("gravity checkpoint parameters disagree with optimizer state.")
+            raise ValueError(
+                "gravity checkpoint parameters disagree with optimizer state."
+            )
     if return_optimizer_state:
-        return raw, int(payload.get("iterations", 0)), float(payload.get("elapsed_seconds", 0)), optimizer_state
+        return (
+            raw,
+            int(payload.get("iterations", 0)),
+            float(payload.get("elapsed_seconds", 0)),
+            optimizer_state,
+        )
     return (
         raw,
         int(payload.get("iterations", 0)),
@@ -950,9 +963,7 @@ def _run_biogeme_tr_bfgs(
     from .biogeme_pilot import _BiogemeObjective
 
     resolved_parameter_scales = (
-        _resolve_typical_parameter_scales(
-            initial.size, config.typical_parameter_scales
-        )
+        _resolve_typical_parameter_scales(initial.size, config.typical_parameter_scales)
         if typical_parameter_scales is None
         else np.asarray(typical_parameter_scales, dtype=np.float64)
     )
@@ -994,12 +1005,8 @@ def _run_biogeme_tr_bfgs(
         )
     if hasattr(optimization_result, "solution"):
         solution = np.asarray(optimization_result.solution, dtype=np.float64)
-        messages = _biogeme_messages(
-            getattr(optimization_result, "messages", None)
-        )
-        optimizer_success = bool(
-            getattr(optimization_result, "convergence", False)
-        )
+        messages = _biogeme_messages(getattr(optimization_result, "messages", None))
+        optimizer_success = bool(getattr(optimization_result, "convergence", False))
     else:
         try:
             solution = np.asarray(optimization_result[0], dtype=np.float64)
@@ -1011,9 +1018,7 @@ def _run_biogeme_tr_bfgs(
         optimizer_success = bool(messages.get("convergence", False))
     if solution.shape != initial.shape or not np.all(np.isfinite(solution)):
         raise RuntimeError("Biogeme TR-BFGS returned invalid parameters.")
-    message = messages.get(
-        "Cause of termination", messages.get("message", "")
-    )
+    message = messages.get("Cause of termination", messages.get("message", ""))
     if not message:
         message = "Biogeme TR-BFGS did not provide a termination message."
     iterations = _biogeme_iteration_count(
@@ -1438,9 +1443,7 @@ def estimate_gravity_model(
                         ),
                         model_fingerprint=model_fingerprint,
                         stop_requested=(
-                            None
-                            if deadline is None
-                            else lambda: clock() >= deadline
+                            None if deadline is None else lambda: clock() >= deadline
                         ),
                     )
             except _DeadlineStop as stop:
@@ -1461,7 +1464,9 @@ def estimate_gravity_model(
             else:
                 assert optimizer_run is not None
                 solver_raw = optimizer_run.raw_parameters
-                if latest_evaluation is None or not np.array_equal(latest_raw, solver_raw):
+                if latest_evaluation is None or not np.array_equal(
+                    latest_raw, solver_raw
+                ):
                     evaluate(solver_raw)
                     assert latest_evaluation is not None
                     accepted_objectives.append(float(latest_evaluation.objective))
@@ -1499,9 +1504,7 @@ def estimate_gravity_model(
             else max(0, completed_iterations - optimizer_start_iterations)
         )
     )
-    optimizer_evaluations = (
-        0 if optimizer_run is None else optimizer_run.evaluations
-    )
+    optimizer_evaluations = 0 if optimizer_run is None else optimizer_run.evaluations
     optimizer_options = {} if optimizer_run is None else optimizer_run.options
     assert latest_evaluation is not None
     objective_value = float(latest_evaluation.objective)
@@ -1520,9 +1523,7 @@ def estimate_gravity_model(
         success = bool(scaled_gradient <= config.gradient_tolerance)
         status = "converged" if success else "iteration_limit"
     objective_array = np.asarray(latest_evaluation.objective)
-    objective_spacing = float(
-        np.spacing(objective_array.dtype.type(objective_value))
-    )
+    objective_spacing = float(np.spacing(objective_array.dtype.type(objective_value)))
     objective_reduction = (
         None
         if len(accepted_objectives) < 2
@@ -1643,9 +1644,13 @@ def estimate_gravity_model(
             "bin_labels": list(problem.parameter_layout.specification.time.bin_labels),
             "smooth_basis_name": problem.parameter_layout.specification.time.smooth_basis_name,
         },
-        problem.parameter_layout.specification.component(
-            "destination_attractiveness"
-        ).source,
+        (
+            problem.parameter_layout.specification.destination_attractiveness_source
+            if problem.parameter_layout.specification.terms
+            else problem.parameter_layout.specification.component(
+                "destination_attractiveness"
+            ).source
+        ),
         count_log_likelihood=float(latest_evaluation.count_log_likelihood),
         auxiliary_log_likelihood=float(latest_evaluation.auxiliary_log_likelihood),
         auxiliary_channel_log_likelihoods=tuple(

@@ -47,6 +47,13 @@ def gravity_demand_kernel(
     feasible = jnp.asarray(structural_feasible, dtype=jnp.bool_)
     groups = jnp.asarray(origin_time_group_index, dtype=jnp.int32)
     totals = jnp.asarray(origin_time_totals, dtype=raw.dtype)
+    if totals.ndim != 1:
+        raise ValueError(
+            "a priori OD matrix is obsolete and unsupported; "
+            "matrix-valued a priori OD matrices are not accepted; "
+            "origin_time_totals must be a one-dimensional origin-time totals vector, "
+            f"got shape {totals.shape}."
+        )
     attractiveness = jnp.asarray(destination_attractiveness, dtype=raw.dtype)
     utility = (
         -beta_time * time / jnp.asarray(journey_time_scale, dtype=raw.dtype)
@@ -87,9 +94,7 @@ def generate_gravity_demand(
     raw = jnp.asarray(raw_parameters)
     groups = jnp.asarray(features.origin_time_group_index, dtype=jnp.int32)
     feasible = jnp.asarray(features.structural_feasible, dtype=jnp.bool_)
-    time_coefficient = parameter_layout.cell_effect(
-        raw, "journey_time", features
-    )
+    time_coefficient = parameter_layout.cell_effect(raw, "journey_time", features)
     explicit_component_names = {
         item.name for item in parameter_layout.specification.components
     }
@@ -107,8 +112,7 @@ def generate_gravity_demand(
         -time_coefficient
         * jnp.asarray(features.journey_time, dtype=raw.dtype)
         / features.journey_time_scale
-        - transfer_coefficient
-        * jnp.asarray(features.transfer_count, dtype=raw.dtype)
+        - transfer_coefficient * jnp.asarray(features.transfer_count, dtype=raw.dtype)
         + jnp.log(jnp.asarray(features.destination_attractiveness, dtype=raw.dtype))
     )
     waiting = parameter_layout.specification.component("waiting_time")
@@ -125,19 +129,30 @@ def generate_gravity_demand(
     utility = utility + parameter_layout.cell_effect(
         raw, "destination_attractiveness", features
     )
+    if parameter_layout.specification.terms:
+        utility = utility + parameter_layout.destination_utility_effect(raw, features)
     if not legacy_temporal_coefficient:
         utility = utility + parameter_layout.cell_effect(raw, "temporal", features)
     masked = jnp.where(feasible, utility, -jnp.inf)
-    maximum = jax.ops.segment_max(masked, groups, num_segments=features.num_origin_time_groups)
+    maximum = jax.ops.segment_max(
+        masked, groups, num_segments=features.num_origin_time_groups
+    )
     weights = jnp.where(feasible, jnp.exp(masked - maximum[groups]), 0)
-    denominator = jax.ops.segment_sum(weights, groups, num_segments=features.num_origin_time_groups)
+    denominator = jax.ops.segment_sum(
+        weights, groups, num_segments=features.num_origin_time_groups
+    )
     probabilities = jnp.where(feasible, weights / denominator[groups], 0)
     log_multiplier = parameter_layout.production_group_log_multiplier(raw, features)
-    totals = jnp.asarray(features.origin_time_totals, dtype=raw.dtype) * jnp.exp(
-        log_multiplier
+    base_totals = (
+        jnp.ones_like(jnp.asarray(features.origin_time_totals, dtype=raw.dtype))
+        if parameter_layout.specification.production_source == "unit_exposure"
+        else jnp.asarray(features.origin_time_totals, dtype=raw.dtype)
     )
+    totals = base_totals * jnp.exp(log_multiplier)
     demand = probabilities * totals[groups]
-    sums = jax.ops.segment_sum(demand, groups, num_segments=features.num_origin_time_groups)
+    sums = jax.ops.segment_sum(
+        demand, groups, num_segments=features.num_origin_time_groups
+    )
     return GravityDemandResult(demand, probabilities, masked, sums)
 
 
@@ -171,7 +186,9 @@ def gravity_demand_numpy_reference(
         component = parameter_layout.specification.component(component_name)
         block = parameter_layout.block(component_name)
         if block is None:
-            return float(0.0 if component.fixed_value is None else component.fixed_value)
+            return float(
+                0.0 if component.fixed_value is None else component.fixed_value
+            )
         value = float(raw[block.parameter_slice.start])
         if block.parameterization is GravityParameterization.POSITIVE:
             return float(np.logaddexp(0.0, value) + parameter_layout.positivity_floor)
@@ -209,14 +226,16 @@ def gravity_demand_numpy_reference(
         time_coefficient = time_coefficient * np.exp(cell_effect("temporal"))
     temporal_utility = 0.0 if legacy_temporal_coefficient else cell_effect("temporal")
     utility = (
-        -time_coefficient
-        * features.journey_time
-        / features.journey_time_scale
+        -time_coefficient * features.journey_time / features.journey_time_scale
         - cell_effect("transfer") * features.transfer_count
         + np.log(features.destination_attractiveness)
         + cell_effect("destination_attractiveness")
         + temporal_utility
     )
+    if parameter_layout.specification.terms:
+        utility = utility + np.asarray(
+            parameter_layout.destination_utility_effect(raw, features)
+        )
     waiting = parameter_layout.specification.component("waiting_time")
     if waiting.scope not in (GravityEffectScope.NONE, GravityEffectScope.FIXED) or (
         waiting.fixed_value not in (None, 0.0)
@@ -227,7 +246,11 @@ def gravity_demand_numpy_reference(
             )
         utility = utility - cell_effect("waiting_time") * features.initial_waiting_time
     production = parameter_layout.specification.component("production")
-    if production.scope in (GravityEffectScope.NONE, GravityEffectScope.FIXED):
+    if parameter_layout.specification.production_terms:
+        log_multipliers = np.asarray(
+            parameter_layout.production_group_log_multiplier(raw, features)
+        )
+    elif production.scope in (GravityEffectScope.NONE, GravityEffectScope.FIXED):
         log_multipliers = np.full(
             features.num_origin_time_groups, scalar_or_base("production")
         )
@@ -242,13 +265,9 @@ def gravity_demand_numpy_reference(
             mapping = features.mapping(deviation_block.mapping)
             assert mapping is not None
             per_cell = deviation_values[np.asarray(mapping)]
-            log_multipliers = np.zeros(
-                features.num_origin_time_groups, dtype=raw.dtype
-            )
+            log_multipliers = np.zeros(features.num_origin_time_groups, dtype=raw.dtype)
             for group in range(features.num_origin_time_groups):
-                positions = np.flatnonzero(
-                    features.origin_time_group_index == group
-                )
+                positions = np.flatnonzero(features.origin_time_group_index == group)
                 log_multipliers[group] = scalar_or_base("production") + float(
                     np.mean(per_cell[positions])
                 )
@@ -259,6 +278,11 @@ def gravity_demand_numpy_reference(
             log_multipliers[group] = per_cell[
                 np.flatnonzero(features.origin_time_group_index == group)[0]
             ]
+    base_totals = (
+        np.ones(features.num_origin_time_groups, dtype=features.dtype)
+        if parameter_layout.specification.production_source == "unit_exposure"
+        else features.origin_time_totals
+    )
     demand = np.zeros(features.num_cells, dtype=features.dtype)
     for group in range(features.num_origin_time_groups):
         positions = np.flatnonzero(
@@ -267,7 +291,7 @@ def gravity_demand_numpy_reference(
         shifted = utility[positions] - np.max(utility[positions])
         weights = np.exp(shifted)
         demand[positions] = (
-            features.origin_time_totals[group]
+            base_totals[group]
             * np.exp(log_multipliers[group])
             * weights
             / weights.sum()

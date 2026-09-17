@@ -93,6 +93,8 @@ from .gravity import (  # noqa: F401
     GravityLineageProgressionResult,
     GravityLikelihood,
     GravityModelSpecification,
+    GravityTermSpecification,
+    gravity_model_specification_from_preset,
     GravityModelComparison,
     GravityModelLineage,
     GravityModelNode,

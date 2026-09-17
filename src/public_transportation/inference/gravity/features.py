@@ -14,6 +14,56 @@ from public_transportation.inference.compact_od_assignment_layout import (
 )
 
 
+_OBSOLETE_OD_MATRIX_KEYS = frozenset(
+    {
+        "od_matrix",
+        "a_priori_od_matrix",
+        "a-priori_od_matrix",
+        "a-priori-od-matrix",
+        "a_priori_od",
+        "a-priori-od",
+        "a_priori_matrix",
+        "a-priori-matrix",
+        "apriori_od_matrix",
+        "apriori-od-matrix",
+        "apriori_od",
+        "apriori_matrix",
+        "prior_od_matrix",
+        "prior_od",
+        "prior_matrix",
+        "baseline_od_matrix",
+        "baseline-od-matrix",
+        "external_od_matrix",
+        "external-od-matrix",
+        "demand_matrix",
+    }
+)
+
+
+def _reject_obsolete_od_matrix_fields(
+    payload: Mapping[str, object], *, context: str
+) -> None:
+    """Reject the removed matrix-valued gravity input explicitly.
+
+    Gravity features use a one-dimensional origin-time total.  An OD matrix
+    is not a legacy spelling of that field: accepting one would change the
+    model's production contract and can silently produce a different fit.
+    """
+
+    present = sorted(
+        str(key)
+        for key in payload
+        if str(key).strip().lower() in _OBSOLETE_OD_MATRIX_KEYS
+    )
+    if present:
+        raise ValueError(
+            "a priori OD matrix is obsolete and unsupported; "
+            "matrix-valued a priori OD matrices are not accepted; "
+            f"remove {context} field(s) {present} and provide a one-dimensional "
+            "origin_time_totals vector or use unit_exposure."
+        )
+
+
 def _immutable_vector(value: object, *, name: str, dtype: np.dtype) -> np.ndarray:
     array = np.array(value, dtype=dtype, copy=True)
     if array.ndim != 1:
@@ -42,7 +92,7 @@ class GravityFeatures:
     journey_time: np.ndarray
     transfer_count: np.ndarray
     structural_feasible: np.ndarray
-    origin_time_totals: np.ndarray
+    origin_time_totals: np.ndarray | None
     destination_attractiveness: np.ndarray
     num_origins: int
     num_destinations: int
@@ -54,6 +104,8 @@ class GravityFeatures:
     destination_zone_index: np.ndarray | None = None
     time_period_index: np.ndarray | None = None
     destination_time_group_index: np.ndarray | None = None
+    origin_zone_time_index: np.ndarray | None = None
+    destination_zone_time_index: np.ndarray | None = None
     zone_pair_index: np.ndarray | None = None
     custom_group_indices: Mapping[str, np.ndarray] = field(default_factory=dict)
     smooth_time_basis: np.ndarray | None = None
@@ -77,11 +129,26 @@ class GravityFeatures:
                 _immutable_vector(source, name=name, dtype=np.dtype(np.int64)),
             )
         journey_source = np.asarray(self.journey_time)
-        totals_source = np.asarray(self.origin_time_totals)
-        attractiveness_source = np.asarray(self.destination_attractiveness)
         if journey_source.dtype.kind not in "f":
             raise TypeError("journey_time must use a floating-point dtype.")
         dtype = journey_source.dtype
+        if self.origin_time_totals is None:
+            # Neutral exposure mode does not require observed production
+            # totals.  Keep a one-per-origin/time placeholder so group
+            # indexing and serialization remain well-defined.
+            group_count = int(np.max(self.origin_time_group_index, initial=-1)) + 1
+            totals_source = np.ones(group_count, dtype=dtype)
+            object.__setattr__(self, "origin_time_totals", totals_source)
+        else:
+            totals_source = np.asarray(self.origin_time_totals)
+            if totals_source.ndim != 1:
+                raise ValueError(
+                    "a priori OD matrix is obsolete and unsupported; "
+                    "matrix-valued a priori OD matrices are not accepted; "
+                    "origin_time_totals must be a one-dimensional origin-time "
+                    f"totals vector, got {totals_source.shape}."
+                )
+        attractiveness_source = np.asarray(self.destination_attractiveness)
         for name, source in (
             ("journey_time", journey_source),
             ("origin_time_totals", totals_source),
@@ -118,6 +185,8 @@ class GravityFeatures:
             "destination_zone_index",
             "time_period_index",
             "destination_time_group_index",
+            "origin_zone_time_index",
+            "destination_zone_time_index",
             "zone_pair_index",
         ):
             value = getattr(self, name)
@@ -143,6 +212,31 @@ class GravityFeatures:
             if prepared.size != cell_count:
                 raise ValueError(f"{name} must contain {cell_count} cells.")
             object.__setattr__(self, name, prepared)
+        # Build deterministic contiguous pair IDs when the component mappings
+        # are supplied.  They are ordinary cell mappings and therefore remain
+        # fully serializable and fingerprinted like every other feature.
+        for combined_name, zone_name in (
+            ("origin_zone_time_index", "origin_zone_index"),
+            ("destination_zone_time_index", "destination_zone_index"),
+        ):
+            if getattr(self, combined_name) is not None:
+                continue
+            zone = getattr(self, zone_name)
+            time = self.time_period_index
+            if zone is None or time is None:
+                continue
+            _, inverse = np.unique(
+                np.column_stack((zone, time)), axis=0, return_inverse=True
+            )
+            object.__setattr__(
+                self,
+                combined_name,
+                _immutable_vector(
+                    inverse,
+                    name=combined_name,
+                    dtype=np.dtype(np.int64),
+                ),
+            )
         custom: dict[str, np.ndarray] = {}
         for name, value in self.custom_group_indices.items():
             if not name or name in self.available_mapping_names:
@@ -274,7 +368,9 @@ class GravityFeatures:
             "time_period_index",
             "origin_time_group_index",
             "origin_zone_index",
+            "origin_zone_time_index",
             "destination_zone_index",
+            "destination_zone_time_index",
             "destination_time_group_index",
             "zone_pair_index",
             "smooth_time_basis",
@@ -307,7 +403,9 @@ class GravityFeatures:
                 )
             return array
         if array.ndim != 1 or array.shape != (self.num_cells,):
-            raise ValueError(f"feature mapping {name!r} must contain {self.num_cells} cells.")
+            raise ValueError(
+                f"feature mapping {name!r} must contain {self.num_cells} cells."
+            )
         if array.dtype.kind not in "iu":
             raise TypeError(f"feature mapping {name!r} must contain integers.")
         if not np.array_equal(np.unique(array), np.arange(group_count)):
@@ -333,27 +431,29 @@ class GravityFeatures:
     @property
     def fingerprint(self) -> str:
         payload = {
-                "schema_version": 1,
-                "origin_index": self.origin_index,
-                "canonical_od_index": self.canonical_od_index,
-                "destination_index": self.destination_index,
-                "departure_time_index": self.departure_time_index,
-                "origin_time_group_index": self.origin_time_group_index,
-                "journey_time": self.journey_time,
-                "transfer_count": self.transfer_count,
-                "structural_feasible": self.structural_feasible,
-                "origin_time_totals": self.origin_time_totals,
-                "destination_attractiveness": self.destination_attractiveness,
-                "num_origins": self.num_origins,
-                "num_destinations": self.num_destinations,
-                "num_departure_times": self.num_departure_times,
-                "od_layout_fingerprint": self.od_layout_fingerprint,
-                "journey_time_scale": self.journey_time_scale,
-                "dtype": str(self.dtype),
-                "initial_waiting_time": self.initial_waiting_time,
-                "origin_zone_index": self.origin_zone_index,
-                "destination_zone_index": self.destination_zone_index,
-                "time_period_index": self.time_period_index,
+            "schema_version": 1,
+            "origin_index": self.origin_index,
+            "canonical_od_index": self.canonical_od_index,
+            "destination_index": self.destination_index,
+            "departure_time_index": self.departure_time_index,
+            "origin_time_group_index": self.origin_time_group_index,
+            "journey_time": self.journey_time,
+            "transfer_count": self.transfer_count,
+            "structural_feasible": self.structural_feasible,
+            "origin_time_totals": self.origin_time_totals,
+            "destination_attractiveness": self.destination_attractiveness,
+            "num_origins": self.num_origins,
+            "num_destinations": self.num_destinations,
+            "num_departure_times": self.num_departure_times,
+            "od_layout_fingerprint": self.od_layout_fingerprint,
+            "journey_time_scale": self.journey_time_scale,
+            "dtype": str(self.dtype),
+            "initial_waiting_time": self.initial_waiting_time,
+            "origin_zone_index": self.origin_zone_index,
+            "destination_zone_index": self.destination_zone_index,
+            "time_period_index": self.time_period_index,
+            "origin_zone_time_index": self.origin_zone_time_index,
+            "destination_zone_time_index": self.destination_zone_time_index,
         }
         if (
             self.destination_time_group_index is not None
@@ -363,11 +463,11 @@ class GravityFeatures:
         ):
             payload.update(
                 {
-                "schema_version": 2,
-                "destination_time_group_index": self.destination_time_group_index,
-                "zone_pair_index": self.zone_pair_index,
-                "custom_group_indices": dict(self.custom_group_indices),
-                "smooth_time_basis": self.smooth_time_basis,
+                    "schema_version": 2,
+                    "destination_time_group_index": self.destination_time_group_index,
+                    "zone_pair_index": self.zone_pair_index,
+                    "custom_group_indices": dict(self.custom_group_indices),
+                    "smooth_time_basis": self.smooth_time_basis,
                 }
             )
         return fingerprint(payload)
@@ -416,6 +516,16 @@ class GravityFeatures:
                 if self.destination_time_group_index is None
                 else self.destination_time_group_index.tolist()
             ),
+            "origin_zone_time_index": (
+                None
+                if self.origin_zone_time_index is None
+                else self.origin_zone_time_index.tolist()
+            ),
+            "destination_zone_time_index": (
+                None
+                if self.destination_zone_time_index is None
+                else self.destination_zone_time_index.tolist()
+            ),
             "zone_pair_index": (
                 None if self.zone_pair_index is None else self.zone_pair_index.tolist()
             ),
@@ -432,6 +542,7 @@ class GravityFeatures:
 
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> GravityFeatures:
+        _reject_obsolete_od_matrix_fields(payload, context="gravity feature")
         if payload.get("schema_version") not in (1, 2):
             raise ValueError("unsupported gravity feature schema version.")
         dtype = np.dtype(str(payload["dtype"]))
@@ -477,6 +588,16 @@ class GravityFeatures:
                 None
                 if payload.get("destination_time_group_index") is None
                 else np.asarray(payload["destination_time_group_index"])
+            ),
+            origin_zone_time_index=(
+                None
+                if payload.get("origin_zone_time_index") is None
+                else np.asarray(payload["origin_zone_time_index"])
+            ),
+            destination_zone_time_index=(
+                None
+                if payload.get("destination_zone_time_index") is None
+                else np.asarray(payload["destination_zone_time_index"])
             ),
             zone_pair_index=(
                 None

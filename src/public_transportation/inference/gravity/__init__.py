@@ -186,6 +186,8 @@ from .specification import (
     GravityRegularization,
     GravityRegularizationType,
     GravityTimeSpecification,
+    GravityTermSpecification,
+    gravity_model_specification_from_preset,
 )
 from .relaxations import (
     GravityRelaxationInfo,

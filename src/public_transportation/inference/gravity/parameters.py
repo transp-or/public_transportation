@@ -23,6 +23,7 @@ from .specification import (
     GravityModelSpecification,
     GravityParameterization,
     GravityRegularizationType,
+    GravityTermSpecification,
 )
 
 
@@ -41,7 +42,9 @@ _DEFAULT_MAPPINGS = {
     GravityEffectScope.ORIGIN_TIME: "origin_time_group_index",
     GravityEffectScope.DESTINATION_TIME: "destination_time_group_index",
     GravityEffectScope.ORIGIN_ZONE: "origin_zone_index",
+    GravityEffectScope.ORIGIN_ZONE_TIME: "origin_zone_time_index",
     GravityEffectScope.DESTINATION_ZONE: "destination_zone_index",
+    GravityEffectScope.DESTINATION_ZONE_TIME: "destination_zone_time_index",
     GravityEffectScope.ZONE_PAIR: "zone_pair_index",
 }
 
@@ -62,6 +65,10 @@ class GravityParameterBlock:
     regularization_type: GravityRegularizationType
     regularization_strength: float
     parent_component: str | None = None
+    row_mapping: str | None = None
+    column_mapping: str | None = None
+    row_group_count: int = 0
+    column_group_count: int = 0
 
     @property
     def size(self) -> int:
@@ -86,19 +93,23 @@ class GravityParameterBlock:
         }
         if self.parent_component is not None:
             payload["parent_component"] = self.parent_component
+        if self.row_mapping is not None:
+            payload["row_mapping"] = self.row_mapping
+        if self.column_mapping is not None:
+            payload["column_mapping"] = self.column_mapping
+        if self.row_group_count:
+            payload["row_group_count"] = self.row_group_count
+        if self.column_group_count:
+            payload["column_group_count"] = self.column_group_count
         return payload
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> GravityParameterBlock:
-        regularization = cast(
-            Mapping[str, object], payload.get("regularization", {})
-        )
+        regularization = cast(Mapping[str, object], payload.get("regularization", {}))
         return cls(
             component=str(payload["component"]),
             scope=GravityEffectScope(str(payload["scope"])),
-            parameterization=GravityParameterization(
-                str(payload["parameterization"])
-            ),
+            parameterization=GravityParameterization(str(payload["parameterization"])),
             constraint=GravityConstraint(str(payload["constraint"])),
             mapping=(
                 None if payload.get("mapping") is None else str(payload["mapping"])
@@ -120,6 +131,14 @@ class GravityParameterBlock:
                 if payload.get("parent_component") is None
                 else str(payload["parent_component"])
             ),
+            row_mapping=None
+            if payload.get("row_mapping") is None
+            else str(payload["row_mapping"]),
+            column_mapping=None
+            if payload.get("column_mapping") is None
+            else str(payload["column_mapping"]),
+            row_group_count=int(payload.get("row_group_count", 0)),
+            column_group_count=int(payload.get("column_group_count", 0)),
         )
 
 
@@ -154,8 +173,7 @@ def _component_names(component: GravityComponentSpecification) -> tuple[str, ...
     }.get((component.name, component.scope))
     prefix = legacy_prefix or f"{component.name}.deviation"
     result.extend(
-        f"{prefix}[{index}]"
-        for index in range(component.parameter_count - len(result))
+        f"{prefix}[{index}]" for index in range(component.parameter_count - len(result))
     )
     return tuple(result)
 
@@ -170,9 +188,15 @@ def _deviation_names(component: GravityComponentSpecification) -> tuple[str, ...
         and deviation.scope is GravityEffectScope.TIME_PERIOD
         else f"{component.name}_deviation"
     )
-    return tuple(
-        f"{prefix}[{index}]" for index in range(deviation.parameter_count)
-    )
+    return tuple(f"{prefix}[{index}]" for index in range(deviation.parameter_count))
+
+
+def _term_names(term: GravityTermSpecification) -> tuple[str, ...]:
+    if term.parameter_count == 0:
+        return ()
+    if term.scope is GravityEffectScope.GLOBAL:
+        return (term.name,)
+    return tuple(f"{term.name}[{index}]" for index in range(term.parameter_count))
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,9 +229,13 @@ class GravityParameterLayout:
                         constraint=component.constraint,
                         mapping=component.grouping
                         or _DEFAULT_MAPPINGS.get(component.scope),
-                        group_count=0 if component.deviation is not None else component.group_count,
+                        group_count=0
+                        if component.deviation is not None
+                        else component.group_count,
                         reference_category=(
-                            None if component.deviation is not None else component.reference_category
+                            None
+                            if component.deviation is not None
+                            else component.reference_category
                         ),
                         parameter_slice=slice(start, stop),
                         names=names,
@@ -217,7 +245,9 @@ class GravityParameterLayout:
                             else component.regularization.kind
                         ),
                         regularization_strength=(
-                            0.0 if component.deviation is not None else component.regularization.strength
+                            0.0
+                            if component.deviation is not None
+                            else component.regularization.strength
                         ),
                     )
                 )
@@ -250,6 +280,35 @@ class GravityParameterLayout:
                     )
                 )
                 start = stop
+        for term in self.specification.terms:
+            names = _term_names(term)
+            if not names:
+                continue
+            stop = start + len(names)
+            result.append(
+                GravityParameterBlock(
+                    component=term.name,
+                    scope=term.scope,
+                    parameterization=term.parameterization,
+                    constraint=term.constraint,
+                    mapping=term.grouping or _DEFAULT_MAPPINGS.get(term.scope),
+                    group_count=(
+                        0
+                        if term.scope is GravityEffectScope.GLOBAL
+                        else term.group_count
+                    ),
+                    reference_category=term.reference_category,
+                    parameter_slice=slice(start, stop),
+                    names=names,
+                    regularization_type=term.regularization.kind,
+                    regularization_strength=term.regularization.strength,
+                    row_mapping=term.row_grouping,
+                    column_mapping=term.column_grouping,
+                    row_group_count=term.row_group_count,
+                    column_group_count=term.column_group_count,
+                )
+            )
+            start = stop
         return tuple(result)
 
     @property
@@ -270,7 +329,11 @@ class GravityParameterLayout:
         }
         for block in self.blocks:
             result[block.component] = block.parameter_slice
-            for name, index in zip(block.names, range(block.parameter_slice.start, block.parameter_slice.stop), strict=True):
+            for name, index in zip(
+                block.names,
+                range(block.parameter_slice.start, block.parameter_slice.stop),
+                strict=True,
+            ):
                 result[name] = slice(index, index + 1)
             legacy = aliases.get(block.component)
             if legacy is not None and block.scope in (
@@ -324,7 +387,11 @@ class GravityParameterLayout:
             reference = block.reference_category
             assert reference is not None
             return jnp.concatenate(
-                (values[:reference], jnp.zeros((1,), dtype=raw.dtype), values[reference:])
+                (
+                    values[:reference],
+                    jnp.zeros((1,), dtype=raw.dtype),
+                    values[reference:],
+                )
             )
         raise ValueError(f"grouped component {component!r} lacks a constraint.")
 
@@ -334,7 +401,9 @@ class GravityParameterLayout:
         specification = self.specification.component(component)
         block = self.block(component)
         if block is None:
-            value = 0.0 if specification.fixed_value is None else specification.fixed_value
+            value = (
+                0.0 if specification.fixed_value is None else specification.fixed_value
+            )
             return jnp.asarray(value, dtype=raw.dtype)
         value = raw[block.parameter_slice.start]
         if block.parameterization is GravityParameterization.POSITIVE:
@@ -351,6 +420,11 @@ class GravityParameterLayout:
     ) -> jax.Array:
         """Return a scalar or per-cell physical effect for one component."""
         raw = self._raw(raw_parameters)
+        term = next(
+            (item for item in self.specification.terms if item.name == component), None
+        )
+        if term is not None:
+            return self.term_effect(raw, term.name, features)
         specification = self.specification.component(component)
         block = self.block(component)
         if block is None or specification.scope in (
@@ -371,17 +445,116 @@ class GravityParameterLayout:
             return self.scalar_or_base(raw, component) * jnp.exp(deviations)
         return deviations
 
+    def term_effect(
+        self,
+        raw_parameters: object,
+        term_name: str,
+        features: GravityFeatures,
+    ) -> jax.Array:
+        """Return the per-cell effect of one composable production/destination term."""
+        raw = self._raw(raw_parameters)
+        term = next(
+            (item for item in self.specification.terms if item.name == term_name), None
+        )
+        if term is None:
+            raise ValueError(f"unknown gravity term {term_name!r}.")
+        block = self.block(term_name)
+        if term.scope in (GravityEffectScope.NONE, GravityEffectScope.FIXED):
+            return jnp.asarray(
+                0.0 if term.fixed_value is None else term.fixed_value, dtype=raw.dtype
+            )
+        if term.scope is GravityEffectScope.GLOBAL:
+            assert block is not None
+            return raw[block.parameter_slice.start]
+        if block is None:
+            raise ValueError(f"gravity term {term_name!r} has no parameter block.")
+        if term.constraint is GravityConstraint.TWO_WAY_CENTERED:
+            if not block.row_mapping or not block.column_mapping:
+                raise ValueError(f"term {term_name!r} lacks row/column mappings.")
+            rows = jnp.asarray(features.mapping(block.row_mapping), dtype=jnp.int32)
+            columns = jnp.asarray(
+                features.mapping(block.column_mapping), dtype=jnp.int32
+            )
+            free = raw[block.parameter_slice].reshape(
+                (block.row_group_count - 1, block.column_group_count - 1)
+            )
+            row_basis = jnp.concatenate(
+                (
+                    jnp.eye(block.row_group_count - 1, dtype=raw.dtype),
+                    -jnp.ones((1, block.row_group_count - 1), dtype=raw.dtype),
+                ),
+                axis=0,
+            )
+            column_basis = jnp.concatenate(
+                (
+                    jnp.eye(block.column_group_count - 1, dtype=raw.dtype),
+                    -jnp.ones((1, block.column_group_count - 1), dtype=raw.dtype),
+                ),
+                axis=0,
+            )
+            matrix = row_basis @ free @ column_basis.T
+            return matrix[rows, columns]
+        assert block.mapping is not None
+        indices = jnp.asarray(features.mapping(block.mapping), dtype=jnp.int32)
+        values = raw[block.parameter_slice]
+        if term.constraint is GravityConstraint.SUM_ZERO:
+            values = jnp.concatenate((values, -jnp.sum(values, keepdims=True)))
+        elif term.constraint is GravityConstraint.REFERENCE:
+            reference = term.reference_category
+            assert reference is not None
+            values = jnp.concatenate(
+                (
+                    values[:reference],
+                    jnp.zeros((1,), dtype=raw.dtype),
+                    values[reference:],
+                )
+            )
+        else:
+            raise ValueError(f"term {term_name!r} lacks a supported constraint.")
+        return values[indices]
+
+    def destination_utility_effect(
+        self, raw_parameters: object, features: GravityFeatures
+    ) -> jax.Array:
+        result = jnp.zeros(features.num_cells, dtype=jnp.asarray(raw_parameters).dtype)
+        for term in self.specification.terms:
+            if term.target == "destination_attractiveness":
+                result = result + self.term_effect(raw_parameters, term.name, features)
+        return result
+
     def production_group_log_multiplier(
         self, raw_parameters: object, features: GravityFeatures
     ) -> jax.Array:
         """Return one production log multiplier per origin-time total."""
         raw = self._raw(raw_parameters)
+        if self.specification.terms:
+            production_terms = tuple(
+                item for item in self.specification.terms if item.target == "production"
+            )
+            if production_terms:
+                result = jnp.zeros(features.num_origin_time_groups, dtype=raw.dtype)
+                groups = jnp.asarray(features.origin_time_group_index, dtype=jnp.int32)
+                counts = jax.ops.segment_sum(
+                    jnp.ones(features.num_cells, dtype=raw.dtype),
+                    groups,
+                    num_segments=features.num_origin_time_groups,
+                )
+                for term in production_terms:
+                    per_cell = self.term_effect(raw, term.name, features)
+                    result = (
+                        result
+                        + jax.ops.segment_sum(
+                            per_cell,
+                            groups,
+                            num_segments=features.num_origin_time_groups,
+                        )
+                        / counts
+                    )
+                return result
         component = self.specification.component("production")
         if component.scope in (GravityEffectScope.NONE, GravityEffectScope.FIXED):
             fixed = 0.0 if component.fixed_value is None else component.fixed_value
-            return jnp.full(
-                (features.num_origin_time_groups,), fixed, dtype=raw.dtype
-            )
+            return jnp.full((features.num_origin_time_groups,), fixed, dtype=raw.dtype)
         if component.scope is GravityEffectScope.GLOBAL:
             base = self.scalar_or_base(raw, "production")
             if component.deviation is None:
@@ -392,9 +565,7 @@ class GravityParameterLayout:
                 )
             deviation_block = self.deviation_block("production")
             assert deviation_block is not None and deviation_block.mapping is not None
-            deviations = self.constrained_deviations(
-                raw, deviation_block.component
-            )
+            deviations = self.constrained_deviations(raw, deviation_block.component)
             indices = jnp.asarray(
                 features.mapping(deviation_block.mapping), dtype=jnp.int32
             )
@@ -416,6 +587,7 @@ class GravityParameterLayout:
         totals = jax.ops.segment_sum(
             cell_effect, groups, num_segments=features.num_origin_time_groups
         )
+
         counts = jax.ops.segment_sum(
             jnp.ones(features.num_cells, dtype=raw.dtype),
             groups,
@@ -464,7 +636,9 @@ class GravityParameterLayout:
             positivity_floor=float(payload.get("positivity_floor", 1.0e-6)),
         )
         if payload.get("names") is not None and tuple(payload["names"]) != layout.names:  # type: ignore[arg-type]
-            raise ValueError("serialized gravity parameter names do not match the specification.")
+            raise ValueError(
+                "serialized gravity parameter names do not match the specification."
+            )
         if payload.get("blocks") is not None:
             restored_blocks = tuple(
                 GravityParameterBlock.from_dict(cast(Mapping[str, object], item))
@@ -504,7 +678,29 @@ class GravityParameterLayout:
             if block.regularization_type is not GravityRegularizationType.RIDGE:
                 continue
             if block.group_count:
-                effect = self.constrained_deviations(raw, block.component)
+                if block.constraint is GravityConstraint.TWO_WAY_CENTERED:
+                    free = raw[block.parameter_slice].reshape(
+                        (block.row_group_count - 1, block.column_group_count - 1)
+                    )
+                    row_basis = jnp.concatenate(
+                        (
+                            jnp.eye(block.row_group_count - 1, dtype=raw.dtype),
+                            -jnp.ones((1, block.row_group_count - 1), dtype=raw.dtype),
+                        ),
+                        axis=0,
+                    )
+                    column_basis = jnp.concatenate(
+                        (
+                            jnp.eye(block.column_group_count - 1, dtype=raw.dtype),
+                            -jnp.ones(
+                                (1, block.column_group_count - 1), dtype=raw.dtype
+                            ),
+                        ),
+                        axis=0,
+                    )
+                    effect = (row_basis @ free @ column_basis.T).reshape(-1)
+                else:
+                    effect = self.constrained_deviations(raw, block.component)
             else:
                 effect = raw[block.parameter_slice]
             result = result + 0.5 * jnp.asarray(
@@ -548,7 +744,9 @@ class GravityParameterLayout:
             ):
                 scale = float(values[position])
                 if scale <= 0:
-                    raise ValueError("global production scale must be strictly positive.")
+                    raise ValueError(
+                        "global production scale must be strictly positive."
+                    )
                 result[position] = np.log(scale)
         return result
 
@@ -630,7 +828,9 @@ class GravityJointParameterLayout:
     @property
     def names(self) -> tuple[str, ...]:
         return self.gravity_layout.names + tuple(
-            name for block in self.additive_flow_blocks for name in block.parameter_names
+            name
+            for block in self.additive_flow_blocks
+            for name in block.parameter_names
         )
 
     @property
@@ -702,17 +902,37 @@ class GravityJointParameterLayout:
     def transform(self, raw_parameters: object) -> MinimalGravityParameters:
         return self.gravity_layout.transform(self.gravity_raw(raw_parameters))
 
-    def constrained_deviations(self, raw_parameters: object, component: str) -> jax.Array:
-        return self.gravity_layout.constrained_deviations(self.gravity_raw(raw_parameters), component)
+    def constrained_deviations(
+        self, raw_parameters: object, component: str
+    ) -> jax.Array:
+        return self.gravity_layout.constrained_deviations(
+            self.gravity_raw(raw_parameters), component
+        )
 
     def scalar_or_base(self, raw_parameters: object, component: str) -> jax.Array:
-        return self.gravity_layout.scalar_or_base(self.gravity_raw(raw_parameters), component)
+        return self.gravity_layout.scalar_or_base(
+            self.gravity_raw(raw_parameters), component
+        )
 
     def cell_effect(
         self, raw_parameters: object, component: str, features: GravityFeatures
     ) -> jax.Array:
         return self.gravity_layout.cell_effect(
             self.gravity_raw(raw_parameters), component, features
+        )
+
+    def term_effect(
+        self, raw_parameters: object, term_name: str, features: GravityFeatures
+    ) -> jax.Array:
+        return self.gravity_layout.term_effect(
+            self.gravity_raw(raw_parameters), term_name, features
+        )
+
+    def destination_utility_effect(
+        self, raw_parameters: object, features: GravityFeatures
+    ) -> jax.Array:
+        return self.gravity_layout.destination_utility_effect(
+            self.gravity_raw(raw_parameters), features
         )
 
     def production_group_log_multiplier(
@@ -723,10 +943,14 @@ class GravityJointParameterLayout:
         )
 
     def production_log_scale(self, raw_parameters: object) -> jax.Array:
-        return self.gravity_layout.production_log_scale(self.gravity_raw(raw_parameters))
+        return self.gravity_layout.production_log_scale(
+            self.gravity_raw(raw_parameters)
+        )
 
     def centered_effect(self, raw_parameters: object, block: str) -> jax.Array:
-        return self.gravity_layout.centered_effect(self.gravity_raw(raw_parameters), block)
+        return self.gravity_layout.centered_effect(
+            self.gravity_raw(raw_parameters), block
+        )
 
     def regularization(self, raw_parameters: object) -> jax.Array:
         raw = self._raw(raw_parameters)
@@ -737,9 +961,16 @@ class GravityJointParameterLayout:
 
     def physical_vector(self, raw_parameters: object) -> jax.Array:
         raw = self._raw(raw_parameters)
-        values = [self.gravity_layout.physical_vector(raw[self.gravity_parameter_slice])]
+        values = [
+            self.gravity_layout.physical_vector(raw[self.gravity_parameter_slice])
+        ]
         values.extend(
-            jnp.asarray(block.latent_flow_model.physical_parameters(self.block_raw(raw, block.name)), dtype=raw.dtype)
+            jnp.asarray(
+                block.latent_flow_model.physical_parameters(
+                    self.block_raw(raw, block.name)
+                ),
+                dtype=raw.dtype,
+            )
             for block in self.additive_flow_blocks
         )
         return jnp.concatenate(values)
@@ -749,9 +980,7 @@ class GravityJointParameterLayout:
         if values.shape != (self.size,) or not np.all(np.isfinite(values)):
             raise ValueError(f"physical_parameters must have shape ({self.size},).")
         result = [
-            self.gravity_layout.raw_from_physical(
-                values[self.gravity_parameter_slice]
-            )
+            self.gravity_layout.raw_from_physical(values[self.gravity_parameter_slice])
         ]
         for block in self.additive_flow_blocks:
             result.append(
@@ -765,7 +994,9 @@ class GravityJointParameterLayout:
         payload = {
             "schema_version": 1,
             "gravity_layout": self.gravity_layout.to_dict(),
-            "additive_flow_blocks": [block.to_dict() for block in self.additive_flow_blocks],
+            "additive_flow_blocks": [
+                block.to_dict() for block in self.additive_flow_blocks
+            ],
             "names": list(self.names),
         }
         payload["fingerprint"] = fingerprint(payload)
@@ -797,7 +1028,9 @@ class GravityJointParameterLayout:
                 raise ValueError("additive flow block payload must be a mapping.")
             name = str(raw_block.get("name", ""))
             if name not in operators:
-                raise ValueError(f"no operator supplied for additive flow block {name!r}.")
+                raise ValueError(
+                    f"no operator supplied for additive flow block {name!r}."
+                )
             blocks.append(
                 GravityAdditiveFlowBlock.from_dict(
                     raw_block,
@@ -806,13 +1039,15 @@ class GravityJointParameterLayout:
             )
         result = cls(gravity_layout, tuple(blocks))
         names = payload.get("names")
-        if names is not None and tuple(str(item) for item in cast(list[object], names)) != result.names:
+        if (
+            names is not None
+            and tuple(str(item) for item in cast(list[object], names)) != result.names
+        ):
             raise ValueError("joint parameter names do not match the restored layout.")
         stored = payload.get("fingerprint")
         if stored is not None and str(stored) != result.fingerprint:
             raise ValueError("joint parameter-layout fingerprint mismatch.")
         return result
-
 
 
 def warm_start_gravity_parameters(
@@ -887,3 +1122,31 @@ def validate_gravity_relaxation_features(
                     }
                 ),
             )
+    for term in specification.terms:
+        if term.scope in _DEFAULT_MAPPINGS or term.scope in (
+            GravityEffectScope.CUSTOM_GROUP,
+            GravityEffectScope.SMOOTH_BASIS,
+        ):
+            mapping = term.grouping or _DEFAULT_MAPPINGS.get(term.scope)
+            if mapping is None:
+                raise ValueError(f"term {term.name!r} requires a feature mapping.")
+            features.validate_mapping(
+                mapping,
+                group_count=term.group_count,
+                constant_within_origin_time=(term.target == "production"),
+                smooth_basis=term.scope is GravityEffectScope.SMOOTH_BASIS,
+            )
+            if term.constraint is GravityConstraint.TWO_WAY_CENTERED:
+                assert (
+                    term.row_grouping is not None and term.column_grouping is not None
+                )
+                features.validate_mapping(
+                    term.row_grouping,
+                    group_count=term.row_group_count,
+                    constant_within_origin_time=(term.target == "production"),
+                )
+                features.validate_mapping(
+                    term.column_grouping,
+                    group_count=term.column_group_count,
+                    constant_within_origin_time=(term.target == "production"),
+                )
