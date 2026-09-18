@@ -991,6 +991,13 @@ does not refit the model, alter the objective, or change the routing operator.
 The calculation is chunked over measurement and OD cells, so it does not
 materialize a complete measurement-by-OD Jacobian.
 
+Identifiability uses reverse-mode autodiff by default (`jacobian_mode="reverse"`).
+This is required by the temporal CSR/CSC routing operators, which expose a
+custom VJP but no forward-mode JVP. `jacobian_mode="forward"` remains available
+for operators that provide a JVP; it is never silently substituted when
+explicitly requested. The diagnostic is post-estimation only: it does not refit
+the model or rebuild routing artifacts.
+
 For the calibration rows, the count contribution is the Gauss--Newton
 curvature
 
@@ -1038,10 +1045,17 @@ diagnostic = compute_gravity_od_identifiability(
     config=GravityIdentifiabilityConfig(
         measurement_chunk_size=4096,
         od_chunk_size=4096,
+        jacobian_mode="reverse",
     ),
 )
 write_gravity_od_identifiability(diagnostic, results / "identifiability")
 ```
+
+The default chunk sizes (`4096` measurements and `4096` OD cells) remain the
+recommended starting point for the real temporal operator. For a memory-limited
+run, benchmark at least two smaller values on a representative fixture before
+changing them; chunk sizes affect peak memory and runtime, not the scientific
+diagnostic.
 
 Persistence consists of `identifiability.json` metadata and a compressed
 `identifiability.npz` numerical payload. The metadata records schema version,

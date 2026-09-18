@@ -13,6 +13,7 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
@@ -51,6 +52,31 @@ _CANONICAL_PROVENANCE_FIELDS = (
     "model_fingerprint",
 )
 
+JacobianMode = Literal["reverse", "forward"]
+
+
+def _jacobian(function, value, *, mode: str):
+    """Evaluate a vector Jacobian in the requested autodiff direction.
+
+    Temporal CSR/CSC operators expose a custom VJP but deliberately do not
+    register a JVP.  Reverse mode is therefore the production default.  An
+    explicitly requested forward-mode failure is reported without silently
+    retrying in the other direction.
+    """
+
+    if mode == "reverse":
+        return jax.jacrev(function)(value)
+    if mode == "forward":
+        try:
+            return jax.jacfwd(function)(value)
+        except TypeError as error:
+            raise ValueError(
+                "forward-mode autodiff is unavailable for this identifiability "
+                "operator; use jacobian_mode='reverse' for temporal operators "
+                "implemented with a custom VJP."
+            ) from error
+    raise ValueError(f"unsupported Jacobian mode: {mode}")
+
 
 def _immutable_array(value: object, *, dtype: np.dtype | None = None) -> np.ndarray:
     array = np.array(value, dtype=dtype, copy=True)
@@ -70,6 +96,7 @@ class GravityIdentifiabilityConfig:
     eigenvalue_absolute_tolerance: float = 1.0e-12
     count_dominated_threshold: float = 0.8
     assumption_dominated_threshold: float = 0.2
+    jacobian_mode: JacobianMode = "reverse"
 
     def __post_init__(self) -> None:
         for name in ("measurement_chunk_size", "od_chunk_size"):
@@ -92,6 +119,8 @@ class GravityIdentifiabilityConfig:
             if not np.isfinite(value) or not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must lie in [0, 1].")
             object.__setattr__(self, name, value)
+        if self.jacobian_mode not in ("reverse", "forward"):
+            raise ValueError("jacobian_mode must be 'reverse' or 'forward'.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,7 +176,9 @@ class GravityODIdentifiability:
             if array.size != size:
                 raise ValueError(f"{name} must have one value per full OD cell.")
             if np.any(~np.isfinite(array[~nullable])):
-                raise ValueError(f"{name} must be finite for identifiable free OD cells.")
+                raise ValueError(
+                    f"{name} must be finite for identifiable free OD cells."
+                )
             if np.any(~np.isnan(array[nullable])):
                 raise ValueError(
                     f"{name} must be null (NaN) for fixed or non-identifiable OD cells."
@@ -178,7 +209,9 @@ class GravityODIdentifiability:
             raise ValueError("free_cells does not match classification.")
         object.__setattr__(self, "fixed_cells", expected_fixed)
         object.__setattr__(self, "free_cells", expected_free)
-        object.__setattr__(self, "discarded_eigenvalues", int(self.discarded_eigenvalues))
+        object.__setattr__(
+            self, "discarded_eigenvalues", int(self.discarded_eigenvalues)
+        )
 
     @property
     def num_cells(self) -> int:
@@ -187,7 +220,9 @@ class GravityODIdentifiability:
     @property
     def classification_counts(self) -> dict[str, int]:
         labels, counts = np.unique(self.classification, return_counts=True)
-        return {str(label): int(count) for label, count in zip(labels, counts, strict=True)}
+        return {
+            str(label): int(count) for label, count in zip(labels, counts, strict=True)
+        }
 
     @staticmethod
     def _quantiles(values: np.ndarray | None) -> dict[str, float] | None:
@@ -274,7 +309,11 @@ class GravityODIdentifiability:
         for name in _CANONICAL_PROVENANCE_FIELDS:
             top_level = payload.get(name, _MISSING)
             nested = provenance.get(name, _MISSING)
-            if top_level is not _MISSING and nested is not _MISSING and top_level != nested:
+            if (
+                top_level is not _MISSING
+                and nested is not _MISSING
+                and top_level != nested
+            ):
                 raise ValueError(f"identifiability provenance mismatch for {name!r}.")
         auxiliary_value = array("auxiliary_information_share")
         if auxiliary_value is None:
@@ -305,10 +344,14 @@ class GravityODIdentifiability:
         )
         persisted_counts = payload.get("classification_counts")
         if persisted_counts is not None:
-            if not isinstance(persisted_counts, Mapping) or {
-                str(key): int(value) for key, value in persisted_counts.items()
-            } != restored.classification_counts:
-                raise ValueError("identifiability classification counts do not match the arrays.")
+            if (
+                not isinstance(persisted_counts, Mapping)
+                or {str(key): int(value) for key, value in persisted_counts.items()}
+                != restored.classification_counts
+            ):
+                raise ValueError(
+                    "identifiability classification counts do not match the arrays."
+                )
         return restored
 
 
@@ -397,25 +440,35 @@ def _validate_inputs(
         raise ValueError("gravity features and operator free-cell dimensions differ.")
     compact = getattr(problem.operator, "compact_layout_fingerprint", None)
     if compact is not None and str(compact) != problem.features.od_layout_fingerprint:
-        raise ValueError("gravity features and operator compact-layout fingerprints differ.")
+        raise ValueError(
+            "gravity features and operator compact-layout fingerprints differ."
+        )
     if (
         result.feature_cache_fingerprint
         and result.feature_cache_fingerprint != problem.features.fingerprint
     ):
-        raise ValueError("fitted result feature fingerprint does not match the problem.")
+        raise ValueError(
+            "fitted result feature fingerprint does not match the problem."
+        )
     operator_artifact = getattr(problem.operator, "artifact_fingerprint", None)
     if (
         operator_artifact
         and result.direct_operator_artifact_fingerprint
         and str(operator_artifact) != result.direct_operator_artifact_fingerprint
     ):
-        raise ValueError("fitted result operator artifact fingerprint does not match the problem.")
+        raise ValueError(
+            "fitted result operator artifact fingerprint does not match the problem."
+        )
     canonical = np.asarray(problem.features.canonical_od_index, dtype=np.int64)
     full = np.asarray(result.full_od_demand, dtype=np.float64)
     if full.ndim != 1 or not np.all(np.isfinite(full)):
-        raise ValueError("fitted full OD demand must be a finite one-dimensional vector.")
+        raise ValueError(
+            "fitted full OD demand must be a finite one-dimensional vector."
+        )
     if canonical.shape != (problem.operator.num_free_od,):
-        raise ValueError("canonical OD indices do not match the operator free dimension.")
+        raise ValueError(
+            "canonical OD indices do not match the operator free dimension."
+        )
     if np.any(canonical < 0) or np.any(canonical >= full.size):
         raise ValueError("canonical OD indices fall outside the fitted full OD vector.")
     if np.unique(canonical).size != canonical.size:
@@ -425,12 +478,20 @@ def _validate_inputs(
     if modeled_np.ndim != 1 or not np.all(np.isfinite(modeled_np)):
         raise ValueError("modeled measurements must be finite and one-dimensional.")
     persisted_predictions = np.asarray(result.predicted_measurements, dtype=np.float64)
-    if persisted_predictions.ndim != 1 or not np.all(np.isfinite(persisted_predictions)):
-        raise ValueError("fitted predicted measurements must be finite and one-dimensional.")
+    if persisted_predictions.ndim != 1 or not np.all(
+        np.isfinite(persisted_predictions)
+    ):
+        raise ValueError(
+            "fitted predicted measurements must be finite and one-dimensional."
+        )
     persisted_demand = np.asarray(result.free_od_demand, dtype=np.float64)
     demand_np = np.asarray(demand, dtype=np.float64)
-    if persisted_demand.shape != demand_np.shape or not np.all(np.isfinite(persisted_demand)):
-        raise ValueError("fitted free OD demand does not match the gravity feature dimension.")
+    if persisted_demand.shape != demand_np.shape or not np.all(
+        np.isfinite(persisted_demand)
+    ):
+        raise ValueError(
+            "fitted free OD demand does not match the gravity feature dimension."
+        )
     tolerance = 5.0e-6 if problem.features.dtype == np.dtype(np.float32) else 1.0e-8
     try:
         np.testing.assert_allclose(
@@ -471,7 +532,9 @@ def _information_hessian(
     else:
         dispersion = float(problem.parameter_layout.transform(raw_jax).dispersion)
         if not np.isfinite(dispersion) or dispersion <= 0.0:
-            raise ValueError("negative-binomial dispersion must be finite and positive.")
+            raise ValueError(
+                "negative-binomial dispersion must be finite and positive."
+            )
         weights = dispersion / (
             np.maximum(modeled_np, float(problem.mean_floor))
             * (dispersion + np.maximum(modeled_np, float(problem.mean_floor)))
@@ -487,7 +550,10 @@ def _information_hessian(
             prediction, _ = predict_gravity_measurements(value, problem=problem)
             return prediction[index_array]
 
-        jacobian = np.asarray(jax.jacfwd(measurement_chunk)(raw_jax), dtype=np.float64)
+        jacobian = np.asarray(
+            _jacobian(measurement_chunk, raw_jax, mode=config.jacobian_mode),
+            dtype=np.float64,
+        )
         if jacobian.ndim != 2 or jacobian.shape[1] != parameter_count:
             raise ValueError("measurement Jacobian chunk has an unexpected shape.")
         h_counts += jacobian.T @ (weights[indices, None] * jacobian)
@@ -495,7 +561,9 @@ def _information_hessian(
     def regularization_function(value: jax.Array) -> jax.Array:
         return problem.parameter_layout.regularization(value)
 
-    h_regularization = np.asarray(jax.hessian(regularization_function)(raw_jax), dtype=np.float64)
+    h_regularization = np.asarray(
+        jax.hessian(regularization_function)(raw_jax), dtype=np.float64
+    )
 
     h_auxiliary: np.ndarray | None = None
     channels = problem.auxiliary_observations.channels
@@ -588,23 +656,30 @@ def compute_gravity_od_identifiability(
         "fixed_input_or_structural_zero_policy",
         dtype="U64",
     )
+
     def demand_jacobian_function(value: jax.Array) -> jax.Array:
         return generate_gravity_demand(
             value,
             features=problem.features,
             parameter_layout=problem.parameter_layout,
         ).demand
+
     variance_cutoff = np.finfo(np.float64).eps
     clipping_required = False
     for start in range(0, free_full_indices.size, config.od_chunk_size):
         stop = start + config.od_chunk_size
-        free_offsets = np.arange(start, min(stop, free_full_indices.size), dtype=np.int64)
+        free_offsets = np.arange(
+            start, min(stop, free_full_indices.size), dtype=np.int64
+        )
         offset_array = jnp.asarray(free_offsets, dtype=jnp.int32)
 
         def demand_chunk(value: jax.Array) -> jax.Array:
             return demand_jacobian_function(value)[offset_array]
 
-        jacobian = np.asarray(jax.jacfwd(demand_chunk)(jnp.asarray(raw)), dtype=np.float64)
+        jacobian = np.asarray(
+            _jacobian(demand_chunk, jnp.asarray(raw), mode=config.jacobian_mode),
+            dtype=np.float64,
+        )
         if jacobian.ndim != 2 or jacobian.shape[1] != raw.size:
             raise ValueError("OD-demand Jacobian chunk has an unexpected shape.")
         directions = jacobian @ h_pseudoinverse.T
@@ -664,9 +739,14 @@ def compute_gravity_od_identifiability(
             elif count_share[full_index] >= config.count_dominated_threshold:
                 classification[full_index] = "count_dominated"
                 reasons[full_index] = "count_information_dominates_local_curvature"
-            elif regularization_share[full_index] >= config.assumption_dominated_threshold:
+            elif (
+                regularization_share[full_index]
+                >= config.assumption_dominated_threshold
+            ):
                 classification[full_index] = "assumption_dominated"
-                reasons[full_index] = "regularization_or_prior_dominates_local_curvature"
+                reasons[full_index] = (
+                    "regularization_or_prior_dominates_local_curvature"
+                )
             else:
                 classification[full_index] = "mixed_information"
                 reasons[full_index] = "counts_and_assumptions_both_contribute"
@@ -748,7 +828,9 @@ def write_gravity_od_identifiability(
             auxiliary_information_share=_persisted_array(
                 diagnostic.auxiliary_information_share
             ),
-            local_information_variance=np.asarray(diagnostic.local_information_variance),
+            local_information_variance=np.asarray(
+                diagnostic.local_information_variance
+            ),
             classification=np.asarray(diagnostic.classification),
             diagnostic_reason=np.asarray(diagnostic.diagnostic_reason),
         )
@@ -781,7 +863,9 @@ def read_gravity_od_identifiability(
         array_map.get(name) != name for name in _ARRAY_NAMES
     ):
         raise ValueError("identifiability array mapping is missing or invalid.")
-    arrays_path = metadata_path.parent / str(payload.get("arrays_file", "identifiability.npz"))
+    arrays_path = metadata_path.parent / str(
+        payload.get("arrays_file", "identifiability.npz")
+    )
     with np.load(arrays_path, allow_pickle=False) as archive:
         arrays = {name: np.asarray(archive[name]) for name in _ARRAY_NAMES}
     if arrays["auxiliary_information_share"].size == 0:
@@ -794,7 +878,9 @@ def read_gravity_od_identifiability(
         if not isinstance(expected_digest, str):
             raise ValueError(f"identifiability array digest is missing for {name!r}.")
         if expected_digest != _array_digest(_persisted_array(arrays[name])):
-            raise ValueError(f"identifiability array fingerprint mismatch for {name!r}.")
+            raise ValueError(
+                f"identifiability array fingerprint mismatch for {name!r}."
+            )
     diagnostic = GravityODIdentifiability.from_dict(payload, arrays=arrays)
     for name in _CANONICAL_PROVENANCE_FIELDS:
         top_level = payload.get(name, _MISSING)
@@ -803,9 +889,7 @@ def read_gravity_od_identifiability(
             raise ValueError(f"identifiability provenance mismatch for {name!r}.")
         if expected_provenance is not None:
             expected = expected_provenance.get(name, _MISSING)
-            if expected is not _MISSING and (
-                nested is _MISSING or expected != nested
-            ):
+            if expected is not _MISSING and (nested is _MISSING or expected != nested):
                 raise ValueError(f"identifiability provenance mismatch for {name!r}.")
     return diagnostic
 

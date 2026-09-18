@@ -4,6 +4,7 @@ from dataclasses import replace
 import json
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -17,8 +18,13 @@ from public_transportation.inference.gravity import (
     write_gravity_detailed_report,
     write_gravity_od_identifiability,
 )
-from public_transportation.inference.gravity.identifiability import _information_hessian
-from public_transportation.inference.gravity.objective import predict_gravity_measurements
+from public_transportation.inference.gravity.identifiability import (
+    _information_hessian,
+    _jacobian,
+)
+from public_transportation.inference.gravity.objective import (
+    predict_gravity_measurements,
+)
 from public_transportation.inference.od_parameter_layout import ODParameterLayout
 
 from tests.gravity.test_phase4_validation import validation_case
@@ -40,10 +46,45 @@ class _AuxiliaryChannel:
 
     def log_likelihood(self, *, prediction, raw_parameters):
         del raw_parameters
-        return -(prediction - 100.0) ** 2
+        return -((prediction - 100.0) ** 2)
 
     def report(self):
         return {"name": self.name, "kind": self.kind}
+
+
+class _CustomVJPMeasurementOperator:
+    """Small production-like operator with a VJP but no JVP registration."""
+
+    def __init__(self, base):
+        matrix = jnp.asarray(base.matrix)
+        self._matrix = matrix
+
+        @jax.custom_vjp
+        def matvec(value):
+            return matrix @ value
+
+        def matvec_forward(value):
+            return matrix @ value, None
+
+        def matvec_reverse(_, cotangent):
+            return (matrix.T @ cotangent,)
+
+        matvec.defvjp(matvec_forward, matvec_reverse)
+        self._matvec = matvec
+        self.fixed_measurement_offset = base.fixed_measurement_offset
+        self.num_free_od = base.num_free_od
+        self.num_measurements = base.num_measurements
+        self.compact_layout_fingerprint = base.compact_layout_fingerprint
+        self.assignment_fingerprint = base.assignment_fingerprint
+        self.graph_fingerprint = base.graph_fingerprint
+        self.mapping_fingerprint = base.mapping_fingerprint
+        self.dtype = base.dtype
+
+    def jax_matvec(self, value):
+        return self._matvec(value)
+
+    def jax_rmatvec(self, value):
+        return self._matrix.T @ value
 
 
 @pytest.fixture(scope="module")
@@ -52,12 +93,16 @@ def fitted_case():
         return validation_case()
 
 
-def _full_layout(num_cells: int = 6, *, fixed: tuple[int, ...] = ()) -> ODParameterLayout:
+def _full_layout(
+    num_cells: int = 6, *, fixed: tuple[int, ...] = ()
+) -> ODParameterLayout:
     fixed_set = set(fixed)
     free = tuple(index for index in range(num_cells) if index not in fixed_set)
     return ODParameterLayout(
         num_od_total=num_cells,
-        od_keys=tuple((f"o{index // 3}", f"d{index % 3}", "am") for index in range(num_cells)),
+        od_keys=tuple(
+            (f"o{index // 3}", f"d{index % 3}", "am") for index in range(num_cells)
+        ),
         free_od_indices=free,
         fixed_od_indices=tuple(fixed),
         fixed_od_values=tuple(0.0 for _ in fixed),
@@ -100,9 +145,15 @@ def test_negative_binomial_weights_and_chunking_are_stable(fitted_case):
             result=result,
             config=GravityIdentifiabilityConfig(),
         )
-    np.testing.assert_allclose(one.count_information_share, many.count_information_share)
-    np.testing.assert_allclose(one.local_information_variance, many.local_information_variance)
-    assert np.all((one.count_information_share >= 0) & (one.count_information_share <= 1))
+    np.testing.assert_allclose(
+        one.count_information_share, many.count_information_share
+    )
+    np.testing.assert_allclose(
+        one.local_information_variance, many.local_information_variance
+    )
+    assert np.all(
+        (one.count_information_share >= 0) & (one.count_information_share <= 1)
+    )
 
 
 def test_negative_binomial_information_uses_expected_weights(fitted_case):
@@ -115,11 +166,13 @@ def test_negative_binomial_information_uses_expected_weights(fitted_case):
         )
         means, _ = predict_gravity_measurements(result.raw_parameters, problem=problem)
         means = np.asarray(means, dtype=np.float64)
-        dispersion = float(problem.parameter_layout.transform(result.raw_parameters).dispersion)
+        dispersion = float(
+            problem.parameter_layout.transform(result.raw_parameters).dispersion
+        )
         jacobian = np.asarray(
-            jax.jacfwd(lambda value: predict_gravity_measurements(value, problem=problem)[0])(
-                result.raw_parameters
-            ),
+            jax.jacfwd(
+                lambda value: predict_gravity_measurements(value, problem=problem)[0]
+            )(result.raw_parameters),
             dtype=np.float64,
         )
     weights = dispersion / (means * (dispersion + means))
@@ -132,7 +185,9 @@ def test_fixed_cells_are_null_and_policy_classified(fitted_case):
     problem, _, result = fitted_case
     expanded = replace(result, full_od_demand=np.r_[result.full_od_demand, 0.0, 0.0])
     with jax.enable_x64():
-        diagnostic = compute_gravity_od_identifiability(problem=problem, result=expanded)
+        diagnostic = compute_gravity_od_identifiability(
+            problem=problem, result=expanded
+        )
     assert diagnostic.fixed_cells == 2
     assert diagnostic.classification[-1] == "fixed_by_policy"
     assert np.isnan(diagnostic.count_information_share[-1])
@@ -180,6 +235,76 @@ def test_identifiability_config_rejects_invalid_values(field, value):
         GravityIdentifiabilityConfig(**{field: value})
 
 
+def test_identifiability_defaults_to_reverse_jacobians():
+    assert GravityIdentifiabilityConfig().jacobian_mode == "reverse"
+
+
+def test_identifiability_rejects_unknown_jacobian_mode():
+    with pytest.raises(ValueError, match="jacobian_mode"):
+        GravityIdentifiabilityConfig(jacobian_mode="diagonal")
+
+
+def test_reverse_and_forward_jacobians_agree_for_plain_function():
+    value = jnp.asarray((0.2, -0.4, 0.7))
+
+    def function(item):
+        return jnp.asarray((item[0] ** 2 + item[1], item[1] * item[2]))
+
+    reverse = np.asarray(_jacobian(function, value, mode="reverse"))
+    forward = np.asarray(_jacobian(function, value, mode="forward"))
+    np.testing.assert_allclose(reverse, forward)
+
+
+def test_reverse_and_forward_information_hessian_agree(fitted_case):
+    problem, _, result = fitted_case
+    with jax.enable_x64():
+        reverse = _information_hessian(
+            raw=np.asarray(result.raw_parameters, dtype=np.float64),
+            problem=problem,
+            config=GravityIdentifiabilityConfig(
+                measurement_chunk_size=2,
+                jacobian_mode="reverse",
+            ),
+        )
+        forward = _information_hessian(
+            raw=np.asarray(result.raw_parameters, dtype=np.float64),
+            problem=problem,
+            config=GravityIdentifiabilityConfig(
+                measurement_chunk_size=2,
+                jacobian_mode="forward",
+            ),
+        )
+    for reverse_matrix, forward_matrix in zip(reverse, forward, strict=True):
+        if reverse_matrix is None:
+            assert forward_matrix is None
+        else:
+            np.testing.assert_allclose(reverse_matrix, forward_matrix)
+
+
+def test_custom_vjp_operator_uses_reverse_mode_by_default(fitted_case):
+    problem, _, result = fitted_case
+    custom_problem = replace(
+        problem, operator=_CustomVJPMeasurementOperator(problem.operator)
+    )
+    with jax.enable_x64():
+        diagnostic = compute_gravity_od_identifiability(
+            problem=custom_problem,
+            result=result,
+            config=GravityIdentifiabilityConfig(
+                measurement_chunk_size=2,
+                od_chunk_size=2,
+            ),
+        )
+    assert diagnostic.config.jacobian_mode == "reverse"
+    assert np.all(np.isfinite(diagnostic.local_information_variance))
+    with jax.enable_x64(), pytest.raises(ValueError, match="jacobian_mode='reverse'"):
+        compute_gravity_od_identifiability(
+            problem=custom_problem,
+            result=result,
+            config=GravityIdentifiabilityConfig(jacobian_mode="forward"),
+        )
+
+
 def test_persistence_roundtrip_and_digests(fitted_case, tmp_path):
     problem, _, result = fitted_case
     with jax.enable_x64():
@@ -194,6 +319,29 @@ def test_persistence_roundtrip_and_digests(fitted_case, tmp_path):
     metadata = json.loads(path.read_text())
     assert metadata["schema_version"] == 1
     assert metadata["artifact_type"] == "gravity_od_identifiability"
+
+
+def test_persistence_retains_jacobian_mode_and_reads_old_metadata(
+    fitted_case, tmp_path
+):
+    problem, _, result = fitted_case
+    with jax.enable_x64():
+        diagnostic = compute_gravity_od_identifiability(
+            problem=problem,
+            result=result,
+            config=GravityIdentifiabilityConfig(jacobian_mode="forward"),
+        )
+    path = write_gravity_od_identifiability(diagnostic, tmp_path / "selected-mode")
+    metadata_path = path
+    metadata = json.loads(metadata_path.read_text())
+    assert metadata["config"]["jacobian_mode"] == "forward"
+    restored = read_gravity_od_identifiability(metadata_path)
+    assert restored.config.jacobian_mode == "forward"
+
+    metadata["config"].pop("jacobian_mode")
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
+    restored_old = read_gravity_od_identifiability(metadata_path)
+    assert restored_old.config.jacobian_mode == "reverse"
 
 
 def test_report_includes_identifiability_columns_and_summary(fitted_case, tmp_path):
