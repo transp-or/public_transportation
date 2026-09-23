@@ -35,6 +35,10 @@ estimator, conflict-free parallel batches, resource-adaptive preflight, and
 deterministic adaptive block refinement. Sharded persistent operator construction
 is documented in
 [sharded_fixed_routing_operator.md](docs/source/sharded_fixed_routing_operator.md).
+The parent-aware scheduled-assignment DAG, strict reuse policy, L7 final
+linear mapping, invalidation rules, and layer-level progress protocol are
+documented in
+[hierarchical_assignment_artifacts.md](docs/source/hierarchical_assignment_artifacts.md).
 Bounded OD batching, cache compatibility, and selected-block construction
 diagnostics are documented in
 [selected_fixed_routing_block_builder.md](docs/source/selected_fixed_routing_block_builder.md).

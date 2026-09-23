@@ -31,6 +31,18 @@ from .assignment_contract import (
     fixed_routing_route_choice_fingerprint,
 )
 from .compact_od_assignment_layout import CompactODAssignmentLayout
+from .hierarchical_artifacts import (
+    ARTIFACT_LAYERS,
+    DAG_PARENT_LAYERS,
+    EstimationAssignmentMapping,
+    HierarchicalArtifactStore,
+    HierarchicalArtifactUnavailableError,
+    HierarchicalProgressReporter,
+    ObsoleteArtifactFormatError,
+    derive_layer_fingerprints,
+    fingerprint as hierarchy_fingerprint,
+    make_manifest,
+)
 from .fixed_routing_measurement_operator import (
     assignment_inputs_fingerprint,
     measurement_mapping_fingerprint,
@@ -88,7 +100,9 @@ from .construction_control import (
 
 DirectTemporalProgressCallback = Callable[[dict[str, object]], None]
 DirectScheduledActivationMode = Literal["off", "auto", "direct"]
-DirectScheduledActivationPolicy = Literal["reuse_only", "build_or_reuse"]
+DirectScheduledActivationPolicy = Literal[
+    "reuse_only", "build_or_reuse", "force_rebuild"
+]
 DirectFixedRoutingSource = FixedRoutingInputs | ShardedFixedRoutingInputs
 TEMPORAL_FRAGMENT_SCHEMA_VERSION = 1
 
@@ -197,6 +211,10 @@ class DirectScheduledGravityOperator:
 
     operator: TemporalBlockAssignmentOperator | PackedTemporalBlockAssignmentOperator
     theta: float
+    hierarchy_artifact_fingerprint: str | None = field(default=None, repr=False)
+    hierarchy_parent_fingerprints: Mapping[str, str] = field(
+        default_factory=dict, repr=False
+    )
     reporter: ConstructionProgressReporter | None = field(
         default=None, repr=False, compare=False
     )
@@ -224,6 +242,24 @@ class DirectScheduledGravityOperator:
             "_execution_backend",
             CSRCSCTemporalAssignmentOperator(self.operator, reporter=self.reporter),
         )
+        if self.hierarchy_artifact_fingerprint is None:
+            _, fingerprints, _ = _direct_hierarchy_specifications(
+                identity=self.operator.identity,
+                canonical_index=self.operator.canonical_index,
+            )
+            object.__setattr__(
+                self,
+                "hierarchy_artifact_fingerprint",
+                fingerprints["estimation_assignment_mapping"],
+            )
+            object.__setattr__(
+                self,
+                "hierarchy_parent_fingerprints",
+                {
+                    name: fingerprints[name]
+                    for name in DAG_PARENT_LAYERS["estimation_assignment_mapping"]
+                },
+            )
 
     @property
     def num_free_od(self) -> int:
@@ -232,6 +268,10 @@ class DirectScheduledGravityOperator:
     @property
     def num_measurements(self) -> int:
         return self.operator.number_of_measurements
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self.num_measurements, self.num_free_od
 
     @property
     def compact_layout_fingerprint(self) -> str | None:
@@ -260,6 +300,17 @@ class DirectScheduledGravityOperator:
     @property
     def mapping_fingerprint(self) -> str:
         return self.operator.identity.measurement_mapping_fingerprint
+
+    @property
+    def artifact_fingerprint(self) -> str:
+        """Fingerprint of the final L7 estimation mapping."""
+
+        assert self.hierarchy_artifact_fingerprint is not None
+        return self.hierarchy_artifact_fingerprint
+
+    @property
+    def artifact_layer(self) -> str:
+        return "estimation_assignment_mapping"
 
     @property
     def dtype(self) -> np.dtype:
@@ -291,8 +342,14 @@ class DirectScheduledGravityOperator:
     def jax_matvec(self, vector: jax.Array) -> jax.Array:
         return self._execution_backend.jax_matvec(vector)
 
+    def matvec(self, vector: object) -> np.ndarray:
+        return np.asarray(self._execution_backend.jax_matvec(jnp.asarray(vector)))
+
     def jax_rmatvec(self, vector: jax.Array) -> jax.Array:
         return self._execution_backend.jax_rmatvec(vector)
+
+    def rmatvec(self, vector: object) -> np.ndarray:
+        return np.asarray(self._execution_backend.jax_rmatvec(jnp.asarray(vector)))
 
     def jax_matmat(self, matrix: jax.Array) -> jax.Array:
         value = jnp.asarray(matrix, dtype=self.dtype)
@@ -301,6 +358,48 @@ class DirectScheduledGravityOperator:
                 f"matrix must have shape ({self.num_free_od}, k), got {value.shape}."
             )
         return jax.vmap(self.jax_matvec, in_axes=1, out_axes=1)(value)
+
+    def matmat(self, matrix: object) -> np.ndarray:
+        return np.asarray(self.jax_matmat(jnp.asarray(matrix)))
+
+    @property
+    def estimation_assignment_mapping(self) -> EstimationAssignmentMapping:
+        """Expose this operator through the final L7 contract."""
+
+        canonical = self.operator.canonical_index
+        _, hierarchy_fingerprints, _ = _direct_hierarchy_specifications(
+            identity=self.operator.identity, canonical_index=canonical
+        )
+        full_to_compact = np.full(canonical.number_of_physical_demand_cells, -1, dtype=np.int64)
+        compact_to_full = np.empty(canonical.number_of_demand_cells, dtype=np.int64)
+        fixed_positive_full_index = np.asarray(
+            [cell.full_index for cell in canonical.demand_cells if cell.role == "fixed_positive"],
+            dtype=np.int64,
+        )
+        fixed_positive_values = np.asarray(
+            [cell.fixed_value for cell in canonical.demand_cells if cell.role == "fixed_positive"],
+            dtype=self.dtype,
+        )
+        for cell in canonical.demand_cells:
+            if cell.operator_column is not None:
+                full_to_compact[cell.full_index] = cell.operator_column
+                compact_to_full[cell.operator_column] = cell.full_index
+        measurement_rows = np.arange(canonical.number_of_measurements, dtype=np.int64)
+        return EstimationAssignmentMapping(
+            A_free=self,
+            fixed_offset=np.asarray(self.fixed_measurement_offset),
+            free_column_index=np.arange(self.num_free_od, dtype=np.int64),
+            measurement_row_index=measurement_rows,
+            full_to_compact=full_to_compact,
+            compact_to_full=compact_to_full,
+            full_od_fingerprint=canonical.artifact_fingerprint,
+            active_od_fingerprint=canonical.binding_fingerprint,
+            parent_fingerprints=self.hierarchy_parent_fingerprints,
+            ancestor_fingerprints=hierarchy_fingerprints,
+            fingerprint=self.artifact_fingerprint,
+            fixed_positive_full_index=fixed_positive_full_index,
+            fixed_positive_values=fixed_positive_values,
+        )
 
 
 def _fragment_path(directory: Path, shard_key: str) -> Path:
@@ -635,6 +734,329 @@ def _file_sha256(path: str | Path) -> str:
 
 def _operator_cache_directory(checkpoint_directory: Path) -> Path:
     return checkpoint_directory / "temporal_operator_cache"
+
+
+def _direct_hierarchy_specifications(
+    *,
+    identity: AssignmentArtifactIdentity,
+    canonical_index: CanonicalAssignmentIndex,
+) -> tuple[dict[str, dict[str, object]], dict[str, str], str]:
+    """Build the scientific hierarchy identity for a direct-scheduled map.
+
+    The route-choice basis is deliberately independent of ``theta``.  The
+    route-choice materialization layer carries the theta-dependent identity;
+    this is what permits changing theta without invalidating scenario,
+    canonical, feasibility, or basis artifacts.
+    """
+
+    fixed_zero_cells = tuple(
+        int(cell.full_index)
+        for cell in canonical_index.demand_cells
+        if cell.role == "fixed_zero"
+    )
+    fixed_positive_cells = tuple(
+        int(cell.full_index)
+        for cell in canonical_index.demand_cells
+        if cell.role == "fixed_positive"
+    )
+    fixed_demand_fingerprint = hierarchy_fingerprint(
+        [
+            [int(cell.full_index), float(cell.fixed_value)]
+            for cell in canonical_index.demand_cells
+            if cell.role == "fixed_positive"
+        ]
+    )
+    fixed_positive_structure = hierarchy_fingerprint(fixed_positive_cells)
+    fixed_zero_structure = hierarchy_fingerprint(fixed_zero_cells)
+    fixed_layout_structure = hierarchy_fingerprint(
+        [
+            [int(cell.full_index), cell.role, cell.operator_column]
+            for cell in canonical_index.demand_cells
+        ]
+    )
+    canonical_od_universe_fingerprint = hierarchy_fingerprint(
+        {
+            "time_intervals": [
+                [
+                    item.interval_id,
+                    item.start_seconds,
+                    item.end_seconds,
+                ]
+                for item in canonical_index.time_intervals
+            ],
+            "demand_cells": [
+                list(cell.physical_key) for cell in canonical_index.demand_cells
+            ],
+        }
+    )
+    specifications: dict[str, dict[str, object]] = {
+        "scenario_base": {
+            "scientific_parameters": {"schema": "scheduled-scenario-v1"},
+            "input_fingerprints": {
+                "network": identity.network_fingerprint,
+                "timetable": identity.timetable_fingerprint,
+            },
+        },
+        "canonical_od_time_universe": {
+            "scientific_parameters": {
+                "policy": identity.temporal_discretization_fingerprint,
+                "canonicalization_schema": canonical_index.schema_version,
+            },
+            "input_fingerprints": {
+                "scenario_base": "scenario_base",
+                "canonical_od_universe": canonical_od_universe_fingerprint,
+            },
+        },
+        "feasibility_support": {
+            "scientific_parameters": {
+                "feasibility": identity.feasibility_fingerprint,
+                "algorithm": "scheduled-feasibility-v1",
+            },
+            "input_fingerprints": {"canonical_od_time_universe": "canonical_od_time_universe"},
+        },
+        "route_choice_basis": {
+            "scientific_parameters": {
+                "family": "fixed-routing",
+                "cost_definition": "scheduled-link-cost-v1",
+                "implementation": "route-choice-basis-v1",
+            },
+            "input_fingerprints": {"feasibility_support": "feasibility_support"},
+        },
+        "route_choice_materialization": {
+            "scientific_parameters": {
+                "route_choice": identity.route_choice_fingerprint,
+                "coefficient_policy": identity.coefficient_policy_fingerprint,
+                "numeric_dtype": identity.numeric_dtype,
+            },
+            "input_fingerprints": {"route_choice_basis": "route_choice_basis"},
+        },
+        "full_od_assignment_mapping": {
+            "scientific_parameters": {
+                "representation": "full-canonical-od-assignment-v1",
+                "numeric_dtype": identity.numeric_dtype,
+            },
+            "input_fingerprints": {
+                "route_choice_materialization": "route_choice_materialization",
+                "full_od_universe": canonical_od_universe_fingerprint,
+            },
+        },
+        "observation_projection": {
+            "scientific_parameters": {
+                "measurement_schema": canonical_index.schema_version,
+                "row_order": "canonical-measurement-order-v1",
+            },
+            "input_fingerprints": {
+                "full_od_assignment_mapping": "full_od_assignment_mapping",
+                "measurement_mapping": identity.measurement_mapping_fingerprint,
+            },
+        },
+        "estimation_assignment_mapping": {
+            "scientific_parameters": {
+                "structural_zero_cells": fixed_zero_structure,
+                "fixed_positive_cells": fixed_positive_structure,
+                "fixed_demand_layout": fixed_layout_structure,
+                "compact_column_order": (
+                    canonical_index.source_compact_layout_fingerprint
+                ),
+                "mapping_schema": "estimation-assignment-mapping-v1",
+            },
+            "input_fingerprints": {
+                "observation_projection": "observation_projection",
+                "canonical_index": identity.canonical_index_fingerprint,
+            },
+        },
+    }
+    layer_fingerprints = derive_layer_fingerprints(specifications)
+    return specifications, layer_fingerprints, fixed_demand_fingerprint
+
+
+def _hierarchy_store(artifact_root: str | Path) -> HierarchicalArtifactStore:
+    """Return the hierarchy store next to the conventional ``artifacts`` root."""
+
+    root = Path(artifact_root)
+    return HierarchicalArtifactStore(root.parent if root.name == "artifacts" else root)
+
+
+def _publish_direct_hierarchy(
+    *,
+    artifact_root: str | Path,
+    artifact_directory: Path,
+    identity: AssignmentArtifactIdentity,
+    canonical_index: CanonicalAssignmentIndex,
+) -> None:
+    """Publish parent-aware manifests after the numerical payload is complete."""
+
+    specifications, fingerprints, fixed_demand_fingerprint = (
+        _direct_hierarchy_specifications(
+            identity=identity, canonical_index=canonical_index
+        )
+    )
+    store = _hierarchy_store(artifact_root)
+    for layer in ARTIFACT_LAYERS:
+        parents = {
+            name: fingerprints[name] for name in DAG_PARENT_LAYERS[layer]
+        }
+        payload: dict[str, object] = {
+            "source": "direct-scheduled-preparation",
+            "source_artifact_identity": identity.fingerprint,
+        }
+        if layer == "estimation_assignment_mapping":
+            try:
+                relative_payload = artifact_directory.relative_to(store.root)
+                payload["operator_artifact_directory"] = str(relative_payload)
+            except ValueError:
+                payload["operator_artifact_directory"] = str(artifact_directory)
+            payload["fixed_demand_fingerprint"] = fixed_demand_fingerprint
+        manifest = make_manifest(
+            artifact_layer=layer,  # type: ignore[arg-type]
+            parent_fingerprints=parents,
+            scientific_parameters=dict(
+                specifications[layer].get("scientific_parameters", {})
+            ),
+            input_fingerprints=dict(
+                specifications[layer].get("input_fingerprints", {})
+            ),
+            execution_parameters={"source": "direct-scheduled-preparation"},
+            payload=payload,
+        )
+        # Keep a separately addressable completed checkpoint for every layer.
+        # The numerical L7 payload remains in the existing sparse temporal
+        # store; these manifests make the hierarchy resumable and validate the
+        # parent chain without conflating checkpoints with published artifacts.
+        store.write_checkpoint(manifest, overwrite=True)
+        store.write(manifest, overwrite=True)
+
+
+def _validate_direct_hierarchy_reuse(
+    *,
+    artifact_root: str | Path,
+    artifact_directory: Path,
+    identity: AssignmentArtifactIdentity,
+    canonical_index: CanonicalAssignmentIndex,
+) -> None:
+    """Validate every parent manifest before strict L7 reuse."""
+
+    specifications, fingerprints, fixed_demand_fingerprint = (
+        _direct_hierarchy_specifications(
+            identity=identity, canonical_index=canonical_index
+        )
+    )
+    hierarchy_store = _hierarchy_store(artifact_root)
+    hierarchy_manifest = hierarchy_store.manifest_path(
+        "estimation_assignment_mapping", fingerprints["estimation_assignment_mapping"]
+    )
+    legacy_manifest = artifact_directory / "manifest.json"
+    if legacy_manifest.is_file() and not hierarchy_manifest.is_file():
+        try:
+            legacy_payload = json.loads(legacy_manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ObsoleteArtifactFormatError(
+                legacy_manifest,
+                artifact_layer="estimation_assignment_mapping",
+            ) from error
+        if "artifact_layer" not in legacy_payload and "artifact_type" not in legacy_payload:
+            raise ObsoleteArtifactFormatError(
+                legacy_manifest,
+                artifact_layer="estimation_assignment_mapping",
+            )
+
+    store = hierarchy_store
+    for layer in ARTIFACT_LAYERS:
+        parents = {
+            name: fingerprints[name] for name in DAG_PARENT_LAYERS[layer]
+        }
+        manifest = store.require(
+            layer,  # type: ignore[arg-type]
+            fingerprints[layer],
+            expected_parents=parents,
+            recommended_command=(
+                "prepare_direct_scheduled_temporal_operator "
+                "(explicit preparation stage)"
+            ),
+        )
+        store.require_checkpoint(
+            layer,  # type: ignore[arg-type]
+            fingerprints[layer],
+            expected_parents=parents,
+            recommended_command=(
+                "prepare_direct_scheduled_temporal_operator "
+                "(explicit preparation stage)"
+            ),
+        )
+        expected_parameters = dict(
+            specifications[layer].get("scientific_parameters", {})
+        )
+        if dict(manifest.scientific_parameters) != expected_parameters:
+            raise ValueError(f"hierarchical {layer} scientific parameters are incompatible")
+        if layer == "estimation_assignment_mapping":
+            if manifest.payload.get("fixed_demand_fingerprint") != fixed_demand_fingerprint:
+                raise ValueError(
+                    "fixed-positive demand values changed; L7 fixed offset must be rebuilt"
+                )
+            payload_directory = manifest.payload.get("operator_artifact_directory")
+            if payload_directory is not None:
+                expected_payload = artifact_directory.relative_to(store.root)
+                if str(payload_directory) != str(expected_payload):
+                    raise ValueError("hierarchical L7 payload path is incompatible")
+
+
+def _emit_direct_hierarchy_progress(
+    *,
+    reporter: ConstructionProgressReporter,
+    hierarchical_progress: HierarchicalProgressReporter | None = None,
+    fingerprints: Mapping[str, str],
+    status: str,
+    activation_policy: str,
+) -> None:
+    """Expose hierarchy-layer status through the existing construction sink."""
+
+    phase = (
+        ConstructionPhase.CACHE_VALIDATION
+        if status == "reused"
+        else ConstructionPhase.PERSISTENCE
+    )
+    for layer in ARTIFACT_LAYERS:
+        direct_parents = DAG_PARENT_LAYERS[layer]
+        parent = None if not direct_parents else fingerprints[direct_parents[0]]
+        if hierarchical_progress is not None:
+            hierarchical_progress.emit(
+                artifact_layer=layer,
+                artifact_fingerprint=fingerprints[layer],
+                parent_fingerprint=parent,
+                activation_policy=activation_policy,
+                phase=phase.value if hasattr(phase, "value") else str(phase),
+                status=status,
+                current_unit=layer,
+                completed_units=1,
+                total_units=1,
+                elapsed_seconds=0.0,
+                estimated_remaining_seconds=0.0,
+                eta_confidence="high",
+                reused=status == "reused",
+                rebuild=status != "reused",
+                force=True,
+            )
+        reporter.emit(
+            phase=phase,
+            status=status,
+            force=True,
+            completed_units=1,
+            total_units=1,
+            current_unit=layer,
+            predicted_remaining_seconds=0.0,
+            eta_confidence="high",
+            checkpoint_reusable=True,
+            details={
+                "artifact_layer": layer,
+                "artifact_fingerprint": fingerprints[layer],
+                "parent_fingerprint": (
+                    parent
+                ),
+                "activation_policy": activation_policy,
+                "reused": status == "reused",
+                "rebuild": status != "reused",
+            },
+        )
 
 
 def _different_prepared_artifact_found(
@@ -1313,10 +1735,17 @@ def prepare_direct_scheduled_temporal_operator(
     deadline: ConstructionDeadline | None = None,
     reporter: ConstructionProgressReporter | None = None,
     support_timing_callback: GroupSupportTimingCallback | None = None,
+    hierarchical_progress: HierarchicalProgressReporter | None = None,
     measurement_info: MappingInfo | None = None,
     fixed_zero_reasons_by_full_index: Mapping[int, str] | None = None,
+    force_rebuild: bool = False,
 ) -> DirectScheduledTemporalConstructionResult:
-    """Build or resume direct measurement shards, then publish temporal blocks."""
+    """Build or resume direct measurement shards, then publish temporal blocks.
+
+    ``hierarchical_progress`` is optional durable L0--L7 JSONL reporting for
+    the parent-aware artifact campaign.  The existing ``reporter``/``progress``
+    hooks remain responsible for detailed shard construction events.
+    """
     legacy_progress = progress if deadline is None and reporter is None else None
     control = ConstructionDeadline.unlimited() if deadline is None else deadline
     events = (
@@ -1353,8 +1782,24 @@ def prepare_direct_scheduled_temporal_operator(
         if artifact_root is None
         else temporal_block_cache_path(artifact_root, identity)
     )
-    if artifact_directory is not None and artifact_directory.exists():
+    if force_rebuild and artifact_directory is not None and artifact_directory.exists():
+        quarantine = artifact_directory.with_name(
+            f"{artifact_directory.name}.force-rebuild-{uuid.uuid4().hex}"
+        )
+        os.replace(artifact_directory, quarantine)
+    if (
+        not force_rebuild
+        and artifact_directory is not None
+        and artifact_directory.exists()
+    ):
         try:
+            if artifact_root is not None:
+                _validate_direct_hierarchy_reuse(
+                    artifact_root=artifact_root,
+                    artifact_directory=artifact_directory,
+                    identity=identity,
+                    canonical_index=canonical_index,
+                )
             operator = load_temporal_block_operator(
                 artifact_directory,
                 expected_identity=identity,
@@ -1363,7 +1808,14 @@ def prepare_direct_scheduled_temporal_operator(
                 validated_cache_directory=operator_cache_directory,
                 preflight_manifest=preflight_manifest,
             )
-        except (AssignmentCompatibilityError, ValueError, KeyError, OSError):
+        except (
+            AssignmentCompatibilityError,
+            HierarchicalArtifactUnavailableError,
+            ObsoleteArtifactFormatError,
+            ValueError,
+            KeyError,
+            OSError,
+        ):
             quarantine = artifact_directory.with_name(
                 f"{artifact_directory.name}.invalid-{uuid.uuid4().hex}"
             )
@@ -1519,6 +1971,22 @@ def prepare_direct_scheduled_temporal_operator(
             provenance_source="full_validation",
             reporter=events,
         )
+        _publish_direct_hierarchy(
+            artifact_root=artifact_root,
+            artifact_directory=artifact_directory,
+            identity=identity,
+            canonical_index=canonical_index,
+        )
+        _, hierarchy_fingerprints, _ = _direct_hierarchy_specifications(
+            identity=identity, canonical_index=canonical_index
+        )
+        _emit_direct_hierarchy_progress(
+            reporter=events,
+            hierarchical_progress=hierarchical_progress,
+            fingerprints=hierarchy_fingerprints,
+            status="completed",
+            activation_policy="force_rebuild" if force_rebuild else "build_or_reuse",
+        )
     finalization_seconds = max(0.0, perf_counter() - finalization_started)
     if control.expired:
         raise deadline_stop(
@@ -1574,6 +2042,7 @@ def activate_direct_scheduled_temporal_operator(
     config: ShardedConstructionConfig | None = None,
     progress: DirectTemporalProgressCallback | None = None,
     support_timing_callback: GroupSupportTimingCallback | None = None,
+    hierarchical_progress: HierarchicalProgressReporter | None = None,
     deadline: ConstructionDeadline | None = None,
     time_budget_seconds: float | None = None,
     safety_margin_seconds: float = 0.0,
@@ -1592,9 +2061,12 @@ def activate_direct_scheduled_temporal_operator(
     ``reuse_only`` is the safe production default: it validates and consumes
     only the identity-addressed persisted artifact and fails closed when that
     artifact is unavailable.  ``build_or_reuse`` retains the explicit opt-in
-    construction behavior.  Use :func:`prepare_direct_scheduled_temporal_operator`
-    directly when a preparation stage is responsible for creating or resuming
-    artifacts.
+    construction behavior, while ``force_rebuild`` explicitly invalidates the
+    current L7 payload before rebuilding it.  Use
+    :func:`prepare_direct_scheduled_temporal_operator` directly when a
+    preparation stage is responsible for creating or resuming artifacts.
+    Pass ``hierarchical_progress`` when the preparation/activation caller also
+    needs the durable layer-level campaign stream.
     """
     if deadline is not None and time_budget_seconds is not None:
         raise ValueError("provide deadline or time_budget_seconds, not both.")
@@ -1610,9 +2082,10 @@ def activate_direct_scheduled_temporal_operator(
     )
     if mode not in ("off", "auto", "direct"):
         raise ValueError("mode must be 'off', 'auto', or 'direct'.")
-    if activation_policy not in ("reuse_only", "build_or_reuse"):
+    if activation_policy not in ("reuse_only", "build_or_reuse", "force_rebuild"):
         raise ValueError(
-            "activation_policy must be 'reuse_only' or 'build_or_reuse'."
+            "activation_policy must be 'reuse_only', 'build_or_reuse', or "
+            "'force_rebuild'."
         )
     if expected_evaluations < 0:
         raise ValueError("expected_evaluations must be nonnegative.")
@@ -1663,6 +2136,22 @@ def activate_direct_scheduled_temporal_operator(
             details={"activation_policy": activation_policy},
         )
         try:
+            _validate_direct_hierarchy_reuse(
+                artifact_root=artifact_root,
+                artifact_directory=artifact_directory,
+                identity=identity,
+                canonical_index=canonical_index,
+            )
+            _, hierarchy_fingerprints, _ = _direct_hierarchy_specifications(
+                identity=identity, canonical_index=canonical_index
+            )
+            _emit_direct_hierarchy_progress(
+                reporter=reporter,
+                hierarchical_progress=hierarchical_progress,
+                fingerprints=hierarchy_fingerprints,
+                status="reused",
+                activation_policy=activation_policy,
+            )
             cached = _load_prepared_artifact_reuse_only(
                 artifact_root=artifact_root,
                 artifact_directory=artifact_directory,
@@ -1677,6 +2166,38 @@ def activate_direct_scheduled_temporal_operator(
                 reporter=reporter,
                 preflight_manifest=preflight_manifest,
             )
+        except ObsoleteArtifactFormatError:
+            raise
+        except HierarchicalArtifactUnavailableError as error:
+            raise PreparedArtifactUnavailableError(
+                reason_code=error.reason_code,
+                expected_identity_fingerprint=identity.fingerprint,
+                expected_artifact_directory=artifact_directory,
+                details={
+                    "artifact_layer": error.artifact_layer,
+                    "expected_fingerprint": error.expected_fingerprint,
+                    "artifact_path": error.artifact_path,
+                    **error.details,
+                },
+                remediation=(
+                    error.recommended_command
+                    or "run the explicit hierarchical preparation stage"
+                ),
+                different_artifact_found=_different_prepared_artifact_found(
+                    artifact_root, artifact_directory
+                ),
+            ) from error
+        except (ValueError, OSError) as error:
+            raise PreparedArtifactUnavailableError(
+                reason_code="hierarchical_validation_failed",
+                expected_identity_fingerprint=identity.fingerprint,
+                expected_artifact_directory=artifact_directory,
+                details={"validation_error": str(error)},
+                remediation="run the explicit hierarchical preparation stage",
+                different_artifact_found=_different_prepared_artifact_found(
+                    artifact_root, artifact_directory
+                ),
+            ) from error
         except PreparedArtifactUnavailableError as error:
             reporter.emit(
                 phase=ConstructionPhase.CACHE_VALIDATION,
@@ -1745,15 +2266,40 @@ def activate_direct_scheduled_temporal_operator(
         force=True,
         current_unit=str(artifact_directory),
     )
-    if artifact_directory.exists():
+    if activation_policy != "force_rebuild" and artifact_directory.exists():
+        hierarchy_valid = True
+        if artifact_root is not None:
+            try:
+                _validate_direct_hierarchy_reuse(
+                    artifact_root=artifact_root,
+                    artifact_directory=artifact_directory,
+                    identity=identity,
+                    canonical_index=canonical_index,
+                )
+            except (
+                AssignmentCompatibilityError,
+                HierarchicalArtifactUnavailableError,
+                ObsoleteArtifactFormatError,
+                ValueError,
+                KeyError,
+                OSError,
+            ):
+                # Explicit preparation is allowed to repair an incompatible
+                # cache, but it must never reinterpret the old payload as a
+                # valid L7 artifact.  Quarantine it before rebuilding.
+                hierarchy_valid = False
         try:
-            cached = load_temporal_block_operator(
-                artifact_directory,
-                expected_identity=identity,
-                expected_canonical_index=canonical_index,
-                reporter=reporter,
-                validated_cache_directory=operator_cache_directory,
-                preflight_manifest=preflight_manifest,
+            cached = (
+                load_temporal_block_operator(
+                    artifact_directory,
+                    expected_identity=identity,
+                    expected_canonical_index=canonical_index,
+                    reporter=reporter,
+                    validated_cache_directory=operator_cache_directory,
+                    preflight_manifest=preflight_manifest,
+                )
+                if hierarchy_valid
+                else None
             )
         except (AssignmentCompatibilityError, ValueError, KeyError, OSError):
             cached = None
@@ -1818,6 +2364,11 @@ def activate_direct_scheduled_temporal_operator(
                 decision,
                 None,
             )
+        if not hierarchy_valid and artifact_directory.exists():
+            quarantine = artifact_directory.with_name(
+                f"{artifact_directory.name}.invalid-{uuid.uuid4().hex}"
+            )
+            os.replace(artifact_directory, quarantine)
     reporter.emit(
         phase=ConstructionPhase.CACHE_VALIDATION,
         status="completed",
@@ -2148,8 +2699,10 @@ def activate_direct_scheduled_temporal_operator(
             deadline=control,
             reporter=reporter,
             support_timing_callback=support_timing_callback,
+            hierarchical_progress=hierarchical_progress,
             measurement_info=measurement_info,
             fixed_zero_reasons_by_full_index=fixed_zero_reasons_by_full_index,
+            force_rebuild=activation_policy == "force_rebuild",
         )
     except ConstructionDeadlineStop as error:
         reporter.terminal(error.termination)

@@ -37,7 +37,7 @@ from public_transportation.inference.construction_control import (
     normalize_progress_event,
 )
 
-GRAVITY_RUN_MANIFEST_SCHEMA_VERSION = 4
+GRAVITY_RUN_MANIFEST_SCHEMA_VERSION = 5
 GRAVITY_PROGRESS_SCHEMA_VERSION = 1
 
 
@@ -234,6 +234,9 @@ def build_gravity_run_manifest(
             "dtype": str(operator.dtype),
         }
     )
+    hierarchy_parents = getattr(operator, "hierarchy_parent_fingerprints", {})
+    if not isinstance(hierarchy_parents, Mapping):
+        hierarchy_parents = {}
     manifest: dict[str, object] = {
         "schema_version": GRAVITY_RUN_MANIFEST_SCHEMA_VERSION,
         "created_at_utc": _utc_now(),
@@ -291,6 +294,8 @@ def build_gravity_run_manifest(
             "mapping": operator.mapping_fingerprint,
             "features": problem.features.fingerprint,
             "direct_operator_artifact": artifact_fingerprint,
+            "estimation_assignment_mapping": artifact_fingerprint,
+            "estimation_assignment_mapping_parents": dict(hierarchy_parents),
             "structural_zeros": structural_zero_fingerprint,
             "calibration_mask": fingerprint(calibration),
             "joint_parameter_layout": problem.parameter_layout.fingerprint,
@@ -404,6 +409,18 @@ def build_gravity_run_manifest(
             "deadline_safety_margin_seconds": getattr(
                 operator, "deadline_safety_margin_seconds", None
             ),
+            "estimation_assignment_mapping": {
+                "fingerprint": artifact_fingerprint,
+                "parent_fingerprints": dict(hierarchy_parents),
+                "shape": [int(operator.num_measurements), int(operator.num_free_od)],
+                "number_of_measurements": int(operator.num_measurements),
+                "number_of_free_od_cells": int(operator.num_free_od),
+                "fixed_offset_fingerprint": getattr(
+                    getattr(operator, "estimation_assignment_mapping", None),
+                    "fixed_offset_fingerprint",
+                    None,
+                ),
+            },
         },
         "estimator_config": _json_value(estimator_config),
         "execution": _json_value(execution),

@@ -18,6 +18,13 @@ is an explicit part of the caller's workflow. The separate
 `prepare_direct_scheduled_temporal_operator` API remains the preparation
 stage for creating or resuming artifacts.
 
+New scheduled campaigns use the parent-aware artifact DAG documented in
+[hierarchical_assignment_artifacts.md](hierarchical_assignment_artifacts.md).
+The final `estimation_assignment_mapping` layer (L7) is the exact linear map
+passed to estimation. `activation_policy="force_rebuild"` is available only
+to an explicit preparation command; it invalidates the current L7 payload and
+rebuilds it while retaining compatible parent checkpoints.
+
 The activation API distinguishes three normal outcomes:
 
 - an activation-policy decline returns no operator and does no routing work;
@@ -44,6 +51,10 @@ Production fitting, validation, reporting, and viewer workflows should keep
 `reuse_only` so a missing or incompatible artifact fails immediately. Run
 `prepare_direct_scheduled_temporal_operator` explicitly when a preparation
 stage is authorized to construct or resume an artifact.
+
+The old monolithic direct-temporal artifact format is obsolete. It is not
+converted or silently reused; regenerate the hierarchy when
+`ObsoleteArtifactFormatError` is reported.
 
 Actual failures still raise their original errors. A deadline stop never
 publishes a partial final artifact.

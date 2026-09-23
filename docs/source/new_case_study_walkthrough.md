@@ -4405,3 +4405,53 @@ probabilities or standard errors. If no identifiability artifact was supplied,
 the manifest explicitly records `identifiability.available = false` and the
 existing structural-only `inference_score` message. A strict export can pass
 `require_identifiability=True`.
+
+## Hierarchical scheduled-assignment artifacts
+
+The scheduled temporal backend is prepared as a parent-aware DAG. The
+final layer, `estimation_assignment_mapping` (L7), is the exact linear map
+consumed by fitting, validation, identifiability, reporting, and viewer/export
+workflows:
+
+```text
+L0 scenario_base
+L1 canonical_od_time_universe
+L2 feasibility_support
+L3 route_choice_basis
+L4 route_choice_materialization
+L5 full_od_assignment_mapping
+L5 ───────────────┐
+L6 observation_projection ──┼──> L7 estimation_assignment_mapping
+```
+
+Manifests record direct scientific parents rather than inheriting every
+earlier layer. L7 joins `full_od_assignment_mapping` and
+`observation_projection`; this lets future observation branches reuse the same
+full assignment mapping.
+
+Preparation is the only stage permitted to use
+`activation_policy="build_or_reuse"` or `"force_rebuild"`. All downstream
+stages must use `activation_policy="reuse_only"`; a missing or incompatible
+layer is an error, not a request to rebuild. The layer manifests and payload
+checksums are stored under separate `checkpoints/<layer>/<fingerprint>` and
+`artifacts/<layer>/<fingerprint>` namespaces.
+
+The hierarchy supports the following invalidation rules:
+
+```text
+theta change:                 rebuild L4-L7 only
+fixed-positive values:        update the L7 fixed offset only
+structural-zero mask change:  rebuild L7 only
+measurement values:           no operator rebuild
+measurement mapping change:  rebuild L6-L7
+likelihood/gravity change:    no routing-artifact rebuild
+feasibility-rule change:     rebuild L2 and descendants
+network/timetable change:    rebuild every descendant
+```
+
+Each layer emits durable JSONL progress events with its fingerprint, direct
+parent fingerprint, activation policy, status, completed and total work, elapsed
+time, ETA and confidence, and reused/rebuilt flags. Per-layer and
+campaign-level streams are supported. Use the API and manifest schema in
+[`hierarchical_assignment_artifacts.md`](hierarchical_assignment_artifacts.md)
+when adding a case-study preparation command.

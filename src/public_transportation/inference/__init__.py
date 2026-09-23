@@ -28,6 +28,27 @@ from .compact_od_assignment_layout import (  # noqa: F401
 )
 from .compact_od_groups import compact_od_groups  # noqa: F401
 from .assignment_adapter import FixedRoutingPreparationDiagnostics  # noqa: F401
+from .hierarchical_artifacts import (  # noqa: F401
+    ARTIFACT_LAYERS,
+    ArtifactLayer,
+    DAG_PARENT_LAYERS,
+    EstimationAssignmentMapping,
+    HIERARCHICAL_ARTIFACT_SCHEMA_VERSION,
+    HIERARCHICAL_PROGRESS_SCHEMA_VERSION,
+    HierarchicalArtifactManifest,
+    HierarchicalArtifactStore,
+    HierarchicalArtifactUnavailableError,
+    HierarchicalPreparationResult,
+    HierarchicalProgressEvent,
+    HierarchicalProgressReporter,
+    ObsoleteArtifactFormatError,
+    canonical_json,
+    derive_layer_fingerprints,
+    file_sha256,
+    fingerprint,
+    make_manifest,
+    prepare_hierarchical_assignment_mapping,
+)
 from .sharded_fixed_routing import (  # noqa: F401
     SHARDED_FIXED_ROUTING_IMPLEMENTATION_VERSION,
     SHARDED_FIXED_ROUTING_SCHEMA_VERSION,

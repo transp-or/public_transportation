@@ -560,6 +560,17 @@ def validate_full_data_gravity_adequacy(
         )
     if result.model_fingerprint != gravity_model_fingerprint(problem, compact_layout):
         raise ValueError("gravity result and validation problem fingerprints differ.")
+    expected_operator_artifact = getattr(problem.operator, "artifact_fingerprint", None)
+    if (
+        expected_operator_artifact is not None
+        and result.direct_operator_artifact_fingerprint
+        and str(expected_operator_artifact)
+        != result.direct_operator_artifact_fingerprint
+    ):
+        raise ValueError(
+            "gravity result and validation problem use different "
+            "estimation_assignment_mapping artifacts."
+        )
     specification = problem.parameter_layout.specification
     _result_specification(result, specification)
     predicted, demand = predict_gravity_measurements(
