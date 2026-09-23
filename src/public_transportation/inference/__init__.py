@@ -372,9 +372,11 @@ from .temporal_assignment_sparse_backend import (  # noqa: F401
 from .direct_scheduled_temporal_builder import (  # noqa: F401
     DirectScheduledActivationDecision,
     DirectScheduledActivationMode,
+    DirectScheduledActivationPolicy,
     DirectScheduledActivationResult,
     DirectScheduledGravityOperator,
     DirectScheduledTemporalConstructionResult,
+    PreparedArtifactUnavailableError,
     activate_direct_scheduled_temporal_operator,
     prepare_direct_scheduled_temporal_operator,
 )

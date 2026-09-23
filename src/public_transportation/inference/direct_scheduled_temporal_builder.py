@@ -88,8 +88,60 @@ from .construction_control import (
 
 DirectTemporalProgressCallback = Callable[[dict[str, object]], None]
 DirectScheduledActivationMode = Literal["off", "auto", "direct"]
+DirectScheduledActivationPolicy = Literal["reuse_only", "build_or_reuse"]
 DirectFixedRoutingSource = FixedRoutingInputs | ShardedFixedRoutingInputs
 TEMPORAL_FRAGMENT_SCHEMA_VERSION = 1
+
+
+class PreparedArtifactUnavailableError(RuntimeError):
+    """Raised when activation cannot consume the requested prepared artifact."""
+
+    reason_code: str
+    expected_identity_fingerprint: str
+    expected_artifact_directory: str
+    details: Mapping[str, object]
+    remediation: str
+    different_artifact_found: bool
+
+    def __init__(
+        self,
+        *,
+        reason_code: str,
+        expected_identity_fingerprint: str,
+        expected_artifact_directory: str | Path,
+        details: Mapping[str, object] | None = None,
+        remediation: str,
+        different_artifact_found: bool = False,
+    ) -> None:
+        self.reason_code = str(reason_code)
+        self.expected_identity_fingerprint = str(expected_identity_fingerprint)
+        self.expected_artifact_directory = str(expected_artifact_directory)
+        self.details = dict(details or {})
+        self.remediation = str(remediation)
+        self.different_artifact_found = bool(different_artifact_found)
+        mismatch = self.details.get("mismatching_fields")
+        mismatch_line = (
+            f"\nMismatching fields:\n  {mismatch}"
+            if mismatch
+            else ""
+        )
+        found_line = "yes" if self.different_artifact_found else "no"
+        validation_error = self.details.get("validation_error")
+        validation_line = (
+            f"\nValidation detail:\n  {validation_error}"
+            if validation_error
+            else ""
+        )
+        message = (
+            "Prepared temporal operator unavailable.\n\n"
+            f"Expected identity:\n  {self.expected_identity_fingerprint}\n\n"
+            f"Expected artifact:\n  {self.expected_artifact_directory}\n\n"
+            f"Reason:\n  {self.reason_code}\n"
+            f"Different artifact found: {found_line}"
+            f"{mismatch_line}{validation_line}\n\n"
+            f"Recommended action:\n  {self.remediation}"
+        )
+        super().__init__(message)
 
 
 def _operator_number_of_blocks(
@@ -583,6 +635,158 @@ def _file_sha256(path: str | Path) -> str:
 
 def _operator_cache_directory(checkpoint_directory: Path) -> Path:
     return checkpoint_directory / "temporal_operator_cache"
+
+
+def _different_prepared_artifact_found(
+    artifact_root: str | Path, expected_directory: Path
+) -> bool:
+    """Return whether the artifact root contains another identity directory."""
+    root = Path(artifact_root)
+    try:
+        return any(
+            item.is_dir()
+            and item.name != expected_directory.name
+            and (
+                (item / "manifest.json").is_file()
+                or (
+                    len(item.name) == 64
+                    and all(
+                        character in "0123456789abcdef" for character in item.name
+                    )
+                )
+            )
+            for item in root.iterdir()
+        )
+    except OSError:
+        return False
+
+
+def _prepared_artifact_unavailable(
+    *,
+    artifact_root: str | Path,
+    artifact_directory: Path,
+    identity: AssignmentArtifactIdentity,
+    error: BaseException | None = None,
+) -> PreparedArtifactUnavailableError:
+    """Build a structured, actionable strict-activation failure."""
+    different_artifact_found = _different_prepared_artifact_found(
+        artifact_root, artifact_directory
+    )
+    if error is None or not artifact_directory.exists():
+        reason_code = "artifact_missing"
+        validation_error = None
+    else:
+        message = str(error)
+        lowered = message.lower()
+        if "incomplete" in lowered:
+            reason_code = "artifact_incomplete"
+        elif "schema" in lowered:
+            reason_code = "artifact_schema_incompatible"
+        elif "canonical binding" in lowered or "binding fingerprint" in lowered:
+            reason_code = "binding_fingerprint_mismatch"
+        elif "canonical" in lowered:
+            reason_code = "canonical_index_mismatch"
+        elif "identity" in lowered or "incompatible" in lowered:
+            reason_code = "artifact_identity_mismatch"
+        elif (
+            "hash" in lowered
+            or "payload" in lowered
+            or "offset" in lowered
+            or "corrupt" in lowered
+        ):
+            reason_code = "artifact_payload_corrupt"
+        else:
+            reason_code = "artifact_validation_failed"
+        validation_error = message
+    details: dict[str, object] = {
+        "artifact_root": str(artifact_root),
+        "different_artifact_found": different_artifact_found,
+    }
+    if validation_error is not None:
+        details["validation_error"] = validation_error
+        candidate_fields = tuple(AssignmentArtifactIdentity.__dataclass_fields__) + (
+            "canonical_index_fingerprint",
+            "binding_fingerprint",
+            "artifact_manifest_sha256",
+            "fixed_measurement_offset_hash",
+        )
+        fields = [field for field in candidate_fields if field in validation_error]
+        if fields:
+            details["mismatching_fields"] = fields
+    return PreparedArtifactUnavailableError(
+        reason_code=reason_code,
+        expected_identity_fingerprint=identity.fingerprint,
+        expected_artifact_directory=artifact_directory,
+        details=details,
+        remediation=(
+            "Run the explicit preparation stage with the same scenario, "
+            "measurements, configuration, package revision, and results root, "
+            "or correct the configured results root if the prepared artifact "
+            "already exists elsewhere."
+        ),
+        different_artifact_found=different_artifact_found,
+    )
+
+
+def _load_prepared_artifact_reuse_only(
+    *,
+    artifact_root: str | Path,
+    artifact_directory: Path,
+    checkpoint_root: str | Path,
+    inputs: AssignmentInputs,
+    spec,
+    canonical_index: CanonicalAssignmentIndex,
+    identity: AssignmentArtifactIdentity,
+    observations: object,
+    measurement_info: MappingInfo | None,
+    fixed_zero_reasons_by_full_index: Mapping[int, str] | None,
+    reporter: ConstructionProgressReporter,
+    preflight_manifest: Path | None,
+) -> TemporalBlockAssignmentOperator | PackedTemporalBlockAssignmentOperator:
+    """Load only a complete artifact; never invoke routing or construction."""
+    if not artifact_directory.is_dir():
+        raise _prepared_artifact_unavailable(
+            artifact_root=artifact_root,
+            artifact_directory=artifact_directory,
+            identity=identity,
+        )
+    operator_cache_directory = _operator_cache_directory(
+        Path(checkpoint_root) / identity.fingerprint
+    )
+    try:
+        cached = load_temporal_block_operator(
+            artifact_directory,
+            expected_identity=identity,
+            expected_canonical_index=canonical_index,
+            reporter=reporter,
+            validated_cache_directory=operator_cache_directory,
+            preflight_manifest=preflight_manifest,
+        )
+    except (AssignmentCompatibilityError, ValueError, KeyError, OSError) as error:
+        raise _prepared_artifact_unavailable(
+            artifact_root=artifact_root,
+            artifact_directory=artifact_directory,
+            identity=identity,
+            error=error,
+        ) from error
+    context = _positive_boarding_context(
+        checkpoint_root=checkpoint_root,
+        inputs=inputs,
+        spec=spec,
+        canonical_index=canonical_index,
+        identity=identity,
+        observations=observations,
+        mapping_info=measurement_info,
+        fixed_zero_reasons_by_full_index=fixed_zero_reasons_by_full_index,
+    )
+    _validate_cached_positive_boarding_support(
+        operator=cached,
+        context=context,
+        reporter=reporter,
+        artifact_directory=artifact_directory,
+        operator_cache_directory=operator_cache_directory,
+    )
+    return cached
 
 
 def _run_origin_positive_boarding_preflight(
@@ -1350,6 +1554,7 @@ def prepare_direct_scheduled_temporal_operator(
 def activate_direct_scheduled_temporal_operator(
     *,
     mode: DirectScheduledActivationMode,
+    activation_policy: DirectScheduledActivationPolicy = "reuse_only",
     expected_evaluations: int,
     construction_seconds: float | None,
     reference_evaluation_seconds: float,
@@ -1382,12 +1587,14 @@ def activate_direct_scheduled_temporal_operator(
     measurement_info: MappingInfo | None = None,
     fixed_zero_reasons_by_full_index: Mapping[int, str] | None = None,
 ) -> DirectScheduledActivationResult:
-    """Reuse a valid artifact or build only when the requested policy permits it.
+    """Activate a prepared artifact, optionally constructing it explicitly.
 
-    Cache validation precedes the cost decision and routing construction.  Thus a
-    fresh process can activate a valid artifact even when no construction-time
-    estimate is available, while a declined automatic decision retains the
-    caller's existing loader without paying routing-preparation cost.
+    ``reuse_only`` is the safe production default: it validates and consumes
+    only the identity-addressed persisted artifact and fails closed when that
+    artifact is unavailable.  ``build_or_reuse`` retains the explicit opt-in
+    construction behavior.  Use :func:`prepare_direct_scheduled_temporal_operator`
+    directly when a preparation stage is responsible for creating or resuming
+    artifacts.
     """
     if deadline is not None and time_budget_seconds is not None:
         raise ValueError("provide deadline or time_budget_seconds, not both.")
@@ -1403,6 +1610,10 @@ def activate_direct_scheduled_temporal_operator(
     )
     if mode not in ("off", "auto", "direct"):
         raise ValueError("mode must be 'off', 'auto', or 'direct'.")
+    if activation_policy not in ("reuse_only", "build_or_reuse"):
+        raise ValueError(
+            "activation_policy must be 'reuse_only' or 'build_or_reuse'."
+        )
     if expected_evaluations < 0:
         raise ValueError("expected_evaluations must be nonnegative.")
     for name, value in (
@@ -1428,12 +1639,6 @@ def activate_direct_scheduled_temporal_operator(
         raise AssignmentCompatibilityError(
             "direct temporal activation theta is incompatible."
         )
-    checkpoint_directory = Path(checkpoint_root) / identity.fingerprint
-    checkpoint_directory.mkdir(parents=True, exist_ok=True)
-    operator_cache_directory = _operator_cache_directory(checkpoint_directory)
-    preflight_manifest = _preflight_manifest_candidate(
-        checkpoint_root=checkpoint_root, artifact_root=artifact_root
-    )
     if mode == "off":
         decision = DirectScheduledActivationDecision(
             mode=mode,
@@ -1444,6 +1649,83 @@ def activate_direct_scheduled_temporal_operator(
             break_even_evaluations=None,
         )
         return DirectScheduledActivationResult(None, decision, None)
+
+    artifact_directory = temporal_block_cache_path(artifact_root, identity)
+    preflight_manifest = _preflight_manifest_candidate(
+        checkpoint_root=checkpoint_root, artifact_root=artifact_root
+    )
+    if activation_policy == "reuse_only":
+        reporter.emit(
+            phase=ConstructionPhase.CACHE_VALIDATION,
+            status="started",
+            force=True,
+            current_unit=str(artifact_directory),
+            details={"activation_policy": activation_policy},
+        )
+        try:
+            cached = _load_prepared_artifact_reuse_only(
+                artifact_root=artifact_root,
+                artifact_directory=artifact_directory,
+                checkpoint_root=checkpoint_root,
+                inputs=inputs,
+                spec=spec,
+                canonical_index=canonical_index,
+                identity=identity,
+                observations=observations,
+                measurement_info=measurement_info,
+                fixed_zero_reasons_by_full_index=fixed_zero_reasons_by_full_index,
+                reporter=reporter,
+                preflight_manifest=preflight_manifest,
+            )
+        except PreparedArtifactUnavailableError as error:
+            reporter.emit(
+                phase=ConstructionPhase.CACHE_VALIDATION,
+                status="failed",
+                force=True,
+                current_unit=str(artifact_directory),
+                details={
+                    "activation_policy": activation_policy,
+                    "reason_code": error.reason_code,
+                    **error.details,
+                },
+            )
+            raise
+        reporter.emit(
+            phase=ConstructionPhase.CACHE_VALIDATION,
+            status="completed",
+            force=True,
+            completed_units=_operator_number_of_blocks(cached),
+            total_units=_operator_number_of_blocks(cached),
+            current_unit=str(artifact_directory),
+            predicted_remaining_seconds=0.0,
+            eta_confidence="high",
+            eta_lower_seconds=0.0,
+            eta_upper_seconds=0.0,
+            throughput_units_per_second=1.0,
+            cache_hits=1,
+            cache_misses=0,
+            details={
+                "activation_policy": activation_policy,
+                "cache_validation_stage": "prepared_artifact_reuse",
+            },
+        )
+        decision = DirectScheduledActivationDecision(
+            mode=mode,
+            activated=True,
+            cache_reused=True,
+            reason="valid persistent artifact",
+            expected_evaluations=expected_evaluations,
+            break_even_evaluations=0.0,
+        )
+        return DirectScheduledActivationResult(
+            DirectScheduledGravityOperator(cached, theta, reporter=reporter),
+            decision,
+            None,
+        )
+
+    checkpoint_directory = Path(checkpoint_root) / identity.fingerprint
+    checkpoint_directory.mkdir(parents=True, exist_ok=True)
+    operator_cache_directory = _operator_cache_directory(checkpoint_directory)
 
     preflight = _positive_boarding_context(
         checkpoint_root=checkpoint_root,
@@ -1457,7 +1739,6 @@ def activate_direct_scheduled_temporal_operator(
     )
     _run_origin_positive_boarding_preflight(context=preflight, reporter=reporter)
 
-    artifact_directory = temporal_block_cache_path(artifact_root, identity)
     reporter.emit(
         phase=ConstructionPhase.CACHE_VALIDATION,
         status="started",

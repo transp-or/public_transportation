@@ -3775,7 +3775,7 @@ The complete current signature is:
 
 ```text
 activate_direct_scheduled_temporal_operator(
-    *, mode, expected_evaluations, construction_seconds,
+    *, mode, activation_policy="reuse_only", expected_evaluations, construction_seconds,
     reference_evaluation_seconds, operator_evaluation_seconds,
     checkpoint_root, artifact_root, inputs, routing_factory, theta, spec,
     compact_layout, canonical_index, observations, identity,
@@ -3883,7 +3883,8 @@ identity = build_scheduled_reference_artifact_identity(
     coefficient_policy_fingerprint="exact-float32-v1",
 )
 activated = activate_direct_scheduled_temporal_operator(
-    mode="direct", expected_evaluations=expected_evaluations,
+    mode="direct", activation_policy="build_or_reuse",
+    expected_evaluations=expected_evaluations,
     construction_seconds=None, reference_evaluation_seconds=reference_seconds,
     operator_evaluation_seconds=operator_seconds,
     checkpoint_root=Path("results/checkpoints"),

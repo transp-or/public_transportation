@@ -22,6 +22,7 @@ from public_transportation.inference.assignment_adapter import (
 )
 from public_transportation.inference.assignment_contract import (
     AssignmentCompatibilityError,
+    AssignmentArtifactIdentity,
     AssignmentOperator,
     CanonicalMeasurement,
     CanonicalTimeInterval,
@@ -32,6 +33,7 @@ from public_transportation.inference.compact_od_assignment_layout import (
 )
 from public_transportation.inference.direct_scheduled_temporal_builder import (
     DirectScheduledGravityOperator,
+    PreparedArtifactUnavailableError,
     activate_direct_scheduled_temporal_operator,
     prepare_direct_scheduled_temporal_operator,
 )
@@ -1063,6 +1065,7 @@ def _activation_arguments(artifacts, tmp_path):
     return dict(
         checkpoint_root=tmp_path / "checkpoints",
         artifact_root=tmp_path / "artifacts",
+        activation_policy="build_or_reuse",
         inputs=inputs,
         routing_factory=routing_factory,
         theta=1.0,
@@ -1095,6 +1098,232 @@ def test_direct_activation_declines_unjustified_build_without_routing(
     assert "does not exceed" in result.decision.reason
     assert result.decision.break_even_evaluations == pytest.approx(20.0 / 1.5)
     assert routing_calls == []
+
+
+def test_direct_activation_default_is_reuse_only(artifacts, tmp_path):
+    arguments, routing_calls = _activation_arguments(artifacts, tmp_path)
+    built = activate_direct_scheduled_temporal_operator(
+        mode="direct",
+        expected_evaluations=1,
+        construction_seconds=None,
+        reference_evaluation_seconds=2.0,
+        operator_evaluation_seconds=0.5,
+        **arguments,
+    )
+    assert built.operator is not None
+    assert len(routing_calls) == 1
+
+    strict_arguments = dict(arguments)
+    strict_arguments.pop("activation_policy")
+    reused = activate_direct_scheduled_temporal_operator(
+        mode="auto",
+        expected_evaluations=1,
+        construction_seconds=None,
+        reference_evaluation_seconds=2.0,
+        operator_evaluation_seconds=0.5,
+        **strict_arguments,
+    )
+    assert reused.operator is not None
+    assert reused.decision.cache_reused
+    assert len(routing_calls) == 1
+
+
+def test_direct_activation_reuse_only_missing_artifact_fails_closed(
+    artifacts, tmp_path
+):
+    arguments, routing_calls = _activation_arguments(artifacts, tmp_path)
+    arguments.pop("activation_policy")
+    alternate = arguments["artifact_root"] / ("0" * 64)
+    alternate.mkdir(parents=True)
+    with pytest.raises(PreparedArtifactUnavailableError) as caught:
+        activate_direct_scheduled_temporal_operator(
+            mode="direct",
+            expected_evaluations=1,
+            construction_seconds=None,
+            reference_evaluation_seconds=2.0,
+            operator_evaluation_seconds=0.5,
+            **arguments,
+        )
+    error = caught.value
+    assert error.reason_code == "artifact_missing"
+    assert error.expected_identity_fingerprint == arguments["identity"].fingerprint
+    assert error.expected_artifact_directory.endswith(error.expected_identity_fingerprint)
+    assert "explicit preparation" in error.remediation
+    assert error.different_artifact_found
+    assert routing_calls == []
+    assert not (arguments["checkpoint_root"]).exists()
+
+
+def test_direct_activation_reuse_only_reports_identity_mismatch_without_quarantine(
+    artifacts, tmp_path
+):
+    arguments, routing_calls = _activation_arguments(artifacts, tmp_path)
+    built = activate_direct_scheduled_temporal_operator(
+        mode="direct",
+        expected_evaluations=1,
+        construction_seconds=None,
+        reference_evaluation_seconds=2.0,
+        operator_evaluation_seconds=0.5,
+        **arguments,
+    )
+    assert built.operator is not None
+    artifact = temporal_block_cache_path(
+        arguments["artifact_root"], arguments["identity"]
+    )
+    manifest_path = artifact / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_identity = dict(manifest["identity"])
+    manifest_identity["timetable_fingerprint"] = "different-timetable"
+    changed_identity = AssignmentArtifactIdentity(**manifest_identity)
+    manifest["identity"] = manifest_identity
+    manifest["identity_fingerprint"] = changed_identity.fingerprint
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    before = manifest_path.read_bytes()
+    strict_arguments = dict(arguments)
+    strict_arguments.pop("activation_policy")
+    with pytest.raises(PreparedArtifactUnavailableError) as caught:
+        activate_direct_scheduled_temporal_operator(
+            mode="auto",
+            expected_evaluations=1,
+            construction_seconds=None,
+            reference_evaluation_seconds=2.0,
+            operator_evaluation_seconds=0.5,
+            **strict_arguments,
+        )
+    error = caught.value
+    assert error.reason_code == "artifact_identity_mismatch"
+    assert "timetable_fingerprint" in error.details["mismatching_fields"]
+    assert manifest_path.read_bytes() == before
+    assert not tuple(artifact.parent.glob(f"{artifact.name}.invalid-*"))
+    assert len(routing_calls) == 1
+
+
+def test_direct_activation_reuse_only_rejects_incomplete_artifact_without_mutation(
+    artifacts, tmp_path
+):
+    arguments, routing_calls = _activation_arguments(artifacts, tmp_path)
+    built = activate_direct_scheduled_temporal_operator(
+        mode="direct",
+        expected_evaluations=1,
+        construction_seconds=None,
+        reference_evaluation_seconds=2.0,
+        operator_evaluation_seconds=0.5,
+        **arguments,
+    )
+    assert built.operator is not None
+    artifact = temporal_block_cache_path(
+        arguments["artifact_root"], arguments["identity"]
+    )
+    manifest_path = artifact / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["complete"] = False
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    before_entries = sorted(path.name for path in artifact.parent.iterdir())
+    strict_arguments = dict(arguments)
+    strict_arguments.pop("activation_policy")
+    with pytest.raises(PreparedArtifactUnavailableError) as caught:
+        activate_direct_scheduled_temporal_operator(
+            mode="auto",
+            expected_evaluations=1,
+            construction_seconds=None,
+            reference_evaluation_seconds=2.0,
+            operator_evaluation_seconds=0.5,
+            **strict_arguments,
+        )
+    assert caught.value.reason_code == "artifact_incomplete"
+    assert sorted(path.name for path in artifact.parent.iterdir()) == before_entries
+    assert routing_calls == [True]
+
+
+def test_direct_activation_reuse_only_rejects_corrupt_payload_without_quarantine(
+    artifacts, tmp_path
+):
+    arguments, routing_calls = _activation_arguments(artifacts, tmp_path)
+    built = activate_direct_scheduled_temporal_operator(
+        mode="direct",
+        expected_evaluations=1,
+        construction_seconds=None,
+        reference_evaluation_seconds=2.0,
+        operator_evaluation_seconds=0.5,
+        **arguments,
+    )
+    assert built.operator is not None
+    artifact = temporal_block_cache_path(
+        arguments["artifact_root"], arguments["identity"]
+    )
+    manifest_path = artifact / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["blocks"][0]["content_hash"] = "corrupt"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    strict_arguments = dict(arguments)
+    strict_arguments.pop("activation_policy")
+    with pytest.raises(PreparedArtifactUnavailableError) as caught:
+        activate_direct_scheduled_temporal_operator(
+            mode="auto",
+            expected_evaluations=1,
+            construction_seconds=None,
+            reference_evaluation_seconds=2.0,
+            operator_evaluation_seconds=0.5,
+            **strict_arguments,
+        )
+    assert caught.value.reason_code == "artifact_payload_corrupt"
+    assert not tuple(artifact.parent.glob(f"{artifact.name}.invalid-*"))
+    assert routing_calls == [True]
+
+
+def test_direct_activation_reuse_only_can_create_derived_cache_without_assembly(
+    artifacts, tmp_path
+):
+    arguments, routing_calls = _activation_arguments(artifacts, tmp_path)
+    built = activate_direct_scheduled_temporal_operator(
+        mode="direct",
+        expected_evaluations=1,
+        construction_seconds=None,
+        reference_evaluation_seconds=2.0,
+        operator_evaluation_seconds=0.5,
+        **arguments,
+    )
+    assert built.operator is not None
+    checkpoint = Path(arguments["checkpoint_root"]) / arguments["identity"].fingerprint
+    cache_directory = checkpoint / "temporal_operator_cache"
+    shutil.rmtree(cache_directory)
+    strict_arguments = dict(arguments)
+    strict_arguments.pop("activation_policy")
+    events: list[dict[str, object]] = []
+    reused = activate_direct_scheduled_temporal_operator(
+        mode="auto",
+        expected_evaluations=1,
+        construction_seconds=None,
+        reference_evaluation_seconds=2.0,
+        operator_evaluation_seconds=0.5,
+        progress=events.append,
+        **strict_arguments,
+    )
+    assert reused.operator is not None
+    assert cache_directory.exists()
+    assert not any(event["phase"] == "temporal_block_assembly" for event in events)
+    assert any(
+        event.get("cache_validation_stage") == "temporal_block_load"
+        for event in events
+    )
+    assert len(routing_calls) == 1
+
+
+def test_direct_activation_mode_off_remains_disabled(artifacts, tmp_path):
+    arguments, routing_calls = _activation_arguments(artifacts, tmp_path)
+    arguments.pop("activation_policy")
+    result = activate_direct_scheduled_temporal_operator(
+        mode="off",
+        expected_evaluations=1,
+        construction_seconds=None,
+        reference_evaluation_seconds=2.0,
+        operator_evaluation_seconds=0.5,
+        **arguments,
+    )
+    assert result.operator is None
+    assert not result.decision.activated
+    assert routing_calls == []
+    assert not arguments["checkpoint_root"].exists()
 
 
 def test_direct_activation_rejects_unsupported_positive_boarding_before_routing(

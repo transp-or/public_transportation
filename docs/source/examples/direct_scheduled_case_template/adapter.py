@@ -1096,6 +1096,7 @@ def activate(
     profile_started = perf_counter()
     activated = activate_direct_scheduled_temporal_operator(
         mode="direct",
+        activation_policy="build_or_reuse",
         expected_evaluations=settings.expected_evaluations,
         construction_seconds=None,
         reference_evaluation_seconds=1.0,

@@ -10,14 +10,40 @@ an absolute monotonic cutoff. Leave the deadline unset for backward-compatible
 unlimited execution. The safety margin prevents a new indivisible unit from
 starting unless its predicted duration fits inside the remaining safe time.
 
-`activate_direct_scheduled_temporal_operator` distinguishes three normal
-outcomes:
+`activate_direct_scheduled_temporal_operator` defaults to strict
+`activation_policy="reuse_only"`. It validates and consumes only the
+identity-addressed prepared artifact; it never starts routing or temporal
+construction. Use `activation_policy="build_or_reuse"` only when construction
+is an explicit part of the caller's workflow. The separate
+`prepare_direct_scheduled_temporal_operator` API remains the preparation
+stage for creating or resuming artifacts.
+
+The activation API distinguishes three normal outcomes:
 
 - an activation-policy decline returns no operator and does no routing work;
 - a deadline stop returns a `ConstructionTermination` and retains validated
   checkpoints;
 - a valid completed artifact is loaded before routing or deadline enforcement,
   including when the new budget is almost exhausted.
+
+If reuse-only activation cannot find or validate the expected artifact it raises
+`PreparedArtifactUnavailableError`. Its structured `reason_code` identifies
+missing, incomplete, schema-incompatible, identity-mismatched, canonical-index,
+binding-fingerprint, payload-corruption, and general validation failures. The
+exception includes the expected identity, searched artifact directory,
+mismatching fields when available, whether another artifact was found, and the
+recommended preparation or results-root correction. Re-run the explicit
+preparation stage with the same scientific inputs to regenerate an artifact;
+activation never quarantines or replaces an invalid artifact.
+
+When a complete source artifact has no packed validation cache, reuse-only
+activation may create that derived cache. This is reported as cache validation
+or artifact loading and never invokes routing or temporal-block assembly.
+
+Production fitting, validation, reporting, and viewer workflows should keep
+`reuse_only` so a missing or incompatible artifact fails immediately. Run
+`prepare_direct_scheduled_temporal_operator` explicitly when a preparation
+stage is authorized to construct or resume an artifact.
 
 Actual failures still raise their original errors. A deadline stop never
 publishes a partial final artifact.

@@ -233,6 +233,7 @@ def run_validation(
     started = perf_counter()
     activated = activate_direct_scheduled_temporal_operator(
         mode="direct",
+        activation_policy="build_or_reuse",
         expected_evaluations=20,
         construction_seconds=None,
         reference_evaluation_seconds=1.94,
