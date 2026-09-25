@@ -43,6 +43,7 @@ from .hierarchical_artifacts import (
     fingerprint as hierarchy_fingerprint,
     make_manifest,
 )
+from .checkpoint_policy import CheckpointPolicy, normalize_checkpoint_policy
 from .fixed_routing_measurement_operator import (
     assignment_inputs_fingerprint,
     measurement_mapping_fingerprint,
@@ -175,6 +176,9 @@ class DirectScheduledTemporalConstructionResult:
     source: ShardedConstructionResult | None
     temporal_artifact_reused: bool
     finalization_seconds: float
+    verification_mode: str = "fast"
+    checkpoint_reused: bool = False
+    rebuild_performed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -933,6 +937,7 @@ def _validate_direct_hierarchy_reuse(
     artifact_directory: Path,
     identity: AssignmentArtifactIdentity,
     canonical_index: CanonicalAssignmentIndex,
+    verify: Literal["fast", "full"] = "fast",
 ) -> None:
     """Validate every parent manifest before strict L7 reuse."""
 
@@ -969,6 +974,7 @@ def _validate_direct_hierarchy_reuse(
             layer,  # type: ignore[arg-type]
             fingerprints[layer],
             expected_parents=parents,
+            verify=verify,
             recommended_command=(
                 "prepare_direct_scheduled_temporal_operator "
                 "(explicit preparation stage)"
@@ -978,6 +984,7 @@ def _validate_direct_hierarchy_reuse(
             layer,  # type: ignore[arg-type]
             fingerprints[layer],
             expected_parents=parents,
+            verify=verify,
             recommended_command=(
                 "prepare_direct_scheduled_temporal_operator "
                 "(explicit preparation stage)"
@@ -1110,6 +1117,8 @@ def _prepared_artifact_unavailable(
             reason_code = "canonical_index_mismatch"
         elif "identity" in lowered or "incompatible" in lowered:
             reason_code = "artifact_identity_mismatch"
+        elif "completion_marker" in lowered:
+            reason_code = "artifact_payload_corrupt"
         elif (
             "hash" in lowered
             or "payload" in lowered
@@ -1164,6 +1173,7 @@ def _load_prepared_artifact_reuse_only(
     fixed_zero_reasons_by_full_index: Mapping[int, str] | None,
     reporter: ConstructionProgressReporter,
     preflight_manifest: Path | None,
+    verify: Literal["fast", "full"] = "fast",
 ) -> TemporalBlockAssignmentOperator | PackedTemporalBlockAssignmentOperator:
     """Load only a complete artifact; never invoke routing or construction."""
     if not artifact_directory.is_dir():
@@ -1183,6 +1193,7 @@ def _load_prepared_artifact_reuse_only(
             reporter=reporter,
             validated_cache_directory=operator_cache_directory,
             preflight_manifest=preflight_manifest,
+            verify=verify,
         )
     except (AssignmentCompatibilityError, ValueError, KeyError, OSError) as error:
         raise _prepared_artifact_unavailable(
@@ -1739,13 +1750,25 @@ def prepare_direct_scheduled_temporal_operator(
     measurement_info: MappingInfo | None = None,
     fixed_zero_reasons_by_full_index: Mapping[int, str] | None = None,
     force_rebuild: bool = False,
+    checkpoint_policy: CheckpointPolicy = "reuse_or_build",
+    verify: Literal["fast", "full"] = "fast",
 ) -> DirectScheduledTemporalConstructionResult:
     """Build or resume direct measurement shards, then publish temporal blocks.
 
+    ``checkpoint_policy="reuse_or_build"`` reuses a compatible complete
+    artifact, resumes matching routing checkpoints, and builds missing data;
+    ``"reuse_only"`` fails closed and ``"rebuild"`` explicitly quarantines
+    the prior identity.  ``verify="fast"`` validates only metadata and
+    completion markers; ``verify="full"`` additionally hashes payloads.
     ``hierarchical_progress`` is optional durable L0--L7 JSONL reporting for
     the parent-aware artifact campaign.  The existing ``reporter``/``progress``
     hooks remain responsible for detailed shard construction events.
     """
+    policy = normalize_checkpoint_policy(
+        "rebuild" if force_rebuild else checkpoint_policy
+    )
+    if verify not in {"fast", "full"}:
+        raise ValueError("verify must be 'fast' or 'full'")
     legacy_progress = progress if deadline is None and reporter is None else None
     control = ConstructionDeadline.unlimited() if deadline is None else deadline
     events = (
@@ -1772,6 +1795,11 @@ def prepare_direct_scheduled_temporal_operator(
     )
     _run_origin_positive_boarding_preflight(context=preflight, reporter=events)
     checkpoint_directory = Path(checkpoint_root) / identity.fingerprint
+    if policy == "rebuild" and checkpoint_directory.exists():
+        quarantine = checkpoint_directory.with_name(
+            f"{checkpoint_directory.name}.rebuild-{uuid.uuid4().hex}"
+        )
+        os.replace(checkpoint_directory, quarantine)
     checkpoint_directory.mkdir(parents=True, exist_ok=True)
     operator_cache_directory = _operator_cache_directory(checkpoint_directory)
     preflight_manifest = _preflight_manifest_candidate(
@@ -1782,13 +1810,13 @@ def prepare_direct_scheduled_temporal_operator(
         if artifact_root is None
         else temporal_block_cache_path(artifact_root, identity)
     )
-    if force_rebuild and artifact_directory is not None and artifact_directory.exists():
+    if policy == "rebuild" and artifact_directory is not None and artifact_directory.exists():
         quarantine = artifact_directory.with_name(
             f"{artifact_directory.name}.force-rebuild-{uuid.uuid4().hex}"
         )
         os.replace(artifact_directory, quarantine)
     if (
-        not force_rebuild
+        policy != "rebuild"
         and artifact_directory is not None
         and artifact_directory.exists()
     ):
@@ -1807,19 +1835,34 @@ def prepare_direct_scheduled_temporal_operator(
                 reporter=events,
                 validated_cache_directory=operator_cache_directory,
                 preflight_manifest=preflight_manifest,
+                verify=verify,
             )
+        except ObsoleteArtifactFormatError:
+            raise
         except (
             AssignmentCompatibilityError,
             HierarchicalArtifactUnavailableError,
-            ObsoleteArtifactFormatError,
             ValueError,
             KeyError,
             OSError,
-        ):
-            quarantine = artifact_directory.with_name(
-                f"{artifact_directory.name}.invalid-{uuid.uuid4().hex}"
+        ) as error:
+            if policy == "reuse_only":
+                raise PreparedArtifactUnavailableError(
+                    reason_code="artifact_incompatible",
+                    expected_identity_fingerprint=identity.fingerprint,
+                    expected_artifact_directory=artifact_directory,
+                    details={"validation_error": str(error)},
+                    remediation="run explicit preparation with checkpoint_policy='rebuild'",
+                    different_artifact_found=False,
+                ) from error
+            raise PreparedArtifactUnavailableError(
+                reason_code="artifact_incompatible",
+                expected_identity_fingerprint=identity.fingerprint,
+                expected_artifact_directory=artifact_directory,
+                details={"validation_error": str(error)},
+                remediation="use checkpoint_policy='rebuild' for an explicit rebuild",
+                different_artifact_found=False,
             )
-            os.replace(artifact_directory, quarantine)
         else:
             _validate_cached_positive_boarding_support(
                 operator=operator,
@@ -1828,6 +1871,16 @@ def prepare_direct_scheduled_temporal_operator(
                 artifact_directory=artifact_directory,
                 operator_cache_directory=operator_cache_directory,
             )
+            _, hierarchy_fingerprints, _ = _direct_hierarchy_specifications(
+                identity=identity, canonical_index=canonical_index
+            )
+            _emit_direct_hierarchy_progress(
+                reporter=events,
+                hierarchical_progress=hierarchical_progress,
+                fingerprints=hierarchy_fingerprints,
+                status="reused",
+                activation_policy=policy,
+            )
             return DirectScheduledTemporalConstructionResult(
                 operator=operator,
                 checkpoint_directory=checkpoint_directory,
@@ -1835,7 +1888,23 @@ def prepare_direct_scheduled_temporal_operator(
                 source=None,
                 temporal_artifact_reused=True,
                 finalization_seconds=0.0,
+                verification_mode=verify,
+                checkpoint_reused=True,
+                rebuild_performed=False,
             )
+    if policy == "reuse_only":
+        raise PreparedArtifactUnavailableError(
+            reason_code="artifact_missing",
+            expected_identity_fingerprint=identity.fingerprint,
+            expected_artifact_directory=(
+                Path(artifact_root) / identity.fingerprint
+                if artifact_root is not None
+                else Path(checkpoint_root) / identity.fingerprint
+            ),
+            details={},
+            remediation="run prepare_direct_scheduled_temporal_operator with checkpoint_policy='reuse_or_build'",
+            different_artifact_found=False,
+        )
     if not control.may_start():
         raise deadline_stop(
             control,
@@ -1985,7 +2054,7 @@ def prepare_direct_scheduled_temporal_operator(
             hierarchical_progress=hierarchical_progress,
             fingerprints=hierarchy_fingerprints,
             status="completed",
-            activation_policy="force_rebuild" if force_rebuild else "build_or_reuse",
+            activation_policy=("force_rebuild" if policy == "rebuild" else "build_or_reuse"),
         )
     finalization_seconds = max(0.0, perf_counter() - finalization_started)
     if control.expired:
@@ -2016,6 +2085,9 @@ def prepare_direct_scheduled_temporal_operator(
         source=source,
         temporal_artifact_reused=False,
         finalization_seconds=finalization_seconds,
+        verification_mode=verify,
+        checkpoint_reused=False,
+        rebuild_performed=policy == "rebuild",
     )
 
 
@@ -2023,6 +2095,8 @@ def activate_direct_scheduled_temporal_operator(
     *,
     mode: DirectScheduledActivationMode,
     activation_policy: DirectScheduledActivationPolicy = "reuse_only",
+    checkpoint_policy: CheckpointPolicy | None = None,
+    verify: Literal["fast", "full"] = "fast",
     expected_evaluations: int,
     construction_seconds: float | None,
     reference_evaluation_seconds: float,
@@ -2087,6 +2161,15 @@ def activate_direct_scheduled_temporal_operator(
             "activation_policy must be 'reuse_only', 'build_or_reuse', or "
             "'force_rebuild'."
         )
+    if verify not in {"fast", "full"}:
+        raise ValueError("verify must be 'fast' or 'full'")
+    if checkpoint_policy is not None:
+        normalized_checkpoint_policy = normalize_checkpoint_policy(checkpoint_policy)
+        activation_policy = {
+            "reuse_only": "reuse_only",
+            "reuse_or_build": "build_or_reuse",
+            "rebuild": "force_rebuild",
+        }[normalized_checkpoint_policy]
     if expected_evaluations < 0:
         raise ValueError("expected_evaluations must be nonnegative.")
     for name, value in (
@@ -2141,6 +2224,7 @@ def activate_direct_scheduled_temporal_operator(
                 artifact_directory=artifact_directory,
                 identity=identity,
                 canonical_index=canonical_index,
+                verify=verify,
             )
             _, hierarchy_fingerprints, _ = _direct_hierarchy_specifications(
                 identity=identity, canonical_index=canonical_index
@@ -2165,6 +2249,7 @@ def activate_direct_scheduled_temporal_operator(
                 fixed_zero_reasons_by_full_index=fixed_zero_reasons_by_full_index,
                 reporter=reporter,
                 preflight_manifest=preflight_manifest,
+                verify=verify,
             )
         except ObsoleteArtifactFormatError:
             raise
@@ -2297,6 +2382,7 @@ def activate_direct_scheduled_temporal_operator(
                     reporter=reporter,
                     validated_cache_directory=operator_cache_directory,
                     preflight_manifest=preflight_manifest,
+                    verify=verify,
                 )
                 if hierarchy_valid
                 else None
@@ -2703,6 +2789,7 @@ def activate_direct_scheduled_temporal_operator(
             measurement_info=measurement_info,
             fixed_zero_reasons_by_full_index=fixed_zero_reasons_by_full_index,
             force_rebuild=activation_policy == "force_rebuild",
+            verify=verify,
         )
     except ConstructionDeadlineStop as error:
         reporter.terminal(error.termination)

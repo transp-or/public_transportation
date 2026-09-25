@@ -7,12 +7,15 @@ import json
 import os
 import shutil
 import tempfile
+import uuid
+from datetime import datetime, timezone
 from collections import deque
 from dataclasses import asdict
 from collections.abc import Mapping
 from contextlib import nullcontext
 from pathlib import Path
 from time import perf_counter
+from typing import Literal
 
 import numpy as np
 
@@ -39,9 +42,11 @@ from .construction_control import (
     deadline_stop,
     estimate_completed_unit_eta,
 )
+from .checkpoint_policy import CheckpointPolicy, normalize_checkpoint_policy
+from .hierarchical_artifacts import package_revision
 
-TEMPORAL_BLOCK_ARTIFACT_SCHEMA_VERSION = 1
-TEMPORAL_OPERATOR_CACHE_SCHEMA_VERSION = 1
+TEMPORAL_BLOCK_ARTIFACT_SCHEMA_VERSION = 2
+TEMPORAL_OPERATOR_CACHE_SCHEMA_VERSION = 2
 TEMPORAL_OPERATOR_VALIDATOR_VERSION = 1
 PREFLIGHT_ADOPTION_SCHEMA_VERSION = 1
 
@@ -99,6 +104,39 @@ def _atomic_json_write(path: str | Path, payload: Mapping[str, object]) -> Path:
         if os.path.exists(temporary):
             os.unlink(temporary)
     return destination
+
+
+def _publish_completion_marker(directory: str | Path) -> None:
+    """Publish the small marker only after the manifest and payload exist."""
+
+    root = Path(directory)
+    manifest_path = root / "manifest.json"
+    manifest = _read_json(manifest_path)
+    _atomic_json_write(
+        root / "COMPLETE.json",
+        {
+            "identity_fingerprint": manifest.get(
+                "artifact_identity_fingerprint", manifest.get("identity_fingerprint")
+            ),
+            "manifest_sha256": _file_sha256(manifest_path),
+            "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
+def _validate_completion_marker(root: Path, manifest: Mapping[str, object]) -> None:
+    marker_path = root / "COMPLETE.json"
+    if not marker_path.is_file():
+        raise ValueError("completion_marker_missing")
+    marker = _read_json(marker_path)
+    expected_identity = manifest.get(
+        "artifact_identity_fingerprint", manifest.get("identity_fingerprint")
+    )
+    if (
+        marker.get("identity_fingerprint") != expected_identity
+        or marker.get("manifest_sha256") != _file_sha256(root / "manifest.json")
+    ):
+        raise ValueError("completion_marker_invalid")
 
 
 def _identity_checkpoint_directory(
@@ -249,9 +287,17 @@ def save_temporal_block_operator(
                     ),
                 )
         np.save(staging / "fixed_measurement_offset.npy", operator.fixed_measurement_offset)
+        payload_names = tuple(
+            [f"blocks/{item['filename']}" for item in block_manifest]
+            + ["fixed_measurement_offset.npy"]
+        )
         manifest = {
             "schema_version": TEMPORAL_BLOCK_ARTIFACT_SCHEMA_VERSION,
             "complete": True,
+            "package_revision": package_revision(),
+            "identity_basis_fingerprint": operator.identity.fingerprint,
+            "configuration_fingerprint": operator.identity.fingerprint,
+            "parent_identity_fingerprint": None,
             "identity": asdict(operator.identity),
             "identity_fingerprint": operator.identity.fingerprint,
             "canonical_index": _canonical_index_payload(operator.canonical_index),
@@ -263,9 +309,20 @@ def save_temporal_block_operator(
             ),
             "diagnostics": asdict(operator.diagnostics),
             "blocks": block_manifest,
+            "file_sizes": {
+                name: int((staging / name).stat().st_size) for name in payload_names
+            },
         }
         (staging / "manifest.json").write_text(
             json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+        )
+        _atomic_json_write(
+            staging / "COMPLETE.json",
+            {
+                "identity_fingerprint": operator.identity.fingerprint,
+                "manifest_sha256": _file_sha256(staging / "manifest.json"),
+                "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+            },
         )
         os.replace(staging, destination)
     except BaseException:
@@ -552,10 +609,17 @@ def materialize_operator_cache_from_adopted_preflight(
         hashes = {
             name: _file_sha256(staging / name) for name in packed_names
         }
+        file_sizes = {
+            name: int((staging / name).stat().st_size) for name in packed_names
+        }
         cache_manifest = {
             "complete": True,
             "schema_version": TEMPORAL_OPERATOR_CACHE_SCHEMA_VERSION,
             "validator_version": TEMPORAL_OPERATOR_VALIDATOR_VERSION,
+            "package_revision": package_revision(),
+            "identity_basis_fingerprint": identity.fingerprint,
+            "configuration_fingerprint": identity.fingerprint,
+            "parent_identity_fingerprint": None,
             "identity": asdict(identity),
             "artifact_identity_fingerprint": identity.fingerprint,
             "artifact_manifest_sha256": artifact_hash,
@@ -569,6 +633,7 @@ def materialize_operator_cache_from_adopted_preflight(
                 "fixed_measurement_offset_hash"
             ),
             "packed_array_hashes": hashes,
+            "file_sizes": file_sizes,
             "diagnostics": artifact_manifest.get("diagnostics", {}),
             "keys": "keys.json",
             "provenance": {
@@ -583,6 +648,7 @@ def materialize_operator_cache_from_adopted_preflight(
         for name in packed_names:
             os.replace(staging / name, cache / name)
         _atomic_json_write(cache / "manifest.json", cache_manifest)
+        _publish_completion_marker(cache)
         if reporting_enabled:
             eta = estimate_completed_unit_eta(
                 recent_durations,
@@ -716,10 +782,15 @@ def _materialize_operator_cache_from_operator(
             "keys.json",
         )
         hashes = {name: _file_sha256(staging / name) for name in names}
+        file_sizes = {name: int((staging / name).stat().st_size) for name in names}
         manifest = {
             "complete": True,
             "schema_version": TEMPORAL_OPERATOR_CACHE_SCHEMA_VERSION,
             "validator_version": TEMPORAL_OPERATOR_VALIDATOR_VERSION,
+            "package_revision": package_revision(),
+            "identity_basis_fingerprint": operator.identity.fingerprint,
+            "configuration_fingerprint": operator.identity.fingerprint,
+            "parent_identity_fingerprint": None,
             "identity": asdict(operator.identity),
             "artifact_identity_fingerprint": operator.identity.fingerprint,
             "artifact_manifest_sha256": artifact_manifest_sha256,
@@ -733,6 +804,7 @@ def _materialize_operator_cache_from_operator(
                 operator.fixed_measurement_offset
             ),
             "packed_array_hashes": hashes,
+            "file_sizes": file_sizes,
             "diagnostics": asdict(operator.diagnostics),
             "keys": "keys.json",
             "provenance": {
@@ -747,6 +819,7 @@ def _materialize_operator_cache_from_operator(
         for name in names:
             os.replace(staging / name, cache / name)
         _atomic_json_write(cache / "manifest.json", manifest)
+        _publish_completion_marker(cache)
         if reporting_enabled:
             reporter.emit(
                 phase=ConstructionPhase.VALIDATED_OPERATOR_CACHE_PERSISTENCE,
@@ -778,9 +851,12 @@ def _load_validated_operator_cache(
     expected_canonical_index: CanonicalAssignmentIndex,
     artifact_manifest_sha256: str,
     reporter: ConstructionProgressReporter | None = None,
+    verify: Literal["fast", "full"] = "fast",
 ) -> TemporalBlockAssignmentOperator | PackedTemporalBlockAssignmentOperator | None:
     """Load packed arrays after validating their metadata and hashes."""
     cache = Path(cache_directory)
+    if verify not in {"fast", "full"}:
+        raise ValueError("verify must be 'fast' or 'full'")
     manifest_path = cache / "manifest.json"
     certificate_path = cache / "validation_certificate.json"
     if not manifest_path.is_file() or not certificate_path.is_file():
@@ -809,6 +885,9 @@ def _load_validated_operator_cache(
             return None
         if manifest.get("binding_fingerprint") != expected_canonical_index.binding_fingerprint:
             return None
+        if manifest.get("package_revision") != package_revision():
+            return None
+        _validate_completion_marker(cache, manifest)
         block_count = int(manifest["number_of_blocks"])
         number_of_measurements = int(manifest["number_of_measurements"])
         number_of_demand_cells = int(manifest["number_of_demand_cells"])
@@ -824,6 +903,13 @@ def _load_validated_operator_cache(
             "fixed_measurement_offset.npy",
             "keys.json",
         )
+        sizes = manifest.get("file_sizes")
+        if not isinstance(sizes, Mapping):
+            return None
+        for filename in filenames:
+            path = cache / filename
+            if not path.is_file() or int(path.stat().st_size) != int(sizes.get(filename, -1)):
+                return None
         reporting_enabled = reporter is not None and reporter.sink is not None
         started = perf_counter() if reporting_enabled else None
         recent_durations: deque[float] = deque(maxlen=16)
@@ -850,10 +936,11 @@ def _load_validated_operator_cache(
                 if reporting_enabled
                 else nullcontext()
             )
-            with hash_scope:
-                actual_hash = None if not path.is_file() else _file_sha256(path)
-            if actual_hash is None or hashes.get(filename) != actual_hash:
-                return None
+            if verify == "full":
+                with hash_scope:
+                    actual_hash = None if not path.is_file() else _file_sha256(path)
+                if actual_hash is None or hashes.get(filename) != actual_hash:
+                    return None
             if reporting_enabled:
                 assert file_started is not None and started is not None
                 duration = max(0.0, perf_counter() - file_started)
@@ -927,9 +1014,11 @@ def _load_validated_operator_cache(
             or fixed_offset.dtype != np.dtype(expected_identity.numeric_dtype)
             or not isinstance(keys_payload, list)
             or len(keys_payload) != block_count
-            or int(offsets[0]) != 0
-            or int(offsets[-1]) != total_nonzeros
-            or np.any(np.diff(offsets) < 0)
+            or (verify == "full" and (
+                int(offsets[0]) != 0
+                or int(offsets[-1]) != total_nonzeros
+                or np.any(np.diff(offsets) < 0)
+            ))
         ):
             return None
         keys: list[TemporalBlockKey] = []
@@ -940,7 +1029,7 @@ def _load_validated_operator_cache(
         diagnostics = TemporalBlockConstructionDiagnostics(
             **dict(manifest.get("diagnostics", {}))
         )
-        if _array_content_hash(fixed_offset) != manifest.get("fixed_measurement_offset_hash"):
+        if verify == "full" and _array_content_hash(fixed_offset) != manifest.get("fixed_measurement_offset_hash"):
             return None
         operator = PackedTemporalBlockAssignmentOperator(
             canonical_index=expected_canonical_index,
@@ -992,12 +1081,15 @@ def load_temporal_block_operator(
     reporter: ConstructionProgressReporter | None = None,
     validated_cache_directory: str | Path | None = None,
     preflight_manifest: str | Path | Mapping[str, object] | None = None,
+    verify: Literal["fast", "full"] = "fast",
 ) -> TemporalBlockAssignmentOperator | PackedTemporalBlockAssignmentOperator:
     """Validate every identity and payload before accepting an artifact.
 
     When supplied, ``reporter`` receives throttled cache-validation progress;
     omitting it preserves the original silent loading behavior.
     """
+    if verify not in {"fast", "full"}:
+        raise ValueError("verify must be 'fast' or 'full'")
     source = Path(directory)
     try:
         manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
@@ -1007,6 +1099,15 @@ def load_temporal_block_operator(
         raise ValueError("temporal block artifact schema is incompatible.")
     if manifest.get("complete") is not True:
         raise ValueError("temporal block artifact is incomplete.")
+    if manifest.get("package_revision") != package_revision():
+        raise ValueError("temporal block artifact package revision is incompatible.")
+    file_sizes = manifest.get("file_sizes")
+    if not isinstance(file_sizes, Mapping):
+        raise ValueError("temporal block artifact file-size metadata is missing.")
+    for relative, expected_size in file_sizes.items():
+        output = source / str(relative)
+        if not output.is_file() or output.stat().st_size != int(expected_size):
+            raise ValueError("temporal block artifact output size is invalid.")
     block_items = manifest.get("blocks", [])
     total_blocks = len(block_items) if isinstance(block_items, list) else 0
     try:
@@ -1027,6 +1128,7 @@ def load_temporal_block_operator(
         raise AssignmentCompatibilityError(
             "temporal block canonical binding is incompatible."
         )
+    _validate_completion_marker(source, manifest)
     artifact_manifest_sha256 = _file_sha256(source / "manifest.json")
     if validated_cache_directory is not None:
         cache_directory = Path(validated_cache_directory)
@@ -1036,6 +1138,7 @@ def load_temporal_block_operator(
             expected_canonical_index=expected_canonical_index,
             artifact_manifest_sha256=artifact_manifest_sha256,
             reporter=reporter,
+            verify=verify,
         )
         if cached is None and preflight_manifest is not None:
             try:
@@ -1058,6 +1161,7 @@ def load_temporal_block_operator(
                     expected_canonical_index=expected_canonical_index,
                     artifact_manifest_sha256=artifact_manifest_sha256,
                     reporter=reporter,
+                    verify=verify,
                 )
             except (AssignmentCompatibilityError, OSError, TypeError, ValueError):
                 # Adoption is an optimization.  If evidence is stale or
@@ -1251,20 +1355,35 @@ def reuse_or_build_temporal_block_operator(
     reference,
     zero_tolerance: float = 0.0,
     progress=None,
+    checkpoint_policy: CheckpointPolicy = "reuse_or_build",
+    verify: Literal["fast", "full"] = "fast",
 ) -> tuple[TemporalBlockAssignmentOperator | PackedTemporalBlockAssignmentOperator, bool]:
     """Reuse a compatible content-addressed artifact or construct it once."""
     from .temporal_assignment_blocks import build_exact_temporal_block_operator
 
+    policy = normalize_checkpoint_policy(checkpoint_policy)
     path = temporal_block_cache_path(cache_root, reference.identity)
-    if path.exists():
-        return (
-            load_temporal_block_operator(
-                path,
-                expected_identity=reference.identity,
-                expected_canonical_index=reference.canonical_index,
-            ),
-            True,
-        )
+    if path.exists() and policy != "rebuild":
+        try:
+            return (
+                load_temporal_block_operator(
+                    path,
+                    expected_identity=reference.identity,
+                    expected_canonical_index=reference.canonical_index,
+                    verify=verify,
+                ),
+                True,
+            )
+        except (AssignmentCompatibilityError, OSError, TypeError, ValueError) as error:
+            raise ValueError(
+                "temporal operator artifact is incompatible; use "
+                "checkpoint_policy='rebuild' to rebuild explicitly"
+            ) from error
+    if policy == "reuse_only":
+        raise FileNotFoundError(path)
+    if policy == "rebuild" and path.exists():
+        quarantine = path.with_name(f"{path.name}.rebuild-{uuid.uuid4().hex}")
+        os.replace(path, quarantine)
     operator = build_exact_temporal_block_operator(
         reference=reference,
         zero_tolerance=zero_tolerance,

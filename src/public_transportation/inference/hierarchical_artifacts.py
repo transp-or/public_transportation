@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
+import importlib.metadata
 import json
 import os
 from pathlib import Path
@@ -29,9 +30,10 @@ import numpy as np
 from scipy import sparse
 
 from .measurement_operator_protocol import GravityOperatorCapabilities
+from .checkpoint_policy import CheckpointPolicy, normalize_checkpoint_policy
 
 
-HIERARCHICAL_ARTIFACT_SCHEMA_VERSION = 2
+HIERARCHICAL_ARTIFACT_SCHEMA_VERSION = 3
 HIERARCHICAL_PROGRESS_SCHEMA_VERSION = 1
 
 ArtifactLayer = Literal[
@@ -79,6 +81,24 @@ _LAYER_SET = frozenset(ARTIFACT_LAYERS)
 _VALID_STATUSES = frozenset(
     {"started", "running", "heartbeat", "reused", "completed", "failed", "interrupted"}
 )
+
+
+def package_revision() -> str:
+    """Return the package revision recorded in new artifact manifests.
+
+    Deployments can provide an exact source revision through the environment;
+    installed distributions otherwise contribute their package version.  The
+    value is metadata, but it is checked before a persisted numerical payload
+    is accepted.
+    """
+
+    explicit = os.environ.get("PUBLIC_TRANSPORTATION_GIT_REVISION")
+    if explicit and explicit.strip():
+        return explicit.strip()
+    try:
+        return importlib.metadata.version("public-transportation")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
 
 
 def _json_default(value: object) -> object:
@@ -189,6 +209,11 @@ class HierarchicalArtifactManifest:
     status: str
     checksums: Mapping[str, str] = field(default_factory=dict)
     payload: Mapping[str, object] = field(default_factory=dict)
+    file_sizes: Mapping[str, int] = field(default_factory=dict)
+    package_revision: str = field(default_factory=package_revision)
+    identity_basis_fingerprint: str = ""
+    configuration_fingerprint: str = ""
+    parent_identity_fingerprint: str | None = None
 
     @property
     def artifact_type(self) -> str:
@@ -197,6 +222,19 @@ class HierarchicalArtifactManifest:
     @property
     def identity_payload(self) -> dict[str, object]:
         """The execution-independent identity payload."""
+
+        return {
+            "artifact_type": self.artifact_layer,
+            "artifact_schema_version": self.artifact_schema_version,
+            "parent_fingerprints": dict(self.parent_fingerprints),
+            "scientific_parameters": dict(self.scientific_parameters),
+            "input_fingerprints": dict(self.input_fingerprints),
+            "package_revision": self.package_revision,
+        }
+
+    @property
+    def identity_basis_payload(self) -> dict[str, object]:
+        """Identity without the package revision, for cheap diagnostics."""
 
         return {
             "artifact_type": self.artifact_layer,
@@ -221,6 +259,14 @@ class HierarchicalArtifactManifest:
             raise ValueError(
                 "hierarchical artifact fingerprint does not match canonical identity"
             )
+        expected_basis = fingerprint(self.identity_basis_payload)
+        if self.identity_basis_fingerprint and self.identity_basis_fingerprint != expected_basis:
+            raise ValueError("hierarchical identity basis fingerprint is invalid")
+        if not self.package_revision.strip():
+            raise ValueError("package revision must be nonempty")
+        expected_configuration = fingerprint(self.execution_parameters)
+        if self.configuration_fingerprint and self.configuration_fingerprint != expected_configuration:
+            raise ValueError("hierarchical configuration fingerprint is invalid")
         for name, values in (
             ("parent_fingerprints", self.parent_fingerprints),
             ("input_fingerprints", self.input_fingerprints),
@@ -241,6 +287,17 @@ class HierarchicalArtifactManifest:
             "status": self.status,
             "checksums": dict(self.checksums),
             "payload": dict(self.payload),
+            "file_sizes": {key: int(value) for key, value in self.file_sizes.items()},
+            "package_revision": self.package_revision,
+            "identity_basis_fingerprint": (
+                self.identity_basis_fingerprint
+                or fingerprint(self.identity_basis_payload)
+            ),
+            "configuration_fingerprint": (
+                self.configuration_fingerprint
+                or fingerprint(self.execution_parameters)
+            ),
+            "parent_identity_fingerprint": self.parent_identity_fingerprint,
         }
 
     @classmethod
@@ -248,6 +305,8 @@ class HierarchicalArtifactManifest:
         layer = value.get("artifact_layer", value.get("artifact_type"))
         if not isinstance(layer, str) or layer not in _LAYER_SET:
             raise ObsoleteArtifactFormatError("manifest", artifact_layer=str(layer))
+        if value.get("artifact_schema_version") != HIERARCHICAL_ARTIFACT_SCHEMA_VERSION:
+            raise ObsoleteArtifactFormatError("manifest", artifact_layer=layer)
         try:
             return cls(
                 artifact_layer=layer,  # type: ignore[arg-type]
@@ -260,6 +319,22 @@ class HierarchicalArtifactManifest:
                 status=str(value["status"]),
                 checksums=dict(value.get("checksums", {})),
                 payload=dict(value.get("payload", {})),
+                file_sizes={
+                    str(key): int(item)
+                    for key, item in dict(value.get("file_sizes", {})).items()
+                },
+                package_revision=str(value.get("package_revision", "unknown")),
+                identity_basis_fingerprint=str(
+                    value.get("identity_basis_fingerprint", "")
+                ),
+                configuration_fingerprint=str(
+                    value.get("configuration_fingerprint", "")
+                ),
+                parent_identity_fingerprint=(
+                    None
+                    if value.get("parent_identity_fingerprint") is None
+                    else str(value["parent_identity_fingerprint"])
+                ),
             )
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError("hierarchical artifact manifest is invalid") from error
@@ -275,16 +350,20 @@ def make_manifest(
     status: str = "completed",
     checksums: Mapping[str, str] | None = None,
     payload: Mapping[str, object] | None = None,
+    package_revision_value: str | None = None,
 ) -> HierarchicalArtifactManifest:
     """Create a manifest whose identity excludes execution-only settings."""
 
-    identity = {
+    revision = package_revision_value or package_revision()
+    identity_basis = {
         "artifact_type": artifact_layer,
         "artifact_schema_version": HIERARCHICAL_ARTIFACT_SCHEMA_VERSION,
         "parent_fingerprints": dict(parent_fingerprints),
         "scientific_parameters": dict(scientific_parameters or {}),
         "input_fingerprints": dict(input_fingerprints or {}),
     }
+    identity = {**identity_basis, "package_revision": revision}
+    execution = dict(execution_parameters or {})
     return HierarchicalArtifactManifest(
         artifact_layer=artifact_layer,
         artifact_schema_version=HIERARCHICAL_ARTIFACT_SCHEMA_VERSION,
@@ -292,15 +371,23 @@ def make_manifest(
         parent_fingerprints=dict(parent_fingerprints),
         scientific_parameters=dict(scientific_parameters or {}),
         input_fingerprints=dict(input_fingerprints or {}),
-        execution_parameters=dict(execution_parameters or {}),
+        execution_parameters=execution,
         status=status,
         checksums=dict(checksums or {}),
         payload=dict(payload or {}),
+        package_revision=revision,
+        identity_basis_fingerprint=fingerprint(identity_basis),
+        configuration_fingerprint=fingerprint(execution),
+        parent_identity_fingerprint=(
+            None if not parent_fingerprints else fingerprint(dict(parent_fingerprints))
+        ),
     )
 
 
 def derive_layer_fingerprints(
     specifications: Mapping[str, Mapping[str, object]],
+    *,
+    package_revision_value: str | None = None,
 ) -> dict[str, str]:
     """Derive deterministic fingerprints from the explicit DAG parent map.
 
@@ -309,6 +396,7 @@ def derive_layer_fingerprints(
     transitive lineage by following those parent manifests.
     """
 
+    revision = package_revision_value or package_revision()
     result: dict[str, str] = {}
     for layer in ARTIFACT_LAYERS:
         raw = specifications.get(layer, {})
@@ -325,6 +413,7 @@ def derive_layer_fingerprints(
                 "parent_fingerprints": parent,
                 "scientific_parameters": dict(raw.get("scientific_parameters", {})),
                 "input_fingerprints": dict(raw.get("input_fingerprints", {})),
+                "package_revision": revision,
             }
         )
     return result
@@ -335,10 +424,56 @@ def _file_checksums(root: Path) -> dict[str, str]:
     if not root.exists():
         return result
     for path in sorted(item for item in root.rglob("*") if item.is_file()):
-        if path.name == "manifest.json":
+        if path.name in {"manifest.json", "COMPLETE.json"}:
             continue
         result[str(path.relative_to(root))] = file_sha256(path)
     return result
+
+
+def _file_sizes(root: Path) -> dict[str, int]:
+    """Return declared payload sizes without reading payload contents."""
+
+    result: dict[str, int] = {}
+    if not root.exists():
+        return result
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        if path.name in {"manifest.json", "COMPLETE.json"}:
+            continue
+        result[str(path.relative_to(root))] = int(path.stat().st_size)
+    return result
+
+
+def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _reason_code_from_error(message: str, fallback: str) -> str:
+    """Map fast metadata failures to stable diagnostics."""
+
+    for prefix, reason in (
+        ("completion_marker_missing", "completion_marker_missing"),
+        ("completion_marker_invalid", "completion_marker_invalid"),
+        ("output_missing:", "output_missing"),
+        ("output_size_mismatch:", "output_size_mismatch"),
+        ("checkpoint_incomplete", "checkpoint_incomplete"),
+        ("hierarchical artifact payload checksum", "payload_corrupt"),
+        ("package revision", "package_revision_mismatch"),
+    ):
+        if prefix in message:
+            return reason
+    return fallback
 
 
 class HierarchicalArtifactStore:
@@ -367,9 +502,14 @@ class HierarchicalArtifactStore:
         layer_fingerprint: str,
         *,
         expected_parents: Mapping[str, str] | None = None,
-        validate_checksums: bool = True,
+        verify: Literal["fast", "full"] = "fast",
+        validate_checksums: bool | None = None,
         _namespace: Literal["artifacts", "checkpoints"] = "artifacts",
     ) -> HierarchicalArtifactManifest:
+        if validate_checksums is not None:
+            verify = "full" if validate_checksums else "fast"
+        if verify not in {"fast", "full"}:
+            raise ValueError("verify must be 'fast' or 'full'")
         path = (
             self.artifact_path(layer, layer_fingerprint)
             if _namespace == "artifacts"
@@ -387,7 +527,32 @@ class HierarchicalArtifactStore:
         if manifest.artifact_layer != layer or manifest.fingerprint != layer_fingerprint:
             raise ValueError("hierarchical artifact layer or fingerprint mismatch")
         if manifest.status != "completed":
-            raise ValueError("partial hierarchical artifacts are not reusable")
+            raise ValueError("checkpoint_incomplete")
+        marker_path = path.parent / "COMPLETE.json"
+        if not marker_path.is_file():
+            raise ValueError("completion_marker_missing")
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError) as error:
+            raise ValueError("completion_marker_missing") from error
+        if (
+            marker.get("identity_fingerprint") != manifest.fingerprint
+            or marker.get("manifest_sha256") != file_sha256(path)
+        ):
+            raise ValueError("completion_marker_invalid")
+        # Empty payloads are valid for hierarchy layers whose scientific
+        # state is represented entirely by their manifest.  When files are
+        # declared, however, their existence and recorded sizes are part of
+        # the cheap reuse contract.
+        sizes = dict(manifest.file_sizes)
+        if not sizes and manifest.checksums:
+            raise ValueError("output_size_metadata_missing")
+        for relative, expected_size in sizes.items():
+            output = path.parent / relative
+            if not output.is_file():
+                raise ValueError(f"output_missing:{relative}")
+            if output.stat().st_size != int(expected_size):
+                raise ValueError(f"output_size_mismatch:{relative}")
         if expected_parents is not None:
             mismatches = {
                 key: (expected, manifest.parent_fingerprints.get(key))
@@ -396,7 +561,7 @@ class HierarchicalArtifactStore:
             }
             if mismatches:
                 raise ValueError(f"hierarchical parent fingerprints mismatch: {mismatches}")
-        if validate_checksums:
+        if verify == "full":
             actual = _file_checksums(path.parent)
             if actual != dict(manifest.checksums):
                 raise ValueError("hierarchical artifact payload checksum mismatch")
@@ -408,15 +573,33 @@ class HierarchicalArtifactStore:
         layer_fingerprint: str,
         *,
         expected_parents: Mapping[str, str] | None = None,
-        validate_checksums: bool = True,
+        verify: Literal["fast", "full"] = "fast",
     ) -> HierarchicalArtifactManifest:
         """Load and validate a checkpoint manifest."""
-
+        path = self.checkpoint_manifest_path(layer, layer_fingerprint)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            manifest = HierarchicalArtifactManifest.from_dict(payload)
+        except FileNotFoundError:
+            raise
+        except ObsoleteArtifactFormatError:
+            raise
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as error:
+            raise ValueError(f"invalid hierarchical checkpoint: {path}") from error
+        if manifest.artifact_layer != layer or manifest.fingerprint != layer_fingerprint:
+            raise ValueError("hierarchical checkpoint layer or fingerprint mismatch")
+        if expected_parents is not None and any(
+            manifest.parent_fingerprints.get(key) != expected
+            for key, expected in expected_parents.items()
+        ):
+            raise ValueError("hierarchical parent fingerprints mismatch")
+        if manifest.status != "completed":
+            return manifest
         return self.load(
             layer,
             layer_fingerprint,
             expected_parents=expected_parents,
-            validate_checksums=validate_checksums,
+            verify=verify,
             _namespace="checkpoints",
         )
 
@@ -426,6 +609,7 @@ class HierarchicalArtifactStore:
         layer_fingerprint: str,
         *,
         expected_parents: Mapping[str, str] | None = None,
+        verify: Literal["fast", "full"] = "fast",
         recommended_command: str | None = None,
     ) -> HierarchicalArtifactManifest:
         """Load one layer or fail with an actionable strict-reuse error."""
@@ -434,6 +618,7 @@ class HierarchicalArtifactStore:
             layer=layer,
             layer_fingerprint=layer_fingerprint,
             expected_parents=expected_parents,
+            verify=verify,
             recommended_command=recommended_command,
             namespace="artifacts",
         )
@@ -444,6 +629,7 @@ class HierarchicalArtifactStore:
         layer_fingerprint: str,
         *,
         expected_parents: Mapping[str, str] | None = None,
+        verify: Literal["fast", "full"] = "fast",
         recommended_command: str | None = None,
     ) -> HierarchicalArtifactManifest:
         """Load one checkpoint or fail with the same strict diagnostics."""
@@ -452,6 +638,7 @@ class HierarchicalArtifactStore:
             layer=layer,
             layer_fingerprint=layer_fingerprint,
             expected_parents=expected_parents,
+            verify=verify,
             recommended_command=recommended_command,
             namespace="checkpoints",
         )
@@ -462,6 +649,7 @@ class HierarchicalArtifactStore:
         layer: ArtifactLayer,
         layer_fingerprint: str,
         expected_parents: Mapping[str, str] | None,
+        verify: Literal["fast", "full"],
         recommended_command: str | None,
         namespace: Literal["artifacts", "checkpoints"],
     ) -> HierarchicalArtifactManifest:
@@ -475,6 +663,7 @@ class HierarchicalArtifactStore:
                 layer,
                 layer_fingerprint,
                 expected_parents=expected_parents,
+                verify=verify,
                 _namespace=namespace,
             )
         except ObsoleteArtifactFormatError:
@@ -593,6 +782,10 @@ class HierarchicalArtifactStore:
             if payload_writer is not None:
                 payload.update(dict(payload_writer(staging) or {}))
             checksums = _file_checksums(staging)
+            file_sizes = _file_sizes(staging)
+            published_status = (
+                "completed" if namespace == "artifacts" else manifest.status
+            )
             completed = HierarchicalArtifactManifest(
                 artifact_layer=manifest.artifact_layer,
                 artifact_schema_version=manifest.artifact_schema_version,
@@ -601,14 +794,30 @@ class HierarchicalArtifactStore:
                 scientific_parameters=manifest.scientific_parameters,
                 input_fingerprints=manifest.input_fingerprints,
                 execution_parameters=manifest.execution_parameters,
-                status="completed",
+                status=published_status,
                 checksums=checksums,
                 payload=payload,
+                file_sizes=file_sizes,
+                package_revision=manifest.package_revision,
+                identity_basis_fingerprint=manifest.identity_basis_fingerprint,
+                configuration_fingerprint=manifest.configuration_fingerprint,
+                parent_identity_fingerprint=manifest.parent_identity_fingerprint,
             )
-            (staging / "manifest.json").write_text(
+            manifest_path = staging / "manifest.json"
+            manifest_path.write_text(
                 json.dumps(completed.to_dict(), indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
+            if published_status == "completed":
+                _atomic_json(
+                    staging / "COMPLETE.json",
+                    {
+                        "identity_fingerprint": completed.fingerprint,
+                        "identity_basis_fingerprint": completed.identity_basis_fingerprint,
+                        "manifest_sha256": file_sha256(manifest_path),
+                        "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
             if destination.exists():
                 if not overwrite:
                     raise FileExistsError(destination)
@@ -639,6 +848,7 @@ class HierarchicalProgressEvent:
     eta_confidence: str
     reused: bool
     rebuild: bool
+    action: str = "build"
     schema_version: int = HIERARCHICAL_PROGRESS_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -656,6 +866,7 @@ class HierarchicalProgressEvent:
             "artifact_fingerprint": self.artifact_fingerprint,
             "parent_fingerprint": self.parent_fingerprint,
             "activation_policy": self.activation_policy,
+            "checkpoint_policy": self.activation_policy,
             "phase": self.phase,
             "status": self.status,
             "current_unit": self.current_unit,
@@ -667,6 +878,9 @@ class HierarchicalProgressEvent:
             "eta_confidence": self.eta_confidence,
             "reused": self.reused,
             "rebuild": self.rebuild,
+            "stage": "prepare",
+            "layer": self.artifact_layer,
+            "action": self.action,
         }
 
 
@@ -710,6 +924,7 @@ class HierarchicalProgressReporter:
         eta_confidence: str = "unavailable",
         reused: bool = False,
         rebuild: bool = False,
+        action: str | None = None,
         force: bool = False,
     ) -> HierarchicalProgressEvent | None:
         now = monotonic()
@@ -741,6 +956,10 @@ class HierarchicalProgressReporter:
             eta_confidence=eta_confidence,
             reused=bool(reused),
             rebuild=bool(rebuild),
+            action=(
+                action
+                or ("reuse" if reused else "rebuild" if rebuild else "build")
+            ),
         )
         encoded = json.dumps(event.to_dict(), sort_keys=True) + "\n"
         for target in (self.path, self.campaign_path):
@@ -1119,6 +1338,47 @@ class HierarchicalPreparationResult:
     manifests: Mapping[str, HierarchicalArtifactManifest]
     reused_layers: tuple[str, ...]
     rebuilt_layers: tuple[str, ...]
+    actions: Mapping[str, str] = field(default_factory=dict)
+    verification_mode: str = "fast"
+    checkpoint_reused: bool = False
+    rebuild_performed: bool = False
+
+
+def _write_preparation_manifest(
+    root: str | Path,
+    *,
+    policy: CheckpointPolicy,
+    verify: Literal["fast", "full"],
+    checkpoint_reused: bool,
+    rebuilt: tuple[str, ...] | list[str],
+    actions: Mapping[str, str],
+    fingerprints: Mapping[str, str],
+) -> None:
+    """Write the small campaign summary after a successful preparation."""
+
+    rebuilt_tuple = tuple(rebuilt)
+    _atomic_json(
+        Path(root) / "prepare-manifest.json",
+        {
+            "status": "completed",
+            "checkpoint_policy": policy,
+            "verification_mode": verify,
+            "checkpoint_reused": checkpoint_reused,
+            "rebuild_performed": bool(rebuilt_tuple),
+            "layers": {
+                layer: {
+                    "action": actions.get(layer, "reuse"),
+                    "identity_fingerprint": fingerprints[layer],
+                    "parent_identity_fingerprint": (
+                        None
+                        if not DAG_PARENT_LAYERS[layer]
+                        else fingerprints[DAG_PARENT_LAYERS[layer][0]]
+                    ),
+                }
+                for layer in ARTIFACT_LAYERS
+            },
+        },
+    )
 
 
 def prepare_hierarchical_assignment_mapping(
@@ -1127,7 +1387,9 @@ def prepare_hierarchical_assignment_mapping(
     specifications: Mapping[str, Mapping[str, object]],
     mapping_builder: Callable[[], EstimationAssignmentMapping] | None = None,
     payload_builders: Mapping[str, Callable[[Path], Mapping[str, object] | None]] | None = None,
-    activation_policy: Literal["reuse_only", "build_or_reuse", "force_rebuild"] = "reuse_only",
+    checkpoint_policy: CheckpointPolicy = "reuse_or_build",
+    activation_policy: Literal["reuse_only", "build_or_reuse", "force_rebuild"] | None = None,
+    verify: Literal["fast", "full"] = "fast",
     execution_parameters: Mapping[str, object] | None = None,
     expected_fixed_offset_fingerprint: str | None = None,
     progress: HierarchicalProgressReporter | None = None,
@@ -1140,15 +1402,22 @@ def prepare_hierarchical_assignment_mapping(
     ``execution_parameters`` and never change layer fingerprints.
     """
 
-    if activation_policy not in {"reuse_only", "build_or_reuse", "force_rebuild"}:
-        raise ValueError("unsupported hierarchical activation policy")
+    policy = normalize_checkpoint_policy(
+        None if activation_policy is not None else checkpoint_policy,
+        legacy_policy=activation_policy,
+    )
+    if verify not in {"fast", "full"}:
+        raise ValueError("verify must be 'fast' or 'full'")
     layer_fingerprints = derive_layer_fingerprints(specifications)
     store = HierarchicalArtifactStore(root)
     manifests: dict[str, HierarchicalArtifactManifest] = {}
     reused: list[str] = []
     rebuilt: list[str] = []
+    actions: dict[str, str] = {}
+    checkpoint_reused = False
     builders = dict(payload_builders or {})
     for position, layer in enumerate(ARTIFACT_LAYERS[:-1]):
+        layer_checkpoint_reused = False
         expected = layer_fingerprints[layer]
         parents = {
             name: layer_fingerprints[name] for name in DAG_PARENT_LAYERS[layer]
@@ -1158,24 +1427,37 @@ def prepare_hierarchical_assignment_mapping(
             if not DAG_PARENT_LAYERS[layer]
             else layer_fingerprints[DAG_PARENT_LAYERS[layer][0]]
         )
-        if activation_policy != "force_rebuild":
+        if policy != "rebuild":
             try:
-                manifest = store.load(layer, expected, expected_parents=parents)
+                manifest = store.load(
+                    layer, expected, expected_parents=parents, verify=verify
+                )
+            except FileNotFoundError:
+                manifest = None
             except ObsoleteArtifactFormatError:
-                if activation_policy == "reuse_only":
-                    raise
-                manifest = None
-            except (FileNotFoundError, OSError, TypeError, ValueError):
-                manifest = None
+                raise
+            except (OSError, TypeError, ValueError) as error:
+                raise HierarchicalArtifactUnavailableError(
+                    artifact_layer=layer,
+                    expected_fingerprint=expected,
+                    artifact_path=store.artifact_path(layer, expected),
+                    reason_code=_reason_code_from_error(
+                        str(error), "artifact_incompatible"
+                    ),
+                    details={"validation_error": str(error)},
+                    recommended_command=recommended_command,
+                ) from error
             if manifest is not None:
                 manifests[layer] = manifest
                 reused.append(layer)
+                checkpoint_reused = True
+                actions[layer] = "reuse"
                 if progress is not None:
                     progress.emit(
                         artifact_layer=layer,
                         artifact_fingerprint=expected,
                         parent_fingerprint=parent,
-                        activation_policy=activation_policy,
+                        activation_policy=policy,
                         phase="activation",
                         status="reused",
                         completed_units=1,
@@ -1184,9 +1466,39 @@ def prepare_hierarchical_assignment_mapping(
                         eta_confidence="high",
                         reused=True,
                         rebuild=False,
+                        action="reuse",
                         force=True,
                     )
                 continue
+        if policy == "reuse_only":
+            raise HierarchicalArtifactUnavailableError(
+                artifact_layer=layer,
+                expected_fingerprint=expected,
+                artifact_path=store.artifact_path(layer, expected),
+                reason_code="artifact_missing",
+                recommended_command=recommended_command,
+            )
+        if policy != "rebuild":
+            try:
+                store.load_checkpoint(
+                    layer, expected, expected_parents=parents, verify="fast"
+                )
+            except FileNotFoundError:
+                pass
+            except (ObsoleteArtifactFormatError, OSError, TypeError, ValueError) as error:
+                raise HierarchicalArtifactUnavailableError(
+                    artifact_layer=layer,
+                    expected_fingerprint=expected,
+                    artifact_path=store.checkpoint_path(layer, expected),
+                    reason_code=_reason_code_from_error(
+                        str(error), "checkpoint_incompatible"
+                    ),
+                    details={"validation_error": str(error)},
+                    recommended_command=recommended_command,
+                ) from error
+            else:
+                layer_checkpoint_reused = True
+                checkpoint_reused = True
         manifest = make_manifest(
             artifact_layer=layer,
             parent_fingerprints=parents,
@@ -1201,7 +1513,7 @@ def prepare_hierarchical_assignment_mapping(
                 artifact_layer=layer,
                 artifact_fingerprint=expected,
                 parent_fingerprint=parent,
-                activation_policy=activation_policy,
+                activation_policy=policy,
                 phase="construction",
                 status="started",
                 completed_units=0,
@@ -1209,6 +1521,9 @@ def prepare_hierarchical_assignment_mapping(
                 eta_confidence="unavailable",
                 reused=False,
                 rebuild=True,
+                action="rebuild" if policy == "rebuild" else (
+                    "resume" if layer_checkpoint_reused else "build"
+                ),
                 force=True,
             )
         # Checkpoint metadata is published separately from the completed
@@ -1223,7 +1538,7 @@ def prepare_hierarchical_assignment_mapping(
                     artifact_layer=layer,
                     artifact_fingerprint=expected,
                     parent_fingerprint=parent,
-                    activation_policy=activation_policy,
+                    activation_policy=policy,
                     phase="construction",
                     status="failed",
                     completed_units=0,
@@ -1231,17 +1546,23 @@ def prepare_hierarchical_assignment_mapping(
                     eta_confidence="unavailable",
                     reused=False,
                     rebuild=True,
+                    action="rebuild" if policy == "rebuild" else (
+                        "resume" if layer_checkpoint_reused else "build"
+                    ),
                     force=True,
                 )
             raise
-        manifests[layer] = store.load(layer, expected)
+        manifests[layer] = store.load(layer, expected, verify=verify)
         rebuilt.append(layer)
+        actions[layer] = "rebuild" if policy == "rebuild" else (
+            "resume" if layer_checkpoint_reused else "build"
+        )
         if progress is not None:
             progress.emit(
                 artifact_layer=layer,
                 artifact_fingerprint=expected,
                 parent_fingerprint=parent,
-                activation_policy=activation_policy,
+                activation_policy=policy,
                 phase="construction",
                 status="completed",
                 completed_units=1,
@@ -1250,6 +1571,7 @@ def prepare_hierarchical_assignment_mapping(
                 eta_confidence="high",
                 reused=False,
                 rebuild=True,
+                action=actions[layer],
                 force=True,
             )
 
@@ -1261,21 +1583,36 @@ def prepare_hierarchical_assignment_mapping(
     }
     final_parent = layer_fingerprints[DAG_PARENT_LAYERS[final_layer][0]]
     final_manifest: HierarchicalArtifactManifest | None = None
-    if activation_policy != "force_rebuild":
+    final_checkpoint_reused = False
+    if policy != "rebuild":
         try:
-            final_manifest = store.load(final_layer, final_expected, expected_parents=final_parents)
+            final_manifest = store.load(
+                final_layer,
+                final_expected,
+                expected_parents=final_parents,
+                verify=verify,
+            )
+        except FileNotFoundError:
+            final_manifest = None
         except ObsoleteArtifactFormatError:
-            if activation_policy == "reuse_only":
-                raise
-            final_manifest = None
-        except (FileNotFoundError, OSError, TypeError, ValueError):
-            final_manifest = None
+            raise
+        except (OSError, TypeError, ValueError) as error:
+            raise HierarchicalArtifactUnavailableError(
+                artifact_layer=final_layer,
+                expected_fingerprint=final_expected,
+                artifact_path=store.artifact_path(final_layer, final_expected),
+                reason_code=_reason_code_from_error(
+                    str(error), "artifact_incompatible"
+                ),
+                details={"validation_error": str(error)},
+                recommended_command=recommended_command,
+            ) from error
     if final_manifest is not None:
         payload_directory = store.artifact_path(final_layer, final_expected)
         try:
             mapping = EstimationAssignmentMapping.from_payload(payload_directory)
         except (OSError, TypeError, ValueError, KeyError) as error:
-            if activation_policy == "reuse_only":
+            if policy == "reuse_only":
                 raise HierarchicalArtifactUnavailableError(
                     artifact_layer=final_layer,
                     expected_fingerprint=final_expected,
@@ -1295,12 +1632,14 @@ def prepare_hierarchical_assignment_mapping(
             else:
                 manifests[final_layer] = final_manifest
                 reused.append(final_layer)
+                checkpoint_reused = True
+                actions[final_layer] = "reuse"
                 if progress is not None:
                     progress.emit(
                         artifact_layer=final_layer,
                         artifact_fingerprint=final_expected,
                         parent_fingerprint=final_parent,
-                        activation_policy=activation_policy,
+                        activation_policy=policy,
                         phase="activation",
                         status="reused",
                         completed_units=1,
@@ -1309,12 +1648,29 @@ def prepare_hierarchical_assignment_mapping(
                         eta_confidence="high",
                         reused=True,
                         rebuild=False,
+                        action="reuse",
                         force=True,
                     )
-                return HierarchicalPreparationResult(
-                    mapping, manifests, tuple(reused), tuple(rebuilt)
+                _write_preparation_manifest(
+                    root,
+                    policy=policy,
+                    verify=verify,
+                    checkpoint_reused=checkpoint_reused,
+                    rebuilt=rebuilt,
+                    actions=actions,
+                    fingerprints=layer_fingerprints,
                 )
-    if activation_policy == "reuse_only":
+                return HierarchicalPreparationResult(
+                    mapping,
+                    manifests,
+                    tuple(reused),
+                    tuple(rebuilt),
+                    actions,
+                    verify,
+                    checkpoint_reused,
+                    bool(rebuilt),
+                )
+    if policy == "reuse_only":
         raise HierarchicalArtifactUnavailableError(
             artifact_layer=final_layer,
             expected_fingerprint=final_expected,
@@ -1322,6 +1678,27 @@ def prepare_hierarchical_assignment_mapping(
             reason_code="artifact_missing",
             recommended_command=recommended_command,
         )
+    if policy != "rebuild":
+        try:
+            store.load_checkpoint(
+                final_layer, final_expected, expected_parents=final_parents, verify="fast"
+            )
+        except FileNotFoundError:
+            pass
+        except (ObsoleteArtifactFormatError, OSError, TypeError, ValueError) as error:
+            raise HierarchicalArtifactUnavailableError(
+                artifact_layer=final_layer,
+                expected_fingerprint=final_expected,
+                artifact_path=store.checkpoint_path(final_layer, final_expected),
+                reason_code=_reason_code_from_error(
+                    str(error), "checkpoint_incompatible"
+                ),
+                details={"validation_error": str(error)},
+                recommended_command=recommended_command,
+            ) from error
+        else:
+            final_checkpoint_reused = True
+            checkpoint_reused = True
     if mapping_builder is None:
         raise ValueError("mapping_builder is required when L7 must be constructed")
     if progress is not None:
@@ -1329,7 +1706,7 @@ def prepare_hierarchical_assignment_mapping(
             artifact_layer=final_layer,
             artifact_fingerprint=final_expected,
             parent_fingerprint=final_parent,
-            activation_policy=activation_policy,
+            activation_policy=policy,
             phase="construction",
             status="started",
             completed_units=0,
@@ -1337,6 +1714,9 @@ def prepare_hierarchical_assignment_mapping(
             eta_confidence="unavailable",
             reused=False,
             rebuild=True,
+            action="rebuild" if policy == "rebuild" else (
+                "resume" if checkpoint_reused else "build"
+            ),
             force=True,
         )
     try:
@@ -1347,7 +1727,7 @@ def prepare_hierarchical_assignment_mapping(
                 artifact_layer=final_layer,
                 artifact_fingerprint=final_expected,
                 parent_fingerprint=final_parent,
-                activation_policy=activation_policy,
+                activation_policy=policy,
                 phase="construction",
                 status="failed",
                 completed_units=0,
@@ -1355,6 +1735,9 @@ def prepare_hierarchical_assignment_mapping(
                 eta_confidence="unavailable",
                 reused=False,
                 rebuild=True,
+                action="rebuild" if policy == "rebuild" else (
+                    "resume" if checkpoint_reused else "build"
+                ),
                 force=True,
             )
         raise
@@ -1391,7 +1774,7 @@ def prepare_hierarchical_assignment_mapping(
                 artifact_layer=final_layer,
                 artifact_fingerprint=final_expected,
                 parent_fingerprint=final_parent,
-                activation_policy=activation_policy,
+                activation_policy=policy,
                 phase="construction",
                 status="failed",
                 completed_units=0,
@@ -1402,14 +1785,17 @@ def prepare_hierarchical_assignment_mapping(
                 force=True,
             )
         raise
-    manifests[final_layer] = store.load(final_layer, final_expected)
+    manifests[final_layer] = store.load(final_layer, final_expected, verify=verify)
     rebuilt.append(final_layer)
+    actions[final_layer] = "rebuild" if policy == "rebuild" else (
+        "resume" if final_checkpoint_reused else "build"
+    )
     if progress is not None:
         progress.emit(
             artifact_layer=final_layer,
             artifact_fingerprint=final_expected,
             parent_fingerprint=final_parent,
-            activation_policy=activation_policy,
+            activation_policy=policy,
             phase="construction",
             status="completed",
             completed_units=1,
@@ -1418,15 +1804,36 @@ def prepare_hierarchical_assignment_mapping(
             eta_confidence="high",
             reused=False,
             rebuild=True,
+            action=actions[final_layer],
             force=True,
         )
-    return HierarchicalPreparationResult(mapping, manifests, tuple(reused), tuple(rebuilt))
+    result = HierarchicalPreparationResult(
+        mapping,
+        manifests,
+        tuple(reused),
+        tuple(rebuilt),
+        actions,
+        verify,
+        checkpoint_reused,
+        bool(rebuilt),
+    )
+    _write_preparation_manifest(
+        root,
+        policy=policy,
+        verify=verify,
+        checkpoint_reused=checkpoint_reused,
+        rebuilt=rebuilt,
+        actions=actions,
+        fingerprints=layer_fingerprints,
+    )
+    return result
 
 
 __all__ = [
     "ARTIFACT_LAYERS",
     "ArtifactLayer",
     "DAG_PARENT_LAYERS",
+    "CheckpointPolicy",
     "EstimationAssignmentMapping",
     "HIERARCHICAL_ARTIFACT_SCHEMA_VERSION",
     "HIERARCHICAL_PROGRESS_SCHEMA_VERSION",
@@ -1442,5 +1849,6 @@ __all__ = [
     "file_sha256",
     "fingerprint",
     "make_manifest",
+    "package_revision",
     "prepare_hierarchical_assignment_mapping",
 ]

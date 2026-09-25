@@ -22,6 +22,7 @@ from .od_parameter_layout import (  # noqa: F401
     assert_od_layout_fingerprint_matches,
     build_od_parameter_layout,
 )
+from .checkpoint_policy import CheckpointPolicy, normalize_checkpoint_policy  # noqa: F401
 from .compact_od_assignment_layout import (  # noqa: F401
     CompactODAssignmentLayout,
     build_compact_od_assignment_layout,
@@ -35,6 +36,7 @@ from .hierarchical_artifacts import (  # noqa: F401
     EstimationAssignmentMapping,
     HIERARCHICAL_ARTIFACT_SCHEMA_VERSION,
     HIERARCHICAL_PROGRESS_SCHEMA_VERSION,
+    package_revision,
     HierarchicalArtifactManifest,
     HierarchicalArtifactStore,
     HierarchicalArtifactUnavailableError,

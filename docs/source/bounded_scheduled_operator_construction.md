@@ -15,15 +15,21 @@ starting unless its predicted duration fits inside the remaining safe time.
 identity-addressed prepared artifact; it never starts routing or temporal
 construction. Use `activation_policy="build_or_reuse"` only when construction
 is an explicit part of the caller's workflow. The separate
-`prepare_direct_scheduled_temporal_operator` API remains the preparation
-stage for creating or resuming artifacts.
+`prepare_direct_scheduled_temporal_operator` API defaults to
+`checkpoint_policy="reuse_or_build"`: complete artifacts are reused and
+matching incomplete routing/measurement checkpoints resume automatically.
+Use `checkpoint_policy="rebuild"` for an explicit rebuild. Both preparation
+and activation accept `verify="full"` for an opt-in payload-integrity audit;
+the default `verify="fast"` path checks metadata, completion markers, output
+existence, and recorded sizes without hashing large arrays.
 
 New scheduled campaigns use the parent-aware artifact DAG documented in
 [hierarchical_assignment_artifacts.md](hierarchical_assignment_artifacts.md).
 The final `estimation_assignment_mapping` layer (L7) is the exact linear map
-passed to estimation. `activation_policy="force_rebuild"` is available only
-to an explicit preparation command; it invalidates the current L7 payload and
-rebuilds it while retaining compatible parent checkpoints.
+passed to estimation. `activation_policy="force_rebuild"` remains an accepted
+compatibility alias for `checkpoint_policy="rebuild"`; it is available only
+to an explicit preparation command and invalidates the current L7 payload
+while retaining compatible parent checkpoints.
 
 The activation API distinguishes three normal outcomes:
 

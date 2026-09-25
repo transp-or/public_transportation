@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
@@ -23,6 +24,7 @@ import platform
 import signal
 import tempfile
 import time
+import uuid
 from bisect import bisect_left
 from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field, is_dataclass
@@ -31,6 +33,22 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Literal, Mapping, Sequence
 
 from public_transportation.domain import Scenario
+from public_transportation.inference.checkpoint_policy import (
+    CheckpointPolicy,
+    normalize_checkpoint_policy,
+)
+
+
+def _package_revision() -> str:
+    """Return the package revision used in checkpoint provenance."""
+
+    value = os.environ.get("PUBLIC_TRANSPORTATION_GIT_REVISION")
+    if value:
+        return value
+    try:
+        return importlib.metadata.version("public-transportation")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
 
 if TYPE_CHECKING:  # pragma: no cover - import only for static analysis
     from .canonical_timetable import CanonicalTimetableIndex
@@ -245,6 +263,8 @@ class ODTimeExpansionRunResult:
     excluded_cells: int
     next_chunk: int
     checkpoint_reused: bool = False
+    rebuild_performed: bool = False
+    verification_mode: str = "fast"
 
 
 class ODTimeExpansionInterrupted(RuntimeError):
@@ -343,6 +363,82 @@ def _file_sha256(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _write_completion_marker(checkpoint: Path, *, identity: str) -> None:
+    manifest = checkpoint / "manifest.json"
+    _atomic_json(
+        checkpoint / "COMPLETE.json",
+        {
+            "identity_fingerprint": identity,
+            "manifest_sha256": _file_sha256(manifest),
+            "completed_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        },
+    )
+
+
+def _validate_completion_marker(
+    checkpoint: Path, *, expected_identity: str, verify: Literal["fast", "full"]
+) -> dict[str, object]:
+    """Validate completion metadata without scanning chunks in fast mode."""
+
+    manifest_path = checkpoint / "manifest.json"
+    marker_path = checkpoint / "COMPLETE.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("completion_marker_missing") from error
+    if manifest.get("expansion_fingerprint") != expected_identity:
+        raise ValueError("identity_mismatch")
+    if manifest.get("status") != "completed":
+        raise ValueError("checkpoint_incomplete")
+    if (
+        marker.get("identity_fingerprint") != expected_identity
+        or marker.get("manifest_sha256") != _file_sha256(manifest_path)
+    ):
+        raise ValueError("completion_marker_invalid")
+    sizes = manifest.get("chunk_sizes", {})
+    if not isinstance(sizes, Mapping):
+        raise ValueError("output_size_metadata_missing")
+    completed_items = manifest.get("completed_chunks", [])
+    if not isinstance(completed_items, list):
+        raise ValueError("completed_chunks_missing")
+    size_keys = {str(item) for item in sizes}
+    for item in completed_items:
+        if str(item) not in size_keys and f"chunk-{int(item):06d}.jsonl" not in size_keys:
+            raise ValueError(f"output_size_metadata_missing:{item}")
+    for name, expected_size in sizes.items():
+        filename = (
+            str(name)
+            if str(name).startswith("chunk-")
+            else f"chunk-{int(name):06d}.jsonl"
+        )
+        path = checkpoint / filename
+        if not path.is_file():
+            raise ValueError(f"output_missing:{name}")
+        if path.stat().st_size != int(expected_size):
+            raise ValueError(f"output_size_mismatch:{name}")
+        if verify == "full":
+            raw_name = str(name)
+            index = (
+                str(int(raw_name.removeprefix("chunk-").removesuffix(".jsonl")))
+                if raw_name.startswith("chunk-")
+                else raw_name
+            )
+            checksum_map = manifest.get("chunk_checksums", {})
+            if not isinstance(checksum_map, Mapping):
+                raise ValueError("chunk_checksums_missing")
+            expected_checksum = str(checksum_map.get(index, ""))
+            if not expected_checksum or _file_sha256(path) != expected_checksum:
+                raise ValueError(f"chunk_checksum_mismatch:{name}")
+        if verify == "full":
+            expected_hash = manifest.get("chunk_checksums", {}).get(
+                str(int(str(name).split("-")[-1].split(".")[0]))
+            )
+            if expected_hash and _file_sha256(path) != expected_hash:
+                raise ValueError(f"checkpoint chunk checksum mismatch: {path}")
+    return manifest
 
 
 def expansion_contract_fingerprint(
@@ -467,7 +563,9 @@ def run_candidate_od_time_expansion(
     feasibility_index: TimetableFeasibilityIndex | None = None,
     configuration: Mapping[str, object] | None = None,
     checkpoint_directory: str | Path | None = None,
-    resume: bool = False,
+    checkpoint_policy: CheckpointPolicy = "reuse_or_build",
+    resume: bool | None = None,
+    verify: Literal["fast", "full"] = "fast",
     progress: Callable[[Mapping[str, object]], None] | None = None,
     timetable_feasibility: Callable[[CandidateODPair, tuple[str, int, int]], bool] | None = None,
     timetable_index: "CanonicalTimetableIndex | None" = None,
@@ -485,6 +583,12 @@ def run_candidate_od_time_expansion(
         config = dict(asdict(configuration))
     else:
         config = dict(vars(configuration))
+    config.setdefault("package_revision", _package_revision())
+    policy = normalize_checkpoint_policy(
+        checkpoint_policy, resume=resume
+    )
+    if verify not in {"fast", "full"}:
+        raise ValueError("verify must be 'fast' or 'full'")
     bins = tuple(_period_tuple(period) for period in time_periods)
     if not bins:
         raise ValueError("at least one approved time period is required")
@@ -509,16 +613,74 @@ def run_candidate_od_time_expansion(
     expansion_fingerprint = expansion_contract_fingerprint(universe, bins, config)
     manifest_path = checkpoint / "manifest.json"
     progress_path = checkpoint / "progress.json"
-    if manifest_path.exists() and not resume:
-        raise FileExistsError(
-            f"checkpoint already exists at {checkpoint}; pass --resume or explicitly archive it before a fresh run"
+    checkpoint_reused = False
+    rebuild_performed = False
+    if policy == "rebuild" and any(checkpoint.iterdir()):
+        quarantine = checkpoint.with_name(
+            f"{checkpoint.name}.rebuild-{uuid.uuid4().hex}"
         )
-    if not manifest_path.exists() and not resume and any(checkpoint.iterdir()):
-        raise FileExistsError(
-            f"checkpoint directory contains existing files at {checkpoint}; pass --resume only for a valid manifest"
-        )
-    if resume and not manifest_path.exists():
-        raise FileNotFoundError(f"cannot resume without checkpoint manifest: {manifest_path}")
+        os.replace(checkpoint, quarantine)
+        checkpoint.mkdir(parents=True, exist_ok=True)
+        rebuild_performed = True
+    elif manifest_path.exists():
+        try:
+            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError("manifest_missing_or_corrupt") from error
+        if existing.get("expansion_fingerprint") != expansion_fingerprint:
+            raise ValueError("identity_mismatch")
+        if existing.get("configuration_fingerprint") != _sha256_payload(config):
+            raise ValueError("configuration_mismatch")
+        if existing.get("package_revision") != config.get("package_revision"):
+            raise ValueError("package_revision_mismatch")
+        if existing.get("status") == "completed":
+            if policy == "reuse_only" or policy == "reuse_or_build":
+                complete = _validate_completion_marker(
+                    checkpoint,
+                    expected_identity=expansion_fingerprint,
+                    verify=verify,
+                )
+                completed_count = len(complete.get("completed_chunks", []))
+                reused_result = ODTimeExpansionRunResult(
+                    checkpoint,
+                    expansion_fingerprint,
+                    str(complete.get("semantic_checksum")),
+                    "reused",
+                    int(complete.get("total_chunks", 0)),
+                    completed_count,
+                    int(complete.get("completed_cells", 0)),
+                    int(complete.get("retained_cells", 0)),
+                    int(complete.get("excluded_cells", 0)),
+                    int(complete.get("next_chunk", completed_count)),
+                    True,
+                    False,
+                    verify,
+                )
+                if progress is not None:
+                    progress(
+                        {
+                            "phase": "od_time_expansion",
+                            "status": "reused",
+                            "action": "reuse",
+                            "verification_mode": verify,
+                            "checkpoint_reused": True,
+                            "rebuild_performed": False,
+                            "completed_units": completed_count,
+                            "total_units": int(complete.get("total_chunks", 0)),
+                            "predicted_remaining_seconds": 0.0,
+                        }
+                    )
+                return reused_result
+            raise ValueError("checkpoint_policy=rebuild required for completed checkpoint")
+        if policy == "reuse_only":
+            raise ValueError("checkpoint_incomplete")
+        checkpoint_reused = True
+    elif any(checkpoint.iterdir()):
+        if policy == "reuse_only":
+            raise FileNotFoundError(f"manifest_missing: {manifest_path}")
+        raise ValueError("manifest_missing_or_corrupt")
+    elif policy == "reuse_only":
+        raise FileNotFoundError(f"manifest_missing: {manifest_path}")
     total_chunks = (len(universe.pairs) + chunk_size - 1) // chunk_size
     total_rows = len(universe.pairs) * len(bins)
     departures, arrivals = (
@@ -573,9 +735,11 @@ def run_candidate_od_time_expansion(
         "status": "running",
         "algorithm_version": EXPANSION_ALGORITHM_VERSION,
         "expansion_fingerprint": expansion_fingerprint,
+        "identity_basis_fingerprint": expansion_fingerprint,
         "configuration": config,
-        "configuration_fingerprint": config.get("configuration_fingerprint"),
+        "configuration_fingerprint": _sha256_payload(config),
         "package_revision": config.get("package_revision"),
+        "parent_identity_fingerprint": universe.fingerprint,
         "scenario_checksums": config.get("scenario_checksums", config.get("source_checksums", {})),
         "od_universe_fingerprint": universe.fingerprint,
         "approved_time_bins_fingerprint": config.get("approved_time_bins_fingerprint"),
@@ -591,24 +755,29 @@ def run_candidate_od_time_expansion(
         "excluded_cells": 0,
         "next_chunk": 0,
         "semantic_checksum": None,
+        "checkpoint_policy": policy,
+        "verification_mode": verify,
+        "chunk_sizes": {},
     }
-    reused = bool(resume)
+    reused = checkpoint_reused
     completed: set[int] = set()
     chunk_checksums: dict[str, str] = {}
-    if resume:
+    if checkpoint_reused:
         existing = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if existing.get("expansion_fingerprint") != expansion_fingerprint:
-            raise ValueError("checkpoint fingerprint does not match the current expansion contract")
         if existing.get("status") == "completed":
-            # A completed checkpoint is reusable, but still verify every chunk.
-            pass
+            raise RuntimeError("completed checkpoint should have taken the fast reuse path")
         for item in existing.get("completed_chunks", []):
             index = int(item)
             chunk_path = checkpoint / f"chunk-{index:06d}.jsonl"
             if not chunk_path.is_file():
                 raise ValueError(f"checkpoint chunk is missing: {chunk_path}")
             expected_checksum = str(existing.get("chunk_checksums", {}).get(str(index), ""))
-            if not expected_checksum or _file_sha256(chunk_path) != expected_checksum:
+            expected_size = existing.get("chunk_sizes", {}).get(str(index))
+            if expected_size is None or chunk_path.stat().st_size != int(expected_size):
+                raise ValueError(f"checkpoint chunk size mismatch: {chunk_path}")
+            if verify == "full" and (
+                not expected_checksum or _file_sha256(chunk_path) != expected_checksum
+            ):
                 raise ValueError(f"checkpoint chunk checksum mismatch: {chunk_path}")
             completed.add(index)
             chunk_checksums[str(index)] = expected_checksum
@@ -620,10 +789,12 @@ def run_candidate_od_time_expansion(
                 "excluded_cells": int(existing.get("excluded_cells", 0)),
                 "next_chunk": int(existing.get("next_chunk", max(completed, default=-1) + 1)),
                 "chunk_checksums": chunk_checksums,
+                "chunk_sizes": dict(existing.get("chunk_sizes", {})),
             }
         )
     else:
         contract["chunk_checksums"] = {}
+        contract["chunk_sizes"] = {}
         _atomic_json(manifest_path, contract)
 
     start = time.monotonic()
@@ -689,6 +860,8 @@ def run_candidate_od_time_expansion(
             "checkpoint_directory": str(checkpoint),
             "checkpoint_location": str(checkpoint),
             "expansion_fingerprint": expansion_fingerprint,
+            "checkpoint_policy": policy,
+            "verification_mode": verify,
             "work_stack": (
                 {
                     "name": "od_chunks",
@@ -729,7 +902,7 @@ def run_candidate_od_time_expansion(
             old_sigterm = signal.signal(signal.SIGTERM, stop_handler)
         except ValueError:
             old_sigterm = None
-        if not resume:
+        if not checkpoint_reused:
             report("started")
         else:
             report("resuming")
@@ -785,6 +958,9 @@ def run_candidate_od_time_expansion(
                 active_chunk_path, rows, maximum_bytes=maximum_temporary_bytes
             )
             chunk_checksums[str(chunk_index)] = checksum
+            contract.setdefault("chunk_sizes", {})[str(chunk_index)] = int(
+                active_chunk_path.stat().st_size
+            )
             completed.add(chunk_index)
             contract["completed_chunks"] = sorted(completed)
             contract["chunk_checksums"] = dict(chunk_checksums)
@@ -810,6 +986,7 @@ def run_candidate_od_time_expansion(
         semantic = _semantic_checksum(persisted_rows())
         contract.update({"status": "completed", "semantic_checksum": semantic, "checkpoint_reusable": False})
         _atomic_json(manifest_path, contract)
+        _write_completion_marker(checkpoint, identity=expansion_fingerprint)
         report("completed", final=True)
         return ODTimeExpansionRunResult(
             checkpoint,
@@ -823,6 +1000,8 @@ def run_candidate_od_time_expansion(
             int(contract["excluded_cells"]),
             int(contract["next_chunk"]),
             reused,
+            rebuild_performed,
+            verify,
         )
     except (KeyboardInterrupt, ODTimeExpansionInterrupted) as error:
         if active_chunk_path is not None and active_chunk_index not in completed:
@@ -2009,6 +2188,9 @@ def materialize_prior_demand_from_checkpoint(
     checkpoint_expansion = str(manifest.get("expansion_fingerprint", ""))
     if not checkpoint_expansion:
         raise ValueError("checkpoint manifest has no expansion fingerprint")
+    _validate_completion_marker(
+        checkpoint, expected_identity=checkpoint_expansion, verify="full"
+    )
     if expansion_fingerprint is not None and expansion_fingerprint != checkpoint_expansion:
         raise ValueError("checkpoint expansion fingerprint does not match the requested fingerprint")
     checkpoint_revision = str(manifest.get("package_revision", ""))

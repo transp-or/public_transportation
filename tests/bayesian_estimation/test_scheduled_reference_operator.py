@@ -508,11 +508,12 @@ def test_completed_preflight_adoption_materializes_and_reuses_packed_cache(
         _load_validated_operator_cache(
             cache_directory=cache_directory,
             expected_identity=reference.identity,
-            expected_canonical_index=reference.canonical_index,
-            artifact_manifest_sha256=_file_sha256(
-                artifact_directory / "manifest.json"
-            ),
-        )
+                expected_canonical_index=reference.canonical_index,
+                artifact_manifest_sha256=_file_sha256(
+                    artifact_directory / "manifest.json"
+                ),
+                verify="full",
+            )
         is None
     )
 
@@ -1188,6 +1189,7 @@ def test_direct_activation_reuse_only_reports_identity_mismatch_without_quaranti
             construction_seconds=None,
             reference_evaluation_seconds=2.0,
             operator_evaluation_seconds=0.5,
+            verify="full",
             **strict_arguments,
         )
     error = caught.value
@@ -1228,6 +1230,7 @@ def test_direct_activation_reuse_only_rejects_incomplete_artifact_without_mutati
             construction_seconds=None,
             reference_evaluation_seconds=2.0,
             operator_evaluation_seconds=0.5,
+            verify="full",
             **strict_arguments,
         )
     assert caught.value.reason_code == "artifact_incomplete"

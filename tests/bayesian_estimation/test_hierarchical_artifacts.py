@@ -17,6 +17,7 @@ from public_transportation.inference.hierarchical_artifacts import (
     HierarchicalProgressReporter,
     ObsoleteArtifactFormatError,
     derive_layer_fingerprints,
+    make_manifest,
     prepare_hierarchical_assignment_mapping,
 )
 
@@ -81,6 +82,63 @@ def test_hierarchy_build_then_fresh_process_reuse(tmp_path):
     events = [json.loads(line) for line in progress_path.read_text().splitlines()]
     assert {event["artifact_layer"] for event in events} == set(ARTIFACT_LAYERS)
     assert all(event["schema_version"] == 1 for event in events)
+
+
+def test_default_policy_reuses_fast_and_requires_completion_marker(tmp_path):
+    specifications = _specifications()
+    first = prepare_hierarchical_assignment_mapping(
+        root=tmp_path,
+        specifications=specifications,
+        mapping_builder=lambda: _mapping(specifications),
+    )
+    marker = (
+        tmp_path
+        / "artifacts"
+        / "scenario_base"
+        / first.manifests["scenario_base"].fingerprint
+        / "COMPLETE.json"
+    )
+    timestamp = marker.stat().st_mtime_ns
+    second = prepare_hierarchical_assignment_mapping(
+        root=tmp_path,
+        specifications=specifications,
+    )
+    assert second.checkpoint_reused is True
+    assert second.rebuilt_layers == ()
+    assert second.reused_layers == ARTIFACT_LAYERS
+    assert marker.stat().st_mtime_ns == timestamp
+    marker.unlink()
+    with pytest.raises(HierarchicalArtifactUnavailableError) as caught:
+        prepare_hierarchical_assignment_mapping(
+            root=tmp_path,
+            specifications=specifications,
+            checkpoint_policy="reuse_only",
+        )
+    assert caught.value.reason_code == "completion_marker_missing"
+
+
+def test_incomplete_hierarchy_checkpoint_resumes(tmp_path):
+    specifications = _specifications()
+    expected = derive_layer_fingerprints(specifications)
+    store = HierarchicalArtifactStore(tmp_path)
+    manifest = make_manifest(
+        artifact_layer="estimation_assignment_mapping",
+        parent_fingerprints={
+            name: expected[name]
+            for name in DAG_PARENT_LAYERS["estimation_assignment_mapping"]
+        },
+        scientific_parameters=specifications[
+            "estimation_assignment_mapping"
+        ]["scientific_parameters"],
+        status="started",
+    )
+    store.write_checkpoint(manifest, overwrite=True)
+    result = prepare_hierarchical_assignment_mapping(
+        root=tmp_path,
+        specifications=specifications,
+        mapping_builder=lambda: _mapping(specifications),
+    )
+    assert result.actions["estimation_assignment_mapping"] == "resume"
 
 
 def test_l7_payload_roundtrip_preserves_explicit_fixed_positive_mapping(tmp_path):
@@ -185,7 +243,7 @@ def test_theta_change_invalidates_materialization_and_descendants(tmp_path):
     )
 
 
-def test_strict_reuse_reports_missing_l7(tmp_path):
+def test_strict_reuse_reports_first_missing_layer(tmp_path):
     specifications = _specifications()
     with pytest.raises(HierarchicalArtifactUnavailableError) as caught:
         prepare_hierarchical_assignment_mapping(
@@ -193,7 +251,7 @@ def test_strict_reuse_reports_missing_l7(tmp_path):
             specifications=specifications,
             activation_policy="reuse_only",
         )
-    assert caught.value.artifact_layer == "estimation_assignment_mapping"
+    assert caught.value.artifact_layer == "scenario_base"
     assert caught.value.reason_code == "artifact_missing"
 
 

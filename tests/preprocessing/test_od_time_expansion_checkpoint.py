@@ -135,7 +135,6 @@ def test_sigint_preserves_completed_chunks_and_resume_is_semantically_identical(
         scenario=scenario,
         configuration=configuration,
         checkpoint_directory=checkpoint,
-        resume=True,
     )
     fresh = run_candidate_od_time_expansion(
         universe,
@@ -149,7 +148,7 @@ def test_sigint_preserves_completed_chunks_and_resume_is_semantically_identical(
     assert resumed.expansion_fingerprint == fresh.expansion_fingerprint
 
 
-def test_checkpoint_requires_explicit_resume_and_rejects_corruption(tmp_path: Path) -> None:
+def test_checkpoint_reuses_by_default_and_rejects_corruption_on_full_verify(tmp_path: Path) -> None:
     scenario, universe, bins, configuration = _inputs()
     checkpoint = tmp_path / "checkpoint"
     run_candidate_od_time_expansion(
@@ -159,24 +158,25 @@ def test_checkpoint_requires_explicit_resume_and_rejects_corruption(tmp_path: Pa
         configuration=configuration,
         checkpoint_directory=checkpoint,
     )
-    with pytest.raises(FileExistsError, match="--resume"):
-        run_candidate_od_time_expansion(
-            universe,
-            bins,
-            scenario=scenario,
-            configuration=configuration,
-            checkpoint_directory=checkpoint,
-        )
+    reused = run_candidate_od_time_expansion(
+        universe,
+        bins,
+        scenario=scenario,
+        configuration=configuration,
+        checkpoint_directory=checkpoint,
+    )
+    assert reused.status == "reused"
+    assert reused.checkpoint_reused is True
     chunk = next(checkpoint.glob("chunk-*.jsonl"))
     chunk.write_text(chunk.read_text() + "\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="checksum"):
+    with pytest.raises(ValueError, match="size|checksum"):
         run_candidate_od_time_expansion(
             universe,
             bins,
             scenario=scenario,
             configuration=configuration,
             checkpoint_directory=checkpoint,
-            resume=True,
+            verify="full",
         )
 
 
@@ -191,7 +191,7 @@ def test_changed_contract_rejects_resume(tmp_path: Path) -> None:
         checkpoint_directory=checkpoint,
     )
     changed = {**configuration, "chunk_size_pairs": 2}
-    with pytest.raises(ValueError, match="fingerprint"):
+    with pytest.raises(ValueError, match="identity_mismatch"):
         run_candidate_od_time_expansion(
             universe,
             bins,
@@ -299,6 +299,6 @@ def test_materialization_rejects_identity_or_checksum_failure_without_replacing_
     assert output.read_text(encoding="utf-8") == "old\n"
     chunk = next(checkpoint.glob("chunk-*.jsonl"))
     chunk.write_text(chunk.read_text(encoding="utf-8") + "\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="checksum"):
+    with pytest.raises(ValueError, match="size|checksum"):
         materialize_prior_demand_from_checkpoint(checkpoint, output)
     assert output.read_text(encoding="utf-8") == "old\n"

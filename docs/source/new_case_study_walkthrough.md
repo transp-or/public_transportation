@@ -271,11 +271,12 @@ configured scratch `scenario_demand` CSV, `"$RESULTS_ROOT/audit/"`, and the
 `bootstrap-prior` manifest/log. The JSONL progress log is
 `"$RESULTS_ROOT/logs/bootstrap-prior.jsonl"`; the checkpoint progress record
 is `.../progress.json`; the durable completion manifest is
-`"$RESULTS_ROOT/manifests/bootstrap-prior.json"`. Resume only after the job
-has exited, with the same results root and the same checkpoint:
+`"$RESULTS_ROOT/manifests/bootstrap-prior.json"`. After the job has exited,
+rerun the same command with the same results root: compatible completed
+checkpoints are reused automatically and incomplete ones resume:
 
 ```bash
-uv run --frozen python run_case.py bootstrap-prior --resume
+uv run --frozen python run_case.py bootstrap-prior
 ```
 
 Submit the next phase only when the manifest reports `"status": "completed"`,
@@ -382,7 +383,10 @@ If the job ends with `TIMEOUT`, `CANCELLED`, or another scheduler interruption:
 2. Rerun the same `prepare` stage with a longer wall-time or memory
    allocation, using the same results root.
 3. Do not add a `--resume` flag: `prepare` resumes automatically through
-   matching checkpoints.
+   matching checkpoints. The fast path checks manifests, completion markers,
+   output sizes, package/configuration identity, and parent fingerprints
+   without hashing all payloads; request `verify="full"` only for an explicit
+   integrity audit.
 
 For example:
 
@@ -1853,7 +1857,8 @@ expansion = run_candidate_od_time_expansion(
     scenario=scenario,
     configuration=explicit_expansion_configuration,
     checkpoint_directory=identity_specific_checkpoint,
-    resume=resume,
+    checkpoint_policy="reuse_or_build",
+    verify="fast",
     progress=progress_callback,
     timetable_index=timetable_index,
 )
@@ -1875,10 +1880,11 @@ materialized = materialize_prior_demand_from_checkpoint(
 ```
 
 The checkpoint directory is generated as
-`results/checkpoints/prior_demand/<expansion_contract_fingerprint>/`. A fresh
-run refuses an existing checkpoint; `--resume` is valid only for that exact
-configuration, scenario, approved-bin fingerprint, and package identity. The
-runner writes immutable `chunk-*.jsonl`, `manifest.json`, and `progress.json`.
+`results/checkpoints/prior_demand/<expansion_contract_fingerprint>/`. The
+default policy reuses a complete matching checkpoint, resumes a matching
+incomplete one, builds a missing one, and fails on incompatible metadata. The
+runner writes immutable `chunk-*.jsonl`, `manifest.json`, `COMPLETE.json`, and
+`progress.json`; use `verify="full"` for an explicit checksum audit.
 Only a manifest with `status = "completed"`, valid chunk checksums, matching
 row counts, and a matching semantic checksum can be materialized. The final
 CSV is written to a temporary sibling and atomically replaced only after all
@@ -1923,7 +1929,7 @@ For a clean interrupted or scheduler-stopped run, use exactly one subsequent
 writer:
 
 ```bash
-uv run --frozen python run_case.py bootstrap-prior --resume
+uv run --frozen python run_case.py bootstrap-prior
 ```
 
 The adapter emits durable JSONL progress while the universe, each expansion
@@ -3476,20 +3482,20 @@ cat "$RESULTS_ROOT/checkpoints/prior_demand/<expansion-contract-fingerprint>/pro
 If the job reaches a wall-time limit or is interrupted, classify the terminal
 manifest as `interrupted` (or `deadline_stopped` if the case driver uses that
 explicit scheduler status). Do not start `check`, structural-zero analysis, or
-any downstream stage. Submit one dependent resume job, after the first job has
-finished and released its lock:
+any downstream stage. Submit one dependent continuation job, after the first
+job has finished and released its lock:
 
 ```bash
 sbatch --dependency=afterany:<bootstrap-job-id> \
   --output="$RESULTS_ROOT/logs/bootstrap-prior-resume-%j.out" \
   --error="$RESULTS_ROOT/logs/bootstrap-prior-resume-%j.err" \
-  --wrap='cd "$SLURM_SUBMIT_DIR" && uv run --frozen python run_case.py bootstrap-prior --resume'
+  --wrap='cd "$SLURM_SUBMIT_DIR" && uv run --frozen python run_case.py bootstrap-prior'
 ```
 
-Resume is accepted only when the checkpoint identity matches the current
-scenario, approved time bins, explicit expansion configuration, and package
-revision. A fresh invocation against an existing checkpoint is refused; never
-delete chunks to force it. Proceed to the next dependency only after
+The normal invocation automatically reuses or resumes only when the checkpoint
+identity matches the current scenario, approved time bins, explicit expansion
+configuration, and package revision; incompatible state fails closed. Never
+delete chunks to force a rebuild. Proceed to the next dependency only after
 `results/manifests/bootstrap-prior.json` says `status = "completed"` and the
 prior CSV and audit checksum are present.
 
@@ -3623,7 +3629,9 @@ run_candidate_od_time_expansion(
     scenario: Scenario | None = None,
     configuration: Mapping[str, object],
     checkpoint_directory: str | Path,
-    resume: bool = False,
+    checkpoint_policy: Literal["reuse_or_build", "reuse_only", "rebuild"] =
+        "reuse_or_build",
+    verify: Literal["fast", "full"] = "fast",
     progress: Callable[[Mapping[str, object]], None] | None = None,
     timetable_index: CanonicalTimetableIndex | None = None,
 ) -> ODTimeExpansionRunResult
@@ -3883,7 +3891,7 @@ identity = build_scheduled_reference_artifact_identity(
     coefficient_policy_fingerprint="exact-float32-v1",
 )
 activated = activate_direct_scheduled_temporal_operator(
-    mode="direct", activation_policy="build_or_reuse",
+    mode="direct", checkpoint_policy="reuse_or_build",
     expected_evaluations=expected_evaluations,
     construction_seconds=None, reference_evaluation_seconds=reference_seconds,
     operator_evaluation_seconds=operator_seconds,
@@ -4021,7 +4029,7 @@ by the stage and must be fingerprinted before a later stage consumes it.
 |---|---|---|---|---|
 | count recommendation | **Example:** `inputs/measurements.csv`; **example settings:** resolution, horizon, `num_od_pairs`, and `max_od_cells` passed to `time_discretization` | `results/time_discretization/recommendation.json`; retain the input checksum and selected candidate | JSON `status = "ok"` and a valid `recommendation`; `blocked` is a stop condition | no; rerun after a deliberate input/policy change |
 | bin materialization | **Generated:** reviewed recommendation JSON; **example output:** `results/time_discretization/time_bins.reviewed.csv` | reviewed three-column CSV; later, the **convention** scenario input `inputs/scenario/time_bins.csv` after explicit adoption | materializer succeeds and the selected candidate is valid; scenario `time_bins.csv` is not replaced implicitly | no |
-| `bootstrap-prior` | **Convention:** approved `inputs/scenario/time_bins.csv`; **example:** network and explicit policy/resource values in `config/case.toml`; no demand file is required yet | `results/checkpoints/prior_demand/<expansion-contract-fingerprint>/manifest.json`, immutable `chunk-*.jsonl`, `progress.json`; `inputs/scenario/prior_demand.csv`; `results/audit/prior_demand_generation.json`; `results/manifests/bootstrap-prior.json`; `results/logs/bootstrap-prior.jsonl` | manifest and stage summary `status = "completed"`; checkpoint is complete, audit exists, and output checksum is present. `interrupted`, `failed`, and `deadline_stopped` stop the chain | yes, only with `bootstrap-prior --resume` and matching identity; a fresh run refuses an existing checkpoint |
+| `bootstrap-prior` | **Convention:** approved `inputs/scenario/time_bins.csv`; **example:** network and explicit policy/resource values in `config/case.toml`; no demand file is required yet | `results/checkpoints/prior_demand/<expansion-contract-fingerprint>/manifest.json`, immutable `chunk-*.jsonl`, `COMPLETE.json`, `progress.json`; `inputs/scenario/prior_demand.csv`; `results/audit/prior_demand_generation.json`; `results/manifests/bootstrap-prior.json`; `results/logs/bootstrap-prior.jsonl` | manifest and stage summary `status = "completed"`; checkpoint is complete, audit exists, and output checksum is present. `interrupted`, `failed`, and `deadline_stopped` stop the chain | yes, automatically with matching identity; use an explicit rebuild policy to invalidate it |
 | `check` | **Convention:** `config/case.toml`, `config/structural_zeros.toml`, `config/model.toml`; **generated:** `inputs/scenario/prior_demand.csv` and its audit; **example:** other paths selected by those files under `inputs/` | `results/manifests/check.json` (including resolved `fixed_demand`, `fixed_demand_source`, and `fixed_demand_sha256`), `results/logs/check.jsonl`, `results/audit/feasibility_support.json`, `results/audit/feasibility_support_cells.jsonl`, and audit fingerprints | manifest `status = "completed"`, support audit `status = "completed"`, zero unsupported free/bootstrap-only cells, all fingerprints present | no |
 | `structural-zeros` | **Convention:** `config/structural_zeros.toml`; **generated:** scenario prior demand; **example:** existing fixed-demand path selected by it | `results/structural_zeros/fixed_demand.csv`, `results/structural_zeros/structural_zero_audit.csv`, `results/structural_zeros/structural_zero_summary.json`, `results/structural_zeros/fingerprints.json`, `results/structural_zeros/resolved_config.toml`, `results/manifests/structural-zeros.json`, `results/logs/structural-zeros.jsonl` | service returns without exception; summary and fingerprints exist | safe to rerun with the same roots |
 | `prepare` | **Generated:** resolved structural-zero fixed demand (or **example:** reviewed fallback fixed-demand file when the stage is disabled); **convention:** scenario/timetable and measurement contracts; **example:** resource limits in TOML | `results/artifacts/<identity>/manifest.json`, `blocks/block-*.npz`, `fixed_measurement_offset.npy`; `results/checkpoints/<identity>/`; stage manifest/log with resolved fixed-demand path, source, and checksum | artifact `complete = true`; routing `status = "completed"`; fixed-demand provenance matches the file actually loaded | yes, only from a matching checkpoint |
@@ -4430,11 +4438,12 @@ earlier layer. L7 joins `full_od_assignment_mapping` and
 full assignment mapping.
 
 Preparation is the only stage permitted to use
-`activation_policy="build_or_reuse"` or `"force_rebuild"`. All downstream
-stages must use `activation_policy="reuse_only"`; a missing or incompatible
-layer is an error, not a request to rebuild. The layer manifests and payload
-checksums are stored under separate `checkpoints/<layer>/<fingerprint>` and
-`artifacts/<layer>/<fingerprint>` namespaces.
+`checkpoint_policy="reuse_or_build"` or `"rebuild"`. All downstream stages
+must use `checkpoint_policy="reuse_only"`; a missing or incompatible layer is
+an error, not a request to rebuild. The layer manifests and payload checksums
+are stored under separate `checkpoints/<layer>/<fingerprint>` and
+`artifacts/<layer>/<fingerprint>` namespaces. Preparation defaults to the fast
+metadata path; request `verify="full"` only for an explicit integrity audit.
 
 The hierarchy supports the following invalidation rules:
 

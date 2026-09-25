@@ -13,7 +13,7 @@ import tomllib
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Literal, Mapping
 
 import jax
 import numpy as np
@@ -385,6 +385,7 @@ def bootstrap_prior_demand(
     root: str | Path,
     *,
     resume: bool = False,
+    verify: Literal["fast", "full"] = "fast",
     settings: CaseSettings | None = None,
     progress: ProgressCallback | None = None,
 ) -> dict[str, object]:
@@ -538,7 +539,9 @@ def bootstrap_prior_demand(
         scenario=scenario,
         configuration=expansion_config,
         checkpoint_directory=checkpoint,
+        checkpoint_policy="reuse_or_build",
         resume=resume,
+        verify=verify,
         progress=progress,
         timetable_index=timetable_index,
     )
@@ -1063,6 +1066,7 @@ def activate(
     context: CaseContext,
     *,
     progress: Callable[[object], None] | None = None,
+    verify: Literal["fast", "full"] = "fast",
 ) -> DirectScheduledActivationResult:
     settings = context.settings
     inputs = build_assignment_inputs(
@@ -1115,6 +1119,7 @@ def activate(
         od_layout_fingerprint=context.parameter_layout.fingerprint,
         config=config,
         progress=progress,
+        verify=verify,
         time_budget_seconds=settings.construction_time_budget_seconds,
         safety_margin_seconds=settings.safety_margin_seconds,
         measurement_info=context.mapping.info,

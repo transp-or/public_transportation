@@ -256,17 +256,23 @@ and does not replace an existing one. The manifest and stage summary must have
 `status = "completed"` before any downstream stage starts.
 
 If a run is interrupted or reaches a scheduler limit, inspect the durable
-manifest and resume exactly once after the previous process has exited:
+manifest and rerun the same command after the previous process has exited:
 
 ```bash
-uv run --frozen python run_case.py bootstrap-prior --resume
+uv run --frozen python run_case.py bootstrap-prior
 tail -f results/logs/bootstrap-prior.jsonl
 ```
 
-A fresh run refuses an existing checkpoint. Resume is accepted only for the
-same scenario, approved bins, explicit configuration, package revision, and
-expansion fingerprint. Do not delete chunks to force a fresh run; archive the
-checkpoint under a case-owned name if a deliberate policy change is intended.
+The runner automatically reuses a complete compatible checkpoint and resumes
+a matching incomplete checkpoint. Incompatible metadata fails closed; use an
+explicit rebuild policy when intentionally invalidating the checkpoint. The
+default fast path checks manifests, completion markers, output sizes,
+package/configuration identity, and parent fingerprints without hashing every
+chunk. Do not delete chunks to force a fresh run; archive the checkpoint under
+a case-owned name if a deliberate policy change is intended.
+For a command-line integrity audit, run
+`uv run --frozen python run_case.py prepare --verify` (or pass
+`--verify full` explicitly).
 
 Zero construction budget means no deadline. `expected_evaluations` is used
 to choose and record the construction policy; it is not a demand value.

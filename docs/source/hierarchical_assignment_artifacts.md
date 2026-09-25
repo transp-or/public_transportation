@@ -49,22 +49,38 @@ scientific parameters, and input fingerprints.  Worker count, batch size,
 temporary directories, deadlines, and progress intervals are execution
 parameters and never change scientific identity.
 
-The DAG layout is schema version 2. Artifacts from the earlier linear layout
+The DAG layout is schema version 3. Artifacts from the earlier linear layout
 are incompatible and must be regenerated explicitly.
 
 ## Reuse policy
 
-Activation defaults to `activation_policy="reuse_only"`.  It validates the
-expected manifest, every parent fingerprint, and every payload checksum.  A
-missing, incomplete, corrupt, or incompatible layer raises a structured
-`HierarchicalArtifactUnavailableError`; an artifact from the obsolete
-monolithic format raises `ObsoleteArtifactFormatError`.
+Preparation defaults to `checkpoint_policy="reuse_or_build"`.  It first takes
+a metadata-only fast path: it checks the manifest, package/configuration and
+parent identities, the `COMPLETE.json` marker, declared output files, and
+recorded file sizes.  It reuses a complete match, resumes a matching
+incomplete checkpoint, builds a missing artifact, and fails rather than
+silently rebuilding an incompatible artifact.  Use `verify="full"` only for
+an explicit integrity audit; the normal reuse path does not hash every
+payload.
 
-Only an explicit preparation command may use:
+`checkpoint_policy="reuse_only"` is the fail-closed policy for fit,
+validation, reporting, identifiability, and export.  `checkpoint_policy="rebuild"`
+is the explicit invalidation request.  The historical
+`activation_policy="build_or_reuse"` and `"force_rebuild"` names remain
+accepted by the preparation API as compatibility aliases.
+
+Every published artifact has a manifest and a `COMPLETE.json` marker.  The
+marker is written only after payload publication and binds the identity to the
+manifest hash.  A missing marker, missing output, size mismatch, or incompatible
+metadata produces a structured `HierarchicalArtifactUnavailableError` with a
+stable reason code; an artifact from the obsolete monolithic format raises
+`ObsoleteArtifactFormatError`.
+
+An explicit preparation command may use the new policies:
 
 ```python
-activation_policy="build_or_reuse"
-activation_policy="force_rebuild"
+checkpoint_policy="reuse_or_build"
+checkpoint_policy="rebuild"
 ```
 
 Fit, validation, reporting, identifiability, and viewer/export workflows must
@@ -144,7 +160,8 @@ prepared = prepare_hierarchical_assignment_mapping(
     root=results_root,
     specifications=layer_specifications,
     mapping_builder=build_l7_mapping,
-    activation_policy="build_or_reuse",
+    checkpoint_policy="reuse_or_build",
+    verify="fast",
     progress=HierarchicalProgressReporter(
         results_root / "progress.jsonl",
         campaign_path=results_root / "campaign_progress.jsonl",
@@ -155,7 +172,8 @@ prepared = prepare_hierarchical_assignment_mapping(
 reused = prepare_hierarchical_assignment_mapping(
     root=results_root,
     specifications=layer_specifications,
-    activation_policy="reuse_only",
+    checkpoint_policy="reuse_only",
+    verify="fast",
 )
 mapping = reused.mapping
 prediction = mapping.fixed_offset + mapping.matvec(d_free)
@@ -165,6 +183,10 @@ For a matrix-free companion backend, `EstimationAssignmentMapping.to_payload`
 records `matrix_format="companion_operator"`; loading it requires an explicit
 `companion_loader` callback.  This prevents an estimator from silently
 substituting a different numerical operator.
+
+The case-template driver exposes the full audit as
+`uv run --frozen python run_case.py prepare --verify`; the API equivalent is
+`verify="full"`.
 
 The existing scheduled operator uses the same L7 contract without allocating a
 dense full-network matrix.  Its sparse/block backend is the numerical payload;
@@ -176,12 +198,12 @@ the existing construction reporter continues to carry low-level shard timing.
 
 ## Campaign workflow
 
-1. Prepare or resume all layers with `build_or_reuse` (or `force_rebuild` when
-   explicitly requested).
-2. Verify completed manifests, parent fingerprints, checksums, and the L7
-   shape/offset/index metadata.
+1. Prepare all layers with `checkpoint_policy="reuse_or_build"`; matching
+   checkpoints resume automatically and complete artifacts are reused.
+2. Use `verify="full"` for an occasional integrity audit, not for every
+   activation.
 3. Run fit, validation, identifiability, reporting, and viewer/export with
-   `reuse_only`.
+   `checkpoint_policy="reuse_only"`.
 4. Rerun those downstream stages to confirm that all layers emit `reused`
    events and no construction event occurs.
 

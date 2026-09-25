@@ -14,7 +14,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from threading import Event, Thread
 from time import perf_counter
-from typing import Mapping
+from typing import Literal, Mapping
 
 import numpy as np
 
@@ -363,7 +363,9 @@ def check(root: Path) -> None:
         raise
 
 
-def bootstrap_prior(root: Path, resume: bool = False) -> None:
+def bootstrap_prior(
+    root: Path, resume: bool = False, verify: Literal["fast", "full"] = "fast"
+) -> None:
     settings, progress = _start_stage(root, "bootstrap-prior")
 
     def normalized_progress(event: Mapping[str, object]) -> None:
@@ -391,10 +393,12 @@ def bootstrap_prior(root: Path, resume: bool = False) -> None:
             "status": "running",
             "current_unit": "candidate_od_time_expansion",
             "resume": resume,
+            "verification_mode": verify,
         })
         audit = bootstrap_prior_demand(
             root,
             resume=resume,
+            verify=verify,
             settings=settings,
             progress=normalized_progress,
         )
@@ -482,13 +486,13 @@ def structural_zeros(root: Path) -> None:
         raise
 
 
-def prepare(root: Path) -> None:
+def prepare(root: Path, verify: Literal["fast", "full"] = "fast") -> None:
     settings, progress = _start_stage(root, "prepare")
     context: CaseContext | None = None
     try:
         context = load_context(root, settings=settings, progress=progress)
         progress.phase_started("operator_activation", "direct_scheduled_operator")
-        activated = activate(context, progress=progress)
+        activated = activate(context, progress=progress, verify=verify)
         progress.phase_completed("operator_activation", "direct_scheduled_operator")
         payload = _base(context, "prepare") | {
             **_activation_summary(activated),
@@ -800,6 +804,11 @@ def main() -> None:
         "--resume", action="store_true",
         help="resume the identity-matching bootstrap or gravity checkpoint",
     )
+    parser.add_argument(
+        "--verify", nargs="?", const="full", choices=("fast", "full"),
+        default="fast",
+        help="verify checkpoint payloads (default flag mode: full)",
+    )
     args = parser.parse_args()
     if args.resume and args.stage not in {"bootstrap-prior", "fit"}:
         parser.error("--resume is valid only for bootstrap-prior and fit stages")
@@ -807,7 +816,9 @@ def main() -> None:
         if args.stage == "fit":
             fit(args.root.resolve(), resume=args.resume)
         elif args.stage == "bootstrap-prior":
-            bootstrap_prior(args.root.resolve(), resume=args.resume)
+            bootstrap_prior(args.root.resolve(), resume=args.resume, verify=args.verify)
+        elif args.stage == "prepare":
+            prepare(args.root.resolve(), verify=args.verify)
         else:
             STAGES[args.stage](args.root.resolve())
     except UnsupportedPositiveBoardingError as error:
