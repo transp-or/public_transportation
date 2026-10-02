@@ -26,6 +26,17 @@ from .report import (
     write_audit,
     write_residual_audit,
 )
+from .measurement import (
+    BootstrapConfig,
+    MEASUREMENT_RESIDUAL_ANALYSIS_SCHEMA_VERSION,
+    MeasurementResidualAnalysis,
+    MeasurementResidualAnalysisResult,
+    PracticalTolerances,
+    ResidualBootstrapConfig,
+    ResidualPracticalTolerances,
+    analyze_measurement_residuals,
+    write_measurement_residual_analysis,
+)
 
 __all__ = [
     "GROUP_METRIC_COLUMNS",
@@ -53,4 +64,13 @@ __all__ = [
     "summarize_comparison_by",
     "write_residual_audit",
     "write_audit",
+    "BootstrapConfig",
+    "MEASUREMENT_RESIDUAL_ANALYSIS_SCHEMA_VERSION",
+    "MeasurementResidualAnalysis",
+    "MeasurementResidualAnalysisResult",
+    "PracticalTolerances",
+    "ResidualBootstrapConfig",
+    "ResidualPracticalTolerances",
+    "analyze_measurement_residuals",
+    "write_measurement_residual_analysis",
 ]

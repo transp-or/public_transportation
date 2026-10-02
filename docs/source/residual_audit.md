@@ -1,5 +1,10 @@
 # Residual audit of persisted model reports
 
+For the richer fit-integrated diagnostics, see
+[`measurement_residual_analysis.md`](measurement_residual_analysis.md). The
+legacy audit described below remains supported and continues to produce its
+original files and schema.
+
 The residual-audit tool analyzes persisted prediction, residual, contribution,
 and metadata tables. It does not rerun preparation, routing, assignment, or
 fitting. It is therefore suitable for investigating systematic model--data

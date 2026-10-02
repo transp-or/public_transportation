@@ -1,5 +1,19 @@
 # Release notes
 
+## Provenance-aware measurement residual analysis
+
+- Added fit-integrated observed-versus-modelled diagnostics with explicit raw,
+  relative, Pearson, and Poisson/negative-binomial deviance residual
+  conventions; supplied-likelihood variance handling; all requested line,
+  direction, stop, time, destination, measurement-type, method, and journey
+  groupings; deterministic vehicle-journey bootstrap confidence intervals;
+  journey-sequence and boarding/alighting-balance diagnostics; conservative
+  candidate-pattern detection; and advisory data-audit/model-review
+  suggestions. Reports retain the historical residual files and add
+  `residual_analysis.json`, rich grouped and journey tables, suggestions, and
+  a provenance manifest. The analysis never modifies data, fitted parameters,
+  calibration masks, or routing artifacts and explicitly remains in-sample.
+
 ## Desired-departure response averaging
 
 - Added supply-independent uniform-midpoint sampling of desired passenger

@@ -223,12 +223,20 @@ from .fixed_routing_measurement_operator import (  # noqa: F401
     validate_fixed_routing_measurement_operator,
 )
 from .residual_audit import (  # noqa: F401
+    BootstrapConfig,
     GROUP_METRIC_COLUMNS,
+    MEASUREMENT_RESIDUAL_ANALYSIS_SCHEMA_VERSION,
     RESIDUAL_AUDIT_SCHEMA_VERSION,
+    MeasurementResidualAnalysis,
+    MeasurementResidualAnalysisResult,
+    PracticalTolerances,
     ResidualAuditConfig,
     ResidualAuditResult,
     ResidualAuditRun,
+    ResidualBootstrapConfig,
+    ResidualPracticalTolerances,
     ResidualRunComparison,
+    analyze_measurement_residuals,
     audit_residuals,
     audit_run,
     compare_runs,
@@ -239,6 +247,7 @@ from .residual_audit import (  # noqa: F401
     summarize_by,
     summarize_comparison_by,
     write_residual_audit,
+    write_measurement_residual_analysis,
     write_audit,
 )
 from .support_discovery_profile import (  # noqa: F401

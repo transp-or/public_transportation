@@ -140,6 +140,11 @@ def test_persisted_report_is_portable_and_records_canonical_provenance(tmp_path)
     assert payload["model_fingerprint"] == fit["model_fingerprint"]
     assert payload["provenance"]["source"] == "persisted_fit_validation"
     assert payload["identifiability"]["available"] is False
+    assert payload["residual_analysis"]["status"] == "completed"
+    assert payload["residual_analysis"]["scope"] == "in_sample"
+    assert (output / "residual_analysis.json").is_file()
+    assert (output / "grouped_residual_analysis.csv").is_file()
+    assert (output / "residual_suggestions.json").is_file()
     assert (
         payload["identifiability"]["message"]
         == "OD identifiability diagnostics were not available; inference_score remains only a structural fixed/free indicator."

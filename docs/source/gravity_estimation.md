@@ -28,7 +28,11 @@ Residual diagnostics for persisted fit artifacts are available through the
 generic [residual-audit tool](residual_audit.md). It reports ordinary residuals,
 near-zero-support failures, arbitrary metadata groupings, contribution
 accounting, and optional row-by-row comparison of two runs without rerunning
-the model.
+the model. Every completed detailed gravity report also runs the richer
+[measurement residual analysis](measurement_residual_analysis.md), which adds
+cluster-aware uncertainty, journey-sequence diagnostics, conservative
+candidate patterns, and advisory suggestions. These are in-sample diagnostics,
+not holdout validation, and they never alter the fit or source observations.
 
 ## Phase 1: demand contracts
 

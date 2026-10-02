@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 from public_transportation.inference.block_coordinate._canonical import canonical_json
 from public_transportation.inference.od_parameter_layout import ODParameterLayout
@@ -23,6 +24,11 @@ from .validation import (
     GravityAdequacyReport,
     GravityValidationMetadata,
     build_gravity_adequacy_report,
+)
+from public_transportation.inference.residual_audit import (
+    ResidualBootstrapConfig,
+    analyze_measurement_residuals,
+    write_measurement_residual_analysis,
 )
 
 
@@ -47,6 +53,12 @@ _REPORT_FILES = (
     "report.json",
     "report.md",
     "executive_summary.md",
+    "residual_analysis.json",
+    "grouped_residual_analysis.csv",
+    "journey_residual_analysis.csv",
+    "residual_suggestions.json",
+    "residual_suggestions.md",
+    "residual_analysis_manifest.json",
 )
 _OPTIONAL_REPORT_FILES = ("measurement_contributions.csv",)
 _METADATA_FIELDS = (
@@ -597,6 +609,61 @@ def _write_text(path: Path, text: str) -> None:
     temporary.replace(path)
 
 
+def _write_unavailable_residual_analysis(
+    output: Path,
+    *,
+    error: Exception,
+    provenance: Mapping[str, object],
+    force: bool,
+) -> dict[str, object]:
+    """Persist a safe failure record instead of silently omitting diagnostics."""
+    files = {
+        name: output / name
+        for name in (
+            "residual_analysis.json",
+            "grouped_residual_analysis.csv",
+            "journey_residual_analysis.csv",
+            "residual_suggestions.json",
+            "residual_suggestions.md",
+            "residual_analysis_manifest.json",
+        )
+    }
+    if not force:
+        existing = [path for path in files.values() if path.exists()]
+        if existing:
+            raise FileExistsError(
+                "residual analysis output already exists: "
+                + ", ".join(map(str, existing))
+            )
+    manifest: dict[str, object] = {
+        "schema_version": 1,
+        "status": "unavailable",
+        "scope": "in_sample",
+        "reason": str(error),
+        "affected_inputs": ["observations", "predicted_measurements", "variance", "metadata"],
+        "recommended_corrective_action": "Inspect the residual-analysis input contract and regenerate the report after correcting the affected input.",
+        "provenance": dict(provenance),
+        "candidate_patterns": [],
+        "suggestions": [],
+        "warnings": ["Residual analysis was unavailable; no data or fitted model was changed."],
+        "advisory_only": True,
+        "holdout_claim": False,
+        "output_files": {name: str(path) for name, path in files.items()},
+    }
+    _write_json(files["residual_analysis.json"], manifest)
+    _write_csv(files["grouped_residual_analysis.csv"], ["grouping", "group_key"] , [])
+    _write_csv(files["journey_residual_analysis.csv"], ["journey_id"], [])
+    _write_json(files["residual_suggestions.json"], {"schema_version": 1, "advisory_only": True, "suggestions": []})
+    _write_text(
+        files["residual_suggestions.md"],
+        "# Measurement residual suggestions\n\nResidual analysis was unavailable: "
+        + str(error)
+        + "\n",
+    )
+    _write_json(files["residual_analysis_manifest.json"], manifest)
+    return manifest
+
+
 def _metadata_rows(
     observations: np.ndarray, metadata: GravityValidationMetadata
 ) -> list[dict[str, object]]:
@@ -952,6 +1019,38 @@ def _identifiability_json(
     }
 
 
+def _residual_analysis_json(analysis: object) -> dict[str, object]:
+    """Return the compact residual-analysis section embedded in report.json."""
+    manifest = analysis if isinstance(analysis, Mapping) else getattr(analysis, "manifest", {})
+    if not isinstance(manifest, Mapping):
+        return {
+            "schema_version": 1,
+            "scope": "in_sample",
+            "status": "unavailable",
+            "reason": "residual analysis did not return a manifest",
+        }
+    return {
+        "schema_version": int(manifest.get("schema_version", 1)),
+        "scope": str(manifest.get("scope", "in_sample")),
+        "status": str(manifest.get("status", "completed")),
+        "residual_convention": manifest.get("residual_convention"),
+        "variance_convention": manifest.get("variance_convention"),
+        "likelihood_family": manifest.get("likelihood_family"),
+        "model_fingerprint": manifest.get("model_fingerprint"),
+        "artifact_fingerprint": manifest.get("artifact_fingerprint"),
+        "package_revision": manifest.get("package_revision"),
+        "cluster_column": manifest.get("cluster_column"),
+        "uncertainty_method": manifest.get("uncertainty_method"),
+        "candidate_patterns": manifest.get("candidate_patterns", []),
+        "suggestions": manifest.get("suggestions", []),
+        "analysis_fingerprint": manifest.get("analysis_fingerprint"),
+        "output_files": manifest.get("output_files", {}),
+        "warnings": manifest.get("warnings", []),
+        "advisory_only": True,
+        "holdout_claim": False,
+    }
+
+
 def _executive_messages(
     *,
     result: GravityEstimationResult,
@@ -1147,6 +1246,21 @@ def _detailed_markdown(
             if isinstance(by_type, Mapping):
                 for label, values in by_type.items():
                     lines.append(f"- `{label}`: {json.dumps(values, sort_keys=True)}")
+    residual_analysis = summary.get("residual_analysis")
+    if isinstance(residual_analysis, Mapping):
+        lines.extend(["", "## Detailed residual analysis", ""])
+        lines.append(
+            "The residual-analysis outputs are advisory in-sample diagnostics; "
+            "they do not delete data, alter the fit, or establish out-of-sample validity."
+        )
+        lines.append(
+            f"- Status: `{residual_analysis.get('status', 'unknown')}`; "
+            f"uncertainty: `{residual_analysis.get('uncertainty_method', 'unknown')}`."
+        )
+        lines.append(
+            f"- Candidate patterns: {len(residual_analysis.get('candidate_patterns', []))}; "
+            f"advisory suggestions: {len(residual_analysis.get('suggestions', []))}."
+        )
     output_lines = [
         "",
         "## Output files",
@@ -1158,6 +1272,11 @@ def _detailed_markdown(
         "- `grouped_residuals.csv`: residual diagnostics by measurement attribute.",
         "- `executive_summary.md`: short decision-oriented summary.",
         "- `report.json`: machine-readable comprehensive summary.",
+        "- `residual_analysis.json`: row, grouped, journey, provenance, and candidate diagnostics.",
+        "- `grouped_residual_analysis.csv`: rich metrics for every available grouping.",
+        "- `journey_residual_analysis.csv`: journey-sequence diagnostics when ordering is available.",
+        "- `residual_suggestions.json` and `residual_suggestions.md`: advisory data-audit/model-review suggestions.",
+        "- `residual_analysis_manifest.json`: residual-analysis provenance and configuration.",
     ]
     if isinstance(contribution_summary, Mapping) and contribution_summary.get(
         "available", False
@@ -1304,6 +1423,37 @@ def write_gravity_detailed_report(
             }
         )
 
+    residual_table = pd.DataFrame(measurement_rows)
+    residual_provenance = {
+        **supplied,
+        "model_fingerprint": result.model_fingerprint,
+        "specification_fingerprint": specification_fingerprint,
+        "model_specification": model_specification,
+        "likelihood_family": likelihood_value,
+        "dispersion": _dispersion(result, likelihood_value),
+        "artifact_fingerprint": supplied.get(
+            "artifact_fingerprint", supplied.get("artifact_identity_fingerprint")
+        ),
+    }
+    try:
+        residual_analysis = analyze_measurement_residuals(
+            residual_table,
+            modeled,
+            variance=variance,
+            cluster_column="trip_id",
+            provenance=residual_provenance,
+            bootstrap_config=ResidualBootstrapConfig(),
+        )
+        residual_analysis_manifest: object = residual_analysis
+    except Exception as error:
+        residual_analysis = None
+        residual_analysis_manifest = _write_unavailable_residual_analysis(
+            output,
+            error=error,
+            provenance=residual_provenance,
+            force=force,
+        )
+
     prediction_fields = ["row_index", *_METADATA_FIELDS, "observed", "modeled"]
     residual_fields = [
         *prediction_fields,
@@ -1332,6 +1482,13 @@ def write_gravity_detailed_report(
         list(grouped_rows[0]) if grouped_rows else ["grouping", "label"],
         grouped_rows,
     )
+    if residual_analysis is not None:
+        residual_analysis = write_measurement_residual_analysis(
+            residual_analysis,
+            output,
+            force=force,
+        )
+        residual_analysis_manifest = residual_analysis
     contribution_result = _measurement_contribution_rows(
         result=result,
         observations=observed,
@@ -1396,6 +1553,7 @@ def write_gravity_detailed_report(
         },
         "adequacy": _adequacy_json(adequacy),
         "measurement_contributions": contribution_summary,
+        "residual_analysis": _residual_analysis_json(residual_analysis_manifest),
         "identifiability": _identifiability_json(identifiability),
         "executive_messages": list(executive_messages),
         "provenance": {
@@ -1427,6 +1585,7 @@ def write_gravity_detailed_report(
                 "executive_messages": executive_messages,
                 "identifiability": _identifiability_json(identifiability),
                 "measurement_contributions": contribution_summary,
+                "residual_analysis": _residual_analysis_json(residual_analysis_manifest),
             },
         ),
     )
