@@ -125,6 +125,8 @@ from .gravity import (  # noqa: F401
     GravityObjectiveProblem,
     GravityJointParameterLayout,
     GravityObservationModel,
+    GravityJourneyLatentClassModel,
+    GravityMeasurementParameterLayout,
     GravityBoundaryArtifact,
     GRAVITY_BOUNDARY_ARTIFACT_SCHEMA_VERSION,
     GravityParameterLayout,

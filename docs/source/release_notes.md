@@ -67,6 +67,15 @@
 
 ## Unreleased
 
+- Added an optional journey-level latent-class measurement equation for
+  aggregate boarding/alighting counts. Independent journey classes are
+  marginalized into a probability-weighted positive flow effect while the
+  configured Poisson or negative-binomial count likelihood remains the sole
+  count likelihood. Stable bounded logits/effects, reference-class scale
+  identification, gradients, fit/checkpoint fingerprints, result provenance,
+  and reuse-only prepared-artifact compatibility are covered by deterministic
+  float32 tests and documentation.
+
 - Added a generic hierarchical progress contract for long-running phases. Flat
   progress fields remain backward compatible while reporters can now expose
   nested work stacks, active/queued units and workers, weighted progress,

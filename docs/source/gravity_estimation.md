@@ -98,6 +98,8 @@ NumPy implementation exists only as a testing reference.
 The principal Phase-1 API is:
 
 ```python
+import numpy as np
+
 from public_transportation.inference.gravity import (
     GravityFeatures,
     GravityModelSpecification,
@@ -159,6 +161,72 @@ Neither strategy constructs a dense measurement-by-parameter or routing
 Jacobian. Phase-2 tests compare both strategies with direct JAX differentiation
 and central finite differences. Automatic strategy selection belongs to the
 estimator phase and is intentionally not implemented yet.
+
+### Journey-level latent bias in the measurement equation
+
+`GravityJourneyLatentClassModel` is an optional fit-time extension for
+aggregate boarding/alighting measurements. It uses the independent-journey
+aggregate interpretation: each underlying journey has a latent class, and the
+expected observed count is
+
+```text
+mu_r = rho * row_scale_r * (
+    fixed_offset_r + assigned_flow_r * sum_k pi_k * s_k
+)
+```
+
+Here `pi_k` are strictly positive class probabilities summing to one and
+`s_k` are positive class effects. The ordinary configured Poisson or
+negative-binomial count likelihood is evaluated on `mu_r`; no auxiliary or
+replacement likelihood is added. A shared latent class across several rows
+would require a joint journey likelihood and is not inferred by this model.
+Callers must choose this aggregate interpretation only when class membership
+is independent across the journeys contributing to a row.
+
+For an estimated model, wrap the existing layout without changing prepared
+assignment artifacts:
+
+```python
+from public_transportation.inference.gravity import (
+    GravityJourneyLatentClassModel,
+    GravityMeasurementParameterLayout,
+)
+
+measurement_model = GravityJourneyLatentClassModel(
+    num_classes=2,
+    max_log_effect=2.0,
+    regularization_strength=1.0e-4,
+)
+layout = GravityMeasurementParameterLayout(
+    GravityParameterLayout(GravityModelSpecification()), measurement_model
+)
+problem = GravityObjectiveProblem(
+    features=features,
+    parameter_layout=layout,
+    operator=operator,
+    observations=observations,
+    likelihood=GravityLikelihood.NEGATIVE_BINOMIAL,
+    measurement_model=measurement_model,
+)
+initial_raw = np.concatenate((base_initial_raw, measurement_model.initial_raw_parameters))
+```
+
+The reference class has logit zero and effect one. Free class logits use a
+stable `log_softmax`; free effects use a bounded `tanh` transform followed by
+`exp`, so probabilities and means remain finite and positive. The reference
+effect prevents an unrestricted global measurement scale from being
+confounded with class effects. The logit and log-effect bounds are explicit
+configuration values (limited to a numerically safe range), and optional ridge
+regularization is explicit in the model configuration. Both supported gradient
+strategies use the same JAX objective, with latent parameters receiving
+ordinary gradients.
+
+The measurement model and extended parameter layout are included in the
+gravity model fingerprint, checkpoint validation, run manifest, and fit-result
+provenance. Only the fit-time parameter vector changes: assignment, routing,
+support, shard, and prepared-artifact fingerprints remain unchanged and can be
+loaded in reuse-only mode. The model is validated for finite predictions and
+gradients in float32 and, where enabled, compared with float64 calculations.
 
 Phase 2 does not include optimization, checkpointing, zone hierarchies, model
 relaxation, or automatic derivative selection. Those are separate reviewed

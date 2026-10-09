@@ -331,6 +331,7 @@ class GravityEstimationResult:
     additive_measurement_contributions: tuple[np.ndarray, ...] = ()
     additive_flows: tuple[np.ndarray, ...] = ()
     observation_scales: np.ndarray | None = None
+    measurement_model: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != GRAVITY_RESULT_SCHEMA_VERSION:
@@ -489,6 +490,7 @@ def _json_safe_result_payload(result: GravityEstimationResult) -> dict[str, obje
             if result.observation_scales is None
             else result.observation_scales.tolist()
         ),
+        "measurement_model": result.measurement_model,
     }
 
 
@@ -589,6 +591,9 @@ def gravity_model_fingerprint(
     observation_model = problem.observation_model
     if observation_model is not None:
         payload["observation_model"] = observation_model.to_dict()
+    measurement_model = problem.measurement_model
+    if measurement_model is not None:
+        payload["measurement_model"] = measurement_model.to_dict()
     additive_blocks = getattr(problem.parameter_layout, "additive_flow_blocks", ())
     if additive_blocks:
         payload["additive_flow_operators"] = {
@@ -1700,5 +1705,10 @@ def estimate_gravity_model(
             None
             if latest_evaluation.observation_scales is None
             else np.asarray(latest_evaluation.observation_scales)
+        ),
+        measurement_model=(
+            None
+            if problem.measurement_model is None
+            else problem.measurement_model.to_dict()
         ),
     )

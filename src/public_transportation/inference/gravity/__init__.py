@@ -120,7 +120,11 @@ from .objective import (
     gravity_value_and_gradient_batched_forward,
     predict_gravity_measurements,
 )
-from .observation_model import GravityObservationModel
+from .observation_model import (
+    GravityJourneyLatentClassModel,
+    GravityMeasurementParameterLayout,
+    GravityObservationModel,
+)
 from .boundary_artifact import (
     GRAVITY_BOUNDARY_ARTIFACT_SCHEMA_VERSION,
     GravityBoundaryArtifact,

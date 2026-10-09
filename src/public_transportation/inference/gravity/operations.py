@@ -287,6 +287,11 @@ def build_gravity_run_manifest(
             if problem.observation_model is None
             else problem.observation_model.to_dict()
         ),
+        "measurement_model": (
+            None
+            if problem.measurement_model is None
+            else problem.measurement_model.to_dict()
+        ),
         "fingerprints": {
             "compact_layout": compact_layout.fingerprint,
             "assignment": operator.assignment_fingerprint,
@@ -303,6 +308,11 @@ def build_gravity_run_manifest(
                 None
                 if problem.observation_model is None
                 else problem.observation_model.fingerprint
+            ),
+            "measurement_model": (
+                None
+                if problem.measurement_model is None
+                else problem.measurement_model.fingerprint
             ),
             "additive_flow_operators": {
                 name: block.operator_fingerprint

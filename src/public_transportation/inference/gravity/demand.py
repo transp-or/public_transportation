@@ -78,9 +78,14 @@ def generate_gravity_demand(
     features: GravityFeatures,
     parameter_layout: GravityParameterLayout,
 ) -> GravityDemandResult:
+    gravity_raw = (
+        parameter_layout.gravity_raw(raw_parameters)
+        if hasattr(parameter_layout, "gravity_raw")
+        else raw_parameters
+    )
     if parameter_layout.specification == parameter_layout.specification.__class__():
         return gravity_demand_kernel(
-            raw_parameters,
+            gravity_raw,
             journey_time=features.journey_time,
             transfer_count=features.transfer_count,
             structural_feasible=features.structural_feasible,
