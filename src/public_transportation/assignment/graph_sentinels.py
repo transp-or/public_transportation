@@ -51,6 +51,7 @@ NODE_KIND_CENTROID_IN: int = 0
 NODE_KIND_EVENT_ARR: int = 1
 NODE_KIND_EVENT_DEP: int = 2
 NODE_KIND_CENTROID_OUT: int = 3
+NODE_KIND_HUB_CONNECTOR: int = 4
 
 # ---------------------------------------------------------------------------
 # Link-type codes (optional: centralize if multiple modules rely on them)
@@ -61,3 +62,4 @@ LINK_TYPE_TRANSFER: int = 1
 LINK_TYPE_ACCESS: int = 2
 LINK_TYPE_EGRESS: int = 3
 LINK_TYPE_DWELL: int = 4
+LINK_TYPE_HUB_CONNECTOR: int = 5

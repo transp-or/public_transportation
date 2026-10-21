@@ -16,6 +16,7 @@ from .stop_time import StopTime
 from .timetable import Timetable
 from .feasibility import validate_timetable_feasibility
 from .trip import Trip
+from .transfer_geometry import TransferGeometry
 from .io_utils import (
     coerce_time_columns_to_seconds,
     read_json_dict,
@@ -48,6 +49,9 @@ class Scenario:
     time_bins: list[TimeBin]
     demand: ODDemand
     timetable: Timetable | None = None
+    # Optional platform-to-station transfer geometry.  It is deliberately
+    # separate from timetable stop IDs and OD endpoint identities.
+    transfer_geometry: TransferGeometry | None = None
 
     # ---------- Validation ----------
     def validate(self) -> ValidationReport:
@@ -68,6 +72,24 @@ class Scenario:
         rep.extend(self.demand.validate())
         if self.timetable is not None:
             rep.extend(self.timetable.validate(known_stop_ids={s.stop_id for s in self.stops}))
+            if self.transfer_geometry is not None:
+                try:
+                    self.transfer_geometry.validate_scenario(
+                        scenario_platform_ids=(stop.stop_id for stop in self.stops),
+                        event_platform_ids=(
+                            stop_time.stop_id
+                            for stop_time in self.timetable.stop_times
+                        ),
+                    )
+                except ValueError as error:
+                    rep.add(
+                        Issue(
+                            severity=Severity.ERROR,
+                            code="TRANSFER_GEOMETRY_INVALID",
+                            message=str(error),
+                            location="scenario.transfer_geometry",
+                        )
+                    )
 
         # Uniqueness checks
         rep.extend(self._validate_unique_ids())
@@ -274,6 +296,57 @@ class Scenario:
                 demand_df = read_table(demand_path)
         trips_df = _read_any(f, "trips", required=False)
         stop_times_df = _read_any(f, "stop_times", required=False)
+        platform_stations_df = _read_any(f, "platform_stations", required=False)
+        hub_platform_distances_df = _read_any(
+            f, "hub_platform_distances", required=False
+        )
+        if (platform_stations_df is None) != (hub_platform_distances_df is None):
+            raise FileNotFoundError(
+                "Transfer geometry loading requires both platform_stations.* and "
+                "hub_platform_distances.* to be present."
+            )
+
+        transfer_geometry = None
+        if platform_stations_df is not None and hub_platform_distances_df is not None:
+            membership_columns = {"platform_id", "station_id"}
+            missing_membership = membership_columns - set(platform_stations_df.columns)
+            if missing_membership:
+                raise ValueError(
+                    "platform_stations table is missing required columns: "
+                    f"{sorted(missing_membership)}."
+                )
+            distance_columns = {"station_id", "platform_id", "distance_m"}
+            missing_distances = distance_columns - set(hub_platform_distances_df.columns)
+            if missing_distances:
+                raise ValueError(
+                    "hub_platform_distances table is missing required columns: "
+                    f"{sorted(missing_distances)}."
+                )
+            if platform_stations_df["platform_id"].duplicated().any():
+                duplicates = sorted(
+                    platform_stations_df.loc[
+                        platform_stations_df["platform_id"].duplicated(keep=False),
+                        "platform_id",
+                    ].astype(str).unique()
+                )
+                raise ValueError(
+                    "platform_stations contains duplicate platform_id values: "
+                    f"{duplicates[:10]}."
+                )
+            transfer_geometry = TransferGeometry(
+                platform_to_station={
+                    str(row["platform_id"]): str(row["station_id"])
+                    for _, row in platform_stations_df.iterrows()
+                },
+                hub_platform_distances_m=[
+                    (
+                        str(row["station_id"]),
+                        str(row["platform_id"]),
+                        float(row["distance_m"]),
+                    )
+                    for _, row in hub_platform_distances_df.iterrows()
+                ],
+            )
 
         # ---- Stops ----
         required_cols = {"stop_id"}
@@ -509,6 +582,7 @@ class Scenario:
             time_bins=time_bins,
             demand=demand,
             timetable=timetable,
+            transfer_geometry=transfer_geometry,
         )
 
         if strict:
@@ -614,6 +688,33 @@ class Scenario:
         if trips_df is not None and stop_times_df is not None:
             write_table(trips_df, f / f"trips.{ext}")
             write_table(stop_times_df, f / f"stop_times.{ext}")
+        if self.transfer_geometry is not None:
+            membership_df = pd.DataFrame(
+                [
+                    {"platform_id": platform_id, "station_id": station_id}
+                    for platform_id, station_id
+                    in self.transfer_geometry.platform_to_station.items()
+                ]
+            )
+            distance_df = pd.DataFrame(
+                [
+                    {
+                        "station_id": station_id,
+                        "platform_id": platform_id,
+                        "distance_m": distance_m,
+                    }
+                    for (station_id, platform_id), distance_m
+                    in self.transfer_geometry.hub_platform_distances_m.items()
+                ]
+            )
+            write_table(membership_df, f / f"platform_stations.{ext}")
+            write_table(distance_df, f / f"hub_platform_distances.{ext}")
+        else:
+            # Avoid retaining sidecars from an earlier save into the same
+            # scenario directory, which would silently restore stale hubs.
+            for stem in ("platform_stations", "hub_platform_distances"):
+                for old_ext in ("csv", "parquet", "json"):
+                    (f / f"{stem}.{old_ext}").unlink(missing_ok=True)
 
 
 def _ext_from_format(fmt: str) -> str:

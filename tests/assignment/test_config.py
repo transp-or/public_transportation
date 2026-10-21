@@ -152,6 +152,18 @@ def test_theta_min_is_present_but_not_validated_by_current_implementation():
     cfg.validate()
 
 
+@pytest.mark.parametrize("walking_speed", [0.0, -1.0, float("inf"), float("nan")])
+def test_walking_speed_must_be_finite_and_positive(walking_speed: float):
+    with pytest.raises(ValueError, match="walking_speed_m_per_s"):
+        AssignmentConfig(walking_speed_m_per_s=walking_speed).validate()
+
+
+@pytest.mark.parametrize("beta_walk", [-1.0, float("inf"), float("nan")])
+def test_beta_walk_must_be_finite_and_nonnegative(beta_walk: float):
+    with pytest.raises(ValueError, match="beta_walk"):
+        AssignmentConfig(beta_walk=beta_walk).validate()
+
+
 def test_capacity_penalty_parameters_are_not_restricted_when_penalty_disabled():
     cfg = AssignmentConfig(
         use_capacity_penalty=False,

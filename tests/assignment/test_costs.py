@@ -21,6 +21,7 @@ from public_transportation.assignment.graph_sentinels import (
     LINK_TYPE_EGRESS,
     LINK_TYPE_RIDE,
     LINK_TYPE_TRANSFER,
+    LINK_TYPE_HUB_CONNECTOR,
 )
 
 
@@ -36,6 +37,8 @@ class _Graph:
     node_bin_start_min: jnp.ndarray | None = None
     node_bin_end_min: jnp.ndarray | None = None
     capacity: jnp.ndarray | None = None
+    transfer_wait_time: jnp.ndarray | None = None
+    transfer_walking_time: jnp.ndarray | None = None
 
 
 def _as_np(x):
@@ -122,6 +125,30 @@ def test_precompute_base_costs_returns_jax_arrays_for_valid_config():
 
     assert isinstance(parts.base_cost, jnp.ndarray)
     assert np.isclose(float(jnp.sum(parts.base_cost)), 12.0 + 8.0 + 1.5)
+
+
+def test_transfer_wait_and_walk_costs_are_separate_and_aggregated():
+    graph = _Graph(
+        num_nodes=2,
+        num_links=3,
+        tail=jnp.asarray([0, 0, 1], dtype=jnp.int32),
+        head=jnp.asarray([1, 1, 1], dtype=jnp.int32),
+        link_type=jnp.asarray(
+            [LINK_TYPE_TRANSFER, LINK_TYPE_HUB_CONNECTOR, LINK_TYPE_HUB_CONNECTOR],
+            dtype=jnp.int32,
+        ),
+        travel_time=jnp.asarray([0.0, 0.0, 0.0], dtype=jnp.float32),
+        transfer_wait_time=jnp.asarray([0.0, 7.0, 0.0], dtype=jnp.float32),
+        transfer_walking_time=jnp.asarray([1.0, 0.0, 2.0], dtype=jnp.float32),
+    )
+    parts = precompute_base_costs(
+        graph, AssignmentConfig(beta_transfer=1.5, beta_walk=1.0)
+    )
+    assert np.allclose(_as_np(parts.base_cost), [1.0, 10.5, 2.0])
+    assert float(np.sum(_as_np(parts.base_cost))) == pytest.approx(13.5)
+    assert np.array_equal(
+        _as_np(parts.is_hub_connector), [False, True, True]
+    )
 
 
 # ---------------------------------------------------------------------

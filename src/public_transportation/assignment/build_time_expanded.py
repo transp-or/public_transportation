@@ -42,6 +42,7 @@ This file is intended to be *self-contained* and deterministic.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import heapq
 from typing import Any, Iterable, TYPE_CHECKING
 
 import numpy as np
@@ -64,7 +65,10 @@ from .graph_sentinels import (
     LINK_TYPE_ACCESS,
     LINK_TYPE_EGRESS,
     LINK_TYPE_DWELL,
+    NODE_KIND_HUB_CONNECTOR,
+    LINK_TYPE_HUB_CONNECTOR,
 )
+from .graph_semantics import assignment_semantics_fingerprint
 
 
 
@@ -345,9 +349,11 @@ class _NodeIndex:
     node_bin_start_min: np.ndarray
     node_bin_end_min: np.ndarray
     node_kind: np.ndarray
+    node_station_id: list[str]
 
     stop_ids: tuple[str, ...]
     time_bins: tuple[Any, ...]
+    station_by_platform: dict[str, str]
 
 
 def _build_nodes(
@@ -391,6 +397,30 @@ def _build_nodes(
     stop_ids_sorted = sorted(stop_ids)
     stop_index = {sid: i for i, sid in enumerate(stop_ids_sorted)}
 
+    stop_times = (
+        scenario.timetable.stop_times
+        if timetable_index is None
+        else timetable_index.stop_times
+    )
+    event_platform_ids = { _get_stop_id(stop_time) for stop_time in stop_times }
+    transfer_geometry = getattr(scenario, "transfer_geometry", None)
+    if transfer_geometry is None:
+        station_by_platform = {stop_id: stop_id for stop_id in stop_ids_sorted}
+    else:
+        transfer_geometry.validate_scenario(
+            scenario_platform_ids=stop_ids_sorted,
+            event_platform_ids=event_platform_ids,
+        )
+        station_by_platform = dict(transfer_geometry.platform_to_station)
+        # Stops with no scheduled event remain usable as explicit OD endpoints.
+        station_by_platform.update(
+            {
+                stop_id: stop_id
+                for stop_id in stop_ids_sorted
+                if stop_id not in station_by_platform
+            }
+        )
+
     # Time bins
     time_bins = _iter_time_bins(scenario)
     _require(len(time_bins) > 0, "Scenario exposes no time bins.")
@@ -409,6 +439,7 @@ def _build_nodes(
     node_time_bin_index: list[int] = []
     node_bin_start_min: list[float] = []
     node_bin_end_min: list[float] = []
+    node_station_id: list[str] = []
 
     # Precompute time-bin interval bounds (minutes) for centroid-in nodes.
     bin_start_min_by_t = [ _to_minutes(_time_bin_start_s(tb)) for tb in time_bins_tuple ]
@@ -431,6 +462,7 @@ def _build_nodes(
             node_time_bin_index.append(int(t_idx))
             node_bin_start_min.append(float(bin_start_min_by_t[int(t_idx)]))
             node_bin_end_min.append(float(bin_end_min_by_t[int(t_idx)]))
+            node_station_id.append(station_by_platform[sid])
 
     # 2) event nodes: split into ARR and DEP per stop_time record.
     #    This ensures (i) correct semantics (arrive -> possibly transfer -> depart)
@@ -439,11 +471,6 @@ def _build_nodes(
     # We store node->trip_index for all event nodes (ARR and DEP).
     event_trip_index_list: list[tuple[int, int]] = []  # (node_idx, trip_index)
 
-    stop_times = (
-        scenario.timetable.stop_times
-        if timetable_index is None
-        else timetable_index.stop_times
-    )
     trips = (
         scenario.timetable.trips
         if timetable_index is None
@@ -487,6 +514,7 @@ def _build_nodes(
             node_time_bin_index.append(-1)
             node_bin_start_min.append(float("nan"))
             node_bin_end_min.append(float("nan"))
+            node_station_id.append(station_by_platform[stop_id])
 
             event_trip_index_list.append((node_idx, tr_idx))
 
@@ -504,6 +532,7 @@ def _build_nodes(
             node_time_bin_index.append(-1)
             node_bin_start_min.append(float("nan"))
             node_bin_end_min.append(float("nan"))
+            node_station_id.append(station_by_platform[stop_id])
 
             event_trip_index_list.append((node_idx, tr_idx))
 
@@ -531,6 +560,7 @@ def _build_nodes(
         node_time_bin_index.append(-1)
         node_bin_start_min.append(float("nan"))
         node_bin_end_min.append(float("nan"))
+        node_station_id.append(station_by_platform[sid])
 
     # Build event_trip_index array aligned with node indices:
     # -1 for centroid nodes, trip index for ARR/DEP event nodes.
@@ -552,8 +582,10 @@ def _build_nodes(
         node_bin_start_min=np.asarray(node_bin_start_min, dtype=float),
         node_bin_end_min=np.asarray(node_bin_end_min, dtype=float),
         node_kind=np.asarray(node_kind, dtype=int),
+        node_station_id=node_station_id,
         stop_ids=tuple(stop_ids_sorted),
         time_bins=time_bins_tuple,
+        station_by_platform=station_by_platform,
     )
 
 
@@ -568,9 +600,18 @@ def _build_links(
     *,
     config: AssignmentConfig,
     timetable_index: "CanonicalTimetableIndex | None" = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
     """
-    Build link arrays (tail, head, link_type, travel_time_min, capacity, link_trip_index).
+    Build the six legacy link arrays and separate transfer waiting/walking times.
 
     Link type codes:
       LINK_TYPE_RIDE
@@ -582,7 +623,8 @@ def _build_links(
     :param scenario: Domain scenario.
     :param nodes: Node index structure.
     :param config: Assignment config (for thresholds).
-    :return: (tail, head, link_type, travel_time_min, capacity, link_trip_index)
+    :return: Legacy link arrays followed by transfer_wait_time and
+        transfer_walking_time, both aligned with links.
     """
     _require(scenario.timetable is not None, "Scenario has no timetable.")
     _require(hasattr(scenario.timetable, "stop_times"), "Scenario timetable has no stop_times.")
@@ -631,6 +673,9 @@ def _build_links(
     travel_time_min: list[float] = []
     capacity: list[float] = []
     link_trip_index: list[int] = []
+    transfer_wait_by_link: dict[int, float] = {}
+    transfer_walking_by_link: dict[int, float] = {}
+    transfer_geometry = getattr(scenario, "transfer_geometry", None)
 
     # -------------------------------------------------------------------------
     # Group ARR and DEP event nodes by stop for efficiency
@@ -765,35 +810,357 @@ def _build_links(
         link_trip_index.append(int(trip_index_by_id[trip_id]))
 
     # -------------------------------------------------------------------------
-    # Transfer links: inter-line, bounded waiting
-    # For each stop, consider all pairs ARR->DEP within max_transfer_s where line differs.
-    # -------------------------------------------------------------------------
-    common_stops = sorted(set(arr_events_by_stop.keys()).intersection(dep_events_by_stop.keys()))
+    def append_transfer_link(
+        *,
+        tail_node: int,
+        head_node: int,
+        link_type_value: int,
+        wait_minutes: float = 0.0,
+        walking_minutes: float = 0.0,
+        physical_time_minutes: float = 0.0,
+    ) -> None:
+        link_index = len(tail)
+        tail.append(int(tail_node))
+        head.append(int(head_node))
+        link_type.append(int(link_type_value))
+        travel_time_min.append(float(physical_time_minutes))
+        capacity.append(np.inf)
+        link_trip_index.append(-1)
+        transfer_wait_by_link[link_index] = float(wait_minutes)
+        transfer_walking_by_link[link_index] = float(walking_minutes)
+
+    # Same-platform transfers keep the legacy event-to-event link and therefore
+    # the exact legacy topology when every station has a single platform.
+    common_stops = sorted(set(arr_events_by_stop).intersection(dep_events_by_stop))
     for stop_id in common_stops:
-        arr_items = sorted(arr_events_by_stop[stop_id], key=lambda z: z[0])
-        dep_items = sorted(dep_events_by_stop[stop_id], key=lambda z: z[0])
-        dep_times = np.asarray([it[0] for it in dep_items], dtype=int)
-        n_arr = len(arr_items)
-        n_dep = len(dep_items)
-        if n_arr == 0 or n_dep == 0:
-            continue
-        for i, (t_arr, n_arr_idx, tr_arr, trip_id_arr, line_arr) in enumerate(arr_items):
-            # Find all dep events with dep in (t_arr, t_arr + max_transfer_s]
-            a = int(np.searchsorted(dep_times, t_arr, side="right"))
-            b = int(np.searchsorted(dep_times, t_arr + max_transfer_s, side="right"))
-            for j in range(a, b):
-                dep_time, n_dep_idx, tr_dep, trip_id_dep, line_dep = dep_items[j]
+        arr_items = sorted(arr_events_by_stop[stop_id], key=lambda item: item[0])
+        dep_items = sorted(dep_events_by_stop[stop_id], key=lambda item: item[0])
+        dep_times = np.asarray([item[0] for item in dep_items], dtype=int)
+        for t_arr, n_arr_idx, _tr_arr, _trip_id_arr, line_arr in arr_items:
+            first = int(np.searchsorted(dep_times, t_arr, side="right"))
+            last = int(np.searchsorted(dep_times, t_arr + max_transfer_s, side="right"))
+            for dep_time, n_dep_idx, _tr_dep, _trip_id_dep, line_dep in dep_items[first:last]:
                 if line_dep == line_arr:
                     continue
-                wait_s = int(dep_time - t_arr)
-                if wait_s <= 0:
+                wait_minutes = _to_minutes(int(dep_time - t_arr))
+                append_transfer_link(
+                    tail_node=n_arr_idx,
+                    head_node=n_dep_idx,
+                    link_type_value=LINK_TYPE_TRANSFER,
+                    wait_minutes=wait_minutes,
+                    physical_time_minutes=wait_minutes,
+                )
+
+    # Cross-platform links use per-station/platform/line segment trees.  An
+    # arriving event enters a canonical range of eligible departures; tree
+    # connectors preserve the incoming-line filter while avoiding the dense
+    # arrival-platform x departure-platform event-link expansion.
+    station_platforms: dict[str, set[str]] = {}
+    for platform_id, station_id in nodes.station_by_platform.items():
+        station_platforms.setdefault(station_id, set()).add(platform_id)
+
+    departures_by_station_platform_line: dict[
+        tuple[str, str, str], list[tuple[int, int, int, str, str]]
+    ] = {}
+    arrivals_by_station: dict[str, list[tuple[int, int, int, str, str, str]]] = {}
+    for platform_id, events in dep_events_by_stop.items():
+        station_id = nodes.station_by_platform[platform_id]
+        for event in events:
+            dep_time, node_index, trip_index, trip_id, line_id = event
+            departures_by_station_platform_line.setdefault(
+                (station_id, platform_id, line_id), []
+            ).append(event)
+    for platform_id, events in arr_events_by_stop.items():
+        station_id = nodes.station_by_platform[platform_id]
+        for dep_time, node_index, trip_index, trip_id, line_id in events:
+            arrivals_by_station.setdefault(station_id, []).append(
+                (dep_time, node_index, trip_index, trip_id, line_id, platform_id)
+            )
+    for events in departures_by_station_platform_line.values():
+        events.sort(key=lambda item: item[0])
+    for events in arrivals_by_station.values():
+        events.sort(key=lambda item: (item[0], item[5], item[4], item[3]))
+
+    if transfer_geometry is not None:
+        extra_node_time_min: list[float] = []
+        extra_node_time_s: list[int] = []
+        extra_node_stop_index: list[int] = []
+        extra_node_time_bin_index: list[int] = []
+        extra_node_bin_start_min: list[float] = []
+        extra_node_bin_end_min: list[float] = []
+        extra_node_kind: list[int] = []
+        extra_node_trip_index: list[int] = []
+        extra_node_station_id: list[str] = []
+        stop_index_by_id = {
+            stop_id: index for index, stop_id in enumerate(nodes.stop_ids)
+        }
+        base_num_nodes = int(nodes.node_time_min.size)
+
+        def add_connector_node(
+            *, station_id: str, platform_id: str, event_time_s: int
+        ) -> int:
+            node_index = base_num_nodes + len(extra_node_time_min)
+            extra_node_time_min.append(_to_minutes(event_time_s))
+            extra_node_time_s.append(int(event_time_s))
+            extra_node_stop_index.append(stop_index_by_id[platform_id])
+            extra_node_time_bin_index.append(-1)
+            extra_node_bin_start_min.append(float("nan"))
+            extra_node_bin_end_min.append(float("nan"))
+            extra_node_kind.append(NODE_KIND_HUB_CONNECTOR)
+            extra_node_trip_index.append(-1)
+            extra_node_station_id.append(station_id)
+            return node_index
+
+        def append_tree_link(tail_node: int, head_node: int) -> None:
+            append_transfer_link(
+                tail_node=tail_node,
+                head_node=head_node,
+                link_type_value=LINK_TYPE_HUB_CONNECTOR,
+            )
+
+        def build_range_tree(
+            *,
+            key: tuple[str, str, str, str],
+            events: list[tuple[int, int, int, str, str]],
+            walking_minutes: float,
+        ) -> dict[tuple[int, int], int]:
+            station_id, platform_id, _line_id, regime = key
+            ranges: dict[tuple[int, int], int] = {}
+
+            def build(lower: int, upper: int) -> int:
+                node_index = add_connector_node(
+                    station_id=station_id,
+                    platform_id=platform_id,
+                    event_time_s=events[lower][0],
+                )
+                ranges[(lower, upper)] = node_index
+                if upper - lower == 1:
+                    departure_time_s, departure_node, *_ = events[lower]
+                    wait_component = (
+                        0.0
+                        if regime == "early"
+                        else _to_minutes(departure_time_s) - walking_minutes
+                    )
+                    append_transfer_link(
+                        tail_node=node_index,
+                        head_node=departure_node,
+                        link_type_value=LINK_TYPE_HUB_CONNECTOR,
+                        wait_minutes=wait_component,
+                        walking_minutes=walking_minutes,
+                    )
+                    return node_index
+                middle = (lower + upper) // 2
+                left_node = build(lower, middle)
+                right_node = build(middle, upper)
+                append_tree_link(node_index, left_node)
+                append_tree_link(node_index, right_node)
+                return node_index
+
+            if events:
+                build(0, len(events))
+            return ranges
+
+        range_trees: dict[
+            tuple[str, str, str, str], dict[tuple[int, int], int]
+        ] = {}
+        distance_lookup = transfer_geometry.hub_platform_distances_m
+        for group_key, events in sorted(departures_by_station_platform_line.items()):
+            station_id, platform_id, line_id = group_key
+            if len(station_platforms.get(station_id, ())) <= 1:
+                continue
+            distance_key = (station_id, platform_id)
+            departure_distance = float(distance_lookup.get(distance_key, 0.0))
+            departure_walk_minutes = departure_distance / (
+                60.0 * float(config.walking_speed_m_per_s)
+            )
+            for regime in ("early", "late"):
+                tree_key = (station_id, platform_id, line_id, regime)
+                range_trees[tree_key] = build_range_tree(
+                    key=tree_key,
+                    events=events,
+                    walking_minutes=departure_walk_minutes,
+                )
+
+        def add_canonical_cover(
+            *,
+            ranges: dict[tuple[int, int], int],
+            lower: int,
+            upper: int,
+            total: int,
+            result: list[int],
+        ) -> None:
+            def visit(left: int, right: int) -> None:
+                if upper <= left or right <= lower:
+                    return
+                if lower <= left and right <= upper:
+                    result.append(ranges[(left, right)])
+                    return
+                if right - left == 1:
+                    return
+                middle = (left + right) // 2
+                visit(left, middle)
+                visit(middle, right)
+
+            if lower < upper:
+                visit(0, total)
+
+        seconds_per_minute = 60.0
+        for station_id, arr_items in sorted(arrivals_by_station.items()):
+            if len(station_platforms.get(station_id, ())) <= 1:
+                continue
+            departure_groups = sorted(
+                key
+                for key in departures_by_station_platform_line
+                if key[0] == station_id
+            )
+            for (
+                arrival_time_s,
+                arrival_node,
+                _arrival_trip,
+                _arrival_trip_id,
+                arrival_line,
+                arrival_platform,
+            ) in arr_items:
+                first_cross_platform_candidate = None
+                for group_key in departure_groups:
+                    _station, departure_platform, departure_line = group_key
+                    if (
+                        departure_platform == arrival_platform
+                        or departure_line == arrival_line
+                    ):
+                        continue
+                    events = departures_by_station_platform_line[group_key]
+                    times = np.asarray([event[0] for event in events], dtype=int)
+                    lower = int(np.searchsorted(times, arrival_time_s, side="right"))
+                    upper = int(
+                        np.searchsorted(
+                            times,
+                            arrival_time_s + max_transfer_s,
+                            side="right",
+                        )
+                    )
+                    if lower < upper:
+                        first_cross_platform_candidate = (
+                            group_key,
+                            events,
+                            times,
+                            lower,
+                            upper,
+                        )
+                        break
+                if first_cross_platform_candidate is None:
                     continue
-                tail.append(int(n_arr_idx))
-                head.append(int(n_dep_idx))
-                link_type.append(LINK_TYPE_TRANSFER)
-                travel_time_min.append(_to_minutes(wait_s))
-                capacity.append(np.inf)
-                link_trip_index.append(-1)
+                arrival_walk_minutes = transfer_geometry.distance_m(
+                    station_id, arrival_platform
+                ) / (seconds_per_minute * float(config.walking_speed_m_per_s))
+
+                # Process every different-line departure platform with at least
+                # one timetable-eligible departure. Distances are required only
+                # for platform pairs that can actually transfer in this window.
+                for group_key in departure_groups:
+                    _station, departure_platform, departure_line = group_key
+                    if (
+                        departure_platform == arrival_platform
+                        or departure_line == arrival_line
+                    ):
+                        continue
+                    events = departures_by_station_platform_line[group_key]
+                    times = np.asarray([event[0] for event in events], dtype=int)
+                    lower = int(np.searchsorted(times, arrival_time_s, side="right"))
+                    upper = int(
+                        np.searchsorted(
+                            times,
+                            arrival_time_s + max_transfer_s,
+                            side="right",
+                        )
+                    )
+                    if lower >= upper:
+                        continue
+                    departure_walk_minutes = transfer_geometry.distance_m(
+                        station_id, departure_platform
+                    ) / (seconds_per_minute * float(config.walking_speed_m_per_s))
+                    split_time_s = arrival_time_s + seconds_per_minute * (
+                        arrival_walk_minutes + departure_walk_minutes
+                    )
+                    split = int(np.searchsorted(times, split_time_s, side="left"))
+                    early_upper = min(upper, split)
+                    late_lower = max(lower, split)
+                    for regime, range_lower, range_upper, arrival_wait in (
+                        ("early", lower, early_upper, 0.0),
+                        (
+                            "late",
+                            late_lower,
+                            upper,
+                            -_to_minutes(arrival_time_s) - arrival_walk_minutes,
+                        ),
+                    ):
+                        if range_lower >= range_upper:
+                            continue
+                        tree_key = (
+                            station_id,
+                            departure_platform,
+                            departure_line,
+                            regime,
+                        )
+                        selected_nodes: list[int] = []
+                        add_canonical_cover(
+                            ranges=range_trees[tree_key],
+                            lower=range_lower,
+                            upper=range_upper,
+                            total=len(events),
+                            result=selected_nodes,
+                        )
+                        for range_node in selected_nodes:
+                            append_transfer_link(
+                                tail_node=arrival_node,
+                                head_node=range_node,
+                                link_type_value=LINK_TYPE_TRANSFER,
+                                wait_minutes=arrival_wait,
+                                walking_minutes=arrival_walk_minutes,
+                            )
+
+        if extra_node_time_min:
+            nodes.node_time_min = np.concatenate(
+                (nodes.node_time_min, np.asarray(extra_node_time_min, dtype=float))
+            )
+            nodes.node_time_s = np.concatenate(
+                (nodes.node_time_s, np.asarray(extra_node_time_s, dtype=int))
+            )
+            nodes.node_stop_index = np.concatenate(
+                (nodes.node_stop_index, np.asarray(extra_node_stop_index, dtype=int))
+            )
+            nodes.node_time_bin_index = np.concatenate(
+                (
+                    nodes.node_time_bin_index,
+                    np.asarray(extra_node_time_bin_index, dtype=int),
+                )
+            )
+            nodes.node_bin_start_min = np.concatenate(
+                (
+                    nodes.node_bin_start_min,
+                    np.asarray(extra_node_bin_start_min, dtype=float),
+                )
+            )
+            nodes.node_bin_end_min = np.concatenate(
+                (
+                    nodes.node_bin_end_min,
+                    np.asarray(extra_node_bin_end_min, dtype=float),
+                )
+            )
+            nodes.node_kind = np.concatenate(
+                (nodes.node_kind, np.asarray(extra_node_kind, dtype=int))
+            )
+            nodes.event_trip_index = np.concatenate(
+                (nodes.event_trip_index, np.asarray(extra_node_trip_index, dtype=int))
+            )
+            nodes.node_station_id.extend(extra_node_station_id)
+
+    transfer_wait_time = np.zeros((len(tail),), dtype=float)
+    transfer_walking_time = np.zeros((len(tail),), dtype=float)
+    for link_index, wait_component in transfer_wait_by_link.items():
+        transfer_wait_time[link_index] = wait_component
+    for link_index, walking_component in transfer_walking_by_link.items():
+        transfer_walking_time[link_index] = walking_component
 
     return (
         np.asarray(tail, dtype=int),
@@ -802,6 +1169,8 @@ def _build_links(
         np.asarray(travel_time_min, dtype=float),
         np.asarray(capacity, dtype=float),
         np.asarray(link_trip_index, dtype=int),
+        transfer_wait_time,
+        transfer_walking_time,
     )
 
 
@@ -864,6 +1233,46 @@ def _build_padded_outgoing(
     return out_links, out_mask
 
 
+def _build_topological_order(
+    *,
+    num_nodes: int,
+    tail: np.ndarray,
+    head: np.ndarray,
+    node_time: np.ndarray,
+    node_kind: np.ndarray,
+) -> np.ndarray:
+    """Return a deterministic topological order for graphs with hub nodes."""
+    outgoing: list[list[int]] = [[] for _ in range(num_nodes)]
+    indegree = np.zeros((num_nodes,), dtype=np.int64)
+    for source, target in zip(tail.tolist(), head.tolist(), strict=True):
+        outgoing[int(source)].append(int(target))
+        indegree[int(target)] += 1
+    ready = [
+        (float(node_time[index]), int(node_kind[index]), index)
+        for index in range(num_nodes)
+        if indegree[index] == 0
+    ]
+    heapq.heapify(ready)
+    order: list[int] = []
+    while ready:
+        _time, _kind, current = heapq.heappop(ready)
+        order.append(current)
+        for successor in outgoing[current]:
+            indegree[successor] -= 1
+            if indegree[successor] == 0:
+                heapq.heappush(
+                    ready,
+                    (
+                        float(node_time[successor]),
+                        int(node_kind[successor]),
+                        successor,
+                    ),
+                )
+    if len(order) != num_nodes:
+        raise ValueError("Time-expanded assignment graph contains a directed cycle.")
+    return np.asarray(order, dtype=int)
+
+
 # =============================================================================
 # Public builder
 # =============================================================================
@@ -906,7 +1315,16 @@ def build_jax_graph(
     )
     record("stop_trip_line_timetable_time_bin_indexing_and_nodes", started)
     started = perf_counter()
-    tail, head, link_type, travel_time_min, capacity, link_trip_index = _build_links(
+    (
+        tail,
+        head,
+        link_type,
+        travel_time_min,
+        capacity,
+        link_trip_index,
+        transfer_wait_time,
+        transfer_walking_time,
+    ) = _build_links(
         scenario, nodes, config=config, timetable_index=timetable_index
     )
     record("link_creation_and_concatenation", started)
@@ -931,7 +1349,16 @@ def build_jax_graph(
     started = perf_counter()
     kind = nodes.node_kind.astype(int)
     time = nodes.node_time_min.astype(float)
-    topo_order = np.lexsort((kind, time)).astype(int)  # primary: time, secondary: kind
+    if np.any(kind == NODE_KIND_HUB_CONNECTOR):
+        topo_order = _build_topological_order(
+            num_nodes=num_nodes,
+            tail=tail,
+            head=head,
+            node_time=time,
+            node_kind=kind,
+        )
+    else:
+        topo_order = np.lexsort((kind, time)).astype(int)  # primary: time, secondary: kind
     topo_order_rev = topo_order[::-1].copy()
     record("link_and_node_sorting_canonicalization", started)
 
@@ -979,11 +1406,17 @@ def build_jax_graph(
         out_mask=jnp.asarray(out_mask),
         link_type=jnp.asarray(link_type),
         travel_time=jnp.asarray(travel_time_min),
+        transfer_wait_time=jnp.asarray(transfer_wait_time),
+        transfer_walking_time=jnp.asarray(transfer_walking_time),
         capacity=jnp.asarray(capacity),
         link_trip_index=jnp.asarray(link_trip_index),
         node_stop_id=stop_ids_sorted,
         trip_id=trip_ids,
         trip_line_ref=trip_line_ref,
+        node_station_id=tuple(nodes.node_station_id),
+        assignment_semantics_fingerprint=assignment_semantics_fingerprint(
+            scenario=scenario, config=config
+        ),
     )
     jax.block_until_ready(graph)
     record("graph_numpy_to_jax_device_transfer_and_synchronization", started)

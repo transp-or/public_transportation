@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import json
 from pathlib import Path
 import shutil
@@ -20,6 +21,10 @@ from public_transportation.assignment.cache import (
 )
 from public_transportation.assignment.config import AssignmentConfig
 from public_transportation.domain import Scenario
+from public_transportation.domain import TransferGeometry
+from public_transportation.inference.fixed_routing_measurement_operator import (
+    assignment_inputs_fingerprint,
+)
 from public_transportation.inference.assignment_adapter import (
     assign_link_flow_fixed_routing,
     build_assignment_inputs,
@@ -140,6 +145,82 @@ def test_scenario_and_configuration_change_cache_keys(scenario):
     finally:
         scenario.stops[0].name = previous
     assert changed_scenario != original
+
+
+def test_transfer_inputs_are_operator_identity_and_unrelated_scenario_identity(
+    scenario,
+):
+    config = AssignmentConfig()
+    _, fallback_key = assignment_cache_provenance(
+        scenario=scenario, config=config
+    )
+    platform_ids = sorted(stop.stop_id for stop in scenario.stops)
+    assert len(platform_ids) >= 2
+    identity_scenario = replace(
+        scenario,
+        transfer_geometry=TransferGeometry(
+            {platform: platform for platform in platform_ids}, {}
+        ),
+    )
+    _, explicit_identity_key = assignment_cache_provenance(
+        scenario=identity_scenario, config=config
+    )
+    assert explicit_identity_key == fallback_key
+
+    p1, p2 = platform_ids[:2]
+    mapping = {platform: platform for platform in platform_ids}
+    mapping[p1] = "HUB"
+    mapping[p2] = "HUB"
+    geometry = TransferGeometry(
+        mapping, {("HUB", p1): 10.0, ("HUB", p2): 20.0}
+    )
+    geometry_scenario = replace(scenario, transfer_geometry=geometry)
+    _, mapping_key = assignment_cache_provenance(
+        scenario=geometry_scenario, config=config
+    )
+    assert mapping_key != fallback_key
+
+    distance_scenario = replace(
+        scenario,
+        transfer_geometry=TransferGeometry(
+            mapping, {("HUB", p1): 11.0, ("HUB", p2): 20.0}
+        ),
+    )
+    _, distance_key = assignment_cache_provenance(
+        scenario=distance_scenario, config=config
+    )
+    assert distance_key != mapping_key
+    _, speed_key = assignment_cache_provenance(
+        scenario=geometry_scenario,
+        config=replace(config, walking_speed_m_per_s=1.3),
+    )
+    _, weight_key = assignment_cache_provenance(
+        scenario=geometry_scenario, config=replace(config, beta_walk=0.8)
+    )
+    assert speed_key != mapping_key
+    assert weight_key != mapping_key
+
+    # New transfer sidecars do not contaminate the base scenario identity used
+    # by unaffected OD-universe/canonical-input artifacts.
+    from public_transportation.preprocessing.structural_zeros.scenario_fingerprint import (
+        fingerprint_scenario,
+    )
+
+    assert fingerprint_scenario(scenario) == fingerprint_scenario(geometry_scenario)
+
+    base_artifacts = prepare_assignment(scenario, config, cache_policy="off")
+    changed_cost_artifacts = prepare_assignment(
+        scenario,
+        replace(config, walking_speed_m_per_s=1.3),
+        cache_policy="off",
+    )
+    base_operator_identity = assignment_inputs_fingerprint(
+        build_assignment_inputs(artifacts=base_artifacts)
+    )
+    changed_operator_identity = assignment_inputs_fingerprint(
+        build_assignment_inputs(artifacts=changed_cost_artifacts)
+    )
+    assert changed_operator_identity != base_operator_identity
 
 
 def test_readonly_miss_and_invalid_entry_fail_without_writing(scenario, tmp_path):

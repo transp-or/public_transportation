@@ -25,15 +25,20 @@ from .config import AssignmentConfig
 from .costs import CostParts
 from .jax_graph_types import JaxGraph
 from .build_od_groups import ODGroups
+from .graph_semantics import (
+    ASSIGNMENT_GRAPH_SEMANTICS_VERSION,
+    transfer_geometry_identity_payload,
+)
 
-ASSIGNMENT_CACHE_SCHEMA_VERSION = 1
+ASSIGNMENT_CACHE_SCHEMA_VERSION = 2
 AssignmentCachePolicy = Literal["off", "auto", "refresh", "readonly"]
 
 _GRAPH_ARRAYS = (
     "tail", "head", "topo_order", "topo_order_rev", "node_time",
     "node_stop_index", "node_time_s", "node_kind", "node_trip_index",
     "out_start", "out_links_csr", "out_links", "out_mask", "link_type",
-    "travel_time", "capacity", "link_trip_index", "node_time_bin_index",
+    "travel_time", "transfer_wait_time", "transfer_walking_time",
+    "capacity", "link_trip_index", "node_time_bin_index",
     "node_bin_start_min", "node_bin_end_min",
 )
 _OD_ARRAYS = (
@@ -41,7 +46,8 @@ _OD_ARRAYS = (
     "group_od_index", "group_od_index_padded", "group_od_mask", "group_link_mask",
 )
 _COST_ARRAYS = (
-    "base_cost", "is_access", "is_ride", "is_transfer", "is_egress", "is_dwell",
+    "base_cost", "is_access", "is_ride", "is_transfer", "is_egress",
+    "is_dwell", "is_hub_connector",
 )
 
 
@@ -83,8 +89,10 @@ def assignment_cache_provenance(
     """Return canonical provenance JSON and its SHA-256 cache key."""
     payload = {
         "schema_version": ASSIGNMENT_CACHE_SCHEMA_VERSION,
+        "graph_semantics_version": ASSIGNMENT_GRAPH_SEMANTICS_VERSION,
         "package_version": __version__,
         "scenario": _assignment_scenario_payload(scenario),
+        "transfer_geometry": _transfer_geometry_payload(scenario),
         "assignment_config": asdict(config),
         "numeric_dtype": numeric_dtype,
         "sentinel_conventions": {
@@ -103,6 +111,11 @@ def assignment_cache_provenance(
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _transfer_geometry_payload(scenario: Any) -> dict[str, Any]:
+    """Return effective station mapping and distances for graph identity."""
+    return transfer_geometry_identity_payload(scenario)
 
 
 def assignment_cache_path(
@@ -150,6 +163,10 @@ def _manifest(*, artifacts: Any, provenance_json: str, cache_key: str) -> dict[s
             "node_stop_name": list(artifacts.graph.node_stop_name),
             "trip_id": list(artifacts.graph.trip_id),
             "trip_line_ref": list(artifacts.graph.trip_line_ref),
+            "node_station_id": list(artifacts.graph.node_station_id),
+            "assignment_semantics_fingerprint": (
+                artifacts.graph.assignment_semantics_fingerprint
+            ),
         },
         "arrays": {
             name: {"shape": list(value.shape), "dtype": str(value.dtype)}
@@ -227,9 +244,37 @@ def _validate_structure(
     num_od = int(metadata["num_od"])
     if min(num_nodes, num_links, num_od) <= 0:
         raise ValueError("Assignment cache counts must be positive.")
+    labels = metadata.get("graph_labels")
+    if not isinstance(labels, dict):
+        raise ValueError("Assignment cache graph labels are missing.")
+    node_station_ids = labels.get("node_station_id")
+    if not isinstance(node_station_ids, list) or len(node_station_ids) != num_nodes:
+        raise ValueError(
+            "Assignment cache graph label shape mismatch for node_station_id."
+        )
+    if not isinstance(labels.get("assignment_semantics_fingerprint"), str):
+        raise ValueError("Assignment cache graph semantics fingerprint is missing.")
+    stop_ids = labels.get("node_stop_id")
+    stop_names = labels.get("node_stop_name")
+    if (
+        not isinstance(stop_ids, list)
+        or not isinstance(stop_names, list)
+        or len(stop_ids) == 0
+        or (stop_names and len(stop_ids) != len(stop_names))
+    ):
+        raise ValueError("Assignment cache stop-label shapes are inconsistent.")
+    trip_ids = labels.get("trip_id")
+    trip_line_refs = labels.get("trip_line_ref")
+    if (
+        not isinstance(trip_ids, list)
+        or not isinstance(trip_line_refs, list)
+        or len(trip_ids) != len(trip_line_refs)
+    ):
+        raise ValueError("Assignment cache trip-label shapes are inconsistent.")
     link_names = (
         "tail", "head", "out_links_csr", "link_type", "travel_time",
-        "capacity", "link_trip_index",
+        "capacity", "link_trip_index", "transfer_wait_time",
+        "transfer_walking_time",
     )
     node_names = (
         "topo_order", "topo_order_rev", "node_time", "node_stop_index",
@@ -278,6 +323,7 @@ def _validate_structure(
         "graph__out_mask", "od__group_od_mask", "od__group_link_mask",
         "cost__is_access", "cost__is_ride", "cost__is_transfer",
         "cost__is_egress", "cost__is_dwell",
+        "cost__is_hub_connector",
     )
     if any(arrays[name].dtype != np.dtype(bool) for name in boolean_names):
         raise ValueError("Assignment cache mask arrays must have boolean dtype.")
@@ -303,6 +349,10 @@ def _reconstruct(
         node_stop_name=tuple(labels["node_stop_name"]),
         trip_id=tuple(labels["trip_id"]),
         trip_line_ref=tuple(labels["trip_line_ref"]),
+        node_station_id=tuple(labels.get("node_station_id", ())),
+        assignment_semantics_fingerprint=str(
+            labels["assignment_semantics_fingerprint"]
+        ),
     )
     od_groups = ODGroups(
         num_od=int(metadata["num_od"]),

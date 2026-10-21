@@ -25,7 +25,7 @@ import signal
 import tempfile
 import time
 import uuid
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
@@ -64,7 +64,7 @@ ODUniverseSource = Literal["file", "network_ordered_pairs"]
 ODUniverseLevel = Literal["stop", "physical_stop"]
 ConnectivityPolicy = Literal["none", "directed_reachable"]
 TimetablePolicy = Literal["required", "defer", "none"]
-EXPANSION_ALGORITHM_VERSION = 1
+EXPANSION_ALGORITHM_VERSION = 2
 
 
 def _text(value: Any, name: str) -> str:
@@ -78,6 +78,39 @@ def _text(value: Any, name: str) -> str:
 
 def _sha256_payload(payload: object) -> str:
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def feasibility_station_mapping_fingerprint(scenario: Scenario | None) -> str:
+    """Fingerprint station membership used by scheduled OD feasibility.
+
+    Hub distances and walking-cost settings are deliberately excluded: they
+    affect assignment costs, not whether a timetable connection is feasible.
+    """
+    geometry = None if scenario is None else getattr(scenario, "transfer_geometry", None)
+    if scenario is None:
+        station_mapping: dict[str, str] = {}
+    else:
+        stop_objects = (
+            scenario.stops.values()
+            if isinstance(scenario.stops, Mapping)
+            else scenario.stops
+        )
+        platform_ids = sorted(str(stop.stop_id) for stop in stop_objects)
+        explicit_mapping = (
+            {} if geometry is None else dict(geometry.platform_to_station)
+        )
+        station_mapping = {
+            platform: explicit_mapping.get(platform, platform)
+            for platform in platform_ids
+        }
+    payload: object = {
+        "platform_to_station": [
+            [platform, station]
+            for platform, station in sorted(station_mapping.items())
+        ],
+        "semantics_version": 2,
+    }
+    return _sha256_payload(payload)
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -605,11 +638,38 @@ def run_candidate_od_time_expansion(
         raise ValueError("checkpoint_directory is required")
     checkpoint = Path(checkpoint_directory).expanduser().resolve()
     checkpoint.mkdir(parents=True, exist_ok=True)
-    feasibility_contract = ScheduledFeasibilityContract.from_mapping(config)
-    config.setdefault("feasibility_contract_version", feasibility_contract.version)
-    config.setdefault(
-        "feasibility_contract_fingerprint", feasibility_contract.fingerprint
+    station_mapping_fingerprint = feasibility_station_mapping_fingerprint(scenario)
+    requested_station_mapping_fingerprint = config.get(
+        "station_mapping_fingerprint"
     )
+    if (
+        requested_station_mapping_fingerprint is not None
+        and str(requested_station_mapping_fingerprint)
+        != station_mapping_fingerprint
+    ):
+        raise ValueError(
+            "configuration station_mapping_fingerprint does not match the "
+            "scenario transfer geometry."
+        )
+    config["station_mapping_fingerprint"] = station_mapping_fingerprint
+    feasibility_contract = ScheduledFeasibilityContract.from_mapping(config)
+    if feasibility_contract.version != 2:
+        raise ValueError(
+            "unsupported feasibility_contract_version; current version is 2."
+        )
+    requested_contract_fingerprint = config.get(
+        "feasibility_contract_fingerprint"
+    )
+    if (
+        requested_contract_fingerprint is not None
+        and str(requested_contract_fingerprint) != feasibility_contract.fingerprint
+    ):
+        raise ValueError(
+            "configuration feasibility_contract_fingerprint does not match "
+            "the effective feasibility contract."
+        )
+    config["feasibility_contract_version"] = feasibility_contract.version
+    config["feasibility_contract_fingerprint"] = feasibility_contract.fingerprint
     expansion_fingerprint = expansion_contract_fingerprint(universe, bins, config)
     manifest_path = checkpoint / "manifest.json"
     progress_path = checkpoint / "progress.json"
@@ -1096,7 +1156,8 @@ class ScheduledFeasibilityContract:
     maximum_initial_wait_seconds: int = 3600
     maximum_journey_seconds: int = 7200
     maximum_waiting_seconds: int = 3600
-    version: int = 1
+    station_mapping_fingerprint: str = ""
+    version: int = 2
 
     def __post_init__(self) -> None:
         if self.maximum_transfers < 0 or self.maximum_initial_wait_seconds < 0:
@@ -1113,6 +1174,7 @@ class ScheduledFeasibilityContract:
                 "maximum_initial_wait_seconds": self.maximum_initial_wait_seconds,
                 "maximum_journey_seconds": self.maximum_journey_seconds,
                 "maximum_waiting_seconds": self.maximum_waiting_seconds,
+                "station_mapping_fingerprint": self.station_mapping_fingerprint,
             }
         )
 
@@ -1125,7 +1187,10 @@ class ScheduledFeasibilityContract:
             ),
             maximum_journey_seconds=int(values.get("maximum_journey_seconds", 7200)),
             maximum_waiting_seconds=int(values.get("maximum_waiting_seconds", 3600)),
-            version=int(values.get("feasibility_contract_version", 1)),
+            station_mapping_fingerprint=str(
+                values.get("station_mapping_fingerprint", "")
+            ),
+            version=int(values.get("feasibility_contract_version", 2)),
         )
 
     def path_metrics(
@@ -1135,6 +1200,15 @@ class ScheduledFeasibilityContract:
         origin: str,
         period: tuple[str, int, int],
     ) -> Mapping[str, "TimetablePathMetrics"]:
+        if (
+            self.station_mapping_fingerprint
+            and self.station_mapping_fingerprint
+            != index.station_mapping_fingerprint
+        ):
+            raise ValueError(
+                "feasibility contract and timetable index use different "
+                "platform-to-station mappings."
+            )
         return index.path_metrics(
             origin,
             period,
@@ -1182,6 +1256,15 @@ class TimetableFeasibilityIndex:
     departure_seconds_by_stop: Mapping[str, tuple[int, ...]]
     arrivals_by_stop: Mapping[str, tuple[tuple[int, str, int], ...]]
     physical_stop_mapping: Mapping[str, str]
+    station_by_platform: Mapping[str, str] = field(default_factory=dict)
+    trip_line_by_id: Mapping[str, str] = field(default_factory=dict)
+    departures_by_station: Mapping[
+        str, tuple[tuple[int, str, int, str, str], ...]
+    ] = field(default_factory=dict)
+    departure_seconds_by_station: Mapping[str, tuple[int, ...]] = field(
+        default_factory=dict
+    )
+    station_mapping_fingerprint: str = ""
 
     @classmethod
     def from_scenario(
@@ -1195,8 +1278,42 @@ class TimetableFeasibilityIndex:
         sequences = _trip_sequences(
             scenario, mapping, timetable_index=timetable_index
         )
+        event_platform_ids = {
+            str(stop_time.stop_id)
+            for sequence in sequences.values()
+            for stop_time in sequence
+        }
+        transfer_geometry = getattr(scenario, "transfer_geometry", None)
+        if transfer_geometry is None:
+            station_mapping = {
+                str(stop.stop_id): str(stop.stop_id) for stop in scenario.stops
+            }
+        else:
+            transfer_geometry.validate_scenario(
+                scenario_platform_ids=(str(stop.stop_id) for stop in scenario.stops),
+                event_platform_ids=event_platform_ids,
+            )
+            station_mapping = dict(transfer_geometry.platform_to_station)
+            station_mapping.update(
+                {
+                    str(stop.stop_id): str(stop.stop_id)
+                    for stop in scenario.stops
+                    if str(stop.stop_id) not in station_mapping
+                }
+            )
+        trip_line_by_id = {
+            str(trip.trip_id): str(trip.line_ref)
+            for trip in (
+                scenario.timetable.trips
+                if timetable_index is None
+                else timetable_index.trips
+            )
+        }
         departures: dict[str, list[tuple[int, str, int]]] = defaultdict(list)
         arrivals: dict[str, list[tuple[int, str, int]]] = defaultdict(list)
+        departures_by_station: dict[
+            str, list[tuple[int, str, int, str, str]]
+        ] = defaultdict(list)
         for trip_id, sequence in sequences.items():
             for index, stop_time in enumerate(sequence):
                 stop = mapping[str(stop_time.stop_id)]
@@ -1204,6 +1321,17 @@ class TimetableFeasibilityIndex:
                 arrival = _arrival_seconds(stop_time)
                 departures[stop].append((departure, trip_id, index))
                 arrivals[stop].append((arrival, trip_id, index))
+                platform_id = str(stop_time.stop_id)
+                station_id = station_mapping[platform_id]
+                departures_by_station[station_id].append(
+                    (
+                        departure,
+                        trip_id,
+                        index,
+                        platform_id,
+                        trip_line_by_id[trip_id],
+                    )
+                )
         ordered_departures = {
             stop: tuple(sorted(items, key=lambda item: (item[0], item[1], item[2])))
             for stop, items in departures.items()
@@ -1211,6 +1339,12 @@ class TimetableFeasibilityIndex:
         ordered_arrivals = {
             stop: tuple(sorted(items, key=lambda item: (item[0], item[1], item[2])))
             for stop, items in arrivals.items()
+        }
+        ordered_station_departures = {
+            station: tuple(
+                sorted(items, key=lambda item: (item[0], item[1], item[2]))
+            )
+            for station, items in departures_by_station.items()
         }
         return cls(
             sequences=MappingProxyType(dict(sequences)),
@@ -1220,6 +1354,18 @@ class TimetableFeasibilityIndex:
             ),
             arrivals_by_stop=MappingProxyType(ordered_arrivals),
             physical_stop_mapping=MappingProxyType(mapping),
+            station_by_platform=MappingProxyType(dict(station_mapping)),
+            trip_line_by_id=MappingProxyType(trip_line_by_id),
+            departures_by_station=MappingProxyType(ordered_station_departures),
+            departure_seconds_by_station=MappingProxyType(
+                {
+                    station: tuple(item[0] for item in items)
+                    for station, items in ordered_station_departures.items()
+                }
+            ),
+            station_mapping_fingerprint=feasibility_station_mapping_fingerprint(
+                scenario
+            ),
         )
 
     def is_feasible(
@@ -1329,13 +1475,17 @@ class TimetableFeasibilityIndex:
                 candidate["arrivals"].append(arrival)
                 if transfers >= maximum_transfers:
                     continue
-                departures = self.departures_by_stop.get(stop, ())
-                seconds = self.departure_seconds_by_stop.get(stop, ())
-                first = bisect_left(seconds, arrival)
-                for departure, next_trip_id, next_index in departures[first:]:
+                station_id = self.station_by_platform.get(
+                    str(alight.stop_id), str(alight.stop_id)
+                )
+                departures = self.departures_by_station.get(station_id, ())
+                seconds = self.departure_seconds_by_station.get(station_id, ())
+                first = bisect_right(seconds, arrival)
+                current_line = self.trip_line_by_id.get(trip_id, trip_id)
+                for departure, next_trip_id, next_index, _platform, next_line in departures[first:]:
                     if departure - arrival > maximum_waiting_seconds:
                         break
-                    if next_trip_id != trip_id:
+                    if next_line != current_line:
                         queue.append((next_trip_id, next_index, first_departure, transfers + 1))
         return {
             destination: TimetablePathMetrics(
@@ -1790,6 +1940,44 @@ def _timetable_feasible(
     )
     if not sequences:
         return False
+    transfer_geometry = getattr(scenario, "transfer_geometry", None)
+    event_platform_ids = {
+        str(stop_time.stop_id)
+        for sequence in sequences.values()
+        for stop_time in sequence
+    }
+    if transfer_geometry is None:
+        station_mapping = {
+            str(stop.stop_id): str(stop.stop_id) for stop in scenario.stops
+        }
+    else:
+        transfer_geometry.validate_scenario(
+            scenario_platform_ids=(str(stop.stop_id) for stop in scenario.stops),
+            event_platform_ids=event_platform_ids,
+        )
+        station_mapping = dict(transfer_geometry.platform_to_station)
+    trip_lines = {
+        str(trip.trip_id): str(trip.line_ref)
+        for trip in scenario.timetable.trips
+    }
+    departures_by_station: dict[
+        str, list[tuple[int, str, int, str, str]]
+    ] = defaultdict(list)
+    for current_trip_id, sequence in sequences.items():
+        for current_index, stop_time in enumerate(sequence):
+            platform_id = str(stop_time.stop_id)
+            station_id = station_mapping.get(platform_id, platform_id)
+            departures_by_station[station_id].append(
+                (
+                    _departure_seconds(stop_time),
+                    current_trip_id,
+                    current_index,
+                    platform_id,
+                    trip_lines[current_trip_id],
+                )
+            )
+    for station_departures in departures_by_station.values():
+        station_departures.sort(key=lambda item: (item[0], item[1], item[2]))
     origin = mapping[pair.origin_stop_id]
     destination = mapping[pair.destination_stop_id]
     start, end = period[1], period[2]
@@ -1823,19 +2011,25 @@ def _timetable_feasible(
                 return True
             if transfers >= maximum_transfers:
                 continue
-            for next_trip_id, next_sequence in sequences.items():
-                for next_index, next_stop_time in enumerate(next_sequence):
-                    if mapping[str(next_stop_time.stop_id)] != stop:
-                        continue
-                    departure = _departure_seconds(next_stop_time)
-                    if departure < arrival:
-                        continue
-                    if departure - arrival > maximum_waiting_seconds:
-                        break
-                    if next_trip_id == trip_id:
-                        continue
-                    queue.append((next_trip_id, next_index, first_departure, transfers + 1))
+            arrival_platform = str(alight.stop_id)
+            station_id = station_mapping.get(arrival_platform, arrival_platform)
+            current_line = trip_lines[trip_id]
+            for (
+                departure,
+                next_trip_id,
+                next_index,
+                _next_platform,
+                next_line,
+            ) in departures_by_station.get(station_id, ()):
+                if departure <= arrival:
+                    continue
+                if departure - arrival > maximum_waiting_seconds:
                     break
+                if next_line == current_line:
+                    continue
+                queue.append(
+                    (next_trip_id, next_index, first_departure, transfers + 1)
+                )
     return False
 
 
@@ -2008,6 +2202,9 @@ def expand_candidate_od_time_cells(
         maximum_initial_wait_seconds=maximum_initial_wait_seconds,
         maximum_journey_seconds=maximum_journey_seconds,
         maximum_waiting_seconds=maximum_waiting_seconds,
+        station_mapping_fingerprint=feasibility_station_mapping_fingerprint(
+            scenario
+        ),
     )
     policies = MappingProxyType(
         {
@@ -2018,6 +2215,9 @@ def expand_candidate_od_time_cells(
             "timetable_policy": timetable_policy,
             "feasibility_contract_version": feasibility_contract.version,
             "feasibility_contract_fingerprint": feasibility_contract.fingerprint,
+            "station_mapping_fingerprint": (
+                feasibility_contract.station_mapping_fingerprint
+            ),
         }
     )
     fingerprint = _sha256_payload(

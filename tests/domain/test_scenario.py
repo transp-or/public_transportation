@@ -7,6 +7,11 @@ from public_transportation.domain.scenario import Scenario
 from public_transportation.domain.stop import Stop
 from public_transportation.domain.time_bin import TimeBin
 from public_transportation.domain.time_of_day import TimeOfDay
+from public_transportation.domain.line import Line
+from public_transportation.domain.stop_time import StopTime
+from public_transportation.domain.timetable import Timetable
+from public_transportation.domain.trip import Trip
+from public_transportation.domain.transfer_geometry import TransferGeometry
 
 
 def _codes(rep):
@@ -63,6 +68,43 @@ def test_valid_scenario_has_no_issues():
 
     rep = sc.validate()
     assert rep.issues == []
+
+
+def test_transfer_geometry_folder_round_trip_and_stale_sidecar_removal(tmp_path):
+    scenario = Scenario(
+        metadata=Metadata(title="transfer round trip"),
+        stops=[_mk_stop(value) for value in ("A", "P1", "P2", "D")],
+        lines=[Line("L1"), Line("L2")],
+        time_bins=[_mk_bin("t0", 0, 1000)],
+        demand=ODDemand(
+            [ODRecord("A", "D", "t0", 1.0)]
+        ),
+        timetable=Timetable(
+            trips=[Trip("T1", "L1"), Trip("T2", "L2")],
+            stop_times=[
+                StopTime("T1", "A", 1, TimeOfDay(10), TimeOfDay(11)),
+                StopTime("T1", "P1", 2, TimeOfDay(100), TimeOfDay(101)),
+                StopTime("T2", "P2", 1, TimeOfDay(150), TimeOfDay(151)),
+                StopTime("T2", "D", 2, TimeOfDay(200), TimeOfDay(201)),
+            ],
+        ),
+        transfer_geometry=TransferGeometry(
+            {"A": "A", "P1": "H", "P2": "H", "D": "D"},
+            {("H", "P1"): 10.0, ("H", "P2"): 20.0},
+        ),
+    )
+    scenario.to_folder(tmp_path)
+    loaded = Scenario.from_folder(tmp_path, strict=True)
+    assert loaded.transfer_geometry is not None
+    assert loaded.transfer_geometry.fingerprint_payload() == (
+        scenario.transfer_geometry.fingerprint_payload()
+    )
+
+    scenario.transfer_geometry = None
+    scenario.to_folder(tmp_path)
+    assert not (tmp_path / "platform_stations.csv").exists()
+    assert not (tmp_path / "hub_platform_distances.csv").exists()
+    assert Scenario.from_folder(tmp_path, strict=True).transfer_geometry is None
 
 
 def test_duplicate_stop_ids_reported_as_error():

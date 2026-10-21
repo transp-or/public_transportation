@@ -45,6 +45,7 @@ from .graph_sentinels import (
     LINK_TYPE_ACCESS,
     LINK_TYPE_EGRESS,
     LINK_TYPE_DWELL,
+    LINK_TYPE_HUB_CONNECTOR,
 )
 
 
@@ -71,6 +72,7 @@ class CostParts:
     is_transfer: Array
     is_egress: Array
     is_dwell: Array
+    is_hub_connector: Array | None = None
 
 
 def precompute_base_costs(graph: JaxGraph, config: AssignmentConfig) -> CostParts:
@@ -95,13 +97,26 @@ def precompute_base_costs(graph: JaxGraph, config: AssignmentConfig) -> CostPart
     is_access = lt == LINK_TYPE_ACCESS
     is_egress = lt == LINK_TYPE_EGRESS
     is_dwell = lt == LINK_TYPE_DWELL
+    is_hub_connector = lt == LINK_TYPE_HUB_CONNECTOR
 
     # travel_time is in minutes (float)
     # - ride links: in-vehicle travel time
     # - transfer links: waiting time weighted by beta_transfer
     # - dwell links: dwell time (same units as travel_time)
     base_cost = jnp.where(is_ride, graph.travel_time, 0.0)
-    base_cost = jnp.where(is_transfer, config.beta_transfer * graph.travel_time, base_cost)
+    transfer_like = is_transfer | is_hub_connector
+    transfer_wait_time = getattr(graph, "transfer_wait_time", None)
+    transfer_walking_time = getattr(graph, "transfer_walking_time", None)
+    if transfer_wait_time is not None and transfer_walking_time is not None:
+        transfer_cost = (
+            config.beta_transfer * transfer_wait_time
+            + config.beta_walk * transfer_walking_time
+        )
+    else:
+        # Compatibility for lightweight graph adapters created before explicit
+        # walking/waiting components were added.
+        transfer_cost = config.beta_transfer * graph.travel_time
+    base_cost = jnp.where(transfer_like, transfer_cost, base_cost)
     base_cost = jnp.where(is_dwell, graph.travel_time, base_cost)
     # access links: keep at 0.0 (penalty added later, per OD-group)
     # egress links: keep at 0.0 (can be made configurable later)
@@ -113,6 +128,7 @@ def precompute_base_costs(graph: JaxGraph, config: AssignmentConfig) -> CostPart
         is_transfer=is_transfer,
         is_egress=is_egress,
         is_dwell=is_dwell,
+        is_hub_connector=is_hub_connector,
     )
 
 

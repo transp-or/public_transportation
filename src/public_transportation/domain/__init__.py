@@ -22,6 +22,7 @@ from .time_bin import TimeBin
 from .time_of_day import TimeOfDay
 from .timetable import Timetable
 from .trip import Trip
+from .transfer_geometry import HubPlatformDistance, TransferGeometry
 
 __all__ = [
     "Issue",
@@ -40,4 +41,6 @@ __all__ = [
     "StopTime",
     "Timetable",
     "Scenario",
+    "HubPlatformDistance",
+    "TransferGeometry",
 ]

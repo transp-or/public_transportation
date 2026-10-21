@@ -61,6 +61,8 @@ Named gravity production/destination specifications, including models that
 estimate production from neutral unit exposure without an observed OD matrix,
 are described in
 [gravity_model_specifications.md](docs/source/gravity_model_specifications.md).
+Station/hub transfer inputs and their cache semantics are documented in
+[station_hub_transfers.md](docs/source/station_hub_transfers.md).
 
 Topology-driven structural-zero detection is configured entirely through TOML.
 Its rules, valid parameter values, conflict policy, audit artifacts, and Python

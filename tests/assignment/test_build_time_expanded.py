@@ -12,7 +12,7 @@ Suggested location in the repository:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -22,10 +22,13 @@ import pytest
 
 from public_transportation.assignment.build_time_expanded import build_jax_graph
 from public_transportation.assignment.config import AssignmentConfig
+from public_transportation.assignment.costs import precompute_base_costs
 from public_transportation.assignment.graph_sentinels import (CENTROID_TIME_S, LINK_TYPE_ACCESS, LINK_TYPE_DWELL,
                                                               LINK_TYPE_EGRESS, LINK_TYPE_RIDE, LINK_TYPE_TRANSFER,
                                                               NODE_KIND_CENTROID_IN, NODE_KIND_CENTROID_OUT,
                                                               NODE_KIND_EVENT_ARR, NODE_KIND_EVENT_DEP)
+from public_transportation.assignment.graph_sentinels import LINK_TYPE_HUB_CONNECTOR
+from public_transportation.domain.transfer_geometry import TransferGeometry
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +75,7 @@ class _Scenario:
     stops: list[_Stop] | dict[str, _Stop]
     timetable: _Timetable | None
     time_bins: list[_TimeBin]
+    transfer_geometry: TransferGeometry | None = None
 
 
 def _cfg(**kwargs: Any) -> AssignmentConfig:
@@ -91,6 +95,7 @@ def _scenario(
     trips: list[_Trip] | None = None,
     stop_times: list[_StopTime] | None = None,
     stops_as_dict: bool = False,
+    transfer_geometry: TransferGeometry | None = None,
 ) -> _Scenario:
     stop_objects = [_Stop(s) for s in stops]
     stop_container: list[_Stop] | dict[str, _Stop]
@@ -113,6 +118,7 @@ def _scenario(
             ],
         ),
         time_bins=time_bins if time_bins is not None else [_TimeBin(0, 600)],
+        transfer_geometry=transfer_geometry,
     )
 
 
@@ -184,6 +190,93 @@ def _centroid_out_node(graph, *, stop_id: str) -> int:
     return int(matches[0])
 
 
+def _has_path(graph, source: int, target: int) -> bool:
+    tail = _as_np(graph.tail).astype(int)
+    head = _as_np(graph.head).astype(int)
+    outgoing: list[list[int]] = [[] for _ in range(graph.num_nodes)]
+    for link, node in enumerate(tail):
+        outgoing[int(node)].append(link)
+    pending = [source]
+    visited = {source}
+    while pending:
+        node = pending.pop()
+        if node == target:
+            return True
+        for link in outgoing[node]:
+            successor = int(head[link])
+            if successor not in visited:
+                visited.add(successor)
+                pending.append(successor)
+    return False
+
+
+def _path_links(graph, source: int, target: int) -> list[int]:
+    tail = _as_np(graph.tail).astype(int)
+    head = _as_np(graph.head).astype(int)
+    outgoing: list[list[int]] = [[] for _ in range(graph.num_nodes)]
+    for link, node in enumerate(tail):
+        outgoing[int(node)].append(link)
+    pending = [source]
+    parent: dict[int, tuple[int, int]] = {}
+    visited = {source}
+    while pending:
+        node = pending.pop(0)
+        if node == target:
+            break
+        for link in outgoing[node]:
+            successor = int(head[link])
+            if successor not in visited:
+                visited.add(successor)
+                parent[successor] = (node, link)
+                pending.append(successor)
+    if target not in visited:
+        raise AssertionError(f"No path from node {source} to {target}.")
+    result: list[int] = []
+    node = target
+    while node != source:
+        previous, link = parent[node]
+        result.append(link)
+        node = previous
+    return list(reversed(result))
+
+
+def _hub_transfer_scenario(
+    *,
+    x2_station: str = "H",
+    l2_arrival_s: int = 500,
+    l1_cross_departure_s: int = 540,
+    distance_x1_m: float = 30.0,
+    distance_x2_m: float = 60.0,
+) -> _Scenario:
+    stops = ["A", "X1", "X2", "D"]
+    trips = [
+        _Trip("T1", "L1"),
+        _Trip("T2", "L2"),
+        _Trip("T3", "L1"),
+        _Trip("T4", "L2"),
+    ]
+    stop_times = [
+        _StopTime("T1", "A", 1, 50, 60),
+        _StopTime("T1", "X1", 2, 300, 301),
+        _StopTime("T2", "X2", 1, l2_arrival_s - 1, l2_arrival_s),
+        _StopTime("T2", "D", 2, l2_arrival_s + 200, l2_arrival_s + 201),
+        _StopTime("T3", "X2", 1, l1_cross_departure_s - 1, l1_cross_departure_s),
+        _StopTime("T3", "D", 2, l1_cross_departure_s + 200, l1_cross_departure_s + 201),
+        _StopTime("T4", "X1", 1, 390, 391),
+        _StopTime("T4", "D", 2, 590, 591),
+    ]
+    membership = {"A": "A", "X1": "H", "X2": x2_station, "D": "D"}
+    distances = {("H", "X1"): distance_x1_m}
+    distances[(x2_station, "X2")] = distance_x2_m
+    return _scenario(
+        stops=stops,
+        time_bins=[_TimeBin(0, 1200)],
+        trips=trips,
+        stop_times=stop_times,
+        transfer_geometry=TransferGeometry(membership, distances),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Structural graph invariants
 # ---------------------------------------------------------------------------
@@ -211,6 +304,10 @@ def test_build_jax_graph_has_expected_basic_shapes_and_metadata():
     assert tuple(g.node_stop_id) == ("A", "B")
     assert tuple(g.trip_id) == ("T1",)
     assert tuple(g.trip_line_ref) == ("L1",)
+    assert len(g.node_station_id) == g.num_nodes
+    assert g.transfer_wait_time.shape == (g.num_links,)
+    assert g.transfer_walking_time.shape == (g.num_links,)
+    assert g.assignment_semantics_fingerprint
 
 
 def test_graph_arrays_have_valid_index_ranges():
@@ -271,6 +368,158 @@ def test_jaxgraph_is_registered_as_a_pytree():
     assert tuple(rebuilt.trip_line_ref) == tuple(g.trip_line_ref)
     assert np.array_equal(_as_np(rebuilt.tail), _as_np(g.tail))
     assert np.array_equal(_as_np(rebuilt.head), _as_np(g.head))
+    assert rebuilt.node_station_id == g.node_station_id
+    assert (
+        rebuilt.assignment_semantics_fingerprint
+        == g.assignment_semantics_fingerprint
+    )
+
+
+def test_interplatform_transfer_is_enabled_and_cost_is_decomposed():
+    scenario = _hub_transfer_scenario()
+    config = _cfg(beta_transfer=1.5, beta_walk=1.0, walking_speed_m_per_s=1.0)
+    graph = build_jax_graph(scenario, config=config)
+    tail = _event_node(
+        graph,
+        stop_id="X1",
+        time_s=300,
+        kind=NODE_KIND_EVENT_ARR,
+        trip_index=0,
+    )
+    head = _event_node(
+        graph,
+        stop_id="X2",
+        time_s=500,
+        kind=NODE_KIND_EVENT_DEP,
+        trip_index=1,
+    )
+    assert _has_path(graph, tail, head)
+    links = _path_links(graph, tail, head)
+    link_types = _as_np(graph.link_type).astype(int)
+    assert np.count_nonzero(link_types[links] == LINK_TYPE_TRANSFER) == 1
+    assert np.count_nonzero(link_types[links] == LINK_TYPE_HUB_CONNECTOR) > 0
+
+    walking = float(np.sum(_as_np(graph.transfer_walking_time)[links]))
+    waiting = float(np.sum(_as_np(graph.transfer_wait_time)[links]))
+    assert walking == pytest.approx(1.5)
+    assert waiting == pytest.approx(200.0 / 60.0 - 1.5)
+    parts = precompute_base_costs(graph, config)
+    path_cost = float(np.sum(_as_np(parts.base_cost)[links]))
+    assert path_cost == pytest.approx(1.5 * (200.0 / 60.0 - 1.5) + 1.5)
+    assert graph.node_station_id[tail] == "H"
+    assert graph.node_station_id[head] == "H"
+
+
+def test_interplatform_transfer_requires_same_station_and_different_line():
+    graph = build_jax_graph(
+        _hub_transfer_scenario(x2_station="J"), config=_cfg()
+    )
+    arrival = _event_node(
+        graph, stop_id="X1", time_s=300, kind=NODE_KIND_EVENT_ARR, trip_index=0
+    )
+    different_line_departure = _event_node(
+        graph, stop_id="X2", time_s=500, kind=NODE_KIND_EVENT_DEP, trip_index=1
+    )
+    same_line_departure = _event_node(
+        graph, stop_id="X2", time_s=540, kind=NODE_KIND_EVENT_DEP, trip_index=2
+    )
+    same_platform_other_line = _event_node(
+        graph, stop_id="X1", time_s=391, kind=NODE_KIND_EVENT_DEP, trip_index=3
+    )
+    assert not _has_path(graph, arrival, different_line_departure)
+    # Different trip IDs on the same line are not transfer eligibility.
+    assert not _has_path(graph, arrival, same_line_departure)
+    # Same platform, different line remains a valid transfer.
+    assert _has_path(graph, arrival, same_platform_other_line)
+    links = _path_links(graph, arrival, same_platform_other_line)
+    assert float(np.sum(_as_np(graph.transfer_walking_time)[links])) == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize(
+    ("departure_s", "maximum_wait_min", "expected"),
+    [(330, 10.0, True), (500, 2.0, False), (300, 10.0, False)],
+)
+def test_transfer_timetable_window_and_short_walking_gap(
+    departure_s: int, maximum_wait_min: float, expected: bool
+):
+    graph = build_jax_graph(
+        _hub_transfer_scenario(l2_arrival_s=departure_s),
+        config=_cfg(
+            max_transfer_wait_min=maximum_wait_min,
+            walking_speed_m_per_s=1.0,
+        ),
+    )
+    arrival = _event_node(
+        graph, stop_id="X1", time_s=300, kind=NODE_KIND_EVENT_ARR, trip_index=0
+    )
+    departure = _event_node(
+        graph,
+        stop_id="X2",
+        time_s=departure_s,
+        kind=NODE_KIND_EVENT_DEP,
+        trip_index=1,
+    )
+    assert _has_path(graph, arrival, departure) is expected
+    if departure_s == 330:
+        links = _path_links(graph, arrival, departure)
+        assert float(np.sum(_as_np(graph.transfer_wait_time)[links])) == pytest.approx(0.0)
+        assert float(np.sum(_as_np(graph.transfer_walking_time)[links])) == pytest.approx(1.5)
+
+
+def test_cross_platform_candidate_requires_both_hub_distances():
+    scenario = _hub_transfer_scenario()
+    scenario = replace(
+        scenario,
+        transfer_geometry=TransferGeometry(
+            scenario.transfer_geometry.platform_to_station,
+        {("H", "X1"): 30.0},
+        ),
+    )
+    with pytest.raises(ValueError, match="Missing hub distance"):
+        build_jax_graph(scenario, config=_cfg())
+
+
+def test_hub_transfer_graph_growth_is_subquadratic_in_departure_events():
+    count = 20
+    stops = ["X1", "X2"]
+    trips: list[_Trip] = []
+    stop_times: list[_StopTime] = []
+    membership = {"X1": "H", "X2": "H"}
+    for index in range(count):
+        origin = f"O{index}"
+        destination = f"D{index}"
+        first_trip = f"A{index}"
+        second_trip = f"B{index}"
+        stops.extend((origin, destination))
+        membership[origin] = origin
+        membership[destination] = destination
+        trips.extend((_Trip(first_trip, "L1"), _Trip(second_trip, "L2")))
+        arrival_s = 100 + index * 2
+        departure_s = 500 + index * 2
+        stop_times.extend(
+            (
+                _StopTime(first_trip, origin, 1, 20, 21),
+                _StopTime(first_trip, "X1", 2, arrival_s, arrival_s + 1),
+                _StopTime(second_trip, "X2", 1, departure_s - 1, departure_s),
+                _StopTime(second_trip, destination, 2, departure_s + 100, departure_s + 101),
+            )
+        )
+    scenario = _scenario(
+        stops=stops,
+        time_bins=[_TimeBin(0, 1000)],
+        trips=trips,
+        stop_times=stop_times,
+        transfer_geometry=TransferGeometry(
+            membership, {("H", "X1"): 0.0, ("H", "X2"): 0.0}
+        ),
+    )
+    graph = build_jax_graph(scenario, config=_cfg(max_transfer_wait_min=30.0))
+    link_types = _as_np(graph.link_type).astype(int)
+    hub_links = np.count_nonzero(
+        (link_types == LINK_TYPE_TRANSFER)
+        | (link_types == LINK_TYPE_HUB_CONNECTOR)
+    )
+    assert hub_links < count * count
 
 
 # ---------------------------------------------------------------------------

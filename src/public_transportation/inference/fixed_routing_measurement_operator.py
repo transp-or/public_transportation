@@ -59,6 +59,8 @@ def assignment_inputs_fingerprint(inputs: AssignmentInputs) -> str:
         graph.topo_order,
         graph.out_links,
         graph.out_mask,
+        np.asarray(graph.node_station_id, dtype=str),
+        np.asarray([graph.assignment_semantics_fingerprint], dtype=str),
         inputs.base_link_cost,
         inputs.group_dest_node,
         inputs.group_link_mask,

@@ -29,6 +29,7 @@ The default implementation uses a global graph plus a per-group link mask for ef
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 
 @dataclass(slots=True)
@@ -45,6 +46,10 @@ class AssignmentConfig:
         Weight applied to in-vehicle time (usually 1.0).
     beta_transfer : float
         Weight applied to transfer time between vehicles.
+    beta_walk : float
+        Fixed weight applied to proxy walking time during inter-platform transfers.
+    walking_speed_m_per_s : float
+        Assumed walking speed used to convert hub distances to minutes.
     beta_wait : float
         Weight applied to waiting time.
 
@@ -100,6 +105,8 @@ class AssignmentConfig:
     beta_in_vehicle: float = 1.0
     beta_transfer: float = 1.5
     beta_wait: float = 1.0
+    beta_walk: float = 1.0
+    walking_speed_m_per_s: float = 1.2
 
     # --- graph construction windows (minutes) ---
     max_access_deviation_min: float = 15.0
@@ -139,12 +146,24 @@ class AssignmentConfig:
         """
 
         def _check_nonneg(name: str, value: float) -> None:
-            if value < 0:
-                raise ValueError(f"{name} must be non-negative, got {value}")
+            if not math.isfinite(float(value)) or value < 0:
+                raise ValueError(
+                    f"{name} must be non-negative and finite, got {value}"
+                )
+
+        if (
+            not math.isfinite(float(self.walking_speed_m_per_s))
+            or self.walking_speed_m_per_s <= 0
+        ):
+            raise ValueError(
+                "walking_speed_m_per_s must be finite and strictly positive, "
+                f"got {self.walking_speed_m_per_s}"
+            )
 
         _check_nonneg("beta_in_vehicle", self.beta_in_vehicle)
         _check_nonneg("beta_transfer", self.beta_transfer)
         _check_nonneg("beta_wait", self.beta_wait)
+        _check_nonneg("beta_walk", self.beta_walk)
         _check_nonneg("egress_cost", self.egress_cost)
         _check_nonneg("beta_early", self.beta_early)
         _check_nonneg("beta_late", self.beta_late)
@@ -159,10 +178,13 @@ class AssignmentConfig:
                 f"mask_strategy must be one of {{'link_mask','egress_by_head'}}, got {self.mask_strategy!r}"
             )
 
-        if self.theta_default <= 0:
-            raise ValueError("theta_default must be strictly positive")
+        if not math.isfinite(float(self.theta_default)) or self.theta_default <= 0:
+            raise ValueError("theta_default must be strictly positive and finite")
 
         if self.use_capacity_penalty:
             _check_nonneg("capacity_penalty_alpha", self.capacity_penalty_alpha)
-            if self.capacity_penalty_kappa <= 0:
-                raise ValueError("capacity_penalty_kappa must be > 0")
+            if (
+                not math.isfinite(float(self.capacity_penalty_kappa))
+                or self.capacity_penalty_kappa <= 0
+            ):
+                raise ValueError("capacity_penalty_kappa must be > 0 and finite")

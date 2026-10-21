@@ -116,6 +116,14 @@ class JaxGraph:
     travel_time : Array[float] shape (num_links,)
         Physical time on the link (minutes). Used to compute generalized cost.
 
+    transfer_wait_time : Array[float] shape (num_links,)
+        Explicit waiting-time component used for transfer cost. Components may
+        be signed on hub-connector paths so their path sum equals
+        ``max(0, elapsed_time - walking_time)``.
+
+    transfer_walking_time : Array[float] shape (num_links,)
+        Explicit proxy walking-time component (minutes), separate from waiting.
+
     capacity : Array[float] shape (num_links,)
         Capacity of ride links. For non-ride links, set to +inf.
 
@@ -139,6 +147,16 @@ class JaxGraph:
 
     trip_line_ref : tuple[str, ...]
         Line reference for each trip index (aligned with `trip_id`).
+
+    node_station_id : tuple[str, ...]
+        Station/hub label for each node. Event and centroid nodes retain their
+        platform-derived station identity; synthetic connector nodes carry
+        their shared station id.
+
+    assignment_semantics_fingerprint : str
+        Fingerprint of transfer geometry, assignment settings, and graph
+        semantics. Included in routing/operator identity even when a setting
+        change does not alter this particular graph's numeric arrays.
         Line identifiers are expected to be provided (builder enforces non-empty IDs).
     """
 
@@ -179,6 +197,10 @@ class JaxGraph:
     node_stop_name: tuple[str, ...] = ()
     trip_id: tuple[str, ...] = ()
     trip_line_ref: tuple[str, ...] = ()
+    transfer_wait_time: Array | None = None
+    transfer_walking_time: Array | None = None
+    node_station_id: tuple[str, ...] = ()
+    assignment_semantics_fingerprint: str = ""
 
 
 # ============================================================================
@@ -244,6 +266,12 @@ def _jaxgraph_flatten(g: JaxGraph):
     bend = g.node_bin_end_min
     if bend is None:
         bend = jnp.asarray([], dtype=jnp.float32)
+    transfer_wait = g.transfer_wait_time
+    if transfer_wait is None:
+        transfer_wait = jnp.zeros((g.num_links,), dtype=g.travel_time.dtype)
+    transfer_walking = g.transfer_walking_time
+    if transfer_walking is None:
+        transfer_walking = jnp.zeros((g.num_links,), dtype=g.travel_time.dtype)
     children = (
         g.tail,
         g.head,
@@ -263,6 +291,8 @@ def _jaxgraph_flatten(g: JaxGraph):
         g.out_mask,
         g.link_type,
         g.travel_time,
+        transfer_wait,
+        transfer_walking,
         g.capacity,
         g.link_trip_index,
     )
@@ -276,15 +306,33 @@ def _jaxgraph_flatten(g: JaxGraph):
         g.node_stop_name,
         g.trip_id,
         g.trip_line_ref,
+        g.node_station_id,
+        g.assignment_semantics_fingerprint,
         has_tbi,
         has_bstart,
         has_bend,
+        g.transfer_wait_time is not None,
+        g.transfer_walking_time is not None,
     )
     return children, aux
 
 
 def _jaxgraph_unflatten(aux, children):
-    (num_nodes, num_links, node_stop_id, node_stop_name, trip_id, trip_line_ref, has_tbi, has_bstart, has_bend) = aux
+    (
+        num_nodes,
+        num_links,
+        node_stop_id,
+        node_stop_name,
+        trip_id,
+        trip_line_ref,
+        node_station_id,
+        assignment_semantics_fingerprint,
+        has_tbi,
+        has_bstart,
+        has_bend,
+        has_transfer_wait,
+        has_transfer_walking,
+    ) = aux
     (
         tail,
         head,
@@ -304,6 +352,8 @@ def _jaxgraph_unflatten(aux, children):
         out_mask,
         link_type,
         travel_time,
+        transfer_wait_time,
+        transfer_walking_time,
         capacity,
         link_trip_index,
     ) = children
@@ -313,6 +363,10 @@ def _jaxgraph_unflatten(aux, children):
         node_bin_start_min = None
     if not has_bend:
         node_bin_end_min = None
+    if not has_transfer_wait:
+        transfer_wait_time = None
+    if not has_transfer_walking:
+        transfer_walking_time = None
     return JaxGraph(
         num_nodes=int(num_nodes),
         num_links=int(num_links),
@@ -340,6 +394,10 @@ def _jaxgraph_unflatten(aux, children):
         node_stop_name=node_stop_name,
         trip_id=trip_id,
         trip_line_ref=trip_line_ref,
+        node_station_id=node_station_id,
+        assignment_semantics_fingerprint=assignment_semantics_fingerprint,
+        transfer_wait_time=transfer_wait_time,
+        transfer_walking_time=transfer_walking_time,
     )
 
 

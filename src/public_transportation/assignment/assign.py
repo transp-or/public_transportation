@@ -433,7 +433,8 @@ def _prepare_assignment_uncached(
     cost_arrays = tuple(
         getattr(cost_parts, name)
         for name in (
-            "base_cost", "is_access", "is_ride", "is_transfer", "is_egress", "is_dwell"
+            "base_cost", "is_access", "is_ride", "is_transfer", "is_egress",
+            "is_dwell", "is_hub_connector",
         )
         if hasattr(cost_parts, name)
     )
