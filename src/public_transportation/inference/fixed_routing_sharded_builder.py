@@ -7,7 +7,9 @@ import math
 import hashlib
 import json
 import os
+import re
 import shutil
+import zipfile
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -92,12 +94,15 @@ def _emit_legacy_progress(
         # hook, and swallowing those would break resumable construction.
         return
 
+
 # Numerical shard contents are tied to the kernel algorithm.  This version is
 # deliberately separate from the support-checkpoint provenance: changing the
 # numerical implementation must invalidate stored shards, but must not force
 # the expensive topology-support discovery to run again.
 MEASUREMENT_KERNEL_ALGORITHM_VERSION = "reachability-edge-gather-v1"
-SUPPORT_DEFINITION_ALGORITHM_VERSION = "positive-probability-group-batched-reachability-v2"
+SUPPORT_DEFINITION_ALGORITHM_VERSION = (
+    "positive-probability-group-batched-reachability-v2"
+)
 SERIALIZATION_ALGORITHM_VERSION = "npz-atomic-shard-v1"
 
 
@@ -196,9 +201,7 @@ class ShardedConstructionConfig:
         if self.max_materialized_support_entries <= 0:
             raise ValueError("max_materialized_support_entries must be positive.")
         if self.support_discovery_mode not in ("compact", "reference"):
-            raise ValueError(
-                "support_discovery_mode must be 'compact' or 'reference'."
-            )
+            raise ValueError("support_discovery_mode must be 'compact' or 'reference'.")
         if not math.isfinite(self.zero_tolerance) or self.zero_tolerance < 0:
             raise ValueError("zero_tolerance must be finite and non-negative.")
         if (
@@ -243,7 +246,7 @@ class ShardedConstructionConfig:
                 self.maximum_sparse_calls_per_product,
                 self.manifest_checkpoint_shards,
                 self.maximum_construction_dispatches,
-        )
+            )
             <= 0
         ):
             raise ValueError("operational shard limits must be positive.")
@@ -258,7 +261,7 @@ class ShardedConstructionConfig:
         """
 
         return {
-            "support_workers_requested": int(self.support_workers),
+            "support_workers_requested": int(self.support_workers or self.workers),
             "shard_construction_workers_requested": int(self.workers),
             "threads_per_worker": 1,
             "support_execution_strategy": "thread_pool",
@@ -652,25 +655,75 @@ class _Support:
     free_column: np.ndarray
     fixed_by_active: np.ndarray
     selected: np.ndarray
-    group_od_indices: tuple[np.ndarray, ...]
-    group_measurements: tuple[np.ndarray, ...]
     global_slots: np.ndarray
     global_slot_mask: np.ndarray
-    shard_od_indices: dict[str, np.ndarray]
-    shard_measurements: dict[str, np.ndarray]
-    expected_shards: tuple[SparseShardIdentity, ...]
+    directory: Path
+    provenance_hash: str
+    group_records: tuple[_CompactSupportGroupRecord, ...]
     group_level_candidate_entries: int
     origin_support_seconds: float
     support_patterns: int
-    patterns: tuple[SupportPattern, ...]
-    construction_tasks: tuple[ConstructionTask, ...]
-    storage_task_keys: dict[str, tuple[str, ...]]
-    construction_metadata: dict[str, tuple[_GroupConstructionMetadata, ...]] = field(
-        default_factory=dict
-    )
+    origin_specific_entries: int
+    compact_payload_bytes: int
+    temporary_directory: object | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def group_measurement_counts(self) -> tuple[int, ...]:
+        return tuple(record.group_measurement_count for record in self.group_records)
 
 
-SUPPORT_CHECKPOINT_SCHEMA_VERSION = 1
+SUPPORT_CHECKPOINT_SCHEMA_VERSION = 2
+COMPACT_SUPPORT_GROUP_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True, slots=True)
+class _CompactSupportGroupRecord:
+    """Small manifest index for one atomically persisted compact group."""
+
+    group: int
+    filename: str
+    sha256: str
+    payload_bytes: int
+    selected_od_cells: int
+    group_measurement_count: int
+    pattern_count: int
+    origin_specific_entries: int
+    group_level_candidate_entries: int
+
+    def to_json(self) -> dict[str, object]:
+        return {name: getattr(self, name) for name in self.__dataclass_fields__}
+
+    @classmethod
+    def from_json(cls, value: dict[str, Any]) -> _CompactSupportGroupRecord:
+        try:
+            return cls(
+                group=int(value["group"]),
+                filename=str(value["filename"]),
+                sha256=str(value["sha256"]),
+                payload_bytes=int(value["payload_bytes"]),
+                selected_od_cells=int(value["selected_od_cells"]),
+                group_measurement_count=int(value["group_measurement_count"]),
+                pattern_count=int(value["pattern_count"]),
+                origin_specific_entries=int(value["origin_specific_entries"]),
+                group_level_candidate_entries=int(
+                    value["group_level_candidate_entries"]
+                ),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                "compact support group manifest entry is invalid."
+            ) from error
+
+
+@dataclass(frozen=True, slots=True)
+class _CompactSupportGroupPayload:
+    """One loaded group; callers must release it before opening another."""
+
+    group_measurements: np.ndarray
+    pattern_od: np.ndarray
+    pattern_od_offsets: np.ndarray
+    pattern_rows: np.ndarray
+    pattern_row_offsets: np.ndarray
 
 
 def _ragged(values: tuple[np.ndarray, ...]) -> tuple[np.ndarray, np.ndarray]:
@@ -688,7 +741,15 @@ def _unragged(flat: np.ndarray, offsets: np.ndarray) -> tuple[np.ndarray, ...]:
 
 
 def _support_checkpoint_path(directory: Path) -> Path:
-    return Path(directory) / "support.npz"
+    return Path(directory) / "support_manifest.json"
+
+
+def _compact_support_group_directory(directory: Path) -> Path:
+    return Path(directory) / "compact_support_groups"
+
+
+def _compact_support_group_path(directory: Path, group: int) -> Path:
+    return _compact_support_group_directory(directory) / f"group-{group:06d}.npz"
 
 
 def _support_checkpoint_hash(arrays: dict[str, np.ndarray]) -> str:
@@ -698,75 +759,292 @@ def _support_checkpoint_hash(arrays: dict[str, np.ndarray]) -> str:
         digest.update(name.encode())
         digest.update(str(array.dtype).encode())
         digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
-        digest.update(array.tobytes())
+        digest.update(memoryview(array).cast("B"))
     return digest.hexdigest()
 
 
-def _derived_support(
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _support_base_arrays(
     *,
-    free_column: np.ndarray,
-    fixed_by_active: np.ndarray,
-    selected: np.ndarray,
-    group_od_indices: tuple[np.ndarray, ...],
-    group_measurements: tuple[np.ndarray, ...],
-    global_slots: np.ndarray,
-    global_slot_mask: np.ndarray,
-    group_level_candidate_entries: int,
-    origin_support_seconds: float,
-    patterns: tuple[SupportPattern, ...],
-    config: ShardedConstructionConfig,
-) -> _Support:
-    tasks = []
-    shard_od_indices = {}
-    shard_measurements = {}
-    identities = []
-    for pattern in patterns:
-        pattern_od = np.asarray(pattern.od_indices, dtype=np.int64)
-        pattern_measurements = np.asarray(pattern.measurements, dtype=np.int64)
-        for block, first in enumerate(
-            range(0, pattern_measurements.size, config.measurement_block_size)
-        ):
-            count = min(
-                config.measurement_block_size, pattern_measurements.size - first
-            )
-            identity = SparseShardIdentity(
-                group=pattern.group,
-                measurement_block=block,
-                first_measurement_position=first,
-                measurement_count=count,
-                support_pattern=pattern.pattern,
-            )
-            measurements = pattern_measurements[first : first + count]
-            identities.append(identity)
-            shard_od_indices[identity.key] = pattern_od
-            shard_measurements[identity.key] = measurements
-            tasks.append(
-                ConstructionTask(
-                    identity=identity,
-                    group=pattern.group,
-                    od_indices=pattern.od_indices,
-                    measurements=tuple(int(value) for value in measurements),
-                    estimated_nonzeros=int(pattern_od.size * measurements.size),
-                )
-            )
-    return _Support(
-        free_column=free_column,
-        fixed_by_active=fixed_by_active,
-        selected=selected,
-        group_od_indices=group_od_indices,
-        group_measurements=group_measurements,
-        global_slots=global_slots,
-        global_slot_mask=global_slot_mask,
-        shard_od_indices=shard_od_indices,
-        shard_measurements=shard_measurements,
-        expected_shards=tuple(identities),
-        group_level_candidate_entries=group_level_candidate_entries,
-        origin_support_seconds=origin_support_seconds,
-        support_patterns=len(patterns),
-        patterns=patterns,
-        construction_tasks=tuple(tasks),
-        storage_task_keys={},
+    inputs: AssignmentInputs,
+    spec,
+    compact_layout: CompactODAssignmentLayout,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    num_active = int(inputs.od_origin_node.shape[0])
+    free_column = np.full(num_active, -1, np.int64)
+    free_indices = np.asarray(compact_layout.free_compact_indices, dtype=np.int64)
+    free_column[free_indices] = np.arange(free_indices.size, dtype=np.int64)
+    fixed_by_active = np.zeros(num_active, dtype=np.dtype(inputs.base_link_cost.dtype))
+    fixed_by_active[
+        np.asarray(compact_layout.fixed_compact_indices, dtype=np.int64)
+    ] = np.asarray(
+        compact_layout.fixed_compact_values,
+        dtype=np.dtype(inputs.base_link_cost.dtype),
     )
+    selected = (free_column >= 0) | (fixed_by_active != 0.0)
+    global_slots, global_slot_mask = _mapping_slots(spec, inputs.graph.num_links)
+    return free_column, fixed_by_active, selected, global_slots, global_slot_mask
+
+
+def _compact_payload_arrays(
+    *,
+    patterns: dict[tuple[int, ...], list[int]],
+    group_measurements: np.ndarray,
+) -> dict[str, np.ndarray]:
+    ordered = sorted(patterns)
+    pattern_od = tuple(
+        np.asarray(sorted(set(patterns[pattern])), dtype=np.int64)
+        for pattern in ordered
+    )
+    pattern_rows = tuple(np.asarray(pattern, dtype=np.int64) for pattern in ordered)
+    flat_od, od_offsets = _ragged(pattern_od)
+    flat_rows, row_offsets = _ragged(pattern_rows)
+    return {
+        "group_measurements": np.asarray(group_measurements, dtype=np.int64),
+        "pattern_od": flat_od,
+        "pattern_od_offsets": od_offsets,
+        "pattern_rows": flat_rows,
+        "pattern_row_offsets": row_offsets,
+    }
+
+
+def _validate_compact_offsets(
+    flat: np.ndarray, offsets: np.ndarray, *, name: str, count: int
+) -> None:
+    if (
+        offsets.ndim != 1
+        or offsets.size != count + 1
+        or offsets.size == 0
+        or offsets[0] != 0
+        or offsets[-1] != flat.size
+        or np.any(offsets[1:] < offsets[:-1])
+    ):
+        raise ValueError(f"compact support {name} offsets are invalid.")
+
+
+def _read_compact_support_group(
+    path: Path,
+    *,
+    group: int,
+    provenance_hash: str,
+) -> _CompactSupportGroupPayload:
+    try:
+        with np.load(path, allow_pickle=False) as archive:
+            metadata = json.loads(str(archive["metadata"]))
+            arrays = {
+                name: np.asarray(archive[name])
+                for name in archive.files
+                if name != "metadata"
+            }
+    except (zipfile.BadZipFile, EOFError, ValueError) as error:
+        raise ValueError("compact support group archive is corrupt.") from error
+    if not isinstance(metadata, dict):
+        raise ValueError("compact support group metadata is invalid.")
+    if metadata.get("schema_version") != COMPACT_SUPPORT_GROUP_SCHEMA_VERSION:
+        raise ValueError("compact support group schema is incompatible.")
+    if metadata.get("provenance_hash") != provenance_hash:
+        raise ValueError("compact support group provenance is incompatible.")
+    if metadata.get("group") != group:
+        raise ValueError("compact support group identity is incompatible.")
+    if metadata.get("content_hash") != _support_checkpoint_hash(arrays):
+        raise ValueError("compact support group content hash is invalid.")
+    required = {
+        "group_measurements",
+        "pattern_od",
+        "pattern_od_offsets",
+        "pattern_rows",
+        "pattern_row_offsets",
+    }
+    if set(arrays) != required:
+        raise ValueError("compact support group arrays are incompatible.")
+    group_measurements = arrays["group_measurements"]
+    pattern_od = arrays["pattern_od"]
+    pattern_od_offsets = arrays["pattern_od_offsets"]
+    pattern_rows = arrays["pattern_rows"]
+    pattern_row_offsets = arrays["pattern_row_offsets"]
+    if any(
+        value.dtype.kind not in "iu" or value.ndim != 1 for value in arrays.values()
+    ):
+        raise ValueError(
+            "compact support group arrays must be one-dimensional integers."
+        )
+    if group_measurements.size and np.any(
+        group_measurements[1:] <= group_measurements[:-1]
+    ):
+        raise ValueError("compact support group measurements are not canonical.")
+    pattern_count = pattern_row_offsets.size - 1
+    if pattern_od_offsets.size != pattern_count + 1:
+        raise ValueError("compact support pattern index arrays are inconsistent.")
+    _validate_compact_offsets(
+        pattern_od, pattern_od_offsets, name="OD", count=pattern_count
+    )
+    _validate_compact_offsets(
+        pattern_rows, pattern_row_offsets, name="row", count=pattern_count
+    )
+    for index in range(pattern_count):
+        ods = pattern_od[pattern_od_offsets[index] : pattern_od_offsets[index + 1]]
+        rows = pattern_rows[pattern_row_offsets[index] : pattern_row_offsets[index + 1]]
+        if ods.size == 0 or rows.size == 0:
+            raise ValueError("compact support contains an empty pattern.")
+        if np.any(ods[1:] <= ods[:-1]) or np.any(rows[1:] <= rows[:-1]):
+            raise ValueError("compact support pattern is not canonical.")
+    if metadata.get("pattern_count") != pattern_count:
+        raise ValueError("compact support pattern count is inconsistent.")
+    if metadata.get("group_measurement_count") != group_measurements.size:
+        raise ValueError("compact support measurement count is inconsistent.")
+    return _CompactSupportGroupPayload(
+        group_measurements=group_measurements,
+        pattern_od=pattern_od,
+        pattern_od_offsets=pattern_od_offsets,
+        pattern_rows=pattern_rows,
+        pattern_row_offsets=pattern_row_offsets,
+    )
+
+
+def _save_compact_support_group(
+    *,
+    directory: Path,
+    group: int,
+    provenance_hash: str,
+    summary,
+    patterns: dict[tuple[int, ...], list[int]],
+    group_measurements: np.ndarray,
+) -> tuple[_CompactSupportGroupRecord, int, int]:
+    """Atomically publish one compact group, reusing a valid existing payload."""
+    destination = _compact_support_group_path(directory, group)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    arrays = _compact_payload_arrays(
+        patterns=patterns,
+        group_measurements=group_measurements,
+    )
+    existing_bytes = 0
+    if destination.exists():
+        existing_bytes = destination.stat().st_size
+        try:
+            payload = _read_compact_support_group(
+                destination, group=group, provenance_hash=provenance_hash
+            )
+            with np.load(destination, allow_pickle=False) as archive:
+                metadata = json.loads(str(archive["metadata"]))
+            if (
+                metadata.get("origin_specific_entries")
+                == summary.origin_specific_entries
+                and metadata.get("group_level_candidate_entries")
+                == summary.group_level_candidate_entries
+                and all(
+                    np.array_equal(payload_value, arrays[name])
+                    for name, payload_value in (
+                        ("group_measurements", payload.group_measurements),
+                        ("pattern_od", payload.pattern_od),
+                        ("pattern_od_offsets", payload.pattern_od_offsets),
+                        ("pattern_rows", payload.pattern_rows),
+                        ("pattern_row_offsets", payload.pattern_row_offsets),
+                    )
+                )
+            ):
+                size = destination.stat().st_size
+                record = _CompactSupportGroupRecord(
+                    group=group,
+                    filename=destination.name,
+                    sha256=_sha256_file(destination),
+                    payload_bytes=size,
+                    selected_od_cells=summary.selected_od_cells,
+                    group_measurement_count=payload.group_measurements.size,
+                    pattern_count=metadata["pattern_count"],
+                    origin_specific_entries=summary.origin_specific_entries,
+                    group_level_candidate_entries=summary.group_level_candidate_entries,
+                )
+                del payload
+                return record, existing_bytes, 0
+            del payload
+        except (KeyError, OSError, ValueError, json.JSONDecodeError):
+            pass
+        quarantine = destination.with_name(
+            f"{destination.name}.invalid-{uuid.uuid4().hex}"
+        )
+        os.replace(destination, quarantine)
+
+    pattern_count = int(arrays["pattern_row_offsets"].size - 1)
+    metadata = {
+        "schema_version": COMPACT_SUPPORT_GROUP_SCHEMA_VERSION,
+        "provenance_hash": provenance_hash,
+        "group": group,
+        "pattern_count": pattern_count,
+        "group_measurement_count": int(group_measurements.size),
+        "origin_specific_entries": int(summary.origin_specific_entries),
+        "group_level_candidate_entries": int(summary.group_level_candidate_entries),
+        "content_hash": _support_checkpoint_hash(arrays),
+    }
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    )
+    os.close(descriptor)
+    try:
+        with open(temporary, "wb") as stream:
+            np.savez(
+                stream,
+                metadata=np.asarray(json.dumps(metadata)),
+                **arrays,  # type: ignore[arg-type]
+            )
+            stream.flush()
+            os.fsync(stream.fileno())
+        with zipfile.ZipFile(temporary) as archive:
+            corrupt_member = archive.testzip()
+        if corrupt_member is not None:
+            raise OSError(
+                f"temporary compact support payload has a corrupt member: {corrupt_member}"
+            )
+        os.replace(temporary, destination)
+        directory_fd = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    size = destination.stat().st_size
+    record = _CompactSupportGroupRecord(
+        group=group,
+        filename=destination.name,
+        sha256=_sha256_file(destination),
+        payload_bytes=size,
+        selected_od_cells=summary.selected_od_cells,
+        group_measurement_count=int(group_measurements.size),
+        pattern_count=pattern_count,
+        origin_specific_entries=summary.origin_specific_entries,
+        group_level_candidate_entries=summary.group_level_candidate_entries,
+    )
+    return record, existing_bytes, size
+
+
+def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    os.close(descriptor)
+    try:
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def _save_support_checkpoint(
@@ -775,64 +1053,21 @@ def _save_support_checkpoint(
     *,
     provenance_hash: str,
 ) -> Path:
-    group_od, group_od_offsets = _ragged(support.group_od_indices)
-    group_rows, group_row_offsets = _ragged(support.group_measurements)
-    pattern_od, pattern_od_offsets = _ragged(
-        tuple(np.asarray(item.od_indices, dtype=np.int64) for item in support.patterns)
-    )
-    pattern_rows, pattern_row_offsets = _ragged(
-        tuple(
-            np.asarray(item.measurements, dtype=np.int64) for item in support.patterns
-        )
-    )
-    arrays = {
-        "free_column": np.asarray(support.free_column),
-        "fixed_by_active": np.asarray(support.fixed_by_active),
-        "selected": np.asarray(support.selected),
-        "group_od": group_od,
-        "group_od_offsets": group_od_offsets,
-        "group_rows": group_rows,
-        "group_row_offsets": group_row_offsets,
-        "global_slots": np.asarray(support.global_slots),
-        "global_slot_mask": np.asarray(support.global_slot_mask),
-        "pattern_group": np.asarray(
-            [item.group for item in support.patterns], np.int64
-        ),
-        "pattern_id": np.asarray([item.pattern for item in support.patterns], np.int64),
-        "pattern_od": pattern_od,
-        "pattern_od_offsets": pattern_od_offsets,
-        "pattern_rows": pattern_rows,
-        "pattern_row_offsets": pattern_row_offsets,
-    }
-    metadata = {
+    metadata: dict[str, object] = {
         "schema_version": SUPPORT_CHECKPOINT_SCHEMA_VERSION,
         "provenance_hash": provenance_hash,
-        "content_hash": _support_checkpoint_hash(arrays),
+        "payload_schema_version": COMPACT_SUPPORT_GROUP_SCHEMA_VERSION,
+        "complete": True,
+        "groups": [item.to_json() for item in support.group_records],
+        "group_count": len(support.group_records),
+        "support_patterns": support.support_patterns,
+        "origin_specific_entries": support.origin_specific_entries,
         "group_level_candidate_entries": support.group_level_candidate_entries,
         "origin_support_seconds": support.origin_support_seconds,
+        "compact_payload_bytes": support.compact_payload_bytes,
     }
     destination = _support_checkpoint_path(directory)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(
-        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
-    )
-    os.close(descriptor)
-    try:
-        with open(temporary, "wb") as stream:
-            np.savez(
-                stream,  # type: ignore[arg-type]
-                metadata=np.asarray(json.dumps(metadata)),
-                **arrays,  # type: ignore[arg-type]
-            )
-            stream.flush()
-            os.fsync(stream.fileno())
-        _load_support_checkpoint(
-            Path(temporary), provenance_hash=provenance_hash, config=None
-        )
-        os.replace(temporary, destination)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    _atomic_write_json(destination, metadata)
     return destination
 
 
@@ -840,51 +1075,106 @@ def _load_support_checkpoint(
     path: Path,
     *,
     provenance_hash: str,
-    config: ShardedConstructionConfig | None,
+    config: ShardedConstructionConfig,
+    inputs: AssignmentInputs,
+    spec,
+    compact_layout: CompactODAssignmentLayout,
 ) -> _Support:
-    with np.load(path, allow_pickle=False) as archive:
-        metadata = json.loads(str(archive["metadata"]))
-        arrays = {
-            name: np.asarray(archive[name])
-            for name in archive.files
-            if name != "metadata"
-        }
+    metadata = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(metadata, dict):
+        raise ValueError("support checkpoint metadata is invalid.")
     if metadata.get("schema_version") != SUPPORT_CHECKPOINT_SCHEMA_VERSION:
         raise ValueError("support checkpoint schema is incompatible.")
     if metadata.get("provenance_hash") != provenance_hash:
         raise ValueError("support checkpoint provenance is incompatible.")
-    if metadata.get("content_hash") != _support_checkpoint_hash(arrays):
-        raise ValueError("support checkpoint content hash is invalid.")
-    pattern_od = _unragged(arrays["pattern_od"], arrays["pattern_od_offsets"])
-    pattern_rows = _unragged(arrays["pattern_rows"], arrays["pattern_row_offsets"])
-    patterns = tuple(
-        SupportPattern(
-            group=int(group),
-            pattern=int(pattern),
-            od_indices=tuple(int(value) for value in od),
-            measurements=tuple(int(value) for value in rows),
-        )
-        for group, pattern, od, rows in zip(
-            arrays["pattern_group"],
-            arrays["pattern_id"],
-            pattern_od,
-            pattern_rows,
-            strict=True,
-        )
+    if metadata.get("complete") is not True:
+        raise ValueError("support checkpoint is incomplete.")
+    if metadata.get("payload_schema_version") != COMPACT_SUPPORT_GROUP_SCHEMA_VERSION:
+        raise ValueError("support payload schema is incompatible.")
+    raw_records = metadata.get("groups")
+    if not isinstance(raw_records, list):
+        raise ValueError("support checkpoint group index is invalid.")
+    records = tuple(
+        _CompactSupportGroupRecord.from_json(item)
+        for item in raw_records
+        if isinstance(item, dict)
     )
-    effective_config = ShardedConstructionConfig() if config is None else config
-    return _derived_support(
-        free_column=arrays["free_column"],
-        fixed_by_active=arrays["fixed_by_active"],
-        selected=arrays["selected"],
-        group_od_indices=_unragged(arrays["group_od"], arrays["group_od_offsets"]),
-        group_measurements=_unragged(arrays["group_rows"], arrays["group_row_offsets"]),
-        global_slots=arrays["global_slots"],
-        global_slot_mask=arrays["global_slot_mask"],
+    if len(records) != len(raw_records):
+        raise ValueError("support checkpoint group index is invalid.")
+    expected_groups = int(inputs.group_dest_node.shape[0])
+    if (
+        metadata.get("group_count") != expected_groups
+        or len(records) != expected_groups
+    ):
+        raise ValueError("support checkpoint group count is incompatible.")
+    if tuple(item.group for item in records) != tuple(range(expected_groups)):
+        raise ValueError("support checkpoint group order is incompatible.")
+    support_entries = int(metadata["origin_specific_entries"])
+    if support_entries > config.max_materialized_support_entries:
+        raise MemoryError(
+            f"origin-specific support has {support_entries} entries, exceeding "
+            "max_materialized_entries="
+            f"{config.max_materialized_support_entries}"
+        )
+    directory = Path(path).parent
+    payload_directory = _compact_support_group_directory(directory)
+    for record in records:
+        if Path(record.filename).name != record.filename:
+            raise ValueError("support checkpoint contains an unsafe payload path.")
+        payload_path = payload_directory / record.filename
+        if (
+            not payload_path.is_file()
+            or payload_path.stat().st_size != record.payload_bytes
+        ):
+            raise ValueError("compact support group payload is missing or truncated.")
+        if _sha256_file(payload_path) != record.sha256:
+            raise ValueError("compact support group payload checksum is invalid.")
+        payload = _read_compact_support_group(
+            payload_path, group=record.group, provenance_hash=provenance_hash
+        )
+        with np.load(payload_path, allow_pickle=False) as archive:
+            payload_metadata = json.loads(str(archive["metadata"]))
+        if not isinstance(payload_metadata, dict):
+            raise ValueError("compact support group metadata is invalid.")
+        if (
+            payload.pattern_row_offsets.size - 1 != record.pattern_count
+            or payload.group_measurements.size != record.group_measurement_count
+            or int(payload_metadata.get("origin_specific_entries", -1))
+            != record.origin_specific_entries
+            or int(payload_metadata.get("group_level_candidate_entries", -1))
+            != record.group_level_candidate_entries
+        ):
+            raise ValueError("compact support group manifest does not match payload.")
+        del payload
+    free_column, fixed_by_active, selected, global_slots, global_slot_mask = (
+        _support_base_arrays(inputs=inputs, spec=spec, compact_layout=compact_layout)
+    )
+    if sum(item.origin_specific_entries for item in records) != support_entries:
+        raise ValueError("support checkpoint entry count is inconsistent.")
+    if sum(item.group_level_candidate_entries for item in records) != int(
+        metadata["group_level_candidate_entries"]
+    ):
+        raise ValueError("support checkpoint candidate-entry count is inconsistent.")
+    if sum(item.pattern_count for item in records) != int(metadata["support_patterns"]):
+        raise ValueError("support checkpoint pattern count is inconsistent.")
+    if sum(item.payload_bytes for item in records) != int(
+        metadata["compact_payload_bytes"]
+    ):
+        raise ValueError("support checkpoint payload-size count is inconsistent.")
+    return _Support(
+        free_column=free_column,
+        fixed_by_active=fixed_by_active,
+        selected=selected,
+        global_slots=global_slots,
+        global_slot_mask=global_slot_mask,
+        directory=directory,
+        provenance_hash=provenance_hash,
+        group_records=records,
         group_level_candidate_entries=int(metadata["group_level_candidate_entries"]),
         origin_support_seconds=float(metadata["origin_support_seconds"]),
-        patterns=patterns,
-        config=effective_config,
+        support_patterns=int(metadata["support_patterns"]),
+        origin_specific_entries=support_entries,
+        compact_payload_bytes=int(metadata["compact_payload_bytes"]),
     )
 
 
@@ -944,6 +1234,220 @@ def _compact_group_patterns(
     return patterns
 
 
+def _support_group_path(support: _Support, record: _CompactSupportGroupRecord) -> Path:
+    return _compact_support_group_directory(support.directory) / record.filename
+
+
+def _load_support_group(support: _Support, group: int) -> _CompactSupportGroupPayload:
+    record = support.group_records[group]
+    path = _support_group_path(support, record)
+    if path.stat().st_size != record.payload_bytes:
+        raise ValueError(f"compact support payload for group-{group:06d} is invalid.")
+    return _read_compact_support_group(
+        path, group=group, provenance_hash=support.provenance_hash
+    )
+
+
+def _tasks_for_group_payload(
+    payload: _CompactSupportGroupPayload,
+    *,
+    group: int,
+    measurement_block_size: int,
+):
+    """Yield canonical group/block/pattern tasks from one loaded group."""
+    pattern_count = int(payload.pattern_row_offsets.size - 1)
+    # Measurement rows are encoded in the pattern tuple itself.  Row values
+    # need not be contiguous, so derive block count from each pattern length.
+    block_count = max(
+        (
+            math.ceil(
+                (
+                    payload.pattern_row_offsets[index + 1]
+                    - payload.pattern_row_offsets[index]
+                )
+                / measurement_block_size
+            )
+            for index in range(pattern_count)
+        ),
+        default=0,
+    )
+    for block in range(block_count):
+        first = block * measurement_block_size
+        for pattern in range(pattern_count):
+            od_first = int(payload.pattern_od_offsets[pattern])
+            od_stop = int(payload.pattern_od_offsets[pattern + 1])
+            row_first = int(payload.pattern_row_offsets[pattern])
+            row_stop = int(payload.pattern_row_offsets[pattern + 1])
+            count = min(measurement_block_size, row_stop - row_first - first)
+            if count <= 0:
+                continue
+            identity = SparseShardIdentity(
+                group=group,
+                measurement_block=block,
+                first_measurement_position=first,
+                measurement_count=count,
+                support_pattern=pattern,
+            )
+            od_indices = tuple(
+                int(value) for value in payload.pattern_od[od_first:od_stop]
+            )
+            measurements = tuple(
+                int(value)
+                for value in payload.pattern_rows[
+                    row_first + first : row_first + first + count
+                ]
+            )
+            yield ConstructionTask(
+                identity=identity,
+                group=group,
+                od_indices=od_indices,
+                measurements=measurements,
+                estimated_nonzeros=len(od_indices) * len(measurements),
+            )
+
+
+def _stream_pack_storage_shards(
+    support: _Support,
+    *,
+    config: ShardedConstructionConfig,
+    itemsize: int,
+) -> tuple[StorageShardPlan, ...]:
+    """Pack tasks while retaining at most one support group plus one shard."""
+    packed: list[StorageShardPlan] = []
+    current_keys: list[str] = []
+    current_rows: set[int] = set()
+    current_estimate = 0
+    current_group: int | None = None
+
+    def flush() -> None:
+        nonlocal current_keys, current_rows, current_estimate, current_group
+        if not current_keys:
+            return
+        if current_group is None:
+            raise AssertionError("non-empty storage task buffer has no group.")
+        identity = SparseShardIdentity(
+            group=int(current_group),
+            measurement_block=0,
+            first_measurement_position=min(current_rows, default=0),
+            measurement_count=len(current_rows),
+            support_pattern=0,
+            storage_shard=len(packed),
+        )
+        estimated_bytes = int(
+            current_estimate * (itemsize + 16) + (len(current_rows) + 1) * 8
+        )
+        packed.append(
+            StorageShardPlan(
+                identity=identity,
+                task_keys=tuple(current_keys),
+                estimated_nonzeros=current_estimate,
+                estimated_uncompressed_bytes=estimated_bytes,
+            )
+        )
+        current_keys = []
+        current_rows = set()
+        current_estimate = 0
+        current_group = None
+
+    for record in support.group_records:
+        payload = _load_support_group(support, record.group)
+        for task in _tasks_for_group_payload(
+            payload,
+            group=record.group,
+            measurement_block_size=config.measurement_block_size,
+        ):
+            exceeds_hard = (
+                current_keys
+                and current_estimate + task.estimated_nonzeros
+                > config.maximum_nonzeros_per_storage_shard
+            )
+            reached_target = (
+                current_keys
+                and current_estimate >= config.target_nonzeros_per_storage_shard
+            )
+            too_many_patterns = (
+                len(current_keys) >= config.maximum_patterns_per_storage_shard
+            )
+            if exceeds_hard or reached_target or too_many_patterns:
+                flush()
+            if current_group is None:
+                current_group = task.group
+            current_keys.append(task.identity.key)
+            current_rows.update(task.measurements)
+            current_estimate += task.estimated_nonzeros
+        del payload
+    flush()
+    return tuple(packed)
+
+
+def _tasks_for_storage_shard(
+    support: _Support,
+    storage_shard: StorageShardPlan,
+    *,
+    measurement_block_size: int,
+) -> tuple[ConstructionTask, ...]:
+    """Reconstruct one storage shard's tasks, releasing each group payload."""
+    parsed: dict[int, list[tuple[int, int, int, int, int, str]]] = {}
+    for key in storage_shard.task_keys:
+        match = re.fullmatch(
+            r"group-(\d+)-pattern-(\d+)-block-(\d+)-rows-(\d+)-(\d+)", key
+        )
+        if match is None:
+            raise ValueError(f"stored support task key is malformed: {key!r}")
+        group, pattern, block, first, count = (int(value) for value in match.groups())
+        parsed.setdefault(group, []).append((block, pattern, first, count, group, key))
+    tasks: list[ConstructionTask] = []
+    for group, entries in sorted(parsed.items()):
+        payload = _load_support_group(support, group)
+        for block, pattern, first, count, _, key in entries:
+            if pattern >= payload.pattern_row_offsets.size - 1:
+                raise ValueError("stored support task references an unknown pattern.")
+            row_first = int(payload.pattern_row_offsets[pattern])
+            row_stop = int(payload.pattern_row_offsets[pattern + 1])
+            od_first = int(payload.pattern_od_offsets[pattern])
+            od_stop = int(payload.pattern_od_offsets[pattern + 1])
+            if first + count > row_stop - row_first:
+                raise ValueError("stored support task references an invalid row block.")
+            measurements = tuple(
+                int(value)
+                for value in payload.pattern_rows[
+                    row_first + first : row_first + first + count
+                ]
+            )
+            od_indices = tuple(
+                int(value) for value in payload.pattern_od[od_first:od_stop]
+            )
+            identity = SparseShardIdentity(
+                group=group,
+                measurement_block=block,
+                first_measurement_position=first,
+                measurement_count=count,
+                support_pattern=pattern,
+            )
+            if identity.key != key:
+                raise ValueError("stored support task identity is inconsistent.")
+            tasks.append(
+                ConstructionTask(
+                    identity=identity,
+                    group=group,
+                    od_indices=od_indices,
+                    measurements=measurements,
+                    estimated_nonzeros=len(od_indices) * len(measurements),
+                )
+            )
+        del payload
+    return tuple(tasks)
+
+
+def _supported_measurement_rows(support: _Support) -> np.ndarray:
+    rows: set[int] = set()
+    for record in support.group_records:
+        payload = _load_support_group(support, record.group)
+        rows.update(int(value) for value in payload.group_measurements)
+        del payload
+    return np.asarray(sorted(rows), dtype=np.int64)
+
+
 def _discover_support(
     *,
     inputs: AssignmentInputs,
@@ -957,33 +1461,27 @@ def _discover_support(
     reporter: ConstructionProgressReporter | None = None,
     timing_callback: GroupSupportTimingCallback | None = None,
 ) -> _Support:
-    num_active = int(inputs.od_origin_node.shape[0])
-    free_column = np.full(num_active, -1, np.int64)
-    free_indices = np.asarray(compact_layout.free_compact_indices, dtype=np.int64)
-    free_column[free_indices] = np.arange(free_indices.size, dtype=np.int64)
-    fixed_by_active = np.zeros(num_active, dtype=np.dtype(inputs.base_link_cost.dtype))
-    fixed_by_active[
-        np.asarray(compact_layout.fixed_compact_indices, dtype=np.int64)
-    ] = np.asarray(
-        compact_layout.fixed_compact_values,
-        dtype=np.dtype(inputs.base_link_cost.dtype),
+    free_column, fixed_by_active, selected, global_slots, global_slot_mask = (
+        _support_base_arrays(inputs=inputs, spec=spec, compact_layout=compact_layout)
     )
-    selected = (free_column >= 0) | (fixed_by_active != 0.0)
-    global_slots, global_slot_mask = _mapping_slots(spec, inputs.graph.num_links)
-    routing_reader = _RoutingBatchReader(routing)
-    group_indices = np.asarray(inputs.group_od_index_padded)
-    group_masks = np.asarray(inputs.group_od_mask)
     num_groups = int(inputs.group_dest_node.shape[0])
-    od_groups_by_group: list[np.ndarray | None] = [None] * num_groups
-    measurements_by_group: list[np.ndarray | None] = [None] * num_groups
-    patterns_by_group: list[dict[tuple[int, ...], list[int]] | None] = [
-        None
-    ] * num_groups
-    positive_fixed = np.asarray(
-        compact_layout.fixed_compact_indices, dtype=np.int64
-    )[
+    if checkpoint_directory is None:
+        temporary_directory = tempfile.TemporaryDirectory(
+            prefix="public-transportation-support-"
+        )
+        payload_directory = Path(temporary_directory.name)
+    else:
+        temporary_directory = None
+        payload_directory = Path(checkpoint_directory)
+    payload_directory.mkdir(parents=True, exist_ok=True)
+    records: list[_CompactSupportGroupRecord] = []
+    cumulative_entries = payload_bytes_written = payload_bytes_read = 0
+    compact_payload_bytes_total = 0
+    free_indices = np.asarray(compact_layout.free_compact_indices, dtype=np.int64)
+    positive_fixed = np.asarray(compact_layout.fixed_compact_indices, dtype=np.int64)[
         np.asarray(compact_layout.fixed_compact_values) > 0.0
     ]
+
     def consume_compact_group(
         group: int,
         active_indices: np.ndarray,
@@ -994,11 +1492,35 @@ def _discover_support(
         group_fixed_rows: np.ndarray,
         group_fixed_columns: np.ndarray,
     ) -> None:
-        od_groups_by_group[group] = np.asarray(active_indices, dtype=np.int64)
-        measurements_by_group[group] = np.asarray(
-            group_measurements, dtype=np.int64
-        )
-        patterns_by_group[group] = _compact_group_patterns(
+        nonlocal cumulative_entries, payload_bytes_read, payload_bytes_written
+        nonlocal compact_payload_bytes_total
+        observed_entries = cumulative_entries + int(summary.origin_specific_entries)
+        if observed_entries > config.max_materialized_support_entries:
+            if reporter is not None:
+                reporter.emit(
+                    phase=ConstructionPhase.SUPPORT_DISCOVERY,
+                    status="failed",
+                    force=True,
+                    completed_units=group,
+                    total_units=num_groups,
+                    current_unit=f"group-{group:06d}",
+                    checkpoint_location=str(payload_directory),
+                    details={
+                        "support_entries_accumulated": observed_entries,
+                        "max_materialized_support_entries": config.max_materialized_support_entries,
+                        "last_completed_group": group - 1,
+                        "raw_group_checkpoint": f"group-{group:06d}",
+                        "next_resume_group": group,
+                        "support_payload_bytes_written": payload_bytes_written,
+                        "support_payload_bytes_read": payload_bytes_read,
+                    },
+                )
+            raise MemoryError(
+                f"origin-specific support has {observed_entries} entries, exceeding "
+                "max_materialized_entries="
+                f"{config.max_materialized_support_entries}"
+            )
+        patterns = _compact_group_patterns(
             active_indices=active_indices,
             free_rows=group_free_rows,
             free_columns=group_free_columns,
@@ -1007,6 +1529,39 @@ def _discover_support(
             free_indices=free_indices,
             positive_fixed_indices=positive_fixed,
         )
+        record, bytes_read, bytes_written = _save_compact_support_group(
+            directory=payload_directory,
+            group=group,
+            provenance_hash=str(checkpoint_provenance_hash),
+            summary=summary,
+            patterns=patterns,
+            group_measurements=np.asarray(group_measurements, dtype=np.int64),
+        )
+        records.append(record)
+        cumulative_entries = observed_entries
+        payload_bytes_read += bytes_read
+        payload_bytes_written += bytes_written
+        compact_payload_bytes_total += record.payload_bytes
+        del patterns
+        if reporter is not None:
+            reporter.emit(
+                phase=ConstructionPhase.SUPPORT_DISCOVERY,
+                status="running",
+                force=True,
+                completed_units=group + 1,
+                total_units=num_groups,
+                current_unit=f"group-{group:06d}",
+                checkpoint_location=str(payload_directory),
+                details={
+                    "support_entries_accumulated": cumulative_entries,
+                    "max_materialized_support_entries": config.max_materialized_support_entries,
+                    "support_payload_bytes_written": payload_bytes_written,
+                    "support_payload_bytes_read": payload_bytes_read,
+                    "support_payload_bytes_total": compact_payload_bytes_total,
+                    "next_resume_group": group + 1,
+                    "support_worker_limit": config.support_workers,
+                },
+            )
 
     analyzed = analyze_fixed_routing_origin_support(
         inputs=inputs,
@@ -1018,96 +1573,34 @@ def _discover_support(
             worker_memory_budget_bytes=config.worker_memory_budget_bytes,
             materialize=config.support_discovery_mode == "reference",
             max_materialized_entries=config.max_materialized_support_entries,
-            workers=int(config.support_workers),
+            workers=int(config.support_workers or config.workers),
         ),
         checkpoint_directory=checkpoint_directory,
         checkpoint_provenance_hash=checkpoint_provenance_hash,
         deadline=deadline,
         reporter=reporter,
         timing_callback=timing_callback,
-        group_callback=(
-            None
-            if config.support_discovery_mode == "reference"
-            else consume_compact_group
-        ),
+        group_callback=consume_compact_group,
     )
-    if (
-        config.support_discovery_mode == "compact"
-        and analyzed.metrics.origin_specific_entries
-        > config.max_materialized_support_entries
-    ):
-        raise MemoryError(
-            f"origin-specific support has {analyzed.metrics.origin_specific_entries} "
-            "entries, exceeding max_materialized_entries="
-            f"{config.max_materialized_support_entries}"
-        )
-    if config.support_discovery_mode == "reference":
-        assert analyzed.free_support is not None
-        assert analyzed.positive_fixed_support is not None
-        free_support = analyzed.free_support.tocsc()
-        fixed_support = analyzed.positive_fixed_support.tocsc()
-        support_by_active: dict[int, tuple[int, ...]] = {}
-        for column, active_index in enumerate(free_indices):
-            support_by_active[int(active_index)] = tuple(
-                int(value)
-                for value in free_support.indices[
-                    free_support.indptr[column] : free_support.indptr[column + 1]
-                ]
-            )
-        for column, active_index in enumerate(positive_fixed):
-            support_by_active[int(active_index)] = tuple(
-                int(value)
-                for value in fixed_support.indices[
-                    fixed_support.indptr[column] : fixed_support.indptr[column + 1]
-                ]
-            )
-        for group in range(num_groups):
-            relevant = group_indices[group][group_masks[group]]
-            relevant = relevant[selected[relevant]].astype(np.int64, copy=False)
-            od_groups_by_group[group] = relevant
-            _, group_effective = routing_reader.host(group)
-            mapped = global_slot_mask & group_effective[:, None]
-            measurements_by_group[group] = np.unique(global_slots[mapped]).astype(
-                np.int64, copy=False
-            )
-            patterns: dict[tuple[int, ...], list[int]] = {}
-            for active_index in relevant:
-                pattern = support_by_active[int(active_index)]
-                if pattern:
-                    patterns.setdefault(pattern, []).append(int(active_index))
-            patterns_by_group[group] = patterns
-    od_groups = tuple(
-        value if value is not None else np.empty(0, dtype=np.int64)
-        for value in od_groups_by_group
-    )
-    measurements = tuple(
-        value if value is not None else np.empty(0, dtype=np.int64)
-        for value in measurements_by_group
-    )
-    discovered_patterns: list[SupportPattern] = []
-    for group, patterns in enumerate(patterns_by_group):
-        assert patterns is not None
-        for pattern_id, pattern in enumerate(sorted(patterns)):
-            discovered_patterns.append(
-                SupportPattern(
-                    group=group,
-                    pattern=pattern_id,
-                    od_indices=tuple(int(value) for value in patterns[pattern]),
-                    measurements=tuple(int(value) for value in pattern),
-                )
-            )
-    return _derived_support(
+    if analyzed.metrics.origin_specific_entries != cumulative_entries:
+        raise ValueError("incremental and analyzed support-entry counts differ.")
+    if len(records) != num_groups:
+        raise ValueError("compact support discovery did not persist every group.")
+    return _Support(
         free_column=free_column,
         fixed_by_active=fixed_by_active,
         selected=selected,
-        group_od_indices=od_groups,
-        group_measurements=measurements,
         global_slots=global_slots,
         global_slot_mask=global_slot_mask,
-        group_level_candidate_entries=(analyzed.metrics.group_level_candidate_entries),
+        directory=payload_directory,
+        provenance_hash=str(checkpoint_provenance_hash),
+        group_records=tuple(records),
+        group_level_candidate_entries=analyzed.metrics.group_level_candidate_entries,
         origin_support_seconds=analyzed.metrics.support_discovery_seconds,
-        patterns=tuple(discovered_patterns),
-        config=config,
+        support_patterns=sum(item.pattern_count for item in records),
+        origin_specific_entries=cumulative_entries,
+        compact_payload_bytes=sum(item.payload_bytes for item in records),
+        temporary_directory=temporary_directory,
     )
 
 
@@ -1174,63 +1667,67 @@ def pack_storage_shards(
     return tuple(packed)
 
 
-def _build_construction_metadata(
+def _build_storage_shard_metadata(
     *,
     support: _Support,
-    storage_shards: tuple[StorageShardPlan, ...],
+    storage_shard: StorageShardPlan,
+    config: ShardedConstructionConfig,
     routing: FixedRoutingSource,
     spec,
-) -> dict[str, tuple[_GroupConstructionMetadata, ...]]:
-    """Derive group unions and mapped edges once for each storage shard."""
-    task_by_key = {task.identity.key: task for task in support.construction_tasks}
+    tasks: tuple[ConstructionTask, ...] | None = None,
+) -> tuple[_GroupConstructionMetadata, ...]:
+    """Derive group unions and mapped edges for one bounded storage shard."""
+    shard_tasks = (
+        _tasks_for_storage_shard(
+            support,
+            storage_shard,
+            measurement_block_size=config.measurement_block_size,
+        )
+        if tasks is None
+        else tasks
+    )
     mapping_links = np.asarray(spec.link_index, dtype=np.int64)
     mapping_measurements = np.asarray(spec.measurement_index, dtype=np.int64)
     routing_reader = _RoutingBatchReader(routing)
-    metadata: dict[str, tuple[_GroupConstructionMetadata, ...]] = {}
-    for storage_shard in storage_shards:
-        tasks_by_group: dict[int, list[ConstructionTask]] = {}
-        for key in storage_shard.task_keys:
-            task = task_by_key[key]
-            tasks_by_group.setdefault(task.group, []).append(task)
-        groups: list[_GroupConstructionMetadata] = []
-        for group, grouped_tasks in sorted(tasks_by_group.items()):
-            batch_measurements = np.asarray(
-                sorted({row for task in grouped_tasks for row in task.measurements}),
-                dtype=np.int64,
+    tasks_by_group: dict[int, list[ConstructionTask]] = {}
+    for task in shard_tasks:
+        tasks_by_group.setdefault(task.group, []).append(task)
+    groups: list[_GroupConstructionMetadata] = []
+    for group, grouped_tasks in sorted(tasks_by_group.items()):
+        batch_measurements = np.asarray(
+            sorted({row for task in grouped_tasks for row in task.measurements}),
+            dtype=np.int64,
+        )
+        batch_lookup = np.full(spec.num_measurements, -1, dtype=np.int32)
+        batch_lookup[batch_measurements] = np.arange(
+            batch_measurements.size, dtype=np.int32
+        )
+        _, group_effective = routing_reader.host(group)
+        mapped_local_rows = batch_lookup[mapping_measurements]
+        selected_mapping = group_effective[mapping_links] & (mapped_local_rows >= 0)
+        selected_links = np.asarray(mapping_links[selected_mapping], dtype=np.int64)
+        selected_local_rows = np.asarray(
+            mapped_local_rows[selected_mapping], dtype=np.int64
+        )
+        od_support: dict[int, set[int]] = {}
+        for task in grouped_tasks:
+            for active_index in task.od_indices:
+                od_support.setdefault(active_index, set()).update(task.measurements)
+        od_indices = np.asarray(sorted(od_support), dtype=np.int64)
+        groups.append(
+            _GroupConstructionMetadata(
+                group=group,
+                batch_measurements=batch_measurements,
+                selected_links=selected_links,
+                selected_local_rows=selected_local_rows,
+                od_indices=od_indices,
+                od_support={
+                    int(index): tuple(sorted(rows))
+                    for index, rows in sorted(od_support.items())
+                },
             )
-            batch_lookup = np.full(spec.num_measurements, -1, dtype=np.int32)
-            batch_lookup[batch_measurements] = np.arange(
-                batch_measurements.size, dtype=np.int32
-            )
-            _, group_effective = routing_reader.host(group)
-            mapped_local_rows = batch_lookup[mapping_measurements]
-            selected_mapping = group_effective[mapping_links] & (
-                mapped_local_rows >= 0
-            )
-            selected_links = np.asarray(mapping_links[selected_mapping], dtype=np.int64)
-            selected_local_rows = np.asarray(
-                mapped_local_rows[selected_mapping], dtype=np.int64
-            )
-            od_support: dict[int, set[int]] = {}
-            for task in grouped_tasks:
-                for active_index in task.od_indices:
-                    od_support.setdefault(active_index, set()).update(task.measurements)
-            od_indices = np.asarray(sorted(od_support), dtype=np.int64)
-            groups.append(
-                _GroupConstructionMetadata(
-                    group=group,
-                    batch_measurements=batch_measurements,
-                    selected_links=selected_links,
-                    selected_local_rows=selected_local_rows,
-                    od_indices=od_indices,
-                    od_support={
-                        int(index): tuple(sorted(rows))
-                        for index, rows in sorted(od_support.items())
-                    },
-                )
-            )
-        metadata[storage_shard.identity.key] = tuple(groups)
-    return metadata
+        )
+    return tuple(groups)
 
 
 def plan_sharded_fixed_routing_operator(
@@ -1263,52 +1760,39 @@ def plan_sharded_fixed_routing_operator(
         if discovered_support is None
         else discovered_support
     )
-    task_identities = support.expected_shards
-    candidates = sum(
-        int(
-            support.shard_od_indices[identity.key].size
-            * support.shard_measurements[identity.key].size
-        )
-        for identity in task_identities
+    storage_shards = _stream_pack_storage_shards(
+        support,
+        config=config,
+        itemsize=np.dtype(inputs.base_link_cost.dtype).itemsize,
     )
+    candidates = 0
+    task_count = 0
+    maximum_support_edges = 0
     mapping_links = np.asarray(spec.link_index, dtype=np.int64)
     mapping_measurements = np.asarray(spec.measurement_index, dtype=np.int64)
     routing_reader = _RoutingBatchReader(routing)
-
-    def support_edge_count(identity: SparseShardIdentity) -> int:
-        _, group_effective = routing_reader.host(identity.group)
-        return int(
-            np.count_nonzero(
-                group_effective[mapping_links]
-                & np.isin(
-                    mapping_measurements,
-                    support.shard_measurements[identity.key],
-                )
+    for record in support.group_records:
+        payload = _load_support_group(support, record.group)
+        for task in _tasks_for_group_payload(
+            payload,
+            group=record.group,
+            measurement_block_size=config.measurement_block_size,
+        ):
+            task_count += 1
+            candidates += task.estimated_nonzeros
+            _, group_effective = routing_reader.host(task.group)
+            maximum_support_edges = max(
+                maximum_support_edges,
+                int(
+                    np.count_nonzero(
+                        group_effective[mapping_links]
+                        & np.isin(mapping_measurements, task.measurements)
+                    )
+                ),
             )
-        )
-
-    maximum_support_edges = max(
-        (support_edge_count(identity) for identity in task_identities),
-        default=0,
-    )
+        del payload
     itemsize = np.dtype(inputs.base_link_cost.dtype).itemsize
-    storage_shards = pack_storage_shards(
-        support.construction_tasks,
-        config=config,
-        itemsize=itemsize,
-    )
     identities = tuple(shard.identity for shard in storage_shards)
-    storage_task_keys = {
-        shard.identity.key: shard.task_keys for shard in storage_shards
-    }
-    support = replace(support, storage_task_keys=storage_task_keys)
-    construction_metadata = _build_construction_metadata(
-        support=support,
-        storage_shards=storage_shards,
-        routing=routing,
-        spec=spec,
-    )
-    support = replace(support, construction_metadata=construction_metadata)
     # Forward reachability stores OD-chunk×node state and returns only one
     # bounded block of structurally supported mapping edges.
     estimated_kernel_bytes = int(
@@ -1337,16 +1821,21 @@ def plan_sharded_fixed_routing_operator(
     estimated_edge_gather_evaluations = 0
     maximum_batch_rows = 0
     for storage_shard in storage_shards:
-        for group_metadata in construction_metadata[storage_shard.identity.key]:
+        shard_metadata = _build_storage_shard_metadata(
+            support=support,
+            storage_shard=storage_shard,
+            config=config,
+            routing=routing,
+            spec=spec,
+        )
+        for group_metadata in shard_metadata:
             estimated_batches += 1
             maximum_batch_rows = max(
                 maximum_batch_rows, group_metadata.batch_measurements.size
             )
             chunk_count = max(
                 1,
-                math.ceil(
-                    group_metadata.od_indices.size / config.od_chunk_size
-                ),
+                math.ceil(group_metadata.od_indices.size / config.od_chunk_size),
             )
             selected_edges = group_metadata.selected_links.size
             edge_block_count = max(
@@ -1354,6 +1843,7 @@ def plan_sharded_fixed_routing_operator(
             )
             estimated_reachability_evaluations += chunk_count
             estimated_edge_gather_evaluations += chunk_count * edge_block_count
+        del shard_metadata
     estimated_dispatches = (
         estimated_reachability_evaluations + estimated_edge_gather_evaluations
     )
@@ -1372,15 +1862,19 @@ def plan_sharded_fixed_routing_operator(
         num_measurements=int(spec.num_measurements),
         num_free_od=compact_layout.num_free,
         num_active_od=compact_layout.num_active,
-        num_groups=len(support.group_measurements),
+        num_groups=len(support.group_records),
         num_shards=len(identities),
         candidate_entries=candidates,
         maximum_group_measurements=max(
-            (value.size for value in support.group_measurements), default=0
+            (value.group_measurement_count for value in support.group_records),
+            default=0,
         ),
         maximum_shard_measurements=min(
             config.measurement_block_size,
-            max((value.size for value in support.group_measurements), default=0),
+            max(
+                (value.group_measurement_count for value in support.group_records),
+                default=0,
+            ),
         ),
         estimated_kernel_bytes=estimated_kernel_bytes,
         worker_memory_budget_bytes=config.worker_memory_budget_bytes,
@@ -1391,7 +1885,7 @@ def plan_sharded_fixed_routing_operator(
         group_level_candidate_entries=support.group_level_candidate_entries,
         origin_support_seconds=support.origin_support_seconds,
         maximum_support_edges=maximum_support_edges,
-        construction_tasks=len(task_identities),
+        construction_tasks=task_count,
         storage_shards=storage_shards,
         estimated_nonzeros_per_storage_shard=tuple(int(value) for value in payloads),
         estimated_payload_min=int(payloads.min()) if payloads.size else 0,
@@ -1494,16 +1988,10 @@ def _restore_plan_from_manifest(
     itemsize: int,
 ) -> tuple[ShardedConstructionPlan, _Support]:
     plan = _plan_from_manifest(manifest)
-    storage = pack_storage_shards(
-        support.construction_tasks, config=config, itemsize=itemsize
-    )
+    storage = _stream_pack_storage_shards(support, config=config, itemsize=itemsize)
     identities = tuple(item.identity for item in storage)
     if identities != manifest.expected_shards:
         raise ValueError("persisted plan and reconstructed support are incompatible.")
-    support = replace(
-        support,
-        storage_task_keys={item.identity.key: item.task_keys for item in storage},
-    )
     restored = replace(plan, storage_shards=storage)
     return _evaluate_operational_preflight(restored, config), support
 
@@ -1683,8 +2171,9 @@ def _construct_measurement_shard(
     inputs: AssignmentInputs,
     routing: FixedRoutingSource,
     plan: ShardedConstructionPlan,
+    storage_shard: StorageShardPlan,
     support: _Support,
-    tasks_by_key: dict[str, ConstructionTask],
+    spec,
     origins: np.ndarray,
     mapping_links: np.ndarray,
     mapping_measurements: np.ndarray,
@@ -1698,7 +2187,11 @@ def _construct_measurement_shard(
     """Construct and stage one measurement shard without shared mutable state."""
     started = perf_counter()
     routing_reader = _RoutingBatchReader(routing)
-    shard_tasks = [tasks_by_key[key] for key in support.storage_task_keys[identity.key]]
+    shard_tasks = _tasks_for_storage_shard(
+        support,
+        storage_shard,
+        measurement_block_size=config.measurement_block_size,
+    )
     measurements = np.asarray(
         sorted({row for task in shard_tasks for row in task.measurements}),
         dtype=np.int64,
@@ -1727,7 +2220,14 @@ def _construct_measurement_shard(
     construction_start = perf_counter()
     metadata_by_group = {
         item.group: item
-        for item in support.construction_metadata.get(identity.key, ())
+        for item in _build_storage_shard_metadata(
+            support=support,
+            storage_shard=storage_shard,
+            config=config,
+            routing=routing,
+            spec=spec,
+            tasks=shard_tasks,
+        )
     }
     if not metadata_by_group:
         raise ValueError("construction metadata is missing for measurement shard")
@@ -2060,15 +2560,12 @@ def prepare_sharded_fixed_routing_measurement_operator(
                     valid = False
                     break
                 aggregate_nonzeros += loaded.metadata.nonzero_entries
-                local_nonzero_rows = np.flatnonzero(
-                    np.diff(loaded.matrix.indptr) > 0
-                )
+                local_nonzero_rows = np.flatnonzero(np.diff(loaded.matrix.indptr) > 0)
                 realized_supported_rows.update(
                     int(row) for row in loaded.row_indices[local_nonzero_rows]
                 )
                 realized_supported_rows.update(
-                    int(row)
-                    for row in loaded.row_indices[loaded.fixed_offset_indices]
+                    int(row) for row in loaded.row_indices[loaded.fixed_offset_indices]
                 )
             if valid and aggregate_nonzeros == existing.aggregate_nonzeros:
                 if positive_boarding_preflight is not None:
@@ -2163,9 +2660,19 @@ def prepare_sharded_fixed_routing_measurement_operator(
         json.dumps(support_provenance, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     directory.mkdir(parents=True, exist_ok=True)
-    for abandoned in directory.glob(".support.npz.*.tmp"):
+    for abandoned in directory.glob(".support_manifest.json.*.tmp"):
         abandoned.unlink(missing_ok=True)
+    compact_payload_directory = _compact_support_group_directory(directory)
+    if compact_payload_directory.exists():
+        for abandoned in compact_payload_directory.glob(".*.tmp"):
+            abandoned.unlink(missing_ok=True)
     support_checkpoint = _support_checkpoint_path(directory)
+    legacy_support_checkpoint = directory / "support.npz"
+    if legacy_support_checkpoint.exists():
+        quarantine = legacy_support_checkpoint.with_name(
+            f"{legacy_support_checkpoint.name}.incompatible-{uuid.uuid4().hex}"
+        )
+        os.replace(legacy_support_checkpoint, quarantine)
     support = None
     support_reused = False
     if support_checkpoint.exists():
@@ -2174,6 +2681,9 @@ def prepare_sharded_fixed_routing_measurement_operator(
                 support_checkpoint,
                 provenance_hash=support_provenance_hash,
                 config=config,
+                inputs=inputs,
+                spec=spec,
+                compact_layout=compact_layout,
             )
         except (KeyError, OSError, ValueError, json.JSONDecodeError):
             quarantine = support_checkpoint.with_name(
@@ -2220,18 +2730,19 @@ def prepare_sharded_fixed_routing_measurement_operator(
         checkpoint_location=str(directory),
         cache_hits=int(support_reused),
         cache_misses=int(not support_reused),
+        details={
+            "completed_groups": len(support.group_records),
+            "support_entries_accumulated": support.origin_specific_entries,
+            "max_materialized_support_entries": (
+                config.max_materialized_support_entries
+            ),
+            "support_payload_bytes_total": support.compact_payload_bytes,
+            "support_payloads_reused": support_reused,
+            "support_manifest_schema_version": SUPPORT_CHECKPOINT_SCHEMA_VERSION,
+        },
     )
     if positive_boarding_preflight is not None:
-        supported_rows = np.asarray(
-            sorted(
-                {
-                    row
-                    for pattern in support.patterns
-                    for row in pattern.measurements
-                }
-            ),
-            dtype=np.int64,
-        )
+        supported_rows = _supported_measurement_rows(support)
         routing_report = audit_positive_boarding_support(
             canonical_index=positive_boarding_preflight.canonical_index,
             observations=positive_boarding_preflight.observations,
@@ -2281,16 +2792,6 @@ def prepare_sharded_fixed_routing_measurement_operator(
             config=config,
             discovered_support=support,
             support_timing_callback=support_timing_callback,
-        )
-    if not support.construction_metadata:
-        support = replace(
-            support,
-            construction_metadata=_build_construction_metadata(
-                support=support,
-                storage_shards=plan.storage_shards,
-                routing=routing,
-                spec=spec,
-            ),
         )
     planning_seconds = perf_counter() - planning_start
     if not plan.safe:
@@ -2517,7 +3018,6 @@ def prepare_sharded_fixed_routing_measurement_operator(
     manifest_write_count = 1
     cumulative_manifest_bytes = initial_manifest_bytes
     finalization_seconds = 0.0
-    tasks_by_key = {task.identity.key: task for task in support.construction_tasks}
     dispatch_durations: list[float] = []
     synchronization_durations: list[float] = []
     origins_per_dispatch: list[int] = []
@@ -2663,7 +3163,7 @@ def prepare_sharded_fixed_routing_measurement_operator(
                     "shard": result.identity.key,
                     "nonzero_entries": result.metadata.nonzero_entries,
                     **progress_details(),
-                }
+                },
             )
         eta = None
         if reporting_enabled:
@@ -2734,6 +3234,9 @@ def prepare_sharded_fixed_routing_measurement_operator(
                         )
                         break
                     identity = missing[submitted]
+                    if identity.storage_shard is None:
+                        raise ValueError("planned storage shard has no stable index.")
+                    storage_shard = plan.storage_shards[identity.storage_shard]
                     future = executor.submit(
                         _construct_measurement_shard,
                         staging_directory=staging_directory,
@@ -2741,8 +3244,9 @@ def prepare_sharded_fixed_routing_measurement_operator(
                         inputs=inputs,
                         routing=routing,
                         plan=plan,
+                        storage_shard=storage_shard,
                         support=support,
-                        tasks_by_key=tasks_by_key,
+                        spec=spec,
                         origins=origins,
                         mapping_links=mapping_links,
                         mapping_measurements=mapping_measurements,
@@ -2797,7 +3301,7 @@ def prepare_sharded_fixed_routing_measurement_operator(
                                     "status": "worker_failed",
                                     "error": str(error),
                                     **progress_details(),
-                                }
+                                },
                             )
                         events.emit(
                             phase=ConstructionPhase.SHARD_CONSTRUCTION,
@@ -2866,9 +3370,7 @@ def prepare_sharded_fixed_routing_measurement_operator(
         completed_units=len(completed),
         total_units=plan.num_shards,
         current_unit=None,
-        predicted_remaining_seconds=(
-            0.0 if final_eta is not None else None
-        ),
+        predicted_remaining_seconds=(0.0 if final_eta is not None else None),
         eta_confidence=("high" if final_eta is not None else "unavailable"),
         estimated_completion_at_utc=(
             None if final_eta is None else final_eta.estimated_completion_at_utc

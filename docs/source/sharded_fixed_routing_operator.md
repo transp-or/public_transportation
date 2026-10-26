@@ -179,6 +179,18 @@ mapping, or support definition invalidates the affected downstream artifacts.
 Malformed manifests and checkpoints are treated as incompatible and quarantined
 rather than reused.
 
+Compact support discovery does not retain every destination group's pattern
+table in memory. It writes a checksummed, versioned compact payload for each
+completed group under `compact_support_groups/`, then indexes the payloads in an
+atomically published `support_manifest.json`. The manifest is written only
+after all group payloads validate. Planning and shard construction load one
+group payload at a time. A support-entry ceiling is counted incrementally and
+fails at the first completed group that exceeds it; it measures support entries,
+not process RSS. Existing raw `support_groups/` checkpoints remain reusable
+when their provenance matches, while the former monolithic `support.npz`
+checkpoint format is quarantined. The configured worker memory budget is an
+estimate for per-worker temporary work, not a total-RSS cap.
+
 Each shard stores sorted global measurement rows, canonical local CSR arrays,
 sparse fixed-offset entries, construction metrics, a numerical content hash
 and the manifest provenance hash. Writes use a temporary sibling followed by

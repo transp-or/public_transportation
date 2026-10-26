@@ -122,7 +122,9 @@ def _layout(num_od: int, *, fixed_positive: bool) -> ODParameterLayout:
     free = tuple(index for index in range(num_od) if index not in fixed)
     return ODParameterLayout(
         num_od_total=num_od,
-        od_keys=tuple((f"origin-{index}", "destination", "period") for index in range(num_od)),
+        od_keys=tuple(
+            (f"origin-{index}", "destination", "period") for index in range(num_od)
+        ),
         free_od_indices=free,
         fixed_od_indices=fixed,
         fixed_od_values=(4.0,) if fixed_positive else (),
@@ -388,7 +390,9 @@ def test_completed_preflight_adoption_materializes_and_reuses_packed_cache(
         spec=_spec(inputs.graph.num_links),
         index=_canonical_index(layout),
     )
-    artifact_directory = temporal_block_cache_path(tmp_path / "artifacts", reference.identity)
+    artifact_directory = temporal_block_cache_path(
+        tmp_path / "artifacts", reference.identity
+    )
     operator, reused = reuse_or_build_temporal_block_operator(
         cache_root=tmp_path / "artifacts", reference=reference
     )
@@ -422,7 +426,9 @@ def test_completed_preflight_adoption_materializes_and_reuses_packed_cache(
     assert certificate.is_file()
     certificate_payload = json.loads(certificate.read_text(encoding="utf-8"))
     assert certificate_payload["provenance"]["legacy_completed_preflight"] is True
-    cache_directory = checkpoint_root / reference.identity.fingerprint / "temporal_operator_cache"
+    cache_directory = (
+        checkpoint_root / reference.identity.fingerprint / "temporal_operator_cache"
+    )
     materialize_operator_cache_from_adopted_preflight(
         artifact_directory=artifact_directory,
         certificate_path=certificate,
@@ -437,6 +443,7 @@ def test_completed_preflight_adoption_materializes_and_reuses_packed_cache(
         return original_load(file, *args, **kwargs)
 
     monkeypatch.setattr(np, "load", recording_load)
+
     def fail_if_block_materialized(*args, **kwargs):
         raise AssertionError("packed-cache activation materialized a source block")
 
@@ -475,9 +482,7 @@ def test_completed_preflight_adoption_materializes_and_reuses_packed_cache(
     assert packed_events[-1]["completed_units"] == 1
     assert packed_events[-1]["total_units"] == 1
     hit_events = [
-        event
-        for event in progress_events
-        if event.get("packed_cache_hit") is True
+        event for event in progress_events if event.get("packed_cache_hit") is True
     ]
     assert hit_events
     assert hit_events[-1]["cache_hits"] == 1
@@ -493,7 +498,10 @@ def test_completed_preflight_adoption_materializes_and_reuses_packed_cache(
         packed_backend.matvec(demand), operator.matvec(demand), rtol=1e-6, atol=1e-6
     )
     np.testing.assert_allclose(
-        packed_backend.rmatvec(residual), operator.rmatvec(residual), rtol=1e-6, atol=1e-6
+        packed_backend.rmatvec(residual),
+        operator.rmatvec(residual),
+        rtol=1e-6,
+        atol=1e-6,
     )
 
     # Packed-array content hashes remain fail-closed.  A modified optional
@@ -508,12 +516,10 @@ def test_completed_preflight_adoption_materializes_and_reuses_packed_cache(
         _load_validated_operator_cache(
             cache_directory=cache_directory,
             expected_identity=reference.identity,
-                expected_canonical_index=reference.canonical_index,
-                artifact_manifest_sha256=_file_sha256(
-                    artifact_directory / "manifest.json"
-                ),
-                verify="full",
-            )
+            expected_canonical_index=reference.canonical_index,
+            artifact_manifest_sha256=_file_sha256(artifact_directory / "manifest.json"),
+            verify="full",
+        )
         is None
     )
 
@@ -528,8 +534,12 @@ def test_completed_preflight_adoption_rejects_incomplete_or_mismatched_manifest(
         spec=_spec(inputs.graph.num_links),
         index=_canonical_index(layout),
     )
-    artifact_directory = temporal_block_cache_path(tmp_path / "artifacts", reference.identity)
-    reuse_or_build_temporal_block_operator(cache_root=tmp_path / "artifacts", reference=reference)
+    artifact_directory = temporal_block_cache_path(
+        tmp_path / "artifacts", reference.identity
+    )
+    reuse_or_build_temporal_block_operator(
+        cache_root=tmp_path / "artifacts", reference=reference
+    )
     incomplete = tmp_path / "incomplete.json"
     incomplete.write_text(json.dumps({"status": "running"}), encoding="utf-8")
     with pytest.raises(ValueError, match="status='completed'"):
@@ -578,7 +588,9 @@ def test_positive_boarding_support_cache_round_trip_is_identity_bound(tmp_path):
     index = build_canonical_assignment_index(
         parameter_layout=layout,
         time_intervals=(CanonicalTimeInterval("period", 0, 3600),),
-        measurements=(CanonicalMeasurement(0, "board", "boarding", "origin", "period"),),
+        measurements=(
+            CanonicalMeasurement(0, "board", "boarding", "origin", "period"),
+        ),
     )
     report = audit_positive_boarding_support(
         canonical_index=index,
@@ -644,8 +656,7 @@ def test_temporal_block_cache_validation_reports_throttled_progress(
     directory = temporal_block_cache_path(tmp_path, reference.identity)
     manifest_before = (directory / "manifest.json").read_bytes()
     block_bytes_before = {
-        path.name: path.read_bytes()
-        for path in (directory / "blocks").glob("*.npz")
+        path.name: path.read_bytes() for path in (directory / "blocks").glob("*.npz")
     }
 
     events: list[dict[str, object]] = []
@@ -697,8 +708,7 @@ def test_temporal_block_cache_validation_reports_throttled_progress(
     assert loaded.identity.fingerprint == operator.identity.fingerprint
     assert (directory / "manifest.json").read_bytes() == manifest_before
     assert {
-        path.name: path.read_bytes()
-        for path in (directory / "blocks").glob("*.npz")
+        path.name: path.read_bytes() for path in (directory / "blocks").glob("*.npz")
     } == block_bytes_before
 
     throttled_events: list[dict[str, object]] = []
@@ -744,9 +754,7 @@ def test_temporal_block_artifact_rejects_corrupt_payload(artifacts, tmp_path):
         columns = data["column_indices"]
         values = np.array(data["values"], copy=True)
     values[0] += 1.0
-    np.savez(
-        block_path, row_indices=rows, column_indices=columns, values=values
-    )
+    np.savez(block_path, row_indices=rows, column_indices=columns, values=values)
 
     with pytest.raises(ValueError, match="missing or corrupt"):
         load_temporal_block_operator(
@@ -787,9 +795,7 @@ def test_chunked_constructor_compiles_once_and_pads_final_chunk(artifacts):
     assert progress[-1].completed_columns == layout.num_free
     assert progress[-1].status == "completed"
     assert progress[-1].eta_confidence == "high"
-    first_completed = next(
-        item for item in progress if item.completed_columns > 0
-    )
+    first_completed = next(item for item in progress if item.completed_columns > 0)
     assert first_completed.predicted_remaining_seconds is not None
     assert layout.num_free % chunk_size != 0
 
@@ -802,9 +808,7 @@ def test_csr_csc_backend_matches_blocks_and_supplies_jax_adjoint(artifacts):
         spec=_spec(inputs.graph.num_links),
         index=_canonical_index(layout),
     )
-    blocks = build_chunked_temporal_block_operator(
-        reference=reference, chunk_size=3
-    )
+    blocks = build_chunked_temporal_block_operator(reference=reference, chunk_size=3)
     sparse_backend = CSRCSCTemporalAssignmentOperator(blocks)
     demand = jnp.linspace(0.2, 1.8, layout.num_free, dtype=jnp.float32)
     residual = jnp.asarray([0.6, -0.2, 1.4], dtype=jnp.float32)
@@ -818,9 +822,9 @@ def test_csr_csc_backend_matches_blocks_and_supplies_jax_adjoint(artifacts):
         rtol=1e-6,
         atol=1e-6,
     )
-    gradient = jax.grad(
-        lambda value: jnp.vdot(sparse_backend.matvec(value), residual)
-    )(demand)
+    gradient = jax.grad(lambda value: jnp.vdot(sparse_backend.matvec(value), residual))(
+        demand
+    )
     np.testing.assert_allclose(
         gradient, sparse_backend.rmatvec(residual), rtol=1e-6, atol=1e-6
     )
@@ -934,13 +938,9 @@ def test_direct_resumable_builder_matches_reference_and_reuses_artifact(
     )
     assert cached_support_events[0]["predicted_remaining_seconds"] is None
     first_support_completed = next(
-        event
-        for event in cached_support_events
-        if int(event["completed_units"]) > 0
+        event for event in cached_support_events if int(event["completed_units"]) > 0
     )
-    assert math.isfinite(
-        float(first_support_completed["predicted_remaining_seconds"])
-    )
+    assert math.isfinite(float(first_support_completed["predicted_remaining_seconds"]))
     assert first_support_completed["throughput_units_per_second"] > 0.0
     assert (
         first_support_completed["eta_lower_seconds"]
@@ -1148,7 +1148,9 @@ def test_direct_activation_reuse_only_missing_artifact_fails_closed(
     error = caught.value
     assert error.reason_code == "artifact_missing"
     assert error.expected_identity_fingerprint == arguments["identity"].fingerprint
-    assert error.expected_artifact_directory.endswith(error.expected_identity_fingerprint)
+    assert error.expected_artifact_directory.endswith(
+        error.expected_identity_fingerprint
+    )
     assert "explicit preparation" in error.remediation
     assert error.different_artifact_found
     assert routing_calls == []
@@ -1306,8 +1308,7 @@ def test_direct_activation_reuse_only_can_create_derived_cache_without_assembly(
     assert cache_directory.exists()
     assert not any(event["phase"] == "temporal_block_assembly" for event in events)
     assert any(
-        event.get("cache_validation_stage") == "temporal_block_load"
-        for event in events
+        event.get("cache_validation_stage") == "temporal_block_load" for event in events
     )
     assert len(routing_calls) == 1
 
@@ -1436,8 +1437,10 @@ def test_direct_activation_builds_then_fresh_call_reuses_without_routing(
             axis=1,
         ),
     )
+
     def expired_clock():
         return 50.0
+
     expired = ConstructionDeadline.from_absolute(49.0, clock=expired_clock)
     reused_after_deadline = activate_direct_scheduled_temporal_operator(
         mode="auto",
@@ -1476,7 +1479,9 @@ def test_direct_construction_quarantines_invalid_final_artifact(artifacts, tmp_p
     assert artifact.exists()
     quarantined = tuple(artifact.parent.glob(f"{artifact.name}.invalid-*"))
     assert len(quarantined) == 1
-    assert (quarantined[0] / "manifest.json").read_text(encoding="utf-8") == "old-schema"
+    assert (quarantined[0] / "manifest.json").read_text(
+        encoding="utf-8"
+    ) == "old-schema"
 
 
 def test_activation_stops_before_routing_with_structured_status(artifacts, tmp_path):
@@ -1514,10 +1519,7 @@ def test_activation_stops_after_committed_shard_then_resumes(artifacts, tmp_path
 
     def stop_after_shard(event):
         events.append(event)
-        if (
-            event["phase"] == "shard_construction"
-            and event["status"] == "running"
-        ):
+        if event["phase"] == "shard_construction" and event["status"] == "running":
             now[0] = 21.0
 
     stopped = activate_direct_scheduled_temporal_operator(
@@ -1564,8 +1566,7 @@ def test_activation_stops_after_committed_shard_then_resumes(artifacts, tmp_path
     shard_terminal = [
         event
         for event in resume_events
-        if event["phase"] == "shard_construction"
-        and event["status"] == "completed"
+        if event["phase"] == "shard_construction" and event["status"] == "completed"
     ]
     assert shard_terminal
     assert shard_terminal[-1]["predicted_remaining_seconds"] == 0.0
@@ -1595,7 +1596,9 @@ def test_activation_reuses_persisted_support_after_planning_stop(
     assert stopped.termination is not None
     assert stopped.termination.phase is ConstructionPhase.PLANNING
     assert stopped.termination.checkpoint_reusable
-    assert (Path(stopped.termination.checkpoint_location) / "support.npz").exists()
+    assert (
+        Path(stopped.termination.checkpoint_location) / "support_manifest.json"
+    ).exists()
     assert len(routing_calls) == 1
 
     def forbidden_support_discovery(**_):
@@ -1673,9 +1676,7 @@ def test_activation_resumes_origin_support_at_next_destination_group(
     assert len(routing_calls) == 1
 
 
-def test_activation_stops_and_resumes_persistent_sharded_routing(
-    artifacts, tmp_path
-):
+def test_activation_stops_and_resumes_persistent_sharded_routing(artifacts, tmp_path):
     arguments, routing_calls = _activation_arguments(artifacts, tmp_path)
     routing_config = FixedRoutingPreparationConfig(
         maximum_groups_per_shard=1,
@@ -1717,9 +1718,7 @@ def test_activation_stops_and_resumes_persistent_sharded_routing(
     assert routing_calls == []
     json.dumps(stopped_events)
     stopped_routing_events = [
-        event
-        for event in stopped_events
-        if event["phase"] == "routing_preparation"
+        event for event in stopped_events if event["phase"] == "routing_preparation"
     ]
     assert stopped_routing_events[0]["routing_phase"] == "planning"
     assert stopped_routing_events[0]["completed_units"] == 0
@@ -1740,10 +1739,10 @@ def test_activation_stops_and_resumes_persistent_sharded_routing(
         "host_transfer",
         "shard_persisted",
     } <= routing_subphases
-    assert max(
-        int(event.get("resident_routing_batches", 0))
-        for event in stopped_events
-    ) <= 1
+    assert (
+        max(int(event.get("resident_routing_batches", 0)) for event in stopped_events)
+        <= 1
+    )
 
     resume_events: list[dict[str, object]] = []
     resumed = activate_direct_scheduled_temporal_operator(
@@ -1782,9 +1781,7 @@ def test_activation_stops_and_resumes_persistent_sharded_routing(
         config=arguments["config"],
     )
     demand = jnp.arange(1, resumed.operator.num_free_od + 1, dtype=jnp.float32)
-    weights = jnp.arange(
-        1, resumed.operator.num_measurements + 1, dtype=jnp.float32
-    )
+    weights = jnp.arange(1, resumed.operator.num_measurements + 1, dtype=jnp.float32)
     np.testing.assert_allclose(
         resumed.operator.jax_matvec(demand),
         dense.operator.jax_matvec(demand),
@@ -1807,10 +1804,7 @@ def test_activation_reuses_temporal_fragment_after_finalization_stop(
     deadline = ConstructionDeadline.from_budget(10.0, clock=lambda: now[0])
 
     def stop_after_fragment(event):
-        if (
-            event["phase"] == "temporal_block_assembly"
-            and event["status"] == "running"
-        ):
+        if event["phase"] == "temporal_block_assembly" and event["status"] == "running":
             now[0] = 21.0
 
     stopped = activate_direct_scheduled_temporal_operator(
@@ -1839,12 +1833,12 @@ def test_activation_reuses_temporal_fragment_after_finalization_stop(
         **arguments,
     )
     assert resumed.operator is not None
-    assembly = [event for event in events if event["phase"] == "temporal_block_assembly"]
+    assembly = [
+        event for event in events if event["phase"] == "temporal_block_assembly"
+    ]
     assert any(event["cache_hits"] == 1 for event in assembly)
     assembly_progress = [
-        event
-        for event in assembly
-        if int(event["completed_units"] or 0) > 0
+        event for event in assembly if int(event["completed_units"] or 0) > 0
     ]
     assert assembly_progress
     assert assembly_progress[0]["predicted_remaining_seconds"] is not None

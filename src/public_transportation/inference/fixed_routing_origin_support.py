@@ -57,6 +57,7 @@ def _current_peak_rss_bytes() -> int | None:
         return None
     return value if sys.platform == "darwin" else value * 1024
 
+
 @dataclass(frozen=True, slots=True)
 class OriginSupportConfig:
     """Memory and numerical controls for structural support discovery."""
@@ -173,9 +174,7 @@ def _emit_timing_callback(
         return
 
 
-GroupSupportInnerProgressCallback = Callable[
-    [int, int, int, float, str | None], None
-]
+GroupSupportInnerProgressCallback = Callable[[int, int, int, float, str | None], None]
 
 
 # The callback receives one complete destination-group result.  Keeping this
@@ -297,9 +296,7 @@ def _compute_group_support_result(
             free = free_column[active_index]
             if free >= 0:
                 group_free_rows_parts.append(rows)
-                group_free_column_parts.append(
-                    np.full(rows.size, free, dtype=np.int64)
-                )
+                group_free_column_parts.append(np.full(rows.size, free, dtype=np.int64))
             else:
                 fixed = fixed_column[active_index]
                 group_fixed_rows_parts.append(rows)
@@ -438,11 +435,14 @@ def _analyze_parallel_support(
             thread_state.descriptor = descriptor
         shard = thread_state.shard
         local = group - descriptor.group_start
-        return shard.group_link_probability[local], shard.effective_group_link_mask[local]
+        return shard.group_link_probability[local], shard.effective_group_link_mask[
+            local
+        ]
 
-    cached: dict[
-        int, tuple[GroupOriginSupportSummary, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
-    ] = {}
+    # Probe cached group checkpoints one at a time.  Retaining each loaded
+    # checkpoint here kept every group's row/column arrays live throughout
+    # compact support discovery, defeating the per-worker memory bound.
+    cached_groups: set[int] = set()
     missing: list[int] = []
     for group in range(num_groups):
         path = (
@@ -454,11 +454,13 @@ def _analyze_parallel_support(
             missing.append(group)
             continue
         try:
-            cached[group] = _load_group_checkpoint(
+            cached_checkpoint = _load_group_checkpoint(
                 path,
                 group=group,
                 provenance_hash=str(checkpoint_provenance_hash),
             )
+            del cached_checkpoint
+            cached_groups.add(group)
         except (KeyError, OSError, ValueError, json.JSONDecodeError):
             quarantine = path.with_name(f"{path.name}.invalid-{os.getpid()}")
             os.replace(path, quarantine)
@@ -623,9 +625,29 @@ def _analyze_parallel_support(
     try:
         submit_available(executor)
         for group in range(num_groups):
-            is_cached = group in cached
+            # Drop the previous worker Future before loading a cached group;
+            # completed Future objects retain their result arrays.
+            future = None
+            is_cached = group in cached_groups
             if is_cached:
-                summary, group_free_rows, group_free_columns, group_fixed_rows, group_fixed_columns = cached[group]
+                group_path = (
+                    _group_checkpoint_path(checkpoint_root, group)
+                    if checkpoint_root is not None
+                    else None
+                )
+                if group_path is None:
+                    raise RuntimeError("cached support group has no checkpoint path")
+                (
+                    summary,
+                    group_free_rows,
+                    group_free_columns,
+                    group_fixed_rows,
+                    group_fixed_columns,
+                ) = _load_group_checkpoint(
+                    group_path,
+                    group=group,
+                    provenance_hash=str(checkpoint_provenance_hash),
+                )
                 active_indices = group_indices[group][group_masks[group]]
                 active_indices = active_indices[selected[active_indices]].astype(
                     np.int64, copy=False
@@ -660,13 +682,16 @@ def _analyze_parallel_support(
                     if deadline is not None and deadline.remaining_seconds is not None:
                         timeout = max(
                             0.0,
-                            deadline.remaining_seconds
-                            - deadline.safety_margin_seconds,
+                            deadline.remaining_seconds - deadline.safety_margin_seconds,
                         )
                     result = future.result(timeout=timeout)
                 except TimeoutError as error:
                     for other in pending.values():
                         other.cancel()
+                    if deadline is None:
+                        raise RuntimeError(
+                            "support worker timed out without a configured deadline"
+                        ) from error
                     raise deadline_stop(
                         deadline,
                         phase=ConstructionPhase.SUPPORT_DISCOVERY,
@@ -722,7 +747,7 @@ def _analyze_parallel_support(
                         cpu_seconds=result.cpu_seconds,
                         worker_id=result.worker_id,
                         peak_rss_bytes=_current_peak_rss_bytes(),
-                    )
+                    ),
                 )
             if config.materialize:
                 free_rows.append(result.free_rows)
@@ -854,6 +879,12 @@ def _analyze_parallel_support(
                     },
                 )
             submit_available(executor)
+            del result
+            future = None
+            if is_cached:
+                del active_indices, group_measurements
+                del group_free_rows, group_free_columns
+                del group_fixed_rows, group_fixed_columns
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
 
@@ -1056,9 +1087,7 @@ def _save_group_checkpoint(
 
 def _load_group_checkpoint(
     path: Path, *, group: int, provenance_hash: str
-) -> tuple[
-    GroupOriginSupportSummary, np.ndarray, np.ndarray, np.ndarray, np.ndarray
-]:
+) -> tuple[GroupOriginSupportSummary, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     with np.load(path, allow_pickle=False) as archive:
         metadata = json.loads(str(archive["metadata"]))
         arrays = {
@@ -1107,10 +1136,7 @@ def diagnose_fixed_routing_support_reuse(
 
     if origin_chunk_size <= 0:
         raise ValueError("origin_chunk_size must be positive.")
-    if (
-        not math.isfinite(probability_tolerance)
-        or probability_tolerance < 0.0
-    ):
+    if not math.isfinite(probability_tolerance) or probability_tolerance < 0.0:
         raise ValueError("probability_tolerance must be finite and non-negative.")
     if isinstance(routing, ShardedFixedRoutingInputs):
         validate_sharded_fixed_routing_compatibility(inputs=inputs, routing=routing)
@@ -1124,9 +1150,9 @@ def diagnose_fixed_routing_support_reuse(
     group_masks = np.asarray(inputs.group_od_mask, dtype=bool)
     origins_by_active = np.asarray(inputs.od_origin_node, dtype=np.int64)
     active_selected = np.zeros(origins_by_active.shape[0], dtype=bool)
-    active_selected[
-        np.asarray(compact_layout.free_compact_indices, dtype=np.int64)
-    ] = True
+    active_selected[np.asarray(compact_layout.free_compact_indices, dtype=np.int64)] = (
+        True
+    )
     fixed_indices = np.asarray(compact_layout.fixed_compact_indices, dtype=np.int64)
     fixed_values = np.asarray(compact_layout.fixed_compact_values)
     positive_fixed = fixed_indices[fixed_values > 0.0]
@@ -1211,11 +1237,7 @@ def diagnose_fixed_routing_support_reuse(
     for origins in mask_origins.values():
         union = np.unique(np.concatenate(origins)) if origins else np.empty(0, np.int64)
         shared_chunks += max(1, math.ceil(union.size / origin_chunk_size))
-    unique_all = (
-        int(np.unique(np.concatenate(all_origins)).size)
-        if all_origins
-        else 0
-    )
+    unique_all = int(np.unique(np.concatenate(all_origins)).size) if all_origins else 0
 
     def reduction(numerator: int, denominator: int) -> float:
         return 0.0 if denominator <= 0 else max(0.0, 1.0 - numerator / denominator)
@@ -1291,9 +1313,9 @@ def _make_support_reachability_kernel(*, chunk_size: int, num_nodes: int):
         # uint8 gives us a deterministic scatter-max operation; the public
         # result is converted back to boolean after the scan.
         reachable = jnp.zeros((chunk_size, num_nodes), dtype=jnp.uint8)
-        reachable = reachable.at[
-            jnp.arange(chunk_size), origin_nodes
-        ].add(valid_origins.astype(jnp.uint8))
+        reachable = reachable.at[jnp.arange(chunk_size), origin_nodes].add(
+            valid_origins.astype(jnp.uint8)
+        )
         reachable = jnp.minimum(reachable, jnp.uint8(1))
 
         def step(values, node):
@@ -1508,9 +1530,7 @@ def analyze_fixed_routing_origin_support(
             np.int64, copy=False
         )
         group_probability, group_effective = routing_for_group(group)
-        enabled = group_effective & (
-            group_probability > config.probability_tolerance
-        )
+        enabled = group_effective & (group_probability > config.probability_tolerance)
         eligible_mapping = enabled[mapping_links]
         group_measurements = np.unique(mapping_measurements[eligible_mapping])
         cached = None
@@ -1584,7 +1604,7 @@ def analyze_fixed_routing_origin_support(
                         cpu_seconds=0.0,
                         worker_id=threading.current_thread().name,
                         peak_rss_bytes=_current_peak_rss_bytes(),
-                    )
+                    ),
                 )
             if reporter is not None:
                 eta = estimate_completed_unit_eta(
@@ -1598,7 +1618,9 @@ def analyze_fixed_routing_origin_support(
                 )
                 chunk_count = max(
                     1,
-                    math.ceil(summary.selected_od_cells / max(1, config.origin_chunk_size)),
+                    math.ceil(
+                        summary.selected_od_cells / max(1, config.origin_chunk_size)
+                    ),
                 )
                 reporter.emit(
                     phase=ConstructionPhase.SUPPORT_DISCOVERY,
@@ -1727,12 +1749,8 @@ def analyze_fixed_routing_origin_support(
                     status="running",
                     completed_units=group,
                     total_units=int(inputs.group_dest_node.shape[0]),
-                    current_unit=(
-                        f"group-{group:06d}/origin-chunk-{chunk_number:06d}"
-                    ),
-                    current_unit_elapsed_seconds=(
-                        perf_counter() - group_started
-                    ),
+                    current_unit=(f"group-{group:06d}/origin-chunk-{chunk_number:06d}"),
+                    current_unit_elapsed_seconds=(perf_counter() - group_started),
                     predicted_remaining_seconds=eta.predicted_remaining_seconds,
                     eta_confidence=eta.eta_confidence,
                     estimated_completion_at_utc=eta.estimated_completion_at_utc,
@@ -1862,23 +1880,20 @@ def analyze_fixed_routing_origin_support(
                     origin_chunks=max(
                         1,
                         math.ceil(
-                            summary.selected_od_cells
-                            / max(1, config.origin_chunk_size)
+                            summary.selected_od_cells / max(1, config.origin_chunk_size)
                         ),
                     ),
                     reachability_seconds=(
                         reachability_seconds - group_reachability_before
                     ),
-                    projection_seconds=(
-                        projection_seconds - group_projection_before
-                    ),
+                    projection_seconds=(projection_seconds - group_projection_before),
                     checkpoint_seconds=checkpoint_seconds,
                     total_seconds=recent_group_seconds[-1] + checkpoint_seconds,
                     cached=False,
                     cpu_seconds=max(0.0, process_time() - group_cpu_before),
                     worker_id=threading.current_thread().name,
                     peak_rss_bytes=_current_peak_rss_bytes(),
-                )
+                ),
             )
         if reporter is not None:
             eta = estimate_completed_unit_eta(
@@ -1943,6 +1958,10 @@ def analyze_fixed_routing_origin_support(
                 cache_hits=0,
                 cache_misses=1,
             )
+        # The compact group callback has consumed the raw support fragments.
+        # Release all aliases before loading the next checkpoint/result.
+        del cached
+        del group_free_rows, group_free_columns, group_fixed_rows, group_fixed_columns
     if config.materialize and total_origin_specific > config.max_materialized_entries:
         raise MemoryError(
             f"origin-specific support has {total_origin_specific} entries, exceeding "
@@ -1955,9 +1974,7 @@ def analyze_fixed_routing_origin_support(
         rows: list[np.ndarray], columns: list[np.ndarray], shape: tuple[int, int]
     ) -> sparse.csr_array:
         row = np.concatenate(rows) if rows else np.empty(0, dtype=np.int64)
-        column = (
-            np.concatenate(columns) if columns else np.empty(0, dtype=np.int64)
-        )
+        column = np.concatenate(columns) if columns else np.empty(0, dtype=np.int64)
         matrix = sparse.csr_array(
             (np.ones(row.size, dtype=bool), (row, column)), shape=shape
         )
@@ -2038,9 +2055,11 @@ def validate_origin_support_against_operator(
         )
     free_support = support.free_support
     assert free_support is not None
-    covered = np.asarray(
-        free_support[realized_rows, realized_columns]
-    ).reshape(-1).astype(bool)
+    covered = (
+        np.asarray(free_support[realized_rows, realized_columns])
+        .reshape(-1)
+        .astype(bool)
+    )
     missing_free = int(np.count_nonzero(~covered))
     realized_free = int(realized_rows.size)
 

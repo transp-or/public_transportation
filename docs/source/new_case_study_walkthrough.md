@@ -451,26 +451,33 @@ continuation writer. Do not delete checkpoints, silently switch to a different
 results root, or submit `preflight` until the final successful preparation
 manifest and complete artifact manifest have been verified.
 
-##### Finalization memory guard
+##### Incremental support-entry guard
 
-A preparation run can complete every support-discovery group and still fail
-during final artifact materialization. A message such as
+Compact support discovery now accumulates the origin-specific entry count as
+destination groups complete. A message such as
 
 ```text
 origin-specific support has <observed> entries,
 exceeding max_materialized_entries=<configured>
 ```
 
-is a recoverable resource/configuration failure, not evidence that the support
-checkpoints are invalid. Do not delete the checkpoints or rerun the case from
-the beginning. Instead:
+is a recoverable entry-count guard, not an RSS measurement and not evidence that
+the support checkpoints are invalid. Discovery stops at the first group that
+pushes the cumulative count over the ceiling. The last completed raw group
+checkpoint remains valid; the group that crossed the ceiling is also
+checkpointed before the compact-payload callback rejects it. Do not delete the
+checkpoints or switch results roots. Instead:
 
 1. Keep `support_discovery_mode = "compact"`.
-2. Set `max_materialized_support_entries` above the observed support count,
-   with reasonable memory headroom.
-3. Request sufficient Slurm memory for finalization.
+2. Set `max_materialized_support_entries` above the reported observed count.
+   This is an entry-count ceiling, not a promise that total RSS fits a given
+   allocation.
+3. Size Slurm memory using measured peak RSS with headroom; the per-worker
+   memory budget does not cap total process RSS.
 4. Rerun the same `prepare` stage against the unchanged results root and
-   unchanged scientific inputs.
+   unchanged scientific inputs. Compatible raw `support_groups/` checkpoints
+   are reused, and compact group payloads are validated or regenerated one at
+   a time.
 
 The adapter must pass the settings documented in the model-configuration
 section when constructing `ShardedConstructionConfig`; changing TOML alone has

@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import shutil
 import time
+import weakref
 from dataclasses import asdict, replace
 from pathlib import Path
 from time import perf_counter
@@ -602,7 +604,8 @@ def test_sharded_builder_matches_monolithic_and_resumes(all_free_operator, tmp_p
     opaque_stages = [
         event
         for event in progress_events
-        if event.get("construction_stage") in {
+        if event.get("construction_stage")
+        in {
             "kernel_lowering",
             "kernel_compilation",
         }
@@ -767,26 +770,54 @@ def test_compact_support_matches_reference_builder_on_small_example(
     assert reference.plan.group_level_candidate_entries == (
         compact.plan.group_level_candidate_entries
     )
-    with np.load(tmp_path / "reference" / "support.npz", allow_pickle=False) as left:
-        with np.load(tmp_path / "compact" / "support.npz", allow_pickle=False) as right:
-            assert set(left.files) == set(right.files)
-            for name in left.files:
-                if name == "metadata":
-                    left_metadata = json.loads(str(left[name]))
-                    right_metadata = json.loads(str(right[name]))
-                    assert left_metadata["content_hash"] == right_metadata["content_hash"]
-                    assert left_metadata["group_level_candidate_entries"] == (
-                        right_metadata["group_level_candidate_entries"]
-                    )
-                    continue
-                np.testing.assert_array_equal(left[name], right[name])
+    reference_support = json.loads(
+        (tmp_path / "reference" / "support_manifest.json").read_text()
+    )
+    compact_support = json.loads(
+        (tmp_path / "compact" / "support_manifest.json").read_text()
+    )
+    assert (
+        reference_support["origin_specific_entries"]
+        == compact_support["origin_specific_entries"]
+    )
+    assert (
+        reference_support["group_level_candidate_entries"]
+        == compact_support["group_level_candidate_entries"]
+    )
+    assert len(reference_support["groups"]) == len(compact_support["groups"])
+    for left_record, right_record in zip(
+        reference_support["groups"], compact_support["groups"], strict=True
+    ):
+        left_path = (
+            tmp_path / "reference" / "compact_support_groups" / left_record["filename"]
+        )
+        right_path = (
+            tmp_path / "compact" / "compact_support_groups" / right_record["filename"]
+        )
+        with np.load(left_path, allow_pickle=False) as left:
+            with np.load(right_path, allow_pickle=False) as right:
+                assert set(left.files) == set(right.files)
+                left_metadata = json.loads(str(left["metadata"]))
+                right_metadata = json.loads(str(right["metadata"]))
+                for field in (
+                    "pattern_count",
+                    "group_measurement_count",
+                    "origin_specific_entries",
+                    "group_level_candidate_entries",
+                    "content_hash",
+                ):
+                    assert left_metadata[field] == right_metadata[field]
+                for name in set(left.files) - {"metadata"}:
+                    np.testing.assert_array_equal(left[name], right[name])
     for identity in reference.manifest.expected_shards:
         left = load_sparse_shard(shard_path(reference.directory, identity))
         right = load_sparse_shard(shard_path(compact.directory, identity))
         assert left.metadata.content_hash == right.metadata.content_hash
         np.testing.assert_array_equal(left.row_indices, right.row_indices)
         np.testing.assert_array_equal(left.matrix.toarray(), right.matrix.toarray())
-        np.testing.assert_array_equal(left.fixed_offset_values, right.fixed_offset_values)
+        np.testing.assert_array_equal(
+            left.fixed_offset_values, right.fixed_offset_values
+        )
     demand = np.linspace(0.0, 2.0, reference.plan.num_free_od)
     cotangent = np.linspace(-0.5, 1.0, reference.plan.num_measurements)
     reference_operator = ShardedSparseLinearOperator(reference.directory)
@@ -797,6 +828,7 @@ def test_compact_support_matches_reference_builder_on_small_example(
     np.testing.assert_allclose(
         reference_operator.rmatvec(cotangent), compact_operator.rmatvec(cotangent)
     )
+
 
 def test_exact_positive_boarding_preflight_stops_before_numerical_kernel(
     all_free_operator, tmp_path, monkeypatch
@@ -1188,8 +1220,9 @@ def test_packing_changes_reuse_support_but_rebuild_measurement_shards(
     assert repacked.rebuilt_shards > 0
     assert repacked.manifest.execution_provenance["workers"] == 2
     assert repacked.manifest.execution_provenance["measurement_block_size"] == 2
-    assert repacked.manifest.provenance["od_layout_fingerprint"] == (
-        first.manifest.provenance["od_layout_fingerprint"]
+    assert (
+        repacked.manifest.provenance["od_layout_fingerprint"]
+        == (first.manifest.provenance["od_layout_fingerprint"])
     )
 
 
@@ -1546,8 +1579,7 @@ def test_support_reuse_diagnostics_are_noninvasive(all_free_operator):
     assert diagnostics.selected_od_cells == num_od
     assert diagnostics.unique_structural_masks <= diagnostics.groups_with_selected_cells
     assert (
-        diagnostics.estimated_shared_origin_chunks
-        <= diagnostics.current_origin_chunks
+        diagnostics.estimated_shared_origin_chunks <= diagnostics.current_origin_chunks
     )
     assert 0.0 <= diagnostics.origin_cell_deduplication_ratio <= 1.0
     assert 0.0 <= diagnostics.structural_mask_reuse_ratio <= 1.0
@@ -1583,9 +1615,7 @@ def test_origin_support_reports_nested_origin_chunk_progress(all_free_operator):
         event
         for event in events
         if event.get("work_stack")
-        and any(
-            item.get("name") == "origin_chunks" for item in event["work_stack"]
-        )
+        and any(item.get("name") == "origin_chunks" for item in event["work_stack"])
     ]
     assert nested
     assert isinstance(nested[0]["inner_work"], dict)
@@ -1641,9 +1671,9 @@ def test_parallel_origin_support_matches_serial_and_resumes(
         serial.positive_fixed_support.toarray(),
         parallel.positive_fixed_support.toarray(),
     )
-    assert len(tuple((tmp_path / "parallel" / "support_groups").glob("group-*.npz"))) == len(
-        parallel.summaries
-    )
+    assert len(
+        tuple((tmp_path / "parallel" / "support_groups").glob("group-*.npz"))
+    ) == len(parallel.summaries)
     summary_only = analyze_fixed_routing_origin_support(
         inputs=inputs,
         routing=routing,
@@ -1658,6 +1688,65 @@ def test_parallel_origin_support_matches_serial_and_resumes(
         ),
     )
     assert not summary_only.materialized
+
+
+def test_parallel_compact_resume_releases_cached_group_arrays(
+    all_free_operator, tmp_path, monkeypatch
+):
+    inputs, routing, spec, _ = all_free_operator
+    num_od = int(inputs.od_origin_node.shape[0])
+    layout = ODParameterLayout(
+        num_od_total=num_od,
+        od_keys=tuple((f"o{i}", "d", "t") for i in range(num_od)),
+        free_od_indices=tuple(range(num_od)),
+        fixed_od_indices=(),
+        fixed_od_values=(),
+        free_baseline_values=tuple(1.0 for _ in range(num_od)),
+        fixed_zero_indices=(),
+        fixed_positive_indices=(),
+    )
+    compact = build_compact_od_assignment_layout(parameter_layout=layout)
+    directory = tmp_path / "compact-parallel"
+
+    def analyze():
+        return analyze_fixed_routing_origin_support(
+            inputs=inputs,
+            routing=routing,
+            spec=spec,
+            compact_layout=compact,
+            config=OriginSupportConfig(
+                origin_chunk_size=3,
+                workers=2,
+                materialize=False,
+                worker_memory_budget_bytes=100_000_000,
+            ),
+            checkpoint_directory=directory,
+            checkpoint_provenance_hash="compact-parallel-support-test",
+        )
+
+    original_loader = origin_support._load_group_checkpoint
+    live_arrays = maximum_live_arrays = 0
+
+    def track_live_array():
+        nonlocal live_arrays
+        live_arrays -= 1
+
+    def tracked_loader(*args, **kwargs):
+        nonlocal live_arrays, maximum_live_arrays
+        result = original_loader(*args, **kwargs)
+        for array in result[1:]:
+            live_arrays += 1
+            maximum_live_arrays = max(maximum_live_arrays, live_arrays)
+            weakref.finalize(array, track_live_array)
+        return result
+
+    initial = analyze()
+    assert not initial.materialized
+    monkeypatch.setattr(origin_support, "_load_group_checkpoint", tracked_loader)
+    resumed = analyze()
+    assert resumed.fingerprint == initial.fingerprint
+    assert live_arrays == 0
+    assert maximum_live_arrays <= 4
 
 
 def test_parallel_origin_support_failure_preserves_published_checkpoints(
@@ -1794,15 +1883,53 @@ def test_sharded_builder_support_cap_fails_then_reuses_group_checkpoints(
         config=OriginSupportConfig(materialize=False),
     )
     actual_entries = summary.metrics.origin_specific_entries
-    with pytest.raises(MemoryError, match=f"has {actual_entries} entries"):
+    compact_group_directory = tmp_path / "compact_support_groups"
+    compact_group_directory.mkdir(parents=True)
+    abandoned_temporary = compact_group_directory / ".group-000000.npz.abandoned.tmp"
+    abandoned_temporary.write_bytes(b"incomplete")
+    legacy_support = tmp_path / "support.npz"
+    legacy_support.write_bytes(b"legacy monolithic support checkpoint")
+    fail_limit = actual_entries // 2
+    progress_events = []
+    reporter = ConstructionProgressReporter(
+        ConstructionDeadline.unlimited(),
+        progress_events.append,
+        minimum_interval_seconds=0.0,
+    )
+    with pytest.raises(
+        MemoryError,
+        match=rf"has [0-9]+ entries, exceeding max_materialized_entries={fail_limit}",
+    ):
         _parallel_builder_case(
             all_free_operator,
             tmp_path,
             workers=1,
-            max_materialized_support_entries=actual_entries - 1,
+            max_materialized_support_entries=fail_limit,
+            reporter=reporter,
         )
+    failed_event = next(
+        event
+        for event in progress_events
+        if event["phase"] == "support_discovery" and event["status"] == "failed"
+    )
+    assert failed_event["support_entries_accumulated"] > fail_limit
+    assert failed_event["completed_units"] < failed_event["total_units"]
+    assert not legacy_support.exists()
+    assert tuple(tmp_path.glob("support.npz.incompatible-*"))
     checkpoints = tuple((tmp_path / "support_groups").glob("group-*.npz"))
     assert checkpoints
+    raw_checkpoint_hashes = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in checkpoints
+    }
+    assert not (tmp_path / "support_manifest.json").exists()
+    assert not (tmp_path / "manifest.json").exists()
+    partial_compact = tuple((tmp_path / "compact_support_groups").glob("group-*.npz"))
+    assert partial_compact
+    compact_payload_hashes = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in partial_compact
+    }
+    assert not abandoned_temporary.exists()
     completed = _parallel_builder_case(
         all_free_operator,
         tmp_path,
@@ -1810,7 +1937,19 @@ def test_sharded_builder_support_cap_fails_then_reuses_group_checkpoints(
         max_materialized_support_entries=actual_entries,
     )
     assert completed.manifest.complete
-    assert tuple((tmp_path / "support_groups").glob("group-*.npz")) == checkpoints
+    for name, content_hash in raw_checkpoint_hashes.items():
+        assert (
+            hashlib.sha256(
+                (tmp_path / "support_groups" / name).read_bytes()
+            ).hexdigest()
+            == content_hash
+        )
+    for payload in partial_compact:
+        assert payload.exists()
+        assert (
+            hashlib.sha256(payload.read_bytes()).hexdigest()
+            == (compact_payload_hashes[payload.name])
+        )
     generous = _parallel_builder_case(
         all_free_operator,
         tmp_path / "generous",
@@ -1829,6 +1968,266 @@ def test_sharded_builder_support_cap_fails_then_reuses_group_checkpoints(
     )
     with pytest.raises(ValueError, match="max_materialized_support_entries"):
         ShardedConstructionConfig(max_materialized_support_entries=0)
+
+
+def test_compact_support_payload_retention_is_one_group_and_measured(
+    sharded_preflight_case, monkeypatch
+):
+    inputs, routing, spec, compact, config, _, support = sharded_preflight_case
+    assert len(support.group_records) > 1
+    assert not hasattr(support, "patterns")
+    assert not hasattr(support, "group_measurements")
+
+    original_loader = sharded_builder._load_support_group
+    legacy_tasks = []
+    for record in support.group_records:
+        payload = original_loader(support, record.group)
+        legacy_tasks.extend(
+            sharded_builder._tasks_for_group_payload(
+                payload,
+                group=record.group,
+                measurement_block_size=config.measurement_block_size,
+            )
+        )
+        del payload
+    legacy_storage = sharded_builder.pack_storage_shards(
+        tuple(legacy_tasks),
+        config=config,
+        itemsize=np.dtype(inputs.base_link_cost.dtype).itemsize,
+    )
+    del legacy_tasks
+    live_payloads = 0
+    maximum_live_payloads = 0
+    live_payload_bytes = 0
+    maximum_live_payload_bytes = 0
+
+    class TrackedPayload:
+        def __init__(self, payload):
+            nonlocal live_payloads, maximum_live_payloads
+            nonlocal live_payload_bytes, maximum_live_payload_bytes
+            self.payload = payload
+            self.payload_bytes = sum(
+                value.nbytes
+                for value in (
+                    payload.group_measurements,
+                    payload.pattern_od,
+                    payload.pattern_od_offsets,
+                    payload.pattern_rows,
+                    payload.pattern_row_offsets,
+                )
+            )
+            live_payloads += 1
+            live_payload_bytes += self.payload_bytes
+            maximum_live_payloads = max(maximum_live_payloads, live_payloads)
+            maximum_live_payload_bytes = max(
+                maximum_live_payload_bytes, live_payload_bytes
+            )
+
+        def __getattr__(self, name):
+            return getattr(self.payload, name)
+
+        def __del__(self):
+            nonlocal live_payloads, live_payload_bytes
+            live_payloads -= 1
+            live_payload_bytes -= self.payload_bytes
+
+    monkeypatch.setattr(
+        sharded_builder,
+        "_load_support_group",
+        lambda current_support, group: TrackedPayload(
+            original_loader(current_support, group)
+        ),
+    )
+    peak_rss_before = origin_support._current_peak_rss_bytes() or 0
+    plan, _ = plan_sharded_fixed_routing_operator(
+        inputs=inputs,
+        routing=routing,
+        spec=spec,
+        compact_layout=compact,
+        config=config,
+        discovered_support=support,
+    )
+    assert plan.storage_shards == legacy_storage
+    peak_rss_after = origin_support._current_peak_rss_bytes() or 0
+    assert maximum_live_payloads == 1
+    assert live_payloads == 0
+    assert maximum_live_payload_bytes > 0
+    # Keep an actual process high-water measurement with the bounded-retention
+    # assertion; the fixture is intentionally small and never an OOM test.
+    assert peak_rss_after >= peak_rss_before > 0
+    if os.environ.get("PUBLIC_TRANSPORTATION_REPORT_SUPPORT_MEMORY") == "1":
+        print(
+            json.dumps(
+                {
+                    "max_live_compact_groups": maximum_live_payloads,
+                    "max_live_compact_group_array_bytes": maximum_live_payload_bytes,
+                    "peak_rss_before_bytes": peak_rss_before,
+                    "peak_rss_after_bytes": peak_rss_after,
+                },
+                sort_keys=True,
+            )
+        )
+
+
+def test_compact_support_pack_stress_is_bounded_by_one_large_group(
+    tmp_path, monkeypatch
+):
+    group_count = 33
+    measurements_per_group = 500_000
+    group_measurement_bytes = measurements_per_group * np.dtype(np.int64).itemsize
+    records = tuple(
+        sharded_builder._CompactSupportGroupRecord(
+            group=group,
+            filename=f"group-{group:06d}.npz",
+            sha256="synthetic",
+            payload_bytes=group_measurement_bytes + 48,
+            selected_od_cells=1,
+            group_measurement_count=measurements_per_group,
+            pattern_count=1,
+            origin_specific_entries=1,
+            group_level_candidate_entries=measurements_per_group,
+        )
+        for group in range(group_count)
+    )
+    support = sharded_builder._Support(
+        free_column=np.empty(0, dtype=np.int64),
+        fixed_by_active=np.empty(0, dtype=np.float32),
+        selected=np.empty(0, dtype=bool),
+        global_slots=np.empty(0, dtype=np.int64),
+        global_slot_mask=np.empty(0, dtype=bool),
+        directory=tmp_path,
+        provenance_hash="synthetic",
+        group_records=records,
+        group_level_candidate_entries=group_count * measurements_per_group,
+        origin_support_seconds=0.0,
+        support_patterns=group_count,
+        origin_specific_entries=group_count,
+        compact_payload_bytes=sum(item.payload_bytes for item in records),
+    )
+    live_payload_bytes = maximum_live_payload_bytes = 0
+    live_payloads = maximum_live_payloads = 0
+
+    class TrackedPayload:
+        def __init__(self, group):
+            nonlocal live_payload_bytes, maximum_live_payload_bytes
+            nonlocal live_payloads, maximum_live_payloads
+            self.group_measurements = np.arange(measurements_per_group, dtype=np.int64)
+            self.pattern_od = np.asarray([group], dtype=np.int64)
+            self.pattern_od_offsets = np.asarray([0, 1], dtype=np.int64)
+            self.pattern_rows = np.asarray([group], dtype=np.int64)
+            self.pattern_row_offsets = np.asarray([0, 1], dtype=np.int64)
+            self.payload_bytes = sum(
+                value.nbytes
+                for value in (
+                    self.group_measurements,
+                    self.pattern_od,
+                    self.pattern_od_offsets,
+                    self.pattern_rows,
+                    self.pattern_row_offsets,
+                )
+            )
+            live_payloads += 1
+            live_payload_bytes += self.payload_bytes
+            maximum_live_payloads = max(maximum_live_payloads, live_payloads)
+            maximum_live_payload_bytes = max(
+                maximum_live_payload_bytes, live_payload_bytes
+            )
+
+        def __del__(self):
+            nonlocal live_payload_bytes, live_payloads
+            live_payload_bytes -= self.payload_bytes
+            live_payloads -= 1
+
+    monkeypatch.setattr(
+        sharded_builder,
+        "_load_support_group",
+        lambda _support, group: TrackedPayload(group),
+    )
+    peak_rss_before = origin_support._current_peak_rss_bytes() or 0
+    storage = sharded_builder._stream_pack_storage_shards(
+        support,
+        config=ShardedConstructionConfig(
+            target_nonzeros_per_storage_shard=1,
+            maximum_nonzeros_per_storage_shard=1,
+            maximum_patterns_per_storage_shard=1,
+        ),
+        itemsize=4,
+    )
+    peak_rss_after = origin_support._current_peak_rss_bytes() or 0
+    assert len(storage) == group_count
+    assert maximum_live_payloads == 1
+    assert live_payloads == 0
+    assert maximum_live_payload_bytes == group_measurement_bytes + 48
+    # 33 groups would retain 132 MiB of these arrays if accumulated; the
+    # stream holds only the current 4 MiB group and a bounded shard plan.
+    assert support.compact_payload_bytes > 32 * maximum_live_payload_bytes
+    assert peak_rss_after >= peak_rss_before > 0
+    if os.environ.get("PUBLIC_TRANSPORTATION_REPORT_SUPPORT_MEMORY") == "1":
+        print(
+            json.dumps(
+                {
+                    "groups": group_count,
+                    "cumulative_payload_array_bytes": (support.compact_payload_bytes),
+                    "max_live_compact_groups": maximum_live_payloads,
+                    "max_live_compact_group_array_bytes": maximum_live_payload_bytes,
+                    "peak_rss_before_bytes": peak_rss_before,
+                    "peak_rss_after_bytes": peak_rss_after,
+                },
+                sort_keys=True,
+            )
+        )
+
+
+def test_compact_support_payload_corruption_is_repaired_atomically(tmp_path):
+    summary = origin_support.GroupOriginSupportSummary(
+        group=0,
+        selected_od_cells=3,
+        free_od_cells=3,
+        positive_fixed_od_cells=0,
+        group_measurements=2,
+        group_level_candidate_entries=6,
+        origin_specific_entries=5,
+    )
+    patterns = {(0, 2): [1, 3], (2,): [4]}
+    measurements = np.asarray([0, 2], dtype=np.int64)
+    record, bytes_read, bytes_written = sharded_builder._save_compact_support_group(
+        directory=tmp_path,
+        group=0,
+        provenance_hash="test-provenance",
+        summary=summary,
+        patterns=patterns,
+        group_measurements=measurements,
+    )
+    path = sharded_builder._compact_support_group_path(tmp_path, 0)
+    assert bytes_read == 0
+    assert bytes_written == path.stat().st_size == record.payload_bytes
+    assert not tuple(path.parent.glob(".*.tmp"))
+    payload = sharded_builder._read_compact_support_group(
+        path, group=0, provenance_hash="test-provenance"
+    )
+    assert payload.pattern_row_offsets.size == 3
+
+    path.write_bytes(b"corrupt archive")
+    with pytest.raises(ValueError, match="archive is corrupt"):
+        sharded_builder._read_compact_support_group(
+            path, group=0, provenance_hash="test-provenance"
+        )
+    corrupt_size = path.stat().st_size
+    repaired, bytes_read, bytes_written = sharded_builder._save_compact_support_group(
+        directory=tmp_path,
+        group=0,
+        provenance_hash="test-provenance",
+        summary=summary,
+        patterns=patterns,
+        group_measurements=measurements,
+    )
+    assert bytes_read == corrupt_size
+    assert bytes_written == path.stat().st_size
+    assert repaired.payload_bytes == path.stat().st_size
+    assert tuple(path.parent.glob("group-000000.npz.invalid-*"))
+    sharded_builder._read_compact_support_group(
+        path, group=0, provenance_hash="test-provenance"
+    )
 
 
 def test_compact_positive_frozen_flow_becomes_offset(artifacts):

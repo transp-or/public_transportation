@@ -334,6 +334,32 @@ identity: raising it preserves compatible per-group support checkpoints and
 numerical shard caches.  Summary analysis may use `materialize=False`, whereas
 the production sharded builder always requires materialized support.
 
+The limit is an **entry-count ceiling, not an RSS limit**.  Compact production
+discovery adds each completed destination group's entry count and stops at the
+first group that would exceed the configured ceiling.  The raw origin-support
+checkpoint for that group is already atomically committed, so retrying with a
+sufficient ceiling can reuse it.  Compact patterns are stored one group per
+atomically written `compact_support_groups/group-*.npz` payload; a small
+`support_manifest.json` indexes those payloads and records their checksums.
+Planning and numerical-shard construction read and release one group payload at
+a time.  The support manifest is published only after every group is present
+and validated.  Older monolithic `support.npz` checkpoints are quarantined,
+not reused; compatible raw `support_groups/group-*.npz` checkpoints remain
+reusable because they already contain the group-level rows and columns needed
+to create the new compact payloads.
+
+Structured progress reports include completed and current destination groups,
+cumulative support entries, compact payload bytes read and written, and the next
+safe resume group. The parallel analyzer separately reports admitted, active,
+queued, and buffered support workers/groups.
+
+`worker_memory_budget_bytes` estimates bounded reachability/batch and staged
+shard work per worker; it is not a cap on total process RSS.  Overall memory
+also includes shared inputs, the largest active support group or storage shard,
+bounded concurrent workers, and runtime overhead.  Use scheduler RSS telemetry
+to size an allocation rather than treating either setting as a total-process
+memory guarantee.
+
 The numerical-shard preflight records both the actual estimate and configured
 ceiling for storage shards, manifest bytes, filesystem operations, sparse calls
 per product, construction dispatches, and per-worker memory.  Rejection remains
