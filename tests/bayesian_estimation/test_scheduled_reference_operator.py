@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import shutil
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -11,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+import public_transportation.inference.direct_scheduled_temporal_builder as temporal_builder_module
 import public_transportation.inference.temporal_assignment_persistence as persistence_module
 
 from public_transportation.assignment import AssignmentConfig
@@ -34,6 +38,7 @@ from public_transportation.inference.compact_od_assignment_layout import (
 from public_transportation.inference.direct_scheduled_temporal_builder import (
     DirectScheduledGravityOperator,
     PreparedArtifactUnavailableError,
+    _finalize_temporal_blocks,
     activate_direct_scheduled_temporal_operator,
     prepare_direct_scheduled_temporal_operator,
 )
@@ -1842,3 +1847,237 @@ def test_activation_reuses_temporal_fragment_after_finalization_stop(
     ]
     assert assembly_progress
     assert assembly_progress[0]["predicted_remaining_seconds"] is not None
+
+
+def test_temporal_assembly_heartbeat_reports_inner_work_without_changing_artifacts(
+    artifacts, tmp_path, monkeypatch
+):
+    arguments, _ = _activation_arguments(artifacts, tmp_path)
+    built = activate_direct_scheduled_temporal_operator(
+        mode="direct",
+        expected_evaluations=1,
+        construction_seconds=None,
+        reference_evaluation_seconds=2.0,
+        operator_evaluation_seconds=0.5,
+        **arguments,
+    )
+    assert built.construction is not None
+    construction = built.construction
+    assert construction.source is not None
+    source = construction.source
+    expected_manifest = source.directory / "manifest.json"
+    manifest_before = expected_manifest.read_bytes()
+    artifact_manifest = (
+        None
+        if construction.artifact_directory is None
+        else construction.artifact_directory / "manifest.json"
+    )
+    artifact_manifest_before = (
+        None if artifact_manifest is None else artifact_manifest.read_bytes()
+    )
+    temporal_fragments = construction.checkpoint_directory / "temporal_fragments"
+    fragment_hashes_before = (
+        tuple(
+            (path.name, hashlib.sha256(path.read_bytes()).hexdigest())
+            for path in sorted(temporal_fragments.glob("*.npz"))
+        )
+        if temporal_fragments.exists()
+        else ()
+    )
+    shard_hashes_before = tuple(
+        hashlib.sha256(
+            shard_path(source.directory, shard_identity).read_bytes()
+        ).hexdigest()
+        for shard_identity in source.manifest.expected_shards
+    )
+
+    last_shard_key = source.manifest.expected_shards[-1].key
+    real_load_sparse_shard = temporal_builder_module.load_sparse_shard
+    load_durations: dict[str, float] = {}
+
+    def slow_final_shard(path, **kwargs):
+        shard_key = Path(path).stem
+        started = time.perf_counter()
+        if shard_key == last_shard_key:
+            time.sleep(0.12)
+        loaded = real_load_sparse_shard(path, **kwargs)
+        load_durations[shard_key] = time.perf_counter() - started
+        return loaded
+
+    monkeypatch.setattr(temporal_builder_module, "load_sparse_shard", slow_final_shard)
+    monkeypatch.setattr(temporal_builder_module, "_TEMPORAL_PROGRESS_COUNTER_BATCH", 1)
+    original_advance = temporal_builder_module._TemporalAssemblyHeartbeat.advance_to
+
+    def slow_counter_update(progress, completed):
+        original_advance(progress, completed)
+        time.sleep(0.025)
+
+    monkeypatch.setattr(
+        temporal_builder_module._TemporalAssemblyHeartbeat,
+        "advance_to",
+        slow_counter_update,
+    )
+    jsonl_path = tmp_path / "prepare.jsonl"
+
+    def append_jsonl(event):
+        with jsonl_path.open("a", encoding="utf-8") as output:
+            output.write(json.dumps(event, allow_nan=False) + "\n")
+
+    reporter = ConstructionProgressReporter(
+        ConstructionDeadline.unlimited(),
+        append_jsonl,
+        minimum_interval_seconds=0.01,
+    )
+    assembled = _finalize_temporal_blocks(
+        construction=source,
+        canonical_index=arguments["canonical_index"],
+        identity=arguments["identity"],
+        reporter=reporter,
+        checkpoint_directory=None,
+    )
+    reporter.flush()
+
+    lines = jsonl_path.read_text(encoding="utf-8").splitlines()
+    events = [json.loads(line) for line in lines]
+    final_heartbeats = [
+        event
+        for event in events
+        if event.get("heartbeat") is True
+        and event.get("current_unit") == last_shard_key
+        and event.get("active_substep") == "load_sparse_shard"
+    ]
+    assert len(final_heartbeats) >= 2
+    assert all(event["status"] == "running" for event in final_heartbeats)
+    assert all(
+        event["completed_units"] < event["total_units"] for event in final_heartbeats
+    )
+    assert all(event["internal_completed"] is None for event in final_heartbeats)
+    assert all(event["internal_total"] is None for event in final_heartbeats)
+    assert all(
+        event["internal_progress_fraction"] is None for event in final_heartbeats
+    )
+    assert all(event["internal_eta_seconds"] is None for event in final_heartbeats)
+    assert all(
+        event["internal_eta_confidence"] == "unavailable" for event in final_heartbeats
+    )
+    assert all(
+        event["predicted_remaining_seconds"] is None for event in final_heartbeats
+    )
+    assert all(
+        event["unit_eta_confidence"] == "unavailable" for event in final_heartbeats
+    )
+    assert [event["unit_elapsed_seconds"] for event in final_heartbeats] == sorted(
+        event["unit_elapsed_seconds"] for event in final_heartbeats
+    )
+    assert [event["operation_elapsed_seconds"] for event in final_heartbeats] == sorted(
+        event["operation_elapsed_seconds"] for event in final_heartbeats
+    )
+    ordinary_loads = [
+        duration for key, duration in load_durations.items() if key != last_shard_key
+    ]
+    if ordinary_loads:
+        assert load_durations[last_shard_key] > max(ordinary_loads) + 0.05
+    else:
+        assert load_durations[last_shard_key] >= 0.12
+
+    grouping_events = [
+        event
+        for event in events
+        if event.get("heartbeat") is True
+        and event.get("active_substep") == "group_nonzero_entries_by_temporal_block"
+    ]
+    assert grouping_events
+    by_unit: dict[str, list[dict[str, object]]] = {}
+    for event in grouping_events:
+        by_unit.setdefault(str(event["current_unit"]), []).append(event)
+        completed = int(event["internal_completed"])
+        total = int(event["internal_total"])
+        assert event["internal_unit"] == "nonzero_entries"
+        assert 0 <= completed <= total
+        assert event["internal_progress_fraction"] == pytest.approx(completed / total)
+        if event["internal_eta_seconds"] is not None:
+            assert event["internal_eta_scope"] == "active_substep"
+            assert event["internal_eta_confidence"] == "low"
+    for unit_events in by_unit.values():
+        counts = [int(event["internal_completed"]) for event in unit_events]
+        assert counts == sorted(counts)
+
+    baseline = construction.operator
+    assert assembled.identity.fingerprint == baseline.identity.fingerprint
+    assert len(assembled.blocks) == len(baseline.blocks)
+    for actual, expected in zip(assembled.blocks, baseline.blocks, strict=True):
+        assert actual.key == expected.key
+        np.testing.assert_array_equal(actual.row_indices, expected.row_indices)
+        np.testing.assert_array_equal(actual.column_indices, expected.column_indices)
+        np.testing.assert_array_equal(actual.values, expected.values)
+    np.testing.assert_array_equal(
+        assembled.fixed_measurement_offset, baseline.fixed_measurement_offset
+    )
+    assert expected_manifest.read_bytes() == manifest_before
+    if artifact_manifest is not None:
+        assert artifact_manifest.read_bytes() == artifact_manifest_before
+    assert (
+        tuple(
+            (path.name, hashlib.sha256(path.read_bytes()).hexdigest())
+            for path in sorted(temporal_fragments.glob("*.npz"))
+        )
+        if temporal_fragments.exists()
+        else ()
+    ) == fragment_hashes_before
+    assert (
+        tuple(
+            hashlib.sha256(
+                shard_path(source.directory, shard_identity).read_bytes()
+            ).hexdigest()
+            for shard_identity in source.manifest.expected_shards
+        )
+        == shard_hashes_before
+    )
+
+
+def test_temporal_assembly_progress_sink_is_safe_for_parallel_producers(tmp_path):
+    jsonl_path = tmp_path / "parallel-prepare.jsonl"
+
+    def append_jsonl(event):
+        with jsonl_path.open("a", encoding="utf-8") as output:
+            output.write(json.dumps(event, allow_nan=False) + "\n")
+
+    reporter = ConstructionProgressReporter(
+        ConstructionDeadline.unlimited(),
+        append_jsonl,
+        minimum_interval_seconds=0.0,
+    )
+
+    def emit_worker(worker_id):
+        for completed in range(1, 5):
+            reporter.emit_nonblocking(
+                phase=ConstructionPhase.TEMPORAL_BLOCK_ASSEMBLY,
+                status="running",
+                completed_units=completed,
+                total_units=4,
+                current_unit=f"worker-{worker_id}",
+                inner_work={
+                    "name": "group_nonzero_entries_by_temporal_block",
+                    "completed_units": completed,
+                    "total_units": 4,
+                    "unit": "nonzero_entries",
+                },
+            )
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        tuple(executor.map(emit_worker, range(4)))
+    reporter.flush()
+    events = [
+        json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(events) == 16
+    observed_counts: dict[str, list[int]] = {}
+    for event in events:
+        inner_work = event["inner_work"]
+        completed = int(inner_work["completed_units"])
+        total = int(inner_work["total_units"])
+        assert 0 <= completed <= total
+        observed_counts.setdefault(str(event["current_unit"]), []).append(completed)
+    assert set(observed_counts) == {f"worker-{worker_id}" for worker_id in range(4)}
+    for counts in observed_counts.values():
+        assert counts == [1, 2, 3, 4]

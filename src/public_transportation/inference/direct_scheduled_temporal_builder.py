@@ -9,6 +9,7 @@ import os
 from collections import deque
 from pathlib import Path
 import tempfile
+import threading
 from time import perf_counter
 from typing import Callable, Literal, Mapping
 import uuid
@@ -135,17 +136,11 @@ class PreparedArtifactUnavailableError(RuntimeError):
         self.remediation = str(remediation)
         self.different_artifact_found = bool(different_artifact_found)
         mismatch = self.details.get("mismatching_fields")
-        mismatch_line = (
-            f"\nMismatching fields:\n  {mismatch}"
-            if mismatch
-            else ""
-        )
+        mismatch_line = f"\nMismatching fields:\n  {mismatch}" if mismatch else ""
         found_line = "yes" if self.different_artifact_found else "no"
         validation_error = self.details.get("validation_error")
         validation_line = (
-            f"\nValidation detail:\n  {validation_error}"
-            if validation_error
-            else ""
+            f"\nValidation detail:\n  {validation_error}" if validation_error else ""
         )
         message = (
             "Prepared temporal operator unavailable.\n\n"
@@ -222,9 +217,7 @@ class DirectScheduledGravityOperator:
     reporter: ConstructionProgressReporter | None = field(
         default=None, repr=False, compare=False
     )
-    _execution_backend: CSRCSCTemporalAssignmentOperator = field(
-        init=False, repr=False
-    )
+    _execution_backend: CSRCSCTemporalAssignmentOperator = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         value = float(self.theta)
@@ -374,14 +367,24 @@ class DirectScheduledGravityOperator:
         _, hierarchy_fingerprints, _ = _direct_hierarchy_specifications(
             identity=self.operator.identity, canonical_index=canonical
         )
-        full_to_compact = np.full(canonical.number_of_physical_demand_cells, -1, dtype=np.int64)
+        full_to_compact = np.full(
+            canonical.number_of_physical_demand_cells, -1, dtype=np.int64
+        )
         compact_to_full = np.empty(canonical.number_of_demand_cells, dtype=np.int64)
         fixed_positive_full_index = np.asarray(
-            [cell.full_index for cell in canonical.demand_cells if cell.role == "fixed_positive"],
+            [
+                cell.full_index
+                for cell in canonical.demand_cells
+                if cell.role == "fixed_positive"
+            ],
             dtype=np.int64,
         )
         fixed_positive_values = np.asarray(
-            [cell.fixed_value for cell in canonical.demand_cells if cell.role == "fixed_positive"],
+            [
+                cell.fixed_value
+                for cell in canonical.demand_cells
+                if cell.role == "fixed_positive"
+            ],
             dtype=self.dtype,
         )
         for cell in canonical.demand_cells:
@@ -460,9 +463,10 @@ def _save_routing_checkpoint(
                 if name != "metadata"
             }
             persisted_metadata = json.loads(str(archive["metadata"]))
-        if persisted_metadata != metadata or _fragment_hash(persisted) != metadata[
-            "content_hash"
-        ]:
+        if (
+            persisted_metadata != metadata
+            or _fragment_hash(persisted) != metadata["content_hash"]
+        ):
             raise ValueError("staged routing checkpoint failed validation.")
         os.replace(temporary, destination)
     finally:
@@ -507,9 +511,7 @@ def _load_routing_checkpoint(
     if identity.route_choice_fingerprint != fixed_routing_route_choice_fingerprint(
         theta
     ):
-        raise AssignmentCompatibilityError(
-            "routing checkpoint theta is incompatible."
-        )
+        raise AssignmentCompatibilityError("routing checkpoint theta is incompatible.")
     return routing
 
 
@@ -816,7 +818,9 @@ def _direct_hierarchy_specifications(
                 "feasibility": identity.feasibility_fingerprint,
                 "algorithm": "scheduled-feasibility-v1",
             },
-            "input_fingerprints": {"canonical_od_time_universe": "canonical_od_time_universe"},
+            "input_fingerprints": {
+                "canonical_od_time_universe": "canonical_od_time_universe"
+            },
         },
         "route_choice_basis": {
             "scientific_parameters": {
@@ -897,9 +901,7 @@ def _publish_direct_hierarchy(
     )
     store = _hierarchy_store(artifact_root)
     for layer in ARTIFACT_LAYERS:
-        parents = {
-            name: fingerprints[name] for name in DAG_PARENT_LAYERS[layer]
-        }
+        parents = {name: fingerprints[name] for name in DAG_PARENT_LAYERS[layer]}
         payload: dict[str, object] = {
             "source": "direct-scheduled-preparation",
             "source_artifact_identity": identity.fingerprint,
@@ -959,7 +961,10 @@ def _validate_direct_hierarchy_reuse(
                 legacy_manifest,
                 artifact_layer="estimation_assignment_mapping",
             ) from error
-        if "artifact_layer" not in legacy_payload and "artifact_type" not in legacy_payload:
+        if (
+            "artifact_layer" not in legacy_payload
+            and "artifact_type" not in legacy_payload
+        ):
             raise ObsoleteArtifactFormatError(
                 legacy_manifest,
                 artifact_layer="estimation_assignment_mapping",
@@ -967,9 +972,7 @@ def _validate_direct_hierarchy_reuse(
 
     store = hierarchy_store
     for layer in ARTIFACT_LAYERS:
-        parents = {
-            name: fingerprints[name] for name in DAG_PARENT_LAYERS[layer]
-        }
+        parents = {name: fingerprints[name] for name in DAG_PARENT_LAYERS[layer]}
         manifest = store.require(
             layer,  # type: ignore[arg-type]
             fingerprints[layer],
@@ -994,9 +997,14 @@ def _validate_direct_hierarchy_reuse(
             specifications[layer].get("scientific_parameters", {})
         )
         if dict(manifest.scientific_parameters) != expected_parameters:
-            raise ValueError(f"hierarchical {layer} scientific parameters are incompatible")
+            raise ValueError(
+                f"hierarchical {layer} scientific parameters are incompatible"
+            )
         if layer == "estimation_assignment_mapping":
-            if manifest.payload.get("fixed_demand_fingerprint") != fixed_demand_fingerprint:
+            if (
+                manifest.payload.get("fixed_demand_fingerprint")
+                != fixed_demand_fingerprint
+            ):
                 raise ValueError(
                     "fixed-positive demand values changed; L7 fixed offset must be rebuilt"
                 )
@@ -1056,9 +1064,7 @@ def _emit_direct_hierarchy_progress(
             details={
                 "artifact_layer": layer,
                 "artifact_fingerprint": fingerprints[layer],
-                "parent_fingerprint": (
-                    parent
-                ),
+                "parent_fingerprint": (parent),
                 "activation_policy": activation_policy,
                 "reused": status == "reused",
                 "rebuild": status != "reused",
@@ -1079,9 +1085,7 @@ def _different_prepared_artifact_found(
                 (item / "manifest.json").is_file()
                 or (
                     len(item.name) == 64
-                    and all(
-                        character in "0123456789abcdef" for character in item.name
-                    )
+                    and all(character in "0123456789abcdef" for character in item.name)
                 )
             )
             for item in root.iterdir()
@@ -1278,7 +1282,8 @@ def _validate_cached_positive_boarding_support(
             cached_support = load_positive_boarding_support_cache(
                 directory=context.report_path.parent / "positive_boarding_support_cache"
                 if context.report_path is not None
-                else operator_cache_directory.parent / "positive_boarding_support_cache",
+                else operator_cache_directory.parent
+                / "positive_boarding_support_cache",
                 artifact_identity_fingerprint=operator.identity.fingerprint,
                 artifact_manifest_sha256=_file_sha256(artifact_manifest),
                 operator_cache_manifest_sha256=_file_sha256(operator_manifest),
@@ -1322,7 +1327,9 @@ def _validate_cached_positive_boarding_support(
                     completed_units=2,
                     total_units=2,
                     checkpoint_location=(
-                        None if context.report_path is None else str(context.report_path)
+                        None
+                        if context.report_path is None
+                        else str(context.report_path)
                     ),
                     details={
                         "preflight_stage": "realized_operator_support",
@@ -1352,10 +1359,14 @@ def _validate_cached_positive_boarding_support(
                 details={"cache_validation_stage": "realized_operator_support"},
             )
         if operator.row_indices.size:
-            for unit, start in enumerate(range(0, operator.row_indices.size, chunk_size), 1):
+            for unit, start in enumerate(
+                range(0, operator.row_indices.size, chunk_size), 1
+            ):
                 started = perf_counter() if reporting_enabled else None
                 stop = min(operator.row_indices.size, start + chunk_size)
-                supported.update(int(row) for row in np.unique(operator.row_indices[start:stop]))
+                supported.update(
+                    int(row) for row in np.unique(operator.row_indices[start:stop])
+                )
                 if reporting_enabled:
                     assert started is not None and phase_started_at is not None
                     duration = max(0.0, perf_counter() - started)
@@ -1451,10 +1462,13 @@ def _validate_cached_positive_boarding_support(
                 directory=(
                     context.report_path.parent / "positive_boarding_support_cache"
                     if context.report_path is not None
-                    else operator_cache_directory.parent / "positive_boarding_support_cache"
+                    else operator_cache_directory.parent
+                    / "positive_boarding_support_cache"
                 ),
                 report=report,
-                supported_measurement_rows=np.asarray(sorted(supported), dtype=np.int64),
+                supported_measurement_rows=np.asarray(
+                    sorted(supported), dtype=np.int64
+                ),
                 artifact_identity_fingerprint=operator.identity.fingerprint,
                 artifact_manifest_sha256=_file_sha256(artifact_manifest),
                 operator_cache_manifest_sha256=_file_sha256(operator_manifest),
@@ -1507,6 +1521,219 @@ def _validate_cached_positive_boarding_support(
     return final_eta
 
 
+_TEMPORAL_PROGRESS_COUNTER_BATCH = 4096
+
+
+def _temporal_progress_update_interval(total: int) -> int:
+    """Keep small counters live while bounding updates for large arrays."""
+    if total <= 32:
+        return 1
+    return _TEMPORAL_PROGRESS_COUNTER_BATCH
+
+
+class _TemporalAssemblyHeartbeat:
+    """Rate-limited, additive progress for one temporal-finalization pass."""
+
+    def __init__(
+        self,
+        *,
+        reporter: ConstructionProgressReporter | None,
+        checkpoint_directory: Path | None,
+        total_units: int,
+    ) -> None:
+        self.reporter = reporter
+        self.checkpoint_directory = checkpoint_directory
+        self.total_units = total_units
+        self.enabled = reporter is not None and reporter.sink is not None
+        self.interval_seconds = (
+            max(0.01, reporter.minimum_interval_seconds)
+            if reporter is not None
+            else 1.0
+        )
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._unit: str | None = None
+        self._unit_position = 0
+        self._unit_started_at: float | None = None
+        self._substep: str | None = None
+        self._substep_started_at: float | None = None
+        self._counter_unit: str | None = None
+        self._counter_total: int | None = None
+        self._counter_completed = 0
+
+    def __enter__(self) -> _TemporalAssemblyHeartbeat:
+        if self.enabled:
+            self._thread = threading.Thread(
+                target=self._run,
+                name="temporal-assembly-progress-heartbeat",
+                daemon=True,
+            )
+            self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, self.interval_seconds * 2.0))
+
+    def begin_unit(self, *, key: str, position: int) -> None:
+        if not self.enabled:
+            return
+        now = perf_counter()
+        with self._lock:
+            self._unit = key
+            self._unit_position = position
+            self._unit_started_at = now
+            self._substep = None
+            self._substep_started_at = None
+            self._counter_unit = None
+            self._counter_total = None
+            self._counter_completed = 0
+
+    def begin_substep(
+        self,
+        name: str,
+        *,
+        counter_unit: str | None = None,
+        counter_total: int | None = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        now = perf_counter()
+        with self._lock:
+            self._substep = name
+            self._substep_started_at = now
+            self._counter_unit = counter_unit
+            self._counter_total = counter_total
+            self._counter_completed = 0
+
+    def advance_to(self, completed: int) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            if self._counter_total is None:
+                return
+            self._counter_completed = max(
+                self._counter_completed,
+                min(self._counter_total, int(completed)),
+            )
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_seconds):
+            self._emit_heartbeat()
+
+    def _emit_heartbeat(self) -> None:
+        assert self.reporter is not None
+        now = perf_counter()
+        with self._lock:
+            if (
+                self._unit is None
+                or self._unit_started_at is None
+                or self._substep is None
+                or self._substep_started_at is None
+            ):
+                return
+            unit = self._unit
+            unit_position = self._unit_position
+            unit_elapsed = max(0.0, now - self._unit_started_at)
+            substep = self._substep
+            substep_elapsed = max(0.0, now - self._substep_started_at)
+            counter_unit = self._counter_unit
+            counter_total = self._counter_total
+            counter_completed = self._counter_completed
+            unit_started_at = self._unit_started_at
+            substep_started_at = self._substep_started_at
+
+        progress_fraction = None
+        throughput = None
+        substep_eta = None
+        substep_eta_confidence = "unavailable"
+        eta_reason = "active operation has no defensible completed-work counter"
+        if counter_total is not None:
+            eta_reason = "no completed work yet for the active operation"
+            if counter_total > 0:
+                progress_fraction = counter_completed / counter_total
+                if counter_completed > 0 and substep_elapsed > 0.0:
+                    throughput = counter_completed / substep_elapsed
+                    substep_eta = max(0, counter_total - counter_completed) / throughput
+                    substep_eta_confidence = "low"
+                    eta_reason = "estimate covers only the active operation"
+            elif counter_total == 0:
+                eta_reason = "active operation has zero work units"
+
+        inner_work = {
+            "name": substep,
+            "current_unit": unit,
+            "status": "running",
+            "completed_units": counter_completed if counter_total is not None else None,
+            "total_units": counter_total,
+            "unit": counter_unit,
+            "progress_fraction": progress_fraction,
+            "elapsed_seconds": substep_elapsed,
+            "throughput_per_second": throughput,
+            "predicted_remaining_seconds": substep_eta,
+            "eta_scope": "active_substep" if substep_eta is not None else None,
+            "eta_confidence": substep_eta_confidence,
+            "eta_reason": eta_reason,
+        }
+        with self._lock:
+            if (
+                self._unit != unit
+                or self._unit_started_at != unit_started_at
+                or self._substep_started_at != substep_started_at
+            ):
+                return
+            self.reporter.emit_nonblocking(
+                phase=ConstructionPhase.TEMPORAL_BLOCK_ASSEMBLY,
+                status="running",
+                completed_units=unit_position,
+                total_units=self.total_units,
+                current_unit=unit,
+                current_unit_elapsed_seconds=unit_elapsed,
+                eta_confidence="unavailable",
+                eta_reason=(
+                    "remaining storage-unit and phase duration are not estimated "
+                    "from an inner operation"
+                ),
+                checkpoint_location=(
+                    None
+                    if self.checkpoint_directory is None
+                    else str(self.checkpoint_directory)
+                ),
+                inner_work=inner_work,
+                details={
+                    "heartbeat": True,
+                    "active_substep": substep,
+                    "unit_elapsed_seconds": unit_elapsed,
+                    "operation_elapsed_seconds": substep_elapsed,
+                    "internal_completed": (
+                        counter_completed if counter_total is not None else None
+                    ),
+                    "internal_total": counter_total,
+                    "internal_unit": counter_unit,
+                    "internal_progress_fraction": progress_fraction,
+                    "internal_throughput_per_second": throughput,
+                    "internal_eta_seconds": substep_eta,
+                    "internal_eta_scope": (
+                        "active_substep" if substep_eta is not None else None
+                    ),
+                    "internal_eta_confidence": substep_eta_confidence,
+                    "internal_eta_reason": eta_reason,
+                    "unit_eta_confidence": "unavailable",
+                },
+            )
+
+    def finish_unit(self) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            self._unit = None
+            self._substep = None
+            self._unit_started_at = None
+            self._substep_started_at = None
+
+
 def _finalize_temporal_blocks(
     *,
     construction: ShardedConstructionResult,
@@ -1541,165 +1768,206 @@ def _finalize_temporal_blocks(
         if fragments.exists():
             for abandoned in fragments.glob(".*.tmp"):
                 abandoned.unlink(missing_ok=True)
-    for shard_position, shard_identity in enumerate(expected):
-        predicted = (
-            float(np.mean(tuple(recent_seconds)[-3:])) if recent_seconds else None
-        )
-        if deadline is not None and not deadline.may_start(predicted):
-            raise deadline_stop(
-                deadline,
-                phase=ConstructionPhase.TEMPORAL_BLOCK_ASSEMBLY,
-                reason="next temporal shard cannot be assembled within the safe deadline",
-                completed_units=shard_position,
-                total_units=len(expected),
-                next_resumable_position=shard_identity.key,
-                checkpoint_location=(
-                    None
-                    if checkpoint_directory is None
-                    else str(checkpoint_directory)
-                ),
-                checkpoint_reusable=True,
-                predicted_next_seconds=predicted,
+    with _TemporalAssemblyHeartbeat(
+        reporter=reporter,
+        checkpoint_directory=checkpoint_directory,
+        total_units=len(expected),
+    ) as inner_progress:
+        for shard_position, shard_identity in enumerate(expected):
+            predicted = (
+                float(np.mean(tuple(recent_seconds)[-3:])) if recent_seconds else None
             )
-        shard_started = deadline.clock() if deadline is not None else perf_counter()
-        fragment = (
-            None
-            if checkpoint_directory is None
-            else _fragment_path(checkpoint_directory, shard_identity.key)
-        )
-        fragment_reused = False
-        local_blocks = None
-        if fragment is not None and fragment.exists():
-            try:
-                local_blocks, offset_rows, offset_values = _load_temporal_fragment(
-                    fragment,
-                    shard_key=shard_identity.key,
-                    identity=identity,
-                    number_of_measurements=canonical_index.number_of_measurements,
-                    number_of_demand_cells=canonical_index.number_of_demand_cells,
-                )
-            except (KeyError, OSError, ValueError, json.JSONDecodeError):
-                quarantine = fragment.with_name(
-                    f"{fragment.name}.invalid-{uuid.uuid4().hex}"
-                )
-                os.replace(fragment, quarantine)
-            else:
-                fragment_reused = True
-        if local_blocks is None:
-            loaded = load_sparse_shard(
-                shard_path(construction.directory, shard_identity),
-                expected_provenance_hash=construction.manifest.provenance_hash,
-            )
-            coo = loaded.matrix.tocoo()
-            global_rows = loaded.row_indices[coo.row]
-            local_triplets: dict[
-                TemporalBlockKey, tuple[list[int], list[int], list[float]]
-            ] = {}
-            for row, column, value in zip(
-                global_rows, coo.col, coo.data, strict=True
-            ):
-                key = TemporalBlockKey(
-                    measurement_intervals[int(row)],
-                    departure_by_column[int(column)],
-                )
-                rows, columns, values = local_triplets.setdefault(
-                    key, ([], [], [])
-                )
-                rows.append(int(row))
-                columns.append(int(column))
-                values.append(float(value))
-            local_blocks = tuple(
-                TemporalSparseBlock(
-                    key=key,
-                    row_indices=np.asarray(values[0], dtype=np.int32),
-                    column_indices=np.asarray(values[1], dtype=np.int32),
-                    values=np.asarray(
-                        values[2], dtype=np.dtype(identity.numeric_dtype)
+            if deadline is not None and not deadline.may_start(predicted):
+                raise deadline_stop(
+                    deadline,
+                    phase=ConstructionPhase.TEMPORAL_BLOCK_ASSEMBLY,
+                    reason="next temporal shard cannot be assembled within the safe deadline",
+                    completed_units=shard_position,
+                    total_units=len(expected),
+                    next_resumable_position=shard_identity.key,
+                    checkpoint_location=(
+                        None
+                        if checkpoint_directory is None
+                        else str(checkpoint_directory)
                     ),
-                    number_of_measurements=canonical_index.number_of_measurements,
-                    number_of_demand_cells=canonical_index.number_of_demand_cells,
+                    checkpoint_reusable=True,
+                    predicted_next_seconds=predicted,
                 )
-                for key, values in sorted(local_triplets.items())
+            shard_started = deadline.clock() if deadline is not None else perf_counter()
+            inner_progress.begin_unit(key=shard_identity.key, position=shard_position)
+            fragment = (
+                None
+                if checkpoint_directory is None
+                else _fragment_path(checkpoint_directory, shard_identity.key)
             )
-            offset_rows = loaded.row_indices[loaded.fixed_offset_indices]
-            offset_values = loaded.fixed_offset_values
-            if checkpoint_directory is not None:
-                _save_temporal_fragment(
-                    directory=checkpoint_directory,
-                    shard_key=shard_identity.key,
-                    identity=identity,
-                    blocks=local_blocks,
-                    offset_rows=offset_rows,
-                    offset_values=offset_values,
+            fragment_reused = False
+            local_blocks = None
+            if fragment is not None and fragment.exists():
+                inner_progress.begin_substep("load_and_validate_temporal_fragment")
+                try:
+                    local_blocks, offset_rows, offset_values = _load_temporal_fragment(
+                        fragment,
+                        shard_key=shard_identity.key,
+                        identity=identity,
+                        number_of_measurements=canonical_index.number_of_measurements,
+                        number_of_demand_cells=canonical_index.number_of_demand_cells,
+                    )
+                except (KeyError, OSError, ValueError, json.JSONDecodeError):
+                    quarantine = fragment.with_name(
+                        f"{fragment.name}.invalid-{uuid.uuid4().hex}"
+                    )
+                    os.replace(fragment, quarantine)
+                else:
+                    fragment_reused = True
+            if local_blocks is None:
+                inner_progress.begin_substep("load_sparse_shard")
+                loaded = load_sparse_shard(
+                    shard_path(construction.directory, shard_identity),
+                    expected_provenance_hash=construction.manifest.provenance_hash,
                 )
-        blocks.extend(local_blocks)
-        retained_l1 += sum(
-            float(np.sum(np.abs(block.values))) for block in local_blocks
-        )
-        if offset_rows.size:
-            np.add.at(offset, offset_rows, offset_values)
-        now = deadline.clock() if deadline is not None else perf_counter()
-        recent_seconds.append(max(0.0, now - shard_started))
-        if reporter is not None:
-            eta = None
-            if reporting_enabled:
-                assert phase_started_at is not None
-                eta = estimate_completed_unit_eta(
-                    recent_seconds,
+                inner_progress.begin_substep("convert_sparse_shard_to_coo")
+                coo = loaded.matrix.tocoo()
+                inner_progress.begin_substep("map_sparse_rows_to_measurements")
+                global_rows = loaded.row_indices[coo.row]
+                local_triplets: dict[
+                    TemporalBlockKey, tuple[list[int], list[int], list[float]]
+                ] = {}
+                entry_update_interval = _temporal_progress_update_interval(int(coo.nnz))
+                inner_progress.begin_substep(
+                    "group_nonzero_entries_by_temporal_block",
+                    counter_unit="nonzero_entries",
+                    counter_total=int(coo.nnz),
+                )
+                for entry_position, (row, column, value) in enumerate(
+                    zip(global_rows, coo.col, coo.data, strict=True), start=1
+                ):
+                    key = TemporalBlockKey(
+                        measurement_intervals[int(row)],
+                        departure_by_column[int(column)],
+                    )
+                    rows, columns, values = local_triplets.setdefault(key, ([], [], []))
+                    rows.append(int(row))
+                    columns.append(int(column))
+                    values.append(float(value))
+                    if entry_position % entry_update_interval == 0:
+                        inner_progress.advance_to(entry_position)
+                inner_progress.advance_to(int(coo.nnz))
+                inner_progress.begin_substep(
+                    "assemble_temporal_sparse_blocks",
+                    counter_unit="temporal_blocks",
+                    counter_total=len(local_triplets),
+                )
+                local_block_list = []
+                block_update_interval = _temporal_progress_update_interval(
+                    len(local_triplets)
+                )
+                for block_position, (key, values) in enumerate(
+                    sorted(local_triplets.items()), start=1
+                ):
+                    local_block_list.append(
+                        TemporalSparseBlock(
+                            key=key,
+                            row_indices=np.asarray(values[0], dtype=np.int32),
+                            column_indices=np.asarray(values[1], dtype=np.int32),
+                            values=np.asarray(
+                                values[2], dtype=np.dtype(identity.numeric_dtype)
+                            ),
+                            number_of_measurements=(
+                                canonical_index.number_of_measurements
+                            ),
+                            number_of_demand_cells=(
+                                canonical_index.number_of_demand_cells
+                            ),
+                        )
+                    )
+                    if block_position % block_update_interval == 0:
+                        inner_progress.advance_to(block_position)
+                inner_progress.advance_to(len(local_triplets))
+                local_blocks = tuple(local_block_list)
+                offset_rows = loaded.row_indices[loaded.fixed_offset_indices]
+                offset_values = loaded.fixed_offset_values
+                if checkpoint_directory is not None:
+                    inner_progress.begin_substep("persist_temporal_fragment")
+                    _save_temporal_fragment(
+                        directory=checkpoint_directory,
+                        shard_key=shard_identity.key,
+                        identity=identity,
+                        blocks=local_blocks,
+                        offset_rows=offset_rows,
+                        offset_values=offset_values,
+                    )
+            inner_progress.begin_substep("merge_sparse_blocks_and_fixed_offsets")
+            blocks.extend(local_blocks)
+            retained_l1 += sum(
+                float(np.sum(np.abs(block.values))) for block in local_blocks
+            )
+            if offset_rows.size:
+                np.add.at(offset, offset_rows, offset_values)
+            inner_progress.finish_unit()
+            now = deadline.clock() if deadline is not None else perf_counter()
+            recent_seconds.append(max(0.0, now - shard_started))
+            if reporter is not None:
+                eta = None
+                if reporting_enabled:
+                    assert phase_started_at is not None
+                    eta = estimate_completed_unit_eta(
+                        recent_seconds,
+                        completed_units=shard_position + 1,
+                        total_units=len(expected),
+                        parallelism=1,
+                        elapsed_seconds=max(0.0, perf_counter() - phase_started_at),
+                    )
+                reporter.emit(
+                    phase=ConstructionPhase.TEMPORAL_BLOCK_ASSEMBLY,
+                    status="running",
+                    force=(shard_position == 0 or shard_position + 1 == len(expected)),
                     completed_units=shard_position + 1,
                     total_units=len(expected),
-                    parallelism=1,
-                    elapsed_seconds=max(0.0, perf_counter() - phase_started_at),
+                    current_unit=shard_identity.key,
+                    recent_unit_seconds=recent_seconds[-1],
+                    predicted_remaining_seconds=(
+                        None if eta is None else eta.predicted_remaining_seconds
+                    ),
+                    eta_confidence=(
+                        "unavailable" if eta is None else eta.eta_confidence
+                    ),
+                    estimated_completion_at_utc=(
+                        None if eta is None else eta.estimated_completion_at_utc
+                    ),
+                    eta_reason=(None if eta is None else eta.eta_reason),
+                    eta_lower_seconds=(None if eta is None else eta.eta_lower_seconds),
+                    eta_upper_seconds=(None if eta is None else eta.eta_upper_seconds),
+                    throughput_units_per_second=(
+                        None if eta is None else eta.throughput_units_per_second
+                    ),
+                    checkpoint_location=(
+                        None
+                        if checkpoint_directory is None
+                        else str(checkpoint_directory)
+                    ),
+                    cache_hits=int(fragment_reused),
+                    cache_misses=int(not fragment_reused),
                 )
-            reporter.emit(
-                phase=ConstructionPhase.TEMPORAL_BLOCK_ASSEMBLY,
-                status="running",
-                force=(shard_position == 0 or shard_position + 1 == len(expected)),
-                completed_units=shard_position + 1,
-                total_units=len(expected),
-                current_unit=shard_identity.key,
-                recent_unit_seconds=recent_seconds[-1],
-                predicted_remaining_seconds=(
-                    None if eta is None else eta.predicted_remaining_seconds
-                ),
-                eta_confidence=("unavailable" if eta is None else eta.eta_confidence),
-                estimated_completion_at_utc=(
-                    None if eta is None else eta.estimated_completion_at_utc
-                ),
-                eta_reason=(None if eta is None else eta.eta_reason),
-                eta_lower_seconds=(None if eta is None else eta.eta_lower_seconds),
-                eta_upper_seconds=(None if eta is None else eta.eta_upper_seconds),
-                throughput_units_per_second=(
-                    None if eta is None else eta.throughput_units_per_second
-                ),
-                checkpoint_location=(
-                    None
-                    if checkpoint_directory is None
-                    else str(checkpoint_directory)
-                ),
-                cache_hits=int(fragment_reused),
-                cache_misses=int(not fragment_reused),
-            )
-        if deadline is not None and deadline.expired:
-            raise deadline_stop(
-                deadline,
-                phase=ConstructionPhase.TEMPORAL_BLOCK_ASSEMBLY,
-                reason="deadline expired after assembling a temporal shard",
-                completed_units=shard_position + 1,
-                total_units=len(expected),
-                next_resumable_position=(
-                    expected[shard_position + 1].key
-                    if shard_position + 1 < len(expected)
-                    else None
-                ),
-                checkpoint_location=(
-                    None
-                    if checkpoint_directory is None
-                    else str(checkpoint_directory)
-                ),
-                checkpoint_reusable=True,
-                predicted_next_seconds=recent_seconds[-1],
-            )
+            if deadline is not None and deadline.expired:
+                raise deadline_stop(
+                    deadline,
+                    phase=ConstructionPhase.TEMPORAL_BLOCK_ASSEMBLY,
+                    reason="deadline expired after assembling a temporal shard",
+                    completed_units=shard_position + 1,
+                    total_units=len(expected),
+                    next_resumable_position=(
+                        expected[shard_position + 1].key
+                        if shard_position + 1 < len(expected)
+                        else None
+                    ),
+                    checkpoint_location=(
+                        None
+                        if checkpoint_directory is None
+                        else str(checkpoint_directory)
+                    ),
+                    checkpoint_reusable=True,
+                    predicted_next_seconds=recent_seconds[-1],
+                )
     block_tuple = tuple(blocks)
     nonzeros = sum(block.nonzero_entries for block in block_tuple)
     source = construction
@@ -1810,7 +2078,11 @@ def prepare_direct_scheduled_temporal_operator(
         if artifact_root is None
         else temporal_block_cache_path(artifact_root, identity)
     )
-    if policy == "rebuild" and artifact_directory is not None and artifact_directory.exists():
+    if (
+        policy == "rebuild"
+        and artifact_directory is not None
+        and artifact_directory.exists()
+    ):
         quarantine = artifact_directory.with_name(
             f"{artifact_directory.name}.force-rebuild-{uuid.uuid4().hex}"
         )
@@ -1936,9 +2208,7 @@ def prepare_direct_scheduled_temporal_operator(
             "route_choice_fingerprint": identity.route_choice_fingerprint,
             "departure_choice_fingerprint": identity.departure_choice_fingerprint,
             "feasibility_fingerprint": identity.feasibility_fingerprint,
-            "coefficient_policy_fingerprint": (
-                identity.coefficient_policy_fingerprint
-            ),
+            "coefficient_policy_fingerprint": (identity.coefficient_policy_fingerprint),
             "numeric_dtype": identity.numeric_dtype,
             "assignment_contract_schema_version": identity.schema_version,
         },
@@ -1946,7 +2216,8 @@ def prepare_direct_scheduled_temporal_operator(
         support_timing_callback=support_timing_callback,
     )
     predicted_finalization = (
-        source.total_seconds / max(1, source.plan.num_shards)
+        source.total_seconds
+        / max(1, source.plan.num_shards)
         * source.plan.num_shards
         * 0.1
     )
@@ -2054,7 +2325,9 @@ def prepare_direct_scheduled_temporal_operator(
             hierarchical_progress=hierarchical_progress,
             fingerprints=hierarchy_fingerprints,
             status="completed",
-            activation_policy=("force_rebuild" if policy == "rebuild" else "build_or_reuse"),
+            activation_policy=(
+                "force_rebuild" if policy == "rebuild" else "build_or_reuse"
+            ),
         )
     finalization_seconds = max(0.0, perf_counter() - finalization_started)
     if control.expired:
@@ -2122,9 +2395,7 @@ def activate_direct_scheduled_temporal_operator(
     safety_margin_seconds: float = 0.0,
     progress_interval_seconds: float = 1.0,
     predicted_routing_seconds: float | None = None,
-    bounded_routing_factory: Callable[
-        [ConstructionDeadline], FixedRoutingInputs
-    ]
+    bounded_routing_factory: Callable[[ConstructionDeadline], FixedRoutingInputs]
     | None = None,
     routing_preparation_config: FixedRoutingPreparationConfig | None = None,
     measurement_info: MappingInfo | None = None,
@@ -2188,9 +2459,8 @@ def activate_direct_scheduled_temporal_operator(
         canonical_index=canonical_index,
         identity=identity,
     )
-    if (
-        identity.route_choice_fingerprint
-        != fixed_routing_route_choice_fingerprint(theta)
+    if identity.route_choice_fingerprint != fixed_routing_route_choice_fingerprint(
+        theta
     ):
         raise AssignmentCompatibilityError(
             "direct temporal activation theta is incompatible."
@@ -2409,17 +2679,13 @@ def activate_direct_scheduled_temporal_operator(
                     else f"block-{_operator_number_of_blocks(cached) - 1:06d}.npz"
                 ),
                 predicted_remaining_seconds=(
-                    None
-                    if cache_eta is None
-                    else cache_eta.predicted_remaining_seconds
+                    None if cache_eta is None else cache_eta.predicted_remaining_seconds
                 ),
                 eta_confidence=(
                     "unavailable" if cache_eta is None else cache_eta.eta_confidence
                 ),
                 estimated_completion_at_utc=(
-                    None
-                    if cache_eta is None
-                    else cache_eta.estimated_completion_at_utc
+                    None if cache_eta is None else cache_eta.estimated_completion_at_utc
                 ),
                 eta_reason=None if cache_eta is None else cache_eta.eta_reason,
                 eta_lower_seconds=(
@@ -2429,9 +2695,7 @@ def activate_direct_scheduled_temporal_operator(
                     None if cache_eta is None else cache_eta.eta_upper_seconds
                 ),
                 throughput_units_per_second=(
-                    None
-                    if cache_eta is None
-                    else cache_eta.throughput_units_per_second
+                    None if cache_eta is None else cache_eta.throughput_units_per_second
                 ),
                 cache_hits=1,
                 cache_misses=0,
@@ -2469,13 +2733,10 @@ def activate_direct_scheduled_temporal_operator(
         if construction_seconds is None or saving <= 0.0
         else construction_seconds / saving
     )
-    justified = (
-        mode == "direct"
-        or (
-            construction_seconds is not None
-            and saving > 0.0
-            and expected_evaluations * saving > construction_seconds
-        )
+    justified = mode == "direct" or (
+        construction_seconds is not None
+        and saving > 0.0
+        and expected_evaluations * saving > construction_seconds
     )
     if not justified:
         reason = (
@@ -2568,7 +2829,8 @@ def activate_direct_scheduled_temporal_operator(
             reporter.emit(
                 phase=ConstructionPhase.ROUTING_PREPARATION,
                 status=event.status,
-                force=event.phase in {
+                force=event.phase
+                in {
                     "planning_cache_scan",
                     "planning",
                     "terminal",
@@ -2687,9 +2949,7 @@ def activate_direct_scheduled_temporal_operator(
                 checkpoint_location=str(routing_directory),
                 artifact_location=str(artifact_directory),
                 checkpoint_reusable=True,
-                predicted_next_seconds=(
-                    routing_result.predicted_next_shard_seconds
-                ),
+                predicted_next_seconds=(routing_result.predicted_next_shard_seconds),
             ).termination
             reporter.terminal(stopped)
             decision = DirectScheduledActivationDecision(
@@ -2801,21 +3061,21 @@ def activate_direct_scheduled_temporal_operator(
             expected_evaluations=expected_evaluations,
             break_even_evaluations=break_even,
         )
-        return DirectScheduledActivationResult(
-            None, decision, None, error.termination
-        )
+        return DirectScheduledActivationResult(None, decision, None, error.termination)
     decision = DirectScheduledActivationDecision(
         mode=mode,
         activated=True,
         cache_reused=construction.temporal_artifact_reused,
-        reason=("explicit direct construction" if mode == "direct" else "positive expected net saving"),
+        reason=(
+            "explicit direct construction"
+            if mode == "direct"
+            else "positive expected net saving"
+        ),
         expected_evaluations=expected_evaluations,
         break_even_evaluations=break_even,
     )
     return DirectScheduledActivationResult(
-        DirectScheduledGravityOperator(
-            construction.operator, theta, reporter=reporter
-        ),
+        DirectScheduledGravityOperator(construction.operator, theta, reporter=reporter),
         decision,
         construction,
     )
