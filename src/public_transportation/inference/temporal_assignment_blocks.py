@@ -469,14 +469,16 @@ class PackedTemporalBlockAssignmentOperator:
         cached = self._blocks
         if cached is not None:
             return cached
+        number_of_measurements = self.number_of_measurements
+        number_of_demand_cells = self.number_of_demand_cells
         materialized = tuple(
             TemporalSparseBlock(
                 key=key,
                 row_indices=self.row_indices[int(self.offsets[position]) : int(self.offsets[position + 1])],
                 column_indices=self.column_indices[int(self.offsets[position]) : int(self.offsets[position + 1])],
                 values=self.values[int(self.offsets[position]) : int(self.offsets[position + 1])],
-                number_of_measurements=self.number_of_measurements,
-                number_of_demand_cells=self.number_of_demand_cells,
+                number_of_measurements=number_of_measurements,
+                number_of_demand_cells=number_of_demand_cells,
             )
             for position, key in enumerate(self.keys)
         )
@@ -519,6 +521,7 @@ def build_exact_temporal_block_operator(
         raise ValueError("zero_tolerance must be finite and nonnegative.")
     started = clock()
     total = reference.number_of_demand_cells
+    number_of_measurements = reference.number_of_measurements
     measurement_intervals = tuple(
         item.interval_id for item in reference.canonical_index.measurements
     )
@@ -591,8 +594,8 @@ def build_exact_temporal_block_operator(
             row_indices=np.asarray(values[0], dtype=np.int32),
             column_indices=np.asarray(values[1], dtype=np.int32),
             values=np.asarray(values[2], dtype=reference.dtype),
-            number_of_measurements=reference.number_of_measurements,
-            number_of_demand_cells=reference.number_of_demand_cells,
+            number_of_measurements=number_of_measurements,
+            number_of_demand_cells=total,
         )
         for key, values in sorted(triplets.items())
     )
@@ -633,6 +636,7 @@ def build_chunked_temporal_block_operator(
         raise ValueError("zero_tolerance must be finite and nonnegative.")
     started = clock()
     total = reference.number_of_demand_cells
+    number_of_measurements = reference.number_of_measurements
     measurement_intervals = tuple(
         item.interval_id for item in reference.canonical_index.measurements
     )
@@ -731,8 +735,8 @@ def build_chunked_temporal_block_operator(
             row_indices=np.asarray(values[0], dtype=np.int32),
             column_indices=np.asarray(values[1], dtype=np.int32),
             values=np.asarray(values[2], dtype=reference.dtype),
-            number_of_measurements=reference.number_of_measurements,
-            number_of_demand_cells=reference.number_of_demand_cells,
+            number_of_measurements=number_of_measurements,
+            number_of_demand_cells=total,
         )
         for key, values in sorted(triplets.items())
     )
@@ -753,6 +757,6 @@ def build_chunked_temporal_block_operator(
             execution_seconds=execution_seconds,
             device_transfer_seconds=transfer_seconds,
             num_chunks=num_chunks,
-            chunk_shape=(chunk_size, reference.number_of_measurements),
+            chunk_shape=(chunk_size, number_of_measurements),
         ),
     )

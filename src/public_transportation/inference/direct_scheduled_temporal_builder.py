@@ -1743,6 +1743,8 @@ def _finalize_temporal_blocks(
     reporter: ConstructionProgressReporter | None = None,
     checkpoint_directory: Path | None = None,
 ) -> TemporalBlockAssignmentOperator:
+    number_of_measurements = canonical_index.number_of_measurements
+    number_of_demand_cells = canonical_index.number_of_demand_cells
     measurement_intervals = tuple(
         item.interval_id for item in canonical_index.measurements
     )
@@ -1753,7 +1755,7 @@ def _finalize_temporal_blocks(
     }
     blocks: list[TemporalSparseBlock] = []
     offset = np.zeros(
-        canonical_index.number_of_measurements, dtype=np.dtype(identity.numeric_dtype)
+        number_of_measurements, dtype=np.dtype(identity.numeric_dtype)
     )
     retained_l1 = 0.0
     # Only the recent tail is needed for deadline prediction and progress ETA;
@@ -1809,8 +1811,8 @@ def _finalize_temporal_blocks(
                         fragment,
                         shard_key=shard_identity.key,
                         identity=identity,
-                        number_of_measurements=canonical_index.number_of_measurements,
-                        number_of_demand_cells=canonical_index.number_of_demand_cells,
+                        number_of_measurements=number_of_measurements,
+                        number_of_demand_cells=number_of_demand_cells,
                     )
                 except (KeyError, OSError, ValueError, json.JSONDecodeError):
                     quarantine = fragment.with_name(
@@ -1872,12 +1874,8 @@ def _finalize_temporal_blocks(
                             values=np.asarray(
                                 values[2], dtype=np.dtype(identity.numeric_dtype)
                             ),
-                            number_of_measurements=(
-                                canonical_index.number_of_measurements
-                            ),
-                            number_of_demand_cells=(
-                                canonical_index.number_of_demand_cells
-                            ),
+                            number_of_measurements=number_of_measurements,
+                            number_of_demand_cells=number_of_demand_cells,
                         )
                     )
                     if block_position % block_update_interval == 0:
@@ -2045,7 +2043,7 @@ def _finalize_temporal_blocks(
                 retained_l1_mass=retained_l1,
                 removed_l1_mass=0.0,
                 zero_tolerance=float(source.manifest.provenance["zero_tolerance"]),
-                columns_processed=canonical_index.number_of_demand_cells,
+                columns_processed=number_of_demand_cells,
                 compilation_count=int(source.compilation_seconds > 0.0),
                 compilation_seconds=source.compilation_seconds,
                 execution_seconds=(

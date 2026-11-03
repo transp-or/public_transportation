@@ -1216,6 +1216,8 @@ def load_temporal_block_operator(
             details={"cache_validation_stage": "temporal_block_load"},
         )
     blocks = []
+    number_of_measurements = actual_index.number_of_measurements
+    number_of_demand_cells = actual_index.number_of_demand_cells
     for block_position, item in enumerate(block_items):
         block_started_at = perf_counter() if reporting_enabled else None
         try:
@@ -1230,8 +1232,8 @@ def load_temporal_block_operator(
                 row_indices=rows,
                 column_indices=columns,
                 values=values,
-                number_of_measurements=actual_index.number_of_measurements,
-                number_of_demand_cells=actual_index.number_of_demand_cells,
+                number_of_measurements=number_of_measurements,
+                number_of_demand_cells=number_of_demand_cells,
             )
         except (KeyError, OSError, TypeError, ValueError) as error:
             raise ValueError("temporal block payload is missing or corrupt.") from error
