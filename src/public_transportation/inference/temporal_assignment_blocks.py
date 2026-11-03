@@ -254,19 +254,26 @@ class TemporalBlockAssignmentOperator:
             )
         # One logical temporal key may be partitioned across independently
         # checkpointed construction fragments. Products sum those partitions.
+        if self.blocks:
+            expected_measurements = int(self.number_of_measurements)
+            expected_demand_cells = int(self.number_of_demand_cells)
+        else:
+            expected_measurements = expected_demand_cells = 0
         if _construction_progress is None:
             for block in self.blocks:
-                if block.number_of_measurements != self.number_of_measurements:
+                if block.number_of_measurements != expected_measurements:
                     raise ValueError("temporal block measurement dimension differs.")
-                if block.number_of_demand_cells != self.number_of_demand_cells:
+                if block.number_of_demand_cells != expected_demand_cells:
                     raise ValueError("temporal block demand dimension differs.")
         else:
             total_blocks = len(self.blocks)
-            _construction_progress("validate_temporal_operator_blocks", 0, total_blocks)
+            _construction_progress(
+                "validate_temporal_operator_blocks", 0, total_blocks
+            )
             for block_position, block in enumerate(self.blocks, start=1):
-                if block.number_of_measurements != self.number_of_measurements:
+                if block.number_of_measurements != expected_measurements:
                     raise ValueError("temporal block measurement dimension differs.")
-                if block.number_of_demand_cells != self.number_of_demand_cells:
+                if block.number_of_demand_cells != expected_demand_cells:
                     raise ValueError("temporal block demand dimension differs.")
                 if block_position % 4096 == 0 or block_position == total_blocks:
                     _construction_progress(
