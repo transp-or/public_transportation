@@ -1968,32 +1968,118 @@ def _finalize_temporal_blocks(
                     checkpoint_reusable=True,
                     predicted_next_seconds=recent_seconds[-1],
                 )
-    block_tuple = tuple(blocks)
-    nonzeros = sum(block.nonzero_entries for block in block_tuple)
     source = construction
-    return TemporalBlockAssignmentOperator(
-        canonical_index=canonical_index,
-        identity=identity,
-        blocks=block_tuple,
-        fixed_measurement_offset=offset,
-        diagnostics=TemporalBlockConstructionDiagnostics(
-            construction_seconds=source.total_seconds,
-            nonzero_entries=nonzeros,
-            retained_l1_mass=retained_l1,
-            removed_l1_mass=0.0,
-            zero_tolerance=float(source.manifest.provenance["zero_tolerance"]),
-            columns_processed=canonical_index.number_of_demand_cells,
-            compilation_count=int(source.compilation_seconds > 0.0),
-            compilation_seconds=source.compilation_seconds,
-            execution_seconds=source.dispatch_seconds + source.synchronization_seconds,
-            device_transfer_seconds=source.transfer_seconds,
-            num_chunks=source.dispatch_count,
-            chunk_shape=(
-                source.manifest.od_chunk_size,
-                source.plan.maximum_shard_measurements,
+    with _TemporalAssemblyHeartbeat(
+        reporter=reporter,
+        checkpoint_directory=checkpoint_directory,
+        total_units=len(expected),
+    ) as finalization_progress:
+        # Keep the existing last-shard identifier from masquerading as active
+        # work after the shard loop has completed.
+        finalization_progress.begin_unit(
+            key="temporal_operator_finalization",
+            position=len(expected),
+        )
+        if reporting_enabled:
+            finalization_progress.begin_substep(
+                "freeze_temporal_block_list",
+                counter_unit="temporal_blocks",
+                counter_total=len(blocks),
+            )
+            update_interval = _temporal_progress_update_interval(len(blocks))
+
+            def tracked_blocks():
+                for block_position, block in enumerate(blocks, start=1):
+                    yield block
+                    if block_position % update_interval == 0:
+                        finalization_progress.advance_to(block_position)
+
+            block_tuple = tuple(tracked_blocks())
+            finalization_progress.advance_to(len(blocks))
+        else:
+            finalization_progress.begin_substep("freeze_temporal_block_list")
+            block_tuple = tuple(blocks)
+
+        finalization_progress.begin_substep(
+            "count_temporal_nonzero_entries",
+            counter_unit="temporal_blocks",
+            counter_total=len(block_tuple),
+        )
+        if reporting_enabled:
+            nonzeros = 0
+            update_interval = _temporal_progress_update_interval(len(block_tuple))
+            for block_position, block in enumerate(block_tuple, start=1):
+                nonzeros += block.nonzero_entries
+                if block_position % update_interval == 0:
+                    finalization_progress.advance_to(block_position)
+            finalization_progress.advance_to(len(block_tuple))
+        else:
+            nonzeros = sum(block.nonzero_entries for block in block_tuple)
+
+        validation_substep: str | None = None
+
+        def report_operator_validation(
+            substep: str,
+            completed: int | None,
+            total: int | None,
+        ) -> None:
+            nonlocal validation_substep
+            if substep != validation_substep:
+                finalization_progress.begin_substep(
+                    substep,
+                    counter_unit=(None if total is None else "temporal_blocks"),
+                    counter_total=total,
+                )
+                validation_substep = substep
+            if completed is not None:
+                finalization_progress.advance_to(completed)
+
+        operator = TemporalBlockAssignmentOperator(
+            canonical_index=canonical_index,
+            identity=identity,
+            blocks=block_tuple,
+            fixed_measurement_offset=offset,
+            diagnostics=TemporalBlockConstructionDiagnostics(
+                construction_seconds=source.total_seconds,
+                nonzero_entries=nonzeros,
+                retained_l1_mass=retained_l1,
+                removed_l1_mass=0.0,
+                zero_tolerance=float(source.manifest.provenance["zero_tolerance"]),
+                columns_processed=canonical_index.number_of_demand_cells,
+                compilation_count=int(source.compilation_seconds > 0.0),
+                compilation_seconds=source.compilation_seconds,
+                execution_seconds=(
+                    source.dispatch_seconds + source.synchronization_seconds
+                ),
+                device_transfer_seconds=source.transfer_seconds,
+                num_chunks=source.dispatch_count,
+                chunk_shape=(
+                    source.manifest.od_chunk_size,
+                    source.plan.maximum_shard_measurements,
+                ),
             ),
-        ),
-    )
+            _construction_progress=(
+                report_operator_validation if reporting_enabled else None
+            ),
+        )
+        finalization_progress.finish_unit()
+    if reporter is not None:
+        reporter.emit(
+            phase=ConstructionPhase.TEMPORAL_BLOCK_ASSEMBLY,
+            status="completed",
+            force=True,
+            completed_units=len(expected),
+            total_units=len(expected),
+            current_unit="temporal_operator_finalization",
+            eta_confidence="unavailable",
+            eta_reason=(
+                "temporal blocks are assembled; later preparation work remains"
+            ),
+            checkpoint_location=(
+                None if checkpoint_directory is None else str(checkpoint_directory)
+            ),
+        )
+    return operator
 
 
 def prepare_direct_scheduled_temporal_operator(

@@ -2002,8 +2002,41 @@ def test_temporal_assembly_heartbeat_reports_inner_work_without_changing_artifac
         counts = [int(event["internal_completed"]) for event in unit_events]
         assert counts == sorted(counts)
 
+    post_shard_events = [
+        event
+        for event in events
+        if event.get("current_unit") == "temporal_operator_finalization"
+        and isinstance(event.get("inner_work"), dict)
+    ]
+    post_shard_substeps = {
+        str(event["inner_work"]["name"]) for event in post_shard_events
+    }
+    assert "freeze_temporal_block_list" in post_shard_substeps
+    assert "count_temporal_nonzero_entries" in post_shard_substeps
+    assert "validate_temporal_operator_blocks" in post_shard_substeps
+    assert any(
+        event.get("phase") == "temporal_block_assembly"
+        and event.get("status") == "completed"
+        and event.get("current_unit") == "temporal_operator_finalization"
+        for event in events
+    )
+    for event in post_shard_events:
+        inner_work = event["inner_work"]
+        if (
+            inner_work["name"]
+            in {
+                "freeze_temporal_block_list",
+                "count_temporal_nonzero_entries",
+                "validate_temporal_operator_blocks",
+            }
+            and inner_work["predicted_remaining_seconds"] is not None
+        ):
+            assert inner_work["eta_scope"] == "active_substep"
+            assert inner_work["eta_confidence"] == "low"
+
     baseline = construction.operator
     assert assembled.identity.fingerprint == baseline.identity.fingerprint
+    assert assembled.diagnostics.nonzero_entries == baseline.diagnostics.nonzero_entries
     assert len(assembled.blocks) == len(baseline.blocks)
     for actual, expected in zip(assembled.blocks, baseline.blocks, strict=True):
         assert actual.key == expected.key

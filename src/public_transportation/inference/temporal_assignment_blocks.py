@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from time import perf_counter
 from typing import Callable
 
@@ -237,8 +237,14 @@ class TemporalBlockAssignmentOperator:
     blocks: tuple[TemporalSparseBlock, ...]
     fixed_measurement_offset: np.ndarray
     diagnostics: TemporalBlockConstructionDiagnostics
+    _construction_progress: InitVar[
+        Callable[[str, int | None, int | None], None] | None
+    ] = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(
+        self,
+        _construction_progress: Callable[[str, int | None, int | None], None] | None,
+    ) -> None:
         if (
             self.identity.canonical_index_fingerprint
             != self.canonical_index.artifact_fingerprint
@@ -248,11 +254,29 @@ class TemporalBlockAssignmentOperator:
             )
         # One logical temporal key may be partitioned across independently
         # checkpointed construction fragments. Products sum those partitions.
-        for block in self.blocks:
-            if block.number_of_measurements != self.number_of_measurements:
-                raise ValueError("temporal block measurement dimension differs.")
-            if block.number_of_demand_cells != self.number_of_demand_cells:
-                raise ValueError("temporal block demand dimension differs.")
+        if _construction_progress is None:
+            for block in self.blocks:
+                if block.number_of_measurements != self.number_of_measurements:
+                    raise ValueError("temporal block measurement dimension differs.")
+                if block.number_of_demand_cells != self.number_of_demand_cells:
+                    raise ValueError("temporal block demand dimension differs.")
+        else:
+            total_blocks = len(self.blocks)
+            _construction_progress("validate_temporal_operator_blocks", 0, total_blocks)
+            for block_position, block in enumerate(self.blocks, start=1):
+                if block.number_of_measurements != self.number_of_measurements:
+                    raise ValueError("temporal block measurement dimension differs.")
+                if block.number_of_demand_cells != self.number_of_demand_cells:
+                    raise ValueError("temporal block demand dimension differs.")
+                if block_position % 4096 == 0 or block_position == total_blocks:
+                    _construction_progress(
+                        "validate_temporal_operator_blocks",
+                        block_position,
+                        total_blocks,
+                    )
+            _construction_progress(
+                "copy_and_validate_fixed_measurement_offset", None, None
+            )
         offset = np.array(self.fixed_measurement_offset, copy=True)
         if offset.shape != (self.number_of_measurements,) or not np.all(
             np.isfinite(offset)
