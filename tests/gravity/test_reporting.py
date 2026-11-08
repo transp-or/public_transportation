@@ -5,6 +5,7 @@ import json
 
 import numpy as np
 import pytest
+import public_transportation.inference.gravity.reporting as reporting_module
 
 from public_transportation.inference.gravity import (
     GRAVITY_REPORT_PROVENANCE_FIELDS,
@@ -312,6 +313,47 @@ def test_direct_report_rejects_result_specification_fingerprint_mismatch(tmp_pat
             likelihood="poisson",
             output_directory=tmp_path / "mismatch",
         )
+
+
+def test_report_serializes_nonfinite_residual_candidate_as_null(tmp_path, monkeypatch):
+    fit, _validation, layout = _portable_inputs()
+    result_payload = fit["result"]
+    assert isinstance(result_payload, dict)
+    result = GravityEstimationResult.from_dict(result_payload)
+    residual_manifest = {
+        "schema_version": 1,
+        "scope": "in_sample",
+        "status": "completed",
+        "candidate_patterns": [
+            {"pattern": "boarding:L1", "relative_bias": np.nan}
+        ],
+        "suggestions": [],
+    }
+    monkeypatch.setattr(
+        reporting_module,
+        "analyze_measurement_residuals",
+        lambda *args, **kwargs: residual_manifest,
+    )
+    monkeypatch.setattr(
+        reporting_module,
+        "write_measurement_residual_analysis",
+        lambda *args, **kwargs: residual_manifest,
+    )
+
+    report = reporting_module.write_gravity_detailed_report(
+        result=result,
+        observations=[3.0, 5.0, 7.0],
+        predicted_measurements=[4.0, 5.0, 6.0],
+        od_layout=layout,
+        likelihood="poisson",
+        output_directory=tmp_path / "nonfinite-candidate",
+    )
+
+    payload = json.loads((report.output_directory / "report.json").read_text())
+    assert (
+        payload["residual_analysis"]["candidate_patterns"][0]["relative_bias"]
+        is None
+    )
 
 
 def test_predictions_must_agree_with_validation(tmp_path):
