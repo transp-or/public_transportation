@@ -30,6 +30,7 @@ from public_transportation.inference.residual_audit import (
     analyze_measurement_residuals,
     write_measurement_residual_analysis,
 )
+from public_transportation.inference.residual_audit.measurement import _json_value
 
 
 GRAVITY_DETAILED_REPORT_SCHEMA_VERSION = 1
@@ -1029,7 +1030,7 @@ def _residual_analysis_json(analysis: object) -> dict[str, object]:
             "status": "unavailable",
             "reason": "residual analysis did not return a manifest",
         }
-    return {
+    summary = {
         "schema_version": int(manifest.get("schema_version", 1)),
         "scope": str(manifest.get("scope", "in_sample")),
         "status": str(manifest.get("status", "completed")),
@@ -1049,6 +1050,9 @@ def _residual_analysis_json(analysis: object) -> dict[str, object]:
         "advisory_only": True,
         "holdout_claim": False,
     }
+    safe_summary = _json_value(summary)
+    assert isinstance(safe_summary, dict)
+    return safe_summary
 
 
 def _executive_messages(
