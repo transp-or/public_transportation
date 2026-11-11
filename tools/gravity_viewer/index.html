@@ -53,6 +53,9 @@
     .map-list tr { cursor: pointer; }
     .map-list tr:hover { background: #eef4ff; }
     .small { font-size: 12px; }
+    .line-select { min-width: 220px; min-height: 120px; }
+    .chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+    .chip { padding: 3px 7px; border-radius: 10px; background: #e9eef8; font-size: 11px; }
     .markdown h1, .markdown h2, .markdown h3 { margin: 18px 0 8px; }
     .markdown h1 { font-size: 22px; }
     .markdown h2 { font-size: 19px; }
@@ -144,13 +147,85 @@
       <div id="od-list-wrap" class="hidden"><h3>Top OD pairs</h3><div class="table-wrap map-list"><table id="od-list"><thead></thead><tbody></tbody></table></div></div>
     </section>
 
+    <section id="flows" class="panel hidden">
+      <h2>Demand and route-assignment explorer</h2>
+      <p id="flow-semantics" class="muted">Select one time partition. Values are estimated OD demand unless explicitly labelled as route-assignment flow or passenger-leg usage.</p>
+      <div class="toolbar">
+        <label>Value type
+          <select id="flow-kind"><option value="od">Estimated OD demand</option><option value="route">Route-assignment flow</option></select>
+        </label>
+        <label>Departure-time slot
+          <select id="flow-bin"></select>
+        </label>
+        <label>Origin
+          <select id="flow-origin"></select>
+        </label>
+        <label>Destination
+          <select id="flow-destination"></select>
+        </label>
+        <label>Line
+          <select id="flow-line"></select>
+        </label>
+        <label>Trip
+          <select id="flow-trip"></select>
+        </label>
+        <label>Transfers
+          <select id="flow-transfers"><option value="">All</option></select>
+        </label>
+        <label>Top rows
+          <input id="flow-limit" type="number" min="1" max="500" value="50">
+        </label>
+        <button id="flow-refresh" type="button">Load selected partition</button>
+        <button id="flow-clear-cache" type="button">Clear viewer cache</button>
+      </div>
+      <div id="flow-status" class="status">No partition selected.</div>
+      <div id="flow-detail" class="detail"></div>
+      <div class="table-wrap"><table id="flow-table"><thead></thead><tbody></tbody></table></div>
+    </section>
+
+    <section id="route-sections" class="panel hidden">
+      <h2>Line sections and OD contributors</h2>
+      <p id="section-unavailable" class="notice hidden"></p>
+      <p class="muted">The selected interval is the OD departure-time interval. Assigned section flow is saved route contribution summed once per traversed directed section; it is passenger-section usage, not unique passengers.</p>
+      <div class="toolbar">
+        <label>Lines
+          <select id="section-lines" class="line-select" multiple></select>
+        </label>
+        <button id="section-all-lines" type="button">All lines</button>
+        <button id="section-clear-lines" type="button">Clear</button>
+        <label>Pattern
+          <select id="section-pattern"><option value="">All patterns</option></select>
+        </label>
+        <label>Direction
+          <select id="section-direction"><option value="">All directions</option></select>
+        </label>
+        <label>Section
+          <select id="section-id"><option value="">Choose a directed section</option></select>
+        </label>
+        <button id="section-inspect" type="button">Inspect section</button>
+        <label>OD departure interval
+          <input id="section-bin" type="range" min="0" max="0" step="1" value="0">
+          <output id="section-bin-label">—</output>
+        </label>
+        <button id="section-previous" type="button">Previous</button>
+        <button id="section-next" type="button">Next</button>
+        <button id="section-clear-cache" type="button">Clear viewer cache</button>
+      </div>
+      <div id="section-line-chips" class="chips"></div>
+      <div id="section-status" class="status">No section interval selected.</div>
+      <div class="toolbar"><button id="section-page-previous" type="button">Previous OD page</button><button id="section-page-next" type="button">Next OD page</button><span id="section-page-label" class="muted small">No section selected.</span></div>
+      <div id="section-detail" class="detail"><p class="muted">Click a directed line section on the map to inspect its load and every matching OD.</p></div>
+      <div class="table-wrap"><table id="section-table"><thead></thead><tbody></tbody></table></div>
+    </section>
+
     <section id="tables" class="panel hidden">
       <h2>Data preview</h2>
       <p class="muted">Showing up to 100 rows per table. The bundle remains on disk and is never modified.</p>
       <div id="table-content"></div>
     </section>
   </main>
-  <script>
+  <script src="viewer.js"></script>
+  <script>if (false) {
     /* Leaflet is used only for display; the bundle itself remains local and read-only. */
     const leafletScript = document.createElement('script');
     leafletScript.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
@@ -457,6 +532,7 @@
     ['stop-search', 'stop-size', 'stop-color'].forEach((id) => $(id).addEventListener('input', () => { if (viewer.mode === 'stops') renderStopMarkers(); }));
     ['od-origin', 'od-destination', 'od-bin', 'od-min', 'od-limit', 'od-residual', 'od-residual-min', 'od-stop-filter'].forEach((id) => $(id).addEventListener('input', () => { if (viewer.mode === 'od') { viewer.selectedOd = null; renderOdList(); } }));
     $('reset-selection').addEventListener('click', () => { viewer.selectedStop = null; viewer.selectedOd = null; $('stop-search').value = ''; $('od-origin').value = ''; $('od-destination').value = ''; $('od-bin').value = 'all'; $('od-min').value = '0'; $('od-limit').value = '25'; $('od-residual').value = 'all'; $('od-residual-min').value = '0'; $('od-stop-filter').checked = false; renderStopMarkers(); renderStopDetail(); renderOdList(); setControlVisibility(); });
+  }
   </script>
 </body>
 </html>

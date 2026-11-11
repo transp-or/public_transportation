@@ -33,6 +33,13 @@ viewer_bundle/
   parameters.csv                   optional
   od_map.csv                       optional display summary
   stop_summary.csv                 optional display summary
+  viewer_summary.json              partition/index metadata
+  partitions/od/                   one CSV per departure-time bin
+  partitions/route_flows/          optional sparse post-fit route flows
+  partitions/route_sections/       optional OD-to-directed-section contributors
+  partitions/section_loads/        optional section-load summaries by OD interval
+  line_geometry/sections.csv       optional directed section catalog
+  line_geometry/lines.geojson      optional compact line geometry
   network/                          optional network snapshot
     stops.csv
     lines.csv
@@ -99,12 +106,15 @@ unavailable.
 4. Confirm the selection in the system folder picker. The browser may display
    only the folder name; it will read the files below that folder recursively.
 
-After selection, the page reads the files in memory for display and validates
-the manifest's file sizes and SHA-256 checksums. A successful load is confirmed
-by the green message:
+After selection, the page reads the manifest, model specification, report, and
+small partition summary first. It does not parse `full_od.csv`,
+`predicted_measurements.csv`, or `residuals.csv` at startup. Selecting a time
+slot streams only that partition through a Web Worker, verifies its size and
+checksum, and stores the bounded result in IndexedDB. A successful load is
+confirmed by the green message:
 
 ```text
-Bundle loaded and all manifest checks passed.
+Bundle manifest and summary loaded. Partition checksums are verified when selected.
 ```
 
 The viewer never writes back to the selected directory. If the message reports
@@ -119,9 +129,61 @@ fingerprint, likelihood, provenance, and available diagnostics. The model
 specification is read from `model_specification.json`; it is the authoritative
 description of the fitted model in the bundle.
 
-The data preview displays bounded samples of the OD, prediction, and residual
-tables. It does not load a second copy of the full case results from the
-original repository.
+The data preview and **Demand and route-assignment explorer** display bounded
+samples. They never load a second copy of the full case results into browser
+memory. Use **Clear viewer cache** after replacing a bundle or when browser
+storage is under pressure; cache entries are keyed by the bundle fingerprints,
+partition checksum, and cache-format version.
+
+The explorer distinguishes estimated OD demand from post-fit assignment data:
+
+- choose a departure-time slot, origin, and destination for origin-first or
+  destination-first OD exploration;
+- select **Route-assignment flow** and filter by line, trip, origin,
+  destination, or realized transfer count when `partitions/route_flows/` is
+  present;
+- service totals are expected assigned demand or passenger-leg usage as stated
+  by the bundle, not automatically unique passengers;
+- the transfer selector uses realized route-assignment transfers only. A
+  minimum-feasible-transfer feature used during demand estimation is never
+  substituted for an observed route-choice outcome.
+
+Existing bundles without `viewer_summary.json` or route-flow partitions remain
+readable. They expose the validated legacy tables and clearly report that
+lazy time-slot and route-level exploration is unavailable until a refreshed
+export is produced.
+
+## Directed line sections
+
+Bundles produced with an explicit post-fit route export may also contain a
+`route_sections` entry in `viewer_summary.json`. The catalog contains one
+directed section for each consecutive stop pair in each unique line pattern.
+When no validated source shape is available, the geometry is labelled
+`stop_to_stop_approximation`; it is a display connector and must not be read as
+road-following vehicle geometry. Branches and directions retain separate
+pattern and section identities.
+
+The section explorer first loads only the small line geometry and the selected
+OD departure-time interval's section-load summary. Clicking a section then
+loads only that interval's contributor partition. Each contributor preserves
+the OD, stable route-path and leg identity, path share, assigned contribution,
+line/pattern/trip, and realized transfer count. Assigned section flow is the
+sum of the saved path contributions once per traversed section. It is passenger
+section usage (a transfer journey can contribute on more than one line), not a
+count of unique passengers. The interval is the OD departure interval, not the
+clock interval at which a vehicle passes the selected section.
+
+The Python API mirrors the viewer:
+
+```python
+bundle.query_section_load("s-…", departure_time_bin="t3")
+bundle.query_section_od("s-…", departure_time_bin="t3", page=0, page_size=100)
+```
+
+`query_section_od` streams the selected interval and section only, and pages
+the returned rows without truncating the underlying contributor data. Older
+schema-1 bundles explicitly report section data as unavailable and continue to
+support the destination/OD view.
 
 When the optional display files and a network snapshot are present, the
 **Network map** panel provides two modes:
@@ -148,9 +210,13 @@ changed during copying. Re-copy the complete bundle from its durable results
 location and select the new copy. Do not edit the CSV or manifest manually.
 
 **“Interactive summaries unavailable.”** The bundle is valid but does not
-contain `od_map.csv` and/or `stop_summary.csv`. Use the ordinary tables, or
-regenerate a viewer bundle with the optional display summaries when those
-inputs are available. This does not change the fitted model.
+contain the optional display summaries or partition index. Use the ordinary
+tables, or regenerate a viewer bundle. This does not change the fitted model.
+
+**“Route flows unavailable.”** The fit and destination demand are present, but
+no post-fit route export was supplied. The viewer does not invent route paths
+from OD demand. Run the separate export step below only after checking the
+saved routing cache and its expected cost.
 
 **Blank map or a Leaflet error.** Check internet access and reload the page.
 Without the map tiles, the validated tables remain usable. Without a bundled
@@ -161,10 +227,62 @@ Use the local HTTP-server command above and select the bundle from the page.
 Browser security settings may also require granting the page permission to
 read the selected folder.
 
-**The bundle is very large.** Select only the bundle directory, keep the
-browser tab dedicated to this inspection, and close it when finished. Viewing
-does not require the original operator, routing cache, checkpoints, or case
-configuration.
+**The bundle is very large.** Select only the bundle directory. Startup reads
+only small metadata, and active memory is bounded by the selected partition and
+display sample. Safari should be tested with the complete Model 6 bundle; a
+reload indicates that the chosen partition or network snapshot is still too
+large and should be split further rather than loading the legacy CSV.
+
+## Optional post-fit route-flow export
+
+The core gravity fit supplies estimated destination demand, not OD-to-line/trip
+paths. If persisted assignment artifacts expose the correct fixed-routing
+operator, prepare a CSV with the canonical fields below and pass it as
+`route_flow_rows` to `write_gravity_viewer_bundle` (or
+`write_persisted_gravity_viewer_bundle`):
+
+```text
+origin_stop_id,destination_stop_id,departure_time_bin,line_id,trip_id,
+boarding_stop_id,alighting_stop_id,route_leg_index,route_leg_count,
+route_legs,assigned_demand,path_share,transfer_count,flow_semantics,
+route_path_id,pattern_id,direction,assignment_fingerprint
+```
+
+`flow_semantics` is `path_probability` when complete path shares are available,
+`service_marginal` for link/trip marginals, or `passenger_leg_usage` for
+leg-level usage. Before any expensive computation, inspect the saved routing
+cache identity and report whether it can provide these rows, the expected
+runtime/storage, and the checkpoint plan. If the cache cannot recover route
+contributions, use the separate post-fit export with the saved fit and routing
+implementation; do not rerun estimation and do not label service marginals as
+complete path probabilities.
+
+The public helper makes that boundary explicit:
+
+```python
+from public_transportation.inference.gravity import (
+    export_gravity_route_flows,
+    plan_gravity_route_flow_export,
+)
+
+plan = plan_gravity_route_flow_export(
+    routing_cache="/path/to/saved-routing-cache",
+    expected_assignment_fingerprint="<fit-assignment-fingerprint>",
+    expected_rows=<estimated-row-count>,
+)
+if not plan.available:
+    raise RuntimeError(plan.reason)
+export_gravity_route_flows(
+    route_flow_rows=rows_from_the_validated_routing_implementation,
+    output_path="route_flows.csv",
+    checkpoint_path="route_flows.checkpoint.json",
+    progress=lambda rows: print(f"exported {rows:,} rows"),
+)
+```
+
+The resulting CSV can be supplied as `route_flow_rows` to the bundle writer;
+the writer partitions it by departure-time bin and records checksums and row
+counts in the manifest.
 
 ## Short checklist
 

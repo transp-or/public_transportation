@@ -10,9 +10,11 @@ import csv
 import hashlib
 import json
 import os
+import re
 import shutil
+import sqlite3
 import tempfile
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -41,8 +43,16 @@ from .validation import GravityAdequacyReport, GravityValidationMetadata
 
 GRAVITY_VIEWER_BUNDLE_SCHEMA_VERSION = 1
 GRAVITY_VIEWER_BUNDLE_TYPE = "gravity_viewer_bundle"
+GRAVITY_VIEWER_CACHE_FORMAT_VERSION = 2
+GRAVITY_VIEWER_ROUTE_SECTION_SCHEMA_VERSION = 1
 _MODEL_SPECIFICATION_SCHEMA_VERSION = 1
 _MODEL_SPECIFICATION_FILE = "model_specification.json"
+_VIEWER_SUMMARY_FILE = "viewer_summary.json"
+_PARTITION_ROOT = "partitions"
+_OD_PARTITION_ROOT = "partitions/od"
+_ROUTE_FLOW_PARTITION_ROOT = "partitions/route_flows"
+_ROUTE_SECTION_PARTITION_ROOT = "partitions/route_sections"
+_SECTION_LOAD_PARTITION_ROOT = "partitions/section_loads"
 _IDENTIFIABILITY_MESSAGE = (
     "OD identifiability diagnostics were not available; inference_score remains "
     "only a structural fixed/free indicator."
@@ -107,8 +117,66 @@ _STOP_SUMMARY_COLUMNS = (
     "incoming_total",
     "outgoing_total",
 )
-_NETWORK_FILES = ("stops.csv", "lines.csv", "trips.csv", "stop_times.csv")
+_NETWORK_FILES = ("stops.csv", "lines.csv", "trips.csv", "stop_times.csv", "shapes.csv")
 _CANONICAL_PROVENANCE = tuple(GRAVITY_REPORT_PROVENANCE_FIELDS)
+_ROUTE_FLOW_COLUMNS = (
+    "origin_stop_id",
+    "destination_stop_id",
+    "departure_time_bin",
+    "line_id",
+    "trip_id",
+    "boarding_stop_id",
+    "alighting_stop_id",
+    "route_leg_index",
+    "route_leg_count",
+    "route_legs",
+    "assigned_demand",
+    "path_share",
+    "transfer_count",
+    "flow_semantics",
+    "route_path_id",
+    "pattern_id",
+    "direction",
+    "assignment_fingerprint",
+)
+_ROUTE_FLOW_REQUIRED_COLUMNS = (
+    "origin_stop_id",
+    "destination_stop_id",
+    "departure_time_bin",
+    "assigned_demand",
+    "flow_semantics",
+)
+_SECTION_CONTRIBUTION_COLUMNS = (
+    "section_id",
+    "origin_stop_id",
+    "destination_stop_id",
+    "departure_time_bin",
+    "route_path_id",
+    "route_leg_index",
+    "route_leg_count",
+    "line_id",
+    "pattern_id",
+    "direction",
+    "trip_id",
+    "boarding_stop_id",
+    "alighting_stop_id",
+    "assigned_demand",
+    "assigned_contribution",
+    "path_share",
+    "transfer_count",
+    "flow_semantics",
+    "assignment_fingerprint",
+)
+_SECTION_LOAD_COLUMNS = (
+    "section_id",
+    "line_id",
+    "pattern_id",
+    "direction",
+    "from_stop_id",
+    "to_stop_id",
+    "assigned_flow",
+    "distinct_od_count",
+)
 
 
 def _json_safe(value: object) -> object:
@@ -159,6 +227,151 @@ def _read_csv(path: Path) -> tuple[list[str], list[dict[str, str]]]:
         return list(reader.fieldnames), list(reader)
 
 
+def _iter_csv_rows(path: Path) -> Iterator[dict[str, str]]:
+    """Yield CSV rows without retaining the complete table in memory."""
+    with path.open(newline="", encoding="utf-8") as stream:
+        reader = csv.DictReader(stream)
+        if reader.fieldnames is None:
+            raise ValueError(f"CSV file {path} has no header.")
+        yield from reader
+
+
+def _csv_fieldnames(path: Path) -> list[str]:
+    with path.open(newline="", encoding="utf-8") as stream:
+        reader = csv.reader(stream)
+        try:
+            return list(next(reader))
+        except StopIteration as error:
+            raise ValueError(f"CSV file {path} has no header.") from error
+
+
+def _csv_row_count(path: Path) -> int:
+    """Count data rows while streaming through a CSV file."""
+    with path.open(newline="", encoding="utf-8") as stream:
+        return max(0, sum(1 for _ in stream) - 1)
+
+
+def _partition_slug(value: object) -> str:
+    text = str(value or "unassigned").strip() or "unassigned"
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("._") or "unassigned"
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:10]
+    return f"{slug[:64]}-{digest}"
+
+
+def _time_bin_sort_key(value: object) -> tuple[int, int, str]:
+    text = str(value)
+    match = re.search(r"(\d+)", text)
+    return (0 if match else 1, int(match.group(1)) if match else 0, text)
+
+
+def _finite_optional(value: object) -> str:
+    if value is None or str(value).strip() == "":
+        return ""
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"route-flow value {value!r} is not numeric.") from error
+    if not np.isfinite(number):
+        raise ValueError("route-flow numeric values must be finite.")
+    return format(number, ".17g")
+
+
+def _route_flow_row(raw: Mapping[str, object]) -> dict[str, object]:
+    """Normalize one sparse route-flow record without changing its semantics."""
+    if "minimum_transfers" in raw:
+        raise ValueError(
+            "minimum_transfers is a demand feature and cannot be used as route-flow transfer_count."
+        )
+    aliases = {
+        "origin": "origin_stop_id",
+        "destination": "destination_stop_id",
+        "line": "line_id",
+        "trip": "trip_id",
+        "boarding_stop": "boarding_stop_id",
+        "alighting_stop": "alighting_stop_id",
+        "legs": "route_legs",
+        "demand": "assigned_demand",
+        "flow": "assigned_demand",
+        "share": "path_share",
+        "transfers": "transfer_count",
+        "path_id": "route_path_id",
+        "route_id": "route_path_id",
+        "pattern": "pattern_id",
+        "direction_id": "direction",
+    }
+    values: dict[str, object] = {}
+    for column in _ROUTE_FLOW_COLUMNS:
+        value = raw.get(column)
+        if value is None:
+            for alias, target in aliases.items():
+                if target == column and alias in raw:
+                    value = raw[alias]
+                    break
+        values[column] = value
+    missing = [
+        column
+        for column in _ROUTE_FLOW_REQUIRED_COLUMNS
+        if values[column] is None or str(values[column]).strip() == ""
+    ]
+    if missing:
+        raise ValueError("route-flow row is missing required fields: " + ", ".join(missing))
+    semantics = str(values["flow_semantics"]).strip()
+    semantics = {
+        "link_marginal": "service_marginal",
+        "trip_marginal": "service_marginal",
+        "expected_service_usage": "service_marginal",
+    }.get(semantics, semantics)
+    allowed = {"path_probability", "service_marginal", "passenger_leg_usage"}
+    if semantics not in allowed:
+        raise ValueError(
+            "flow_semantics must be path_probability, service_marginal, "
+            "or passenger_leg_usage."
+        )
+    assigned = float(values["assigned_demand"])
+    if not np.isfinite(assigned) or assigned < 0:
+        raise ValueError("assigned_demand must be a finite non-negative number.")
+    path_share = values["path_share"]
+    if path_share is not None and str(path_share).strip() != "":
+        path_share_value = float(path_share)
+        if not np.isfinite(path_share_value) or not 0 <= path_share_value <= 1:
+            raise ValueError("path_share must be finite and between zero and one.")
+        path_share = format(path_share_value, ".17g")
+    else:
+        path_share = ""
+    transfer_count = values["transfer_count"]
+    if transfer_count is not None and str(transfer_count).strip() != "":
+        transfer_value = float(transfer_count)
+        if not np.isfinite(transfer_value) or transfer_value < 0 or transfer_value != np.floor(transfer_value):
+            raise ValueError("transfer_count must be a finite non-negative integer.")
+        transfer_count = str(int(transfer_value))
+    else:
+        transfer_count = ""
+    return {
+        "origin_stop_id": str(values["origin_stop_id"]),
+        "destination_stop_id": str(values["destination_stop_id"]),
+        "departure_time_bin": str(values["departure_time_bin"]),
+        "line_id": str(values["line_id"] or ""),
+        "trip_id": str(values["trip_id"] or ""),
+        "boarding_stop_id": str(values["boarding_stop_id"] or ""),
+        "alighting_stop_id": str(values["alighting_stop_id"] or ""),
+        "route_leg_index": str(values["route_leg_index"] or ""),
+        "route_leg_count": str(values["route_leg_count"] or ""),
+        "route_legs": (
+            json.dumps(values["route_legs"], separators=(",", ":"))
+            if isinstance(values["route_legs"], (list, tuple))
+            else str(values["route_legs"] or "")
+        ),
+        "assigned_demand": format(assigned, ".17g"),
+        "path_share": path_share,
+        "transfer_count": transfer_count,
+        "flow_semantics": semantics,
+        "route_path_id": str(values.get("route_path_id") or ""),
+        "pattern_id": str(values.get("pattern_id") or ""),
+        "direction": str(values.get("direction") or ""),
+        "assignment_fingerprint": str(values.get("assignment_fingerprint") or ""),
+    }
+
+
 def _write_csv(path: Path, fieldnames: Sequence[str], rows: Sequence[Mapping[str, object]]) -> None:
     """Write a small deterministic CSV atomically."""
     temporary = path.with_name(f".{path.name}.tmp")
@@ -167,6 +380,511 @@ def _write_csv(path: Path, fieldnames: Sequence[str], rows: Sequence[Mapping[str
         writer.writeheader()
         writer.writerows(rows)
     temporary.replace(path)
+
+
+def _write_partitioned_table(
+    *,
+    source: Path,
+    destination: Path,
+    partition_field: str,
+    fieldnames: Sequence[str],
+    row_transform: Any | None = None,
+) -> tuple[list[dict[str, object]], dict[str, set[str]]]:
+    """Partition a CSV by one field using bounded, streaming writes."""
+    destination.mkdir(parents=True, exist_ok=True)
+    descriptors: list[dict[str, object]] = []
+    values: dict[str, set[str]] = {
+        "origins": set(),
+        "destinations": set(),
+        "lines": set(),
+        "trips": set(),
+        "semantics": set(),
+        "transfers": set(),
+        "patterns": set(),
+        "directions": set(),
+    }
+    writers: dict[str, csv.DictWriter] = {}
+    streams: dict[str, Any] = {}
+    counts: dict[str, int] = {}
+    paths: dict[str, Path] = {}
+    try:
+        for source_row in _iter_csv_rows(source):
+            row = row_transform(source_row) if row_transform is not None else dict(source_row)
+            key = str(row.get(partition_field, "") or "unassigned")
+            slug = _partition_slug(key)
+            if slug not in writers:
+                path = destination / f"{slug}.csv"
+                stream = path.open("w", newline="", encoding="utf-8")
+                writer = csv.DictWriter(stream, fieldnames=list(fieldnames), extrasaction="raise")
+                writer.writeheader()
+                writers[slug] = writer
+                streams[slug] = stream
+                counts[slug] = 0
+                paths[slug] = path
+            writers[slug].writerow({name: row.get(name, "") for name in fieldnames})
+            counts[slug] += 1
+            if "origin_stop_id" in row:
+                values["origins"].add(str(row["origin_stop_id"]))
+            if "destination_stop_id" in row:
+                values["destinations"].add(str(row["destination_stop_id"]))
+            if "line_id" in row and str(row["line_id"]):
+                values["lines"].add(str(row["line_id"]))
+            if "trip_id" in row and str(row["trip_id"]):
+                values["trips"].add(str(row["trip_id"]))
+            if "flow_semantics" in row and str(row["flow_semantics"]):
+                values["semantics"].add(str(row["flow_semantics"]))
+            if "transfer_count" in row and str(row["transfer_count"]):
+                values["transfers"].add(str(row["transfer_count"]))
+            if "pattern_id" in row and str(row["pattern_id"]):
+                values["patterns"].add(str(row["pattern_id"]))
+            if "direction" in row and str(row["direction"]):
+                values["directions"].add(str(row["direction"]))
+    finally:
+        for stream in streams.values():
+            stream.close()
+    for slug, path in sorted(paths.items()):
+        descriptors.append(
+            {
+                "key": next(
+                    (
+                        str(row.get(partition_field, "") or "unassigned")
+                        for row in _iter_csv_rows(path)
+                    ),
+                    "unassigned",
+                ),
+                "path": path.relative_to(destination.parent.parent).as_posix(),
+                "file": path.relative_to(destination.parent.parent).as_posix(),
+                "row_count": counts[slug],
+                "sha256": _sha256(path),
+                "size_bytes": path.stat().st_size,
+            }
+        )
+    return descriptors, values
+
+
+def _network_column(fieldnames: Sequence[str], candidates: Sequence[str]) -> str | None:
+    return _first_column(fieldnames, candidates)
+
+
+def _read_network_patterns(root: Path) -> tuple[
+    dict[str, dict[str, object]], dict[str, tuple[str, ...]], dict[tuple[str, str], str]
+]:
+    """Return validated trip patterns, ordered stops, and trip-to-pattern IDs."""
+    network = root / "network"
+    trips_path = network / "trips.csv"
+    stop_times_path = network / "stop_times.csv"
+    if not trips_path.is_file() or not stop_times_path.is_file():
+        return {}, {}, {}
+    trip_fields = _csv_fieldnames(trips_path)
+    trip_id_field = _network_column(trip_fields, ("trip_id", "trip", "id"))
+    line_field = _network_column(trip_fields, ("line_id", "route_id", "line"))
+    direction_field = _network_column(trip_fields, ("direction_id", "direction", "dir"))
+    if trip_id_field is None:
+        return {}, {}, {}
+    trip_meta: dict[str, tuple[str, str, str]] = {}
+    for row in _iter_csv_rows(trips_path):
+        trip = str(row.get(trip_id_field, "")).strip()
+        if not trip:
+            continue
+        trip_meta[trip] = (
+            str(row.get(line_field, "") if line_field else "").strip(),
+            str(row.get(direction_field, "") if direction_field else "").strip(),
+            str(row.get("shape_id", "")).strip(),
+        )
+    st_fields = _csv_fieldnames(stop_times_path)
+    st_trip = _network_column(st_fields, ("trip_id", "trip"))
+    st_stop = _network_column(st_fields, ("stop_id", "stop"))
+    st_sequence = _network_column(st_fields, ("stop_sequence", "sequence", "seq"))
+    if st_trip is None or st_stop is None:
+        return {}, {}, {}
+    grouped: dict[str, list[tuple[float, int, str]]] = {}
+    ordinal = 0
+    for row in _iter_csv_rows(stop_times_path):
+        trip = str(row.get(st_trip, "")).strip()
+        stop = str(row.get(st_stop, "")).strip()
+        if not trip or not stop:
+            continue
+        raw_sequence = row.get(st_sequence, "") if st_sequence else ""
+        try:
+            sequence = float(raw_sequence)
+        except (TypeError, ValueError):
+            sequence = float(ordinal)
+        grouped.setdefault(trip, []).append((sequence, ordinal, stop))
+        ordinal += 1
+    patterns: dict[str, dict[str, object]] = {}
+    trip_patterns: dict[tuple[str, str], str] = {}
+    trip_sequences: dict[str, tuple[str, ...]] = {}
+    for trip, items in grouped.items():
+        sequence = tuple(item[2] for item in sorted(items, key=lambda item: (item[0], item[1])))
+        if len(sequence) < 2:
+            continue
+        line, direction, shape_id = trip_meta.get(trip, ("", "", ""))
+        key = canonical_json({"line_id": line, "direction": direction, "shape_id": shape_id, "stops": sequence})
+        pattern_id = "p-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+        patterns.setdefault(
+            pattern_id,
+            {"line_id": line, "direction": direction, "shape_id": shape_id,
+             "stops": sequence, "trips": []},
+        )["trips"].append(trip)
+        trip_patterns[(trip, line)] = pattern_id
+        trip_sequences[trip] = sequence
+    return patterns, trip_sequences, trip_patterns
+
+
+def _write_line_geometry(staging: Path) -> dict[str, object]:
+    """Write a compact line/section catalog and GeoJSON layer from the snapshot."""
+    patterns, _trip_sequences, _trip_patterns = _read_network_patterns(staging)
+    network = staging / "network"
+    stops_path = network / "stops.csv"
+    if not patterns or not stops_path.is_file():
+        return {
+            "available": False,
+            "message": "validated trips/stop_times and stop coordinates are required",
+            "schema_version": GRAVITY_VIEWER_ROUTE_SECTION_SCHEMA_VERSION,
+        }
+    stop_fields = _csv_fieldnames(stops_path)
+    stop_id = _network_column(stop_fields, ("stop_id", "stop", "id"))
+    lat_field = _network_column(stop_fields, ("lat", "latitude", "y"))
+    lon_field = _network_column(stop_fields, ("lon", "longitude", "lng", "x"))
+    if stop_id is None or lat_field is None or lon_field is None:
+        return {
+            "available": False,
+            "message": "stop coordinates are unavailable for line geometry",
+            "schema_version": GRAVITY_VIEWER_ROUTE_SECTION_SCHEMA_VERSION,
+        }
+    coordinates: dict[str, tuple[float, float]] = {}
+    for row in _iter_csv_rows(stops_path):
+        identifier = str(row.get(stop_id, "")).strip()
+        try:
+            lat = float(row.get(lat_field, ""))
+            lon = float(row.get(lon_field, ""))
+        except (TypeError, ValueError):
+            continue
+        if identifier and np.isfinite(lat) and np.isfinite(lon):
+            coordinates[identifier] = (lon, lat)
+    shape_geometries: dict[str, list[list[float]]] = {}
+    shapes_path = network / "shapes.csv"
+    if shapes_path.is_file():
+        shape_fields = _csv_fieldnames(shapes_path)
+        shape_id_field = _network_column(shape_fields, ("shape_id", "shape"))
+        shape_lat_field = _network_column(shape_fields, ("shape_pt_lat", "lat", "latitude"))
+        shape_lon_field = _network_column(shape_fields, ("shape_pt_lon", "lon", "longitude"))
+        shape_seq_field = _network_column(shape_fields, ("shape_pt_sequence", "sequence", "seq"))
+        if shape_id_field and shape_lat_field and shape_lon_field:
+            grouped_shapes: dict[str, list[tuple[float, int, list[float]]]] = {}
+            for ordinal, row in enumerate(_iter_csv_rows(shapes_path)):
+                try:
+                    point = [float(row[shape_lon_field]), float(row[shape_lat_field])]
+                    sequence = float(row.get(shape_seq_field, ordinal)) if shape_seq_field else float(ordinal)
+                except (TypeError, ValueError):
+                    continue
+                grouped_shapes.setdefault(str(row[shape_id_field]), []).append((sequence, ordinal, point))
+            shape_geometries = {
+                key: [point for _sequence, _ordinal, point in sorted(points, key=lambda item: (item[0], item[1]))]
+                for key, points in grouped_shapes.items() if len(points) >= 2
+            }
+    catalog_rows: list[dict[str, object]] = []
+    features: list[dict[str, object]] = []
+    for pattern_id, pattern in sorted(patterns.items()):
+        stops = tuple(pattern["stops"])
+        line = str(pattern.get("line_id", ""))
+        direction = str(pattern.get("direction", ""))
+        for index, (from_stop, to_stop) in enumerate(zip(stops, stops[1:], strict=False)):
+            section_key = canonical_json(
+                {"line_id": line, "pattern_id": pattern_id, "direction": direction,
+                 "sequence": index, "from_stop_id": from_stop, "to_stop_id": to_stop}
+            )
+            section_id = "s-" + hashlib.sha256(section_key.encode("utf-8")).hexdigest()[:20]
+            from_xy = coordinates.get(from_stop)
+            to_xy = coordinates.get(to_stop)
+            geometry = None
+            shape_id = str(pattern.get("shape_id", ""))
+            shape_points = shape_geometries.get(shape_id)
+            if shape_points:
+                geometry = {"type": "LineString", "coordinates": shape_points}
+                geometry_mode = "source_route_shape"
+            elif from_xy is not None and to_xy is not None:
+                geometry = {"type": "LineString", "coordinates": [list(from_xy), list(to_xy)]}
+                geometry_mode = "stop_to_stop_approximation"
+            else:
+                geometry_mode = "unavailable"
+            if geometry is not None:
+                features.append(
+                    {"type": "Feature", "id": section_id,
+                     "properties": {"section_id": section_id, "line_id": line,
+                                    "pattern_id": pattern_id, "direction": direction,
+                                    "sequence": index, "from_stop_id": from_stop,
+                                    "to_stop_id": to_stop, "geometry_mode": geometry_mode},
+                     "geometry": geometry}
+                )
+            catalog_rows.append(
+                {"section_id": section_id, "line_id": line, "pattern_id": pattern_id,
+                 "direction": direction, "sequence": index, "from_stop_id": from_stop,
+                 "to_stop_id": to_stop, "geometry_ref": section_id if geometry else ""}
+            )
+    geometry_dir = staging / "line_geometry"
+    geometry_dir.mkdir(parents=True, exist_ok=True)
+    _write_csv(geometry_dir / "sections.csv", (
+        "section_id", "line_id", "pattern_id", "direction", "sequence",
+        "from_stop_id", "to_stop_id", "geometry_ref"
+    ), catalog_rows)
+    _write_json(
+        geometry_dir / "lines.geojson",
+        {"type": "FeatureCollection", "geometry_mode": "stop_to_stop_approximation",
+         "features": features},
+    )
+    catalog_path = geometry_dir / "sections.csv"
+    geometry_path = geometry_dir / "lines.geojson"
+    return {
+        "available": bool(catalog_rows),
+        "schema_version": GRAVITY_VIEWER_ROUTE_SECTION_SCHEMA_VERSION,
+        "geometry_mode": "source_route_shape" if shape_geometries else "stop_to_stop_approximation",
+        "message": ("validated source route-shape geometry" if shape_geometries else
+                    "straight stop-to-stop approximation; not a road-following vehicle shape"),
+        "catalog_path": "line_geometry/sections.csv",
+        "geometry_path": "line_geometry/lines.geojson",
+        "catalog_sha256": _sha256(catalog_path),
+        "geometry_sha256": _sha256(geometry_path),
+        "catalog_size_bytes": catalog_path.stat().st_size,
+        "geometry_size_bytes": geometry_path.stat().st_size,
+        "patterns": len(patterns),
+        "sections": len(catalog_rows),
+    }
+
+
+def _write_route_section_products(staging: Path, geometry: Mapping[str, object]) -> dict[str, object]:
+    """Expand saved route legs into directed section contributions and summaries."""
+    route_source = staging / "route_flows.csv"
+    if not route_source.is_file() or not geometry.get("available"):
+        return {
+            "available": False,
+            "schema_version": GRAVITY_VIEWER_ROUTE_SECTION_SCHEMA_VERSION,
+            "message": "route-section data unavailable: no compatible post-fit route export",
+        }
+    patterns, trip_sequences, trip_patterns = _read_network_patterns(staging)
+    section_lookup: dict[tuple[str, str, str, str], str] = {}
+    section_meta: dict[str, dict[str, str]] = {}
+    for row in _iter_csv_rows(staging / str(geometry["catalog_path"])):
+        section_id = str(row["section_id"])
+        section_meta[section_id] = dict(row)
+        section_lookup[(str(row["line_id"]), str(row["pattern_id"]), str(row["from_stop_id"]), str(row["to_stop_id"]))] = section_id
+    contributors_dir = staging / _ROUTE_SECTION_PARTITION_ROOT
+    loads_dir = staging / _SECTION_LOAD_PARTITION_ROOT
+    contributors_dir.mkdir(parents=True, exist_ok=True)
+    loads_dir.mkdir(parents=True, exist_ok=True)
+    writers: dict[str, csv.DictWriter] = {}
+    streams: dict[str, Any] = {}
+    counts: dict[str, int] = {}
+    paths: dict[str, Path] = {}
+    section_index: dict[str, dict[str, dict[str, int]]] = {}
+    load_db_path = contributors_dir / ".section_loads.sqlite"
+    load_db = sqlite3.connect(load_db_path)
+    load_db.execute(
+        "CREATE TABLE section_od (bin TEXT, section_id TEXT, origin TEXT, destination TEXT, assigned REAL, "
+        "PRIMARY KEY (bin, section_id, origin, destination))"
+    )
+    try:
+        for raw in _iter_csv_rows(route_source):
+            row = _route_flow_row(raw)
+            leg_rows: list[dict[str, object]] = [row]
+            if (not row["boarding_stop_id"] or not row["alighting_stop_id"]) and row["route_legs"]:
+                try:
+                    encoded_legs = json.loads(row["route_legs"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    encoded_legs = ()
+                if isinstance(encoded_legs, list):
+                    leg_rows = []
+                    for leg_number, leg in enumerate(encoded_legs):
+                        if not isinstance(leg, Mapping):
+                            continue
+                        leg_row = dict(row)
+                        for source, target in (("line", "line_id"), ("line_id", "line_id"),
+                                               ("trip", "trip_id"), ("trip_id", "trip_id"),
+                                               ("boarding_stop", "boarding_stop_id"),
+                                               ("boarding_stop_id", "boarding_stop_id"),
+                                               ("alighting_stop", "alighting_stop_id"),
+                                               ("alighting_stop_id", "alighting_stop_id"),
+                                               ("pattern", "pattern_id"), ("pattern_id", "pattern_id"),
+                                               ("direction", "direction")):
+                            if source in leg:
+                                leg_row[target] = str(leg[source])
+                        leg_row["route_leg_index"] = str(leg.get("route_leg_index", leg_number))
+                        leg_rows.append(leg_row)
+            if row["route_path_id"]:
+                base_path_id = row["route_path_id"]
+            else:
+                path_identity = {key: row[key] for key in (
+                    "origin_stop_id", "destination_stop_id", "departure_time_bin", "assigned_demand"
+                )}
+                path_identity.update(
+                    {"route_legs": row.get("route_legs", "")} if row.get("route_legs") else
+                    {key: row[key] for key in ("line_id", "trip_id", "boarding_stop_id", "alighting_stop_id")}
+                )
+                base_path_id = "rp-" + hashlib.sha256(canonical_json(path_identity).encode("utf-8")).hexdigest()[:20]
+            for leg_row in leg_rows:
+                line = str(leg_row["line_id"])
+                trip = str(leg_row["trip_id"])
+                pattern = str(leg_row["pattern_id"]) or trip_patterns.get((trip, line), "")
+                sequence = patterns.get(pattern, {}).get("stops") if pattern else trip_sequences.get(trip)
+                if not sequence:
+                    if leg_row["flow_semantics"] == "path_probability" and leg_row["boarding_stop_id"] and leg_row["alighting_stop_id"]:
+                        raise ValueError("route path cannot be expanded into validated line sections.")
+                    continue
+                boarding = str(leg_row["boarding_stop_id"])
+                alighting = str(leg_row["alighting_stop_id"])
+                try:
+                    start = sequence.index(boarding)
+                    end = sequence.index(alighting, start + 1)
+                except ValueError:
+                    if leg_row["flow_semantics"] == "path_probability":
+                        raise ValueError("route path boarding/alighting stops are not ordered in the validated pattern.")
+                    continue
+                row = leg_row
+                # The stable path identity is retained across all expanded legs.
+                path_id = base_path_id
+                for index in range(start, end):
+                    from_stop, to_stop = sequence[index], sequence[index + 1]
+                    section_id = section_lookup.get((line, pattern, from_stop, to_stop))
+                    if section_id is None:
+                        if row["flow_semantics"] == "path_probability":
+                            raise ValueError("route path section identity is absent from the validated line catalog.")
+                        continue
+                    key = row["departure_time_bin"]
+                    if key not in writers:
+                        path = contributors_dir / f"{_partition_slug(key)}.csv"
+                        stream = path.open("w", newline="", encoding="utf-8")
+                        writers[key] = csv.DictWriter(stream, fieldnames=list(_SECTION_CONTRIBUTION_COLUMNS), extrasaction="raise")
+                        writers[key].writeheader()
+                        streams[key] = stream
+                        counts[key] = 0
+                        paths[key] = path
+                    contribution = {name: row.get(name, "") for name in _SECTION_CONTRIBUTION_COLUMNS}
+                    contribution.update({"section_id": section_id, "route_path_id": path_id,
+                                         "pattern_id": pattern, "line_id": line,
+                                         "assigned_contribution": row["assigned_demand"]})
+                    writers[key].writerow(contribution)
+                    section_index.setdefault(key, {}).setdefault(section_id, {"row_start": counts[key], "row_count": 0})["row_count"] += 1
+                    counts[key] += 1
+                    load_db.execute(
+                        "INSERT INTO section_od VALUES (?, ?, ?, ?, ?) "
+                        "ON CONFLICT(bin, section_id, origin, destination) DO UPDATE SET assigned = assigned + excluded.assigned",
+                        (key, section_id, row["origin_stop_id"], row["destination_stop_id"], float(row["assigned_demand"])),
+                    )
+    finally:
+        for stream in streams.values():
+            stream.close()
+        load_db.commit()
+        load_db.close()
+    contributor_descriptors = []
+    for key, path in sorted(paths.items()):
+        contributor_descriptors.append({"key": key, "path": path.relative_to(staging).as_posix(),
+                                        "file": path.relative_to(staging).as_posix(),
+                                        "row_count": counts[key], "sha256": _sha256(path),
+                                        "size_bytes": path.stat().st_size})
+    index_path = contributors_dir / "index.json"
+    _write_json(index_path, {"schema_version": GRAVITY_VIEWER_ROUTE_SECTION_SCHEMA_VERSION,
+                             "partition_field": "departure_time_bin", "sections": section_index})
+    load_descriptors = []
+    load_connection = sqlite3.connect(load_db_path)
+    load_bins = [row[0] for row in load_connection.execute("SELECT DISTINCT bin FROM section_od ORDER BY bin")]
+    for key in sorted(load_bins, key=_time_bin_sort_key):
+        rows = []
+        for section_id, assigned_flow, distinct_od_count in load_connection.execute(
+            "SELECT section_id, SUM(assigned), COUNT(*) FROM section_od WHERE bin = ? GROUP BY section_id ORDER BY section_id",
+            (key,),
+        ):
+            meta = section_meta[section_id]
+            rows.append({"section_id": section_id, "line_id": meta["line_id"],
+                         "pattern_id": meta["pattern_id"], "direction": meta["direction"],
+                         "from_stop_id": meta["from_stop_id"], "to_stop_id": meta["to_stop_id"],
+                         "assigned_flow": format(float(assigned_flow), ".17g"),
+                         "distinct_od_count": int(distinct_od_count)})
+        path = loads_dir / f"{_partition_slug(key)}.csv"
+        _write_csv(path, _SECTION_LOAD_COLUMNS, rows)
+        load_descriptors.append({"key": key, "path": path.relative_to(staging).as_posix(),
+                                "file": path.relative_to(staging).as_posix(),
+                                "row_count": len(rows), "sha256": _sha256(path),
+                                "size_bytes": path.stat().st_size})
+    load_connection.close()
+    load_db_path.unlink(missing_ok=True)
+    return {
+        "available": bool(contributor_descriptors),
+        "schema_version": GRAVITY_VIEWER_ROUTE_SECTION_SCHEMA_VERSION,
+        "cache_format_version": GRAVITY_VIEWER_CACHE_FORMAT_VERSION,
+        "interval_semantics": "OD departure-time interval; not vehicle passage time at the section",
+        "contributors": {"partition_field": "departure_time_bin", "partitions": contributor_descriptors,
+                         "bins": sorted({str(item["key"]) for item in contributor_descriptors}, key=_time_bin_sort_key),
+                         "columns": list(_SECTION_CONTRIBUTION_COLUMNS),
+                         "index_path": index_path.relative_to(staging).as_posix(),
+                         "index_sha256": _sha256(index_path)},
+        "section_loads": {"partition_field": "departure_time_bin", "partitions": load_descriptors,
+                          "bins": sorted({str(item["key"]) for item in load_descriptors}, key=_time_bin_sort_key),
+                          "columns": list(_SECTION_LOAD_COLUMNS)},
+        "geometry_path": geometry.get("geometry_path"),
+        "catalog_path": geometry.get("catalog_path"),
+        "geometry_mode": geometry.get("geometry_mode"),
+        "message": "assigned flow is summed saved path contribution once per traversed section; transfer legs are passenger-section usages",
+    }
+
+
+def _write_viewer_partitions(staging: Path) -> dict[str, object]:
+    """Create compact per-time-bin indexes for OD, routes, and route sections."""
+    od_fields = _csv_fieldnames(staging / "full_od.csv")
+    od_descriptors, values = _write_partitioned_table(
+        source=staging / "full_od.csv",
+        destination=staging / _OD_PARTITION_ROOT,
+        partition_field="departure_time_bin",
+        fieldnames=od_fields,
+    )
+    summary: dict[str, object] = {
+        "cache_format_version": GRAVITY_VIEWER_CACHE_FORMAT_VERSION,
+        "od": {
+            "available": True,
+            "partition_field": "departure_time_bin",
+            "partitions": od_descriptors,
+            "origins": sorted(values["origins"]),
+            "destinations": sorted(values["destinations"]),
+            "bins": sorted({str(item["key"]) for item in od_descriptors}, key=_time_bin_sort_key),
+        },
+        "route_flows": {
+            "available": False,
+            "message": "No post-fit route-flow export was supplied.",
+        },
+        "route_sections": {"available": False, "schema_version": GRAVITY_VIEWER_ROUTE_SECTION_SCHEMA_VERSION,
+                           "message": "route-section data unavailable until an explicit route export is supplied."},
+    }
+    route_source = staging / "route_flows.csv"
+    if route_source.is_file():
+        route_descriptors, route_values = _write_partitioned_table(
+            source=route_source,
+            destination=staging / _ROUTE_FLOW_PARTITION_ROOT,
+            partition_field="departure_time_bin",
+            fieldnames=_ROUTE_FLOW_COLUMNS,
+            row_transform=_route_flow_row,
+        )
+        summary["route_flows"] = {
+            "available": bool(route_descriptors),
+            "partition_field": "departure_time_bin",
+            "partitions": route_descriptors,
+            "bins": sorted({str(item["key"]) for item in route_descriptors}, key=_time_bin_sort_key),
+            "lines": sorted(route_values["lines"]),
+            "trips": sorted(route_values["trips"]),
+            "origins": sorted(route_values["origins"]),
+            "destinations": sorted(route_values["destinations"]),
+            "flow_semantics": sorted(route_values["semantics"]),
+            "transfer_counts": sorted(route_values["transfers"], key=int),
+            "patterns": sorted(route_values["patterns"]),
+            "directions": sorted(route_values["directions"]),
+            "transfer_count_definition": (
+                "realized route-assignment transfer_count; absent values mean the "
+                "routing artifact did not provide realized transfer counts"
+            ),
+        }
+    geometry = _write_line_geometry(staging)
+    summary["line_geometry"] = geometry
+    summary["route_sections"] = _write_route_section_products(staging, geometry)
+    _write_json(staging / _VIEWER_SUMMARY_FILE, summary)
+    return summary
 
 
 def _csv_number(value: object) -> float | None:
@@ -223,49 +941,67 @@ def _fixed_free_status(value: object) -> str:
 def _write_od_map(
     destination: Path,
     *,
-    full_od_rows: Sequence[Mapping[str, str]],
+    full_od_rows: Iterable[Mapping[str, str]],
     report_payload: Mapping[str, object],
 ) -> int:
     """Write the optional display-oriented OD aggregation."""
+    rows_iter = iter(full_od_rows)
+    first = next(rows_iter, None)
     required = {"origin_stop_id", "destination_stop_id", "departure_time_bin", "estimated_demand"}
-    if not required.issubset(full_od_rows[0].keys() if full_od_rows else ()):
+    if first is None or not required.issubset(first.keys()):
         return 0
-    observed_values = _observed_od_values(full_od_rows, report_payload)
-    rows: list[dict[str, object]] = []
-    for index, source in enumerate(full_od_rows):
-        origin = str(source.get("origin_stop_id", ""))
-        destination_id = str(source.get("destination_stop_id", ""))
-        if not origin or not destination_id:
-            continue
-        modeled = _csv_number(source.get("estimated_demand"))
-        if modeled is None:
-            continue
-        observed = observed_values[index]
-        residual = None if observed is None else observed - modeled
-        rows.append(
-            {
-                "origin_stop_id": origin,
-                "destination_stop_id": destination_id,
-                "departure_time_bin": str(source.get("departure_time_bin", "")),
-                "observed_demand": _csv_number_text(observed),
-                "modeled_demand": _csv_number_text(modeled),
-                "residual": _csv_number_text(residual),
-                "fixed_free_status": _fixed_free_status(source.get("cell_status")),
-                "identifiability_class": str(source.get("identifiability_class", "")),
-            }
-        )
-    if not rows:
-        return 0
-    _write_csv(destination, list(_OD_MAP_COLUMNS), rows)
-    return len(rows)
+    report_values = report_payload.get("observed_od_demand")
+    report_values_available = isinstance(report_values, Sequence) and not isinstance(
+        report_values, (str, bytes)
+    )
+    def all_rows() -> Iterator[Mapping[str, str]]:
+        yield first
+        yield from rows_iter
 
+    temporary = destination.with_name(f".{destination.name}.tmp")
+    count = 0
+    with temporary.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(_OD_MAP_COLUMNS), extrasaction="raise")
+        writer.writeheader()
+        for index, source in enumerate(all_rows()):
+            origin = str(source.get("origin_stop_id", ""))
+            destination_id = str(source.get("destination_stop_id", ""))
+            if not origin or not destination_id:
+                continue
+            modeled = _csv_number(source.get("estimated_demand"))
+            if modeled is None:
+                continue
+            observed = (
+                _csv_number(report_values[index])
+                if report_values_available and index < len(report_values)
+                else _csv_number(source.get("observed_demand") or source.get("observed"))
+            )
+            residual = None if observed is None else observed - modeled
+            writer.writerow(
+                {
+                    "origin_stop_id": origin,
+                    "destination_stop_id": destination_id,
+                    "departure_time_bin": str(source.get("departure_time_bin", "")),
+                    "observed_demand": _csv_number_text(observed),
+                    "modeled_demand": _csv_number_text(modeled),
+                    "residual": _csv_number_text(residual),
+                    "fixed_free_status": _fixed_free_status(source.get("cell_status")),
+                    "identifiability_class": str(source.get("identifiability_class", "")),
+                }
+            )
+            count += 1
+    if not count:
+        temporary.unlink(missing_ok=True)
+        return 0
+    temporary.replace(destination)
+    return count
 
 def _write_stop_summary(
     destination: Path,
     *,
     predicted_fields: Sequence[str],
-    predicted_rows: Sequence[Mapping[str, str]],
-    network_stops: Sequence[Mapping[str, str]] = (),
+    predicted_rows: Iterable[Mapping[str, str]],
+    network_stops: Iterable[Mapping[str, str]] = (),
 ) -> int:
     """Write display-oriented observed/modelled stop totals."""
     stop_field = "stop" if "stop" in predicted_fields else "stop_id" if "stop_id" in predicted_fields else None
@@ -344,7 +1080,7 @@ def _integer_column(rows: Sequence[Mapping[str, str]], name: str, path: Path) ->
     return values.astype(np.int64)
 
 
-def _nonempty_values(rows: Sequence[Mapping[str, str]], name: str) -> set[str]:
+def _nonempty_values(rows: Iterable[Mapping[str, str]], name: str) -> set[str]:
     return {str(row.get(name, "")) for row in rows if str(row.get(name, "")) != ""}
 
 
@@ -641,7 +1377,8 @@ def _validate_network(
         raise ValueError(f"unsupported network snapshot files: {', '.join(unknown)}.")
     if "stops.csv" not in files:
         raise ValueError("network snapshot must include stops.csv.")
-    stop_fields, stops = _read_csv(network_dir / "stops.csv")
+    stop_fields = _csv_fieldnames(network_dir / "stops.csv")
+    stops = list(_iter_csv_rows(network_dir / "stops.csv"))
     _require_columns(network_dir / "stops.csv", stop_fields, ("stop_id", "name", "lat", "lon"))
     stop_ids = [str(row["stop_id"]) for row in stops]
     if len(set(stop_ids)) != len(stop_ids):
@@ -657,12 +1394,12 @@ def _validate_network(
         raise ValueError("network/stops.csv contains invalid latitude/longitude values.")
     stop_set = set(stop_ids)
 
-    od_fields, od_rows = _read_csv(staging / "full_od.csv")
-    report_stops = _nonempty_values(od_rows, "origin_stop_id") | _nonempty_values(
-        od_rows, "destination_stop_id"
+    report_stops = _nonempty_values(
+        _iter_csv_rows(staging / "full_od.csv"), "origin_stop_id"
+    ) | _nonempty_values(_iter_csv_rows(staging / "full_od.csv"), "destination_stop_id")
+    report_stops |= _nonempty_values(
+        _iter_csv_rows(staging / "predicted_measurements.csv"), "stop"
     )
-    pred_fields, pred_rows = _read_csv(staging / "predicted_measurements.csv")
-    report_stops |= _nonempty_values(pred_rows, "stop")
     missing_stops = sorted(report_stops - stop_set)
     if missing_stops:
         raise ValueError(
@@ -673,15 +1410,18 @@ def _validate_network(
     counts = {"network/stops.csv": len(stops)}
     line_ids: set[str] = set()
     if "lines.csv" in files:
-        fields, rows = _read_csv(network_dir / "lines.csv")
+        fields = _csv_fieldnames(network_dir / "lines.csv")
         line_column = _first_column(fields, ("line_id", "route_id", "line", "id"))
         if line_column is None:
             raise ValueError("network/lines.csv must contain line_id or route_id.")
-        line_ids = _nonempty_values(rows, line_column)
-        if len(line_ids) != len(rows):
+        line_ids = _nonempty_values(_iter_csv_rows(network_dir / "lines.csv"), line_column)
+        line_count = _csv_row_count(network_dir / "lines.csv")
+        if len(line_ids) != line_count:
             raise ValueError("network/lines.csv contains duplicate or empty line identifiers.")
-        counts["network/lines.csv"] = len(rows)
-        measurement_lines = _nonempty_values(pred_rows, "line")
+        counts["network/lines.csv"] = line_count
+        measurement_lines = _nonempty_values(
+            _iter_csv_rows(staging / "predicted_measurements.csv"), "line"
+        )
         missing_lines = sorted(measurement_lines - line_ids)
         if missing_lines:
             raise ValueError(
@@ -690,44 +1430,93 @@ def _validate_network(
             )
     trip_ids: set[str] = set()
     if "trips.csv" in files:
-        fields, rows = _read_csv(network_dir / "trips.csv")
+        fields = _csv_fieldnames(network_dir / "trips.csv")
         trip_column = _first_column(fields, ("trip_id", "trip", "id"))
         if trip_column is None:
             raise ValueError("network/trips.csv must contain trip_id.")
-        trip_ids = _nonempty_values(rows, trip_column)
-        if len(trip_ids) != len(rows):
+        trip_ids = _nonempty_values(_iter_csv_rows(network_dir / "trips.csv"), trip_column)
+        trip_count = _csv_row_count(network_dir / "trips.csv")
+        if len(trip_ids) != trip_count:
             raise ValueError("network/trips.csv contains duplicate or empty trip identifiers.")
         if line_ids:
             line_column = _first_column(fields, ("line_id", "route_id", "line"))
             if line_column is not None:
-                missing = sorted(_nonempty_values(rows, line_column) - line_ids)
+                missing = sorted(
+                    _nonempty_values(_iter_csv_rows(network_dir / "trips.csv"), line_column)
+                    - line_ids
+                )
                 if missing:
                     raise ValueError(
                         "network/trips.csv references line IDs absent from lines.csv: "
                         + ", ".join(missing[:10])
                     )
-        counts["network/trips.csv"] = len(rows)
+        counts["network/trips.csv"] = trip_count
     if "stop_times.csv" in files:
-        fields, rows = _read_csv(network_dir / "stop_times.csv")
+        fields = _csv_fieldnames(network_dir / "stop_times.csv")
         trip_column = _first_column(fields, ("trip_id", "trip"))
         stop_column = _first_column(fields, ("stop_id", "stop"))
         if trip_column is None or stop_column is None:
             raise ValueError("network/stop_times.csv must contain trip_id and stop_id.")
         if trip_ids:
-            missing = sorted(_nonempty_values(rows, trip_column) - trip_ids)
+            missing = sorted(
+                _nonempty_values(_iter_csv_rows(network_dir / "stop_times.csv"), trip_column)
+                - trip_ids
+            )
             if missing:
                 raise ValueError(
                     "network/stop_times.csv references unknown trip IDs: "
                     + ", ".join(missing[:10])
                 )
-        missing = sorted(_nonempty_values(rows, stop_column) - stop_set)
+        missing = sorted(
+            _nonempty_values(_iter_csv_rows(network_dir / "stop_times.csv"), stop_column)
+            - stop_set
+        )
         if missing:
             raise ValueError(
                 "network/stop_times.csv references unknown stop IDs: "
                 + ", ".join(missing[:10])
             )
-        counts["network/stop_times.csv"] = len(rows)
+        counts["network/stop_times.csv"] = _csv_row_count(network_dir / "stop_times.csv")
     return counts
+
+
+def _validate_route_flow_network(root: Path, summary: Mapping[str, object]) -> None:
+    """Validate sparse route references against the optional network snapshot."""
+    network_dir = root / "network"
+    route_summary = summary.get("route_flows", {})
+    if not network_dir.is_dir() or not isinstance(route_summary, Mapping) or not route_summary.get("available"):
+        return
+    line_ids: set[str] = set()
+    trip_ids: set[str] = set()
+    stop_ids: set[str] = set()
+    if (network_dir / "stops.csv").is_file():
+        stop_ids = _nonempty_values(_iter_csv_rows(network_dir / "stops.csv"), "stop_id")
+    if (network_dir / "lines.csv").is_file():
+        fields = _csv_fieldnames(network_dir / "lines.csv")
+        line_column = _first_column(fields, ("line_id", "route_id", "line", "id"))
+        if line_column is not None:
+            line_ids = _nonempty_values(_iter_csv_rows(network_dir / "lines.csv"), line_column)
+    if (network_dir / "trips.csv").is_file():
+        fields = _csv_fieldnames(network_dir / "trips.csv")
+        trip_column = _first_column(fields, ("trip_id", "trip", "id"))
+        if trip_column is not None:
+            trip_ids = _nonempty_values(_iter_csv_rows(network_dir / "trips.csv"), trip_column)
+    for descriptor in route_summary.get("partitions", ()):
+        if not isinstance(descriptor, Mapping):
+            continue
+        path = root / str(descriptor.get("path") or descriptor.get("file"))
+        for row in _iter_csv_rows(path):
+            for field, known, label in (
+                ("origin_stop_id", stop_ids, "origin"),
+                ("destination_stop_id", stop_ids, "destination"),
+                ("boarding_stop_id", stop_ids, "boarding"),
+                ("alighting_stop_id", stop_ids, "alighting"),
+                ("line_id", line_ids, "line"),
+                ("trip_id", trip_ids, "trip"),
+            ):
+                value = str(row.get(field, ""))
+                if value and known and value not in known:
+                    raise ValueError(f"route-flow {label} ID {value!r} is absent from the network snapshot.")
 
 
 def _file_records(root: Path) -> dict[str, dict[str, object]]:
@@ -908,11 +1697,12 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
     if not isinstance(counts, Mapping):
         raise ValueError("bundle row_counts are missing or invalid.")
     for name in _TABLE_FILES:
-        fields, rows = _read_csv(root / name)
+        fields = _csv_fieldnames(root / name)
+        actual_rows = _csv_row_count(root / name)
         expected = counts.get(name)
-        if expected != len(rows):
+        if expected != actual_rows:
             raise ValueError(
-                f"bundle row count mismatch for {name!r}: manifest={expected!r}, actual={len(rows)!r}."
+                f"bundle row count mismatch for {name!r}: manifest={expected!r}, actual={actual_rows!r}."
             )
         if name == "full_od.csv":
             _require_columns(root / name, fields, _FULL_OD_COLUMNS)
@@ -928,14 +1718,75 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
     ):
         if not (root / name).is_file():
             continue
-        fields, rows = _read_csv(root / name)
+        fields = _csv_fieldnames(root / name)
+        actual_rows = _csv_row_count(root / name)
         expected = counts.get(name)
-        if expected != len(rows):
+        if expected != actual_rows:
             raise ValueError(
                 f"bundle row count mismatch for {name!r}: "
-                f"manifest={expected!r}, actual={len(rows)!r}."
+                f"manifest={expected!r}, actual={actual_rows!r}."
             )
         _require_columns(root / name, fields, columns)
+    summary_path = root / _VIEWER_SUMMARY_FILE
+    if summary_path.is_file():
+        summary_payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        if not isinstance(summary_payload, Mapping):
+            raise ValueError("viewer_summary.json must contain an object.")
+        if summary_payload.get("cache_format_version") not in (1, GRAVITY_VIEWER_CACHE_FORMAT_VERSION):
+            raise ValueError("unsupported viewer cache format version.")
+        for kind, expected_columns in (("od", _FULL_OD_COLUMNS), ("route_flows", _ROUTE_FLOW_REQUIRED_COLUMNS)):
+            kind_payload = summary_payload.get(kind, {})
+            if not isinstance(kind_payload, Mapping) or not kind_payload.get("available"):
+                continue
+            partitions = kind_payload.get("partitions", ())
+            if not isinstance(partitions, Sequence) or isinstance(partitions, (str, bytes)):
+                raise ValueError(f"viewer summary {kind!r} partitions are invalid.")
+            total = 0
+            for descriptor in partitions:
+                if not isinstance(descriptor, Mapping):
+                    raise ValueError(f"viewer summary {kind!r} contains an invalid partition.")
+                relative = Path(str(descriptor.get("path") or descriptor.get("file") or ""))
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise ValueError("viewer summary contains an unsafe partition path.")
+                path = root / relative
+                if not path.is_file():
+                    raise ValueError(f"viewer summary partition is missing: {relative}")
+                _require_columns(path, _csv_fieldnames(path), expected_columns)
+                count = _csv_row_count(path)
+                if descriptor.get("row_count") != count:
+                    raise ValueError(f"viewer summary row count mismatch for {relative!s}.")
+                total += count
+            if kind == "od" and total != counts.get("full_od.csv"):
+                raise ValueError("viewer OD partition rows do not match full_od.csv.")
+        section_payload = summary_payload.get("route_sections", {})
+        if isinstance(section_payload, Mapping) and section_payload.get("available"):
+            if section_payload.get("schema_version") != GRAVITY_VIEWER_ROUTE_SECTION_SCHEMA_VERSION:
+                raise ValueError("unsupported viewer route-section schema version.")
+            for group_name, expected_columns in (
+                ("contributors", _SECTION_CONTRIBUTION_COLUMNS),
+                ("section_loads", _SECTION_LOAD_COLUMNS),
+            ):
+                group = section_payload.get(group_name, {})
+                if not isinstance(group, Mapping):
+                    raise ValueError(f"viewer summary route_sections {group_name!r} is invalid.")
+                for descriptor in group.get("partitions", ()):
+                    relative = Path(str(descriptor.get("path") or descriptor.get("file") or ""))
+                    if relative.is_absolute() or ".." in relative.parts:
+                        raise ValueError("viewer route-section partition path is unsafe.")
+                    path = root / relative
+                    if not path.is_file():
+                        raise ValueError(f"viewer route-section partition is missing: {relative}")
+                    _require_columns(path, _csv_fieldnames(path), expected_columns)
+                    if descriptor.get("row_count") != _csv_row_count(path):
+                        raise ValueError(f"viewer route-section row count mismatch for {relative!s}.")
+                    if group_name == "contributors":
+                        expected_assignment = manifest.get("assignment_fingerprint")
+                        if expected_assignment:
+                            for row in _iter_csv_rows(path):
+                                supplied = str(row.get("assignment_fingerprint", ""))
+                                if supplied and supplied != str(expected_assignment):
+                                    raise ValueError("viewer route-section assignment fingerprint mismatch.")
+        _validate_route_flow_network(root, summary_payload)
     identifiability = manifest.get("identifiability", {})
     if not isinstance(identifiability, Mapping):
         raise ValueError("bundle identifiability metadata is invalid.")
@@ -952,6 +1803,40 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
             raise ValueError(
                 f"bundle row count mismatch for {name!r}: manifest={counts.get(name)!r}, actual={count!r}."
             )
+
+
+def _write_route_flow_source(
+    destination: Path,
+    route_flow_rows: Iterable[Mapping[str, object]] | str | Path,
+    *,
+    expected_assignment_fingerprint: str | None = None,
+) -> int:
+    """Normalize an externally prepared post-fit route-flow export."""
+    if isinstance(route_flow_rows, (str, Path)):
+        rows: Iterable[Mapping[str, object]] = _iter_csv_rows(Path(route_flow_rows))
+    else:
+        rows = route_flow_rows
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    count = 0
+    temporary = destination.with_name(f".{destination.name}.tmp")
+    with temporary.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(_ROUTE_FLOW_COLUMNS), extrasaction="raise")
+        writer.writeheader()
+        for raw in rows:
+            normalized = _route_flow_row(raw)
+            supplied_fingerprint = normalized.get("assignment_fingerprint", "")
+            if (
+                expected_assignment_fingerprint
+                and supplied_fingerprint
+                and supplied_fingerprint != expected_assignment_fingerprint
+            ):
+                raise ValueError(
+                    "route-flow assignment fingerprint differs from the fitted bundle identity."
+                )
+            writer.writerow(normalized)
+            count += 1
+    temporary.replace(destination)
+    return count
 
 
 @dataclass(frozen=True, slots=True)
@@ -995,6 +1880,30 @@ class GravityViewerBundle:
             raise FileNotFoundError(f"network snapshot file is not present: {name}")
         return path
 
+    @property
+    def viewer_summary(self) -> Mapping[str, object]:
+        """Return the small partition/index summary, if present."""
+        path = self.path / _VIEWER_SUMMARY_FILE
+        if not path.is_file():
+            return {}
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, Mapping):
+            raise ValueError("viewer_summary.json must contain an object.")
+        return payload
+
+    @property
+    def route_flow_available(self) -> bool:
+        route_summary = self.viewer_summary.get("route_flows", {})
+        return isinstance(route_summary, Mapping) and bool(route_summary.get("available"))
+
+    @property
+    def transfer_count_definition(self) -> str | None:
+        route_summary = self.viewer_summary.get("route_flows", {})
+        if not isinstance(route_summary, Mapping):
+            return None
+        value = route_summary.get("transfer_count_definition")
+        return None if value is None else str(value)
+
     def iter_table(
         self,
         name: str,
@@ -1022,6 +1931,313 @@ class GravityViewerBundle:
                     chunk = chunk[chunk[field] == expected]
             if not chunk.empty:
                 yield chunk
+
+    def iter_partition(
+        self,
+        partition: str,
+        *,
+        columns: Sequence[str] | None = None,
+        chunksize: int = 100_000,
+        filters: Mapping[str, object] | None = None,
+    ) -> Iterator[Any]:
+        """Yield one indexed partition using bounded pandas chunks."""
+        if chunksize <= 0:
+            raise ValueError("chunksize must be positive.")
+        relative = Path(partition)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("partition path must stay inside the bundle.")
+        path = self.path / relative
+        if not path.is_file() or not relative.as_posix().startswith(f"{_PARTITION_ROOT}/"):
+            raise FileNotFoundError(f"bundle partition is not present: {partition}")
+        try:
+            import pandas as pd
+        except ImportError as error:  # pragma: no cover
+            raise RuntimeError("pandas is required for chunked viewer access.") from error
+        filters = {} if filters is None else dict(filters)
+        for chunk in pd.read_csv(path, usecols=columns, chunksize=chunksize):
+            for field, expected in filters.items():
+                if field not in chunk.columns:
+                    raise ValueError(f"partition has no filter column {field!r}.")
+                if isinstance(expected, (set, frozenset, tuple, list)):
+                    chunk = chunk[chunk[field].isin(expected)]
+                else:
+                    chunk = chunk[chunk[field] == expected]
+            if not chunk.empty:
+                yield chunk
+
+    def _partition_descriptors(self, kind: str) -> tuple[Mapping[str, object], ...]:
+        summary = self.viewer_summary.get(kind, {})
+        if not isinstance(summary, Mapping):
+            return ()
+        partitions = summary.get("partitions", ())
+        if not isinstance(partitions, Sequence) or isinstance(partitions, (str, bytes)):
+            return ()
+        return tuple(item for item in partitions if isinstance(item, Mapping))
+
+    def iter_route_flows(
+        self,
+        *,
+        departure_time_bin: str | None = None,
+        origin: str | None = None,
+        destination: str | None = None,
+        line: str | None = None,
+        trip: str | None = None,
+        transfer_count: int | None = None,
+        chunksize: int = 100_000,
+    ) -> Iterator[Any]:
+        """Stream sparse post-fit route flows in either query direction."""
+        descriptors = self._partition_descriptors("route_flows")
+        filters: dict[str, object] = {}
+        if origin is not None:
+            filters["origin_stop_id"] = origin
+        if destination is not None:
+            filters["destination_stop_id"] = destination
+        if line is not None:
+            filters["line_id"] = line
+        if trip is not None:
+            filters["trip_id"] = trip
+        if transfer_count is not None:
+            filters["transfer_count"] = transfer_count
+        for descriptor in descriptors:
+            if departure_time_bin is not None and descriptor.get("key") != departure_time_bin:
+                continue
+            path = descriptor.get("path") or descriptor.get("file")
+            if path is None:
+                continue
+            yield from self.iter_partition(
+                str(path),
+                columns=_ROUTE_FLOW_COLUMNS,
+                chunksize=chunksize,
+                filters=filters,
+            )
+
+    def query_route_flows(
+        self,
+        *,
+        departure_time_bin: str | None = None,
+        origin: str | None = None,
+        destination: str | None = None,
+        line: str | None = None,
+        trip: str | None = None,
+        transfer_count: int | None = None,
+        top_n: int | None = None,
+        chunksize: int = 100_000,
+    ) -> Any:
+        """Return a bounded route-flow query for origin-, destination-, or service-first views."""
+        try:
+            import pandas as pd
+        except ImportError as error:  # pragma: no cover
+            raise RuntimeError("pandas is required for viewer access.") from error
+        chunks: list[Any] = []
+        for chunk in self.iter_route_flows(
+            departure_time_bin=departure_time_bin,
+            origin=origin,
+            destination=destination,
+            line=line,
+            trip=trip,
+            transfer_count=transfer_count,
+            chunksize=chunksize,
+        ):
+            if top_n is not None:
+                if top_n <= 0:
+                    raise ValueError("top_n must be positive when provided.")
+                chunk["assigned_demand"] = pd.to_numeric(chunk["assigned_demand"])
+                chunk = chunk.nlargest(top_n, "assigned_demand")
+            chunks.append(chunk)
+        if not chunks:
+            return pd.DataFrame(columns=_ROUTE_FLOW_COLUMNS)
+        result = pd.concat(chunks, ignore_index=True)
+        if top_n is not None:
+            result["assigned_demand"] = pd.to_numeric(result["assigned_demand"])
+            result = result.nlargest(top_n, "assigned_demand")
+        return result
+
+    def aggregate_route_flows(
+        self,
+        by: str | Sequence[str] = ("line_id",),
+        **filters: object,
+    ) -> Any:
+        """Aggregate expected assigned demand while preserving passenger-leg semantics."""
+        group_by = (by,) if isinstance(by, str) else tuple(by)
+        if not group_by:
+            raise ValueError("at least one route-flow aggregation column is required.")
+        totals: dict[tuple[object, ...], float] = {}
+        for chunk in self.iter_route_flows(**filters):
+            chunk["assigned_demand"] = chunk["assigned_demand"].astype(float)
+            grouped = chunk.groupby(list(group_by), dropna=False, sort=False)["assigned_demand"].sum()
+            for key, value in grouped.items():
+                normalized = key if isinstance(key, tuple) else (key,)
+                totals[normalized] = totals.get(normalized, 0.0) + float(value)
+        try:
+            import pandas as pd
+        except ImportError as error:  # pragma: no cover
+            raise RuntimeError("pandas is required for viewer access.") from error
+        rows = [dict(zip(group_by, key, strict=True), assigned_demand=value) for key, value in sorted(totals.items(), key=str)]
+        return pd.DataFrame(rows, columns=[*group_by, "assigned_demand"])
+
+    def query_od_routes(
+        self,
+        *,
+        origin: str,
+        destination: str,
+        departure_time_bin: str | None = None,
+        top_n: int | None = None,
+    ) -> Any:
+        return self.query_route_flows(
+            origin=origin,
+            destination=destination,
+            departure_time_bin=departure_time_bin,
+            top_n=top_n,
+        )
+
+    def query_service_flows(
+        self,
+        *,
+        line: str | None = None,
+        trip: str | None = None,
+        departure_time_bin: str | None = None,
+        top_n: int | None = None,
+    ) -> Any:
+        if line is None and trip is None:
+            raise ValueError("line or trip is required for a service-flow query.")
+        return self.query_route_flows(
+            line=line,
+            trip=trip,
+            departure_time_bin=departure_time_bin,
+            top_n=top_n,
+        )
+
+    @property
+    def route_section_available(self) -> bool:
+        payload = self.viewer_summary.get("route_sections", {})
+        return isinstance(payload, Mapping) and bool(payload.get("available"))
+
+    def _section_group_descriptors(self, group_name: str) -> tuple[Mapping[str, object], ...]:
+        payload = self.viewer_summary.get("route_sections", {})
+        group = payload.get(group_name, {}) if isinstance(payload, Mapping) else {}
+        partitions = group.get("partitions", ()) if isinstance(group, Mapping) else ()
+        if not isinstance(partitions, Sequence) or isinstance(partitions, (str, bytes)):
+            return ()
+        return tuple(item for item in partitions if isinstance(item, Mapping))
+
+    def iter_section_od(
+        self,
+        section_id: str,
+        *,
+        departure_time_bin: str,
+        line: str | None = None,
+        pattern: str | None = None,
+        direction: str | None = None,
+        chunksize: int = 100_000,
+    ) -> Iterator[Any]:
+        """Stream every saved OD/path contribution traversing one directed section."""
+        if not self.route_section_available:
+            return
+        filters: dict[str, object] = {"section_id": section_id}
+        if line is not None:
+            filters["line_id"] = line
+        if pattern is not None:
+            filters["pattern_id"] = pattern
+        if direction is not None:
+            filters["direction"] = direction
+        descriptors = self._section_group_descriptors("contributors")
+        for descriptor in descriptors:
+            if str(descriptor.get("key")) != str(departure_time_bin):
+                continue
+            path = descriptor.get("path") or descriptor.get("file")
+            if path:
+                yield from self.iter_partition(
+                    str(path), columns=_SECTION_CONTRIBUTION_COLUMNS,
+                    chunksize=chunksize, filters=filters
+                )
+
+    def query_section_od(
+        self,
+        section_id: str,
+        *,
+        departure_time_bin: str,
+        line: str | None = None,
+        pattern: str | None = None,
+        direction: str | None = None,
+        page: int | None = None,
+        page_size: int | None = None,
+        aggregate_by_od: bool = False,
+        chunksize: int = 100_000,
+    ) -> Any:
+        """Return all (or one page of) saved contributions for a directed section."""
+        if page is not None and page < 0:
+            raise ValueError("page must be non-negative")
+        if page_size is not None and page_size <= 0:
+            raise ValueError("page_size must be positive")
+        try:
+            import pandas as pd
+        except ImportError as error:  # pragma: no cover
+            raise RuntimeError("pandas is required for viewer access.") from error
+        chunks = list(self.iter_section_od(
+            section_id, departure_time_bin=departure_time_bin, line=line,
+            pattern=pattern, direction=direction, chunksize=chunksize,
+        ))
+        if not chunks:
+            result = pd.DataFrame(columns=_SECTION_CONTRIBUTION_COLUMNS)
+        else:
+            result = pd.concat(chunks, ignore_index=True)
+        if aggregate_by_od and not result.empty:
+            numeric = pd.to_numeric(result["assigned_demand"], errors="coerce").fillna(0.0)
+            result = result.assign(assigned_contribution=numeric)
+            group = ["origin_stop_id", "destination_stop_id", "departure_time_bin"]
+            result = result.groupby(group, as_index=False, sort=False).agg(
+                assigned_contribution=("assigned_contribution", "sum"),
+                path_count=("route_path_id", "nunique"),
+                transfer_count=("transfer_count", "first"),
+            )
+            od = self.read_table(
+                "full_od.csv",
+                columns=("origin_stop_id", "destination_stop_id", "departure_time_bin", "estimated_demand"),
+                filters={"departure_time_bin": departure_time_bin},
+                chunksize=chunksize,
+            )
+            if not od.empty:
+                od["estimated_demand"] = pd.to_numeric(od["estimated_demand"], errors="coerce")
+                result = result.merge(od, on=group, how="left").rename(
+                    columns={"estimated_demand": "total_od_demand"}
+                )
+            else:
+                result["total_od_demand"] = np.nan
+        if page_size is not None:
+            start = 0 if page is None else page * page_size
+            result = result.iloc[start:start + page_size].reset_index(drop=True)
+        return result
+
+    def query_section_load(
+        self,
+        section_id: str,
+        *,
+        departure_time_bin: str,
+        line: str | None = None,
+        pattern: str | None = None,
+        direction: str | None = None,
+    ) -> Any:
+        """Return the aggregate assigned passenger-section usage for a section."""
+        try:
+            import pandas as pd
+        except ImportError as error:  # pragma: no cover
+            raise RuntimeError("pandas is required for viewer access.") from error
+        filters: dict[str, object] = {"section_id": section_id}
+        if line is not None:
+            filters["line_id"] = line
+        if pattern is not None:
+            filters["pattern_id"] = pattern
+        if direction is not None:
+            filters["direction"] = direction
+        for descriptor in self._section_group_descriptors("section_loads"):
+            if str(descriptor.get("key")) != str(departure_time_bin):
+                continue
+            path = descriptor.get("path") or descriptor.get("file")
+            if path:
+                chunks = list(self.iter_partition(str(path), columns=_SECTION_LOAD_COLUMNS,
+                                                  filters=filters))
+                return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=_SECTION_LOAD_COLUMNS)
+        return pd.DataFrame(columns=_SECTION_LOAD_COLUMNS)
 
     def read_table(
         self,
@@ -1070,6 +2286,16 @@ class GravityViewerBundle:
         result = self.read_table("full_od.csv", filters=filters, chunksize=chunksize)
         if minimum_flow is not None:
             result = result[result["estimated_demand"] >= minimum_flow]
+        if not result.empty:
+            result["demand_share"] = 0.0
+            if origin is not None or destination is None:
+                group_by = ["origin_stop_id", "departure_time_bin"]
+            else:
+                group_by = ["destination_stop_id", "departure_time_bin"]
+            totals = result.groupby(group_by, dropna=False)["estimated_demand"].transform("sum")
+            result["demand_share"] = np.divide(
+                result["estimated_demand"], totals, out=np.zeros_like(totals), where=totals != 0
+            )
         if top_n is not None:
             if top_n <= 0:
                 raise ValueError("top_n must be positive when provided.")
@@ -1118,6 +2344,7 @@ def write_gravity_viewer_bundle(
     metadata: Mapping[str, object] | None = None,
     require_identifiability: bool = False,
     model_specification: GravityModelSpecification | Mapping[str, object] | None = None,
+    route_flow_rows: Iterable[Mapping[str, object]] | str | Path | None = None,
 ) -> GravityViewerBundle:
     """Export validated fit/report data for an independent graphical viewer."""
     if not isinstance(fit_result, GravityEstimationResult):
@@ -1197,29 +2424,51 @@ def write_gravity_viewer_bundle(
         # These are intentionally derived, display-oriented summaries.  They
         # never participate in model identity and are omitted when the source
         # report does not contain enough information to construct them.
-        full_od_fields, full_od_rows = _read_csv(staging / "full_od.csv")
-        del full_od_fields
         if _write_od_map(
             staging / "od_map.csv",
-            full_od_rows=full_od_rows,
+            full_od_rows=_iter_csv_rows(staging / "full_od.csv"),
             report_payload=report_payload,
         ):
-            table_counts["od_map.csv"] = len(_read_csv(staging / "od_map.csv")[1])
+            table_counts["od_map.csv"] = _csv_row_count(staging / "od_map.csv")
 
-        predicted_fields, predicted_rows = _read_csv(staging / "predicted_measurements.csv")
-        network_stops: list[dict[str, str]] = []
+        predicted_fields = _csv_fieldnames(staging / "predicted_measurements.csv")
+        predicted_rows = _iter_csv_rows(staging / "predicted_measurements.csv")
+        network_stops: Iterable[Mapping[str, str]] = ()
         stops_path = staging / "network" / "stops.csv"
         if stops_path.is_file():
-            _, network_stops = _read_csv(stops_path)
+            network_stops = _iter_csv_rows(stops_path)
         if _write_stop_summary(
             staging / "stop_summary.csv",
             predicted_fields=predicted_fields,
             predicted_rows=predicted_rows,
             network_stops=network_stops,
         ):
-            table_counts["stop_summary.csv"] = len(
-                _read_csv(staging / "stop_summary.csv")[1]
+            table_counts["stop_summary.csv"] = _csv_row_count(staging / "stop_summary.csv")
+
+        if route_flow_rows is not None:
+            report_provenance = report_payload.get("provenance", {})
+            expected_assignment = (
+                report_provenance.get("assignment_fingerprint")
+                if isinstance(report_provenance, Mapping)
+                else None
             )
+            if expected_assignment is None:
+                metadata_provenance = metadata.get("provenance", {})
+                expected_assignment = (
+                    metadata_provenance.get("assignment_fingerprint")
+                    if isinstance(metadata_provenance, Mapping)
+                    else None
+                )
+            _write_route_flow_source(
+                staging / "route_flows.csv", route_flow_rows,
+                expected_assignment_fingerprint=(
+                    None if expected_assignment is None else str(expected_assignment)
+                ),
+            )
+        viewer_summary = _write_viewer_partitions(staging)
+        route_source = staging / "route_flows.csv"
+        if route_source.exists():
+            route_source.unlink()
 
         provenance = _source_provenance(report_payload, fit_result, metadata)
         provenance["specification_fingerprint"] = specification_fingerprint
@@ -1244,6 +2493,10 @@ def write_gravity_viewer_bundle(
                 "total_hessian_dimension": identifiability.total_hessian_dimension,
                 "classification_counts": identifiability.classification_counts,
             }
+        route_summary = viewer_summary["route_flows"]
+        route_flow_fingerprint = hashlib.sha256(
+            canonical_json(route_summary).encode("utf-8")
+        ).hexdigest()
         bundle_metadata = dict(metadata)
         bundle_metadata.pop("provenance", None)
         coordinate_convention = {
@@ -1294,6 +2547,46 @@ def write_gravity_viewer_bundle(
             "coordinate_convention": coordinate_convention,
             "metadata": bundle_metadata,
             "row_counts": table_counts,
+            "partitions": {
+                "od": viewer_summary["od"]["partitions"],
+                "route_flows": viewer_summary["route_flows"].get("partitions", []),
+                "route_sections": viewer_summary.get("route_sections", {}),
+                "cache_format_version": GRAVITY_VIEWER_CACHE_FORMAT_VERSION,
+            },
+            "viewer_summary": {
+                "path": _VIEWER_SUMMARY_FILE,
+                "cache_format_version": GRAVITY_VIEWER_CACHE_FORMAT_VERSION,
+                "od_partitions": len(viewer_summary["od"]["partitions"]),
+                "route_flows_available": bool(viewer_summary["route_flows"]["available"]),
+                "route_sections_available": bool(viewer_summary.get("route_sections", {}).get("available")),
+            },
+            "route_flow_provenance": {
+                "available": bool(viewer_summary["route_flows"]["available"]),
+                "route_flow_fingerprint": route_flow_fingerprint,
+                "assignment_fingerprint": provenance.get("assignment_fingerprint"),
+                "routing_assignment_fingerprint": provenance.get("assignment_fingerprint"),
+                "fit_fingerprint": fit_result.model_fingerprint,
+                "specification_fingerprint": specification_fingerprint,
+                "package_revision": provenance.get("package_revision"),
+                "transfer_count_definition": viewer_summary["route_flows"].get(
+                    "transfer_count_definition"
+                ),
+                "flow_semantics": viewer_summary["route_flows"].get("flow_semantics", []),
+                "partition_row_counts": {
+                    str(item.get("path")): item.get("row_count")
+                    for item in viewer_summary["route_flows"].get("partitions", [])
+                },
+            },
+            "route_section_provenance": {
+                "available": bool(viewer_summary.get("route_sections", {}).get("available")),
+                "schema_version": GRAVITY_VIEWER_ROUTE_SECTION_SCHEMA_VERSION,
+                "cache_format_version": GRAVITY_VIEWER_CACHE_FORMAT_VERSION,
+                "interval_semantics": viewer_summary.get("route_sections", {}).get("interval_semantics"),
+                "geometry_path": viewer_summary.get("route_sections", {}).get("geometry_path"),
+                "catalog_path": viewer_summary.get("route_sections", {}).get("catalog_path"),
+                "message": viewer_summary.get("route_sections", {}).get("message"),
+                "assignment_fingerprint": provenance.get("assignment_fingerprint"),
+            },
         }
         manifest["files"] = _file_records(staging)
         _write_json(staging / "bundle_manifest.json", manifest)
@@ -1322,6 +2615,7 @@ def write_persisted_gravity_viewer_bundle(
     require_identifiability: bool = False,
     model_specification: GravityModelSpecification | Mapping[str, object] | None = None,
     report_output_directory: str | Path | None = None,
+    route_flow_rows: Iterable[Mapping[str, object]] | str | Path | None = None,
 ) -> GravityViewerBundle:
     """Export a viewer bundle directly from persisted fit/validation artifacts.
 
@@ -1379,6 +2673,7 @@ def write_persisted_gravity_viewer_bundle(
             metadata=bundle_metadata,
             require_identifiability=require_identifiability,
             model_specification=model_specification,
+            route_flow_rows=route_flow_rows,
         )
     finally:
         if temporary_report is not None:
@@ -1400,8 +2695,10 @@ def read_gravity_viewer_bundle(path: str | Path) -> GravityViewerBundle:
 
 
 __all__ = [
+    "GRAVITY_VIEWER_CACHE_FORMAT_VERSION",
     "GRAVITY_VIEWER_BUNDLE_SCHEMA_VERSION",
     "GRAVITY_VIEWER_BUNDLE_TYPE",
+    "GRAVITY_VIEWER_ROUTE_SECTION_SCHEMA_VERSION",
     "GravityViewerBundle",
     "read_gravity_viewer_bundle",
     "write_gravity_viewer_bundle",

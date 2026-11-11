@@ -474,6 +474,149 @@ def test_bundle_requires_exact_model_specification(tmp_path):
         )
 
 
+def test_route_flow_partitions_support_od_and_service_queries(tmp_path):
+    result, report, _ = _inputs(tmp_path)
+    bundle = write_gravity_viewer_bundle(
+        output_directory=tmp_path / "route-bundle",
+        fit_result=result,
+        validation_result=report.adequacy,
+        report=report,
+        route_flow_rows=(
+            {
+                "origin": "o1",
+                "destination": "d1",
+                "departure_time_bin": "am",
+                "line": "L1",
+                "trip": "T1",
+                "boarding_stop": "o1",
+                "alighting_stop": "d1",
+                "assigned_demand": 0.75,
+                "path_share": 0.75,
+                "transfer_count": 0,
+                "flow_semantics": "path_probability",
+            },
+            {
+                "origin": "o1",
+                "destination": "d2",
+                "departure_time_bin": "am",
+                "line": "L1",
+                "trip": "T1",
+                "assigned_demand": 0.25,
+                "path_share": 0.25,
+                "transfer_count": 1,
+                "flow_semantics": "path_probability",
+            },
+        ),
+    )
+    assert bundle.route_flow_available
+    assert "realized route-assignment" in (bundle.transfer_count_definition or "")
+    assert bundle.query_od_routes(origin="o1", destination="d1")["trip_id"].tolist() == ["T1"]
+    service = bundle.query_service_flows(line="L1")
+    assert service["assigned_demand"].astype(float).sum() == pytest.approx(1.0)
+    aggregate = bundle.aggregate_route_flows("line_id", line="L1")
+    assert aggregate.iloc[0]["assigned_demand"] == pytest.approx(1.0)
+    assert bundle.manifest["viewer_summary"]["route_flows_available"] is True
+    assert len(bundle.viewer_summary["route_flows"]["partitions"]) == 1
+
+
+def test_route_flow_rejects_minimum_feasible_transfer_substitute(tmp_path):
+    result, report, _ = _inputs(tmp_path)
+    with pytest.raises(ValueError, match="(flow_semantics|minimum_transfers)"):
+        write_gravity_viewer_bundle(
+            output_directory=tmp_path / "bad-route-bundle",
+            fit_result=result,
+            validation_result=report.adequacy,
+            report=report,
+            route_flow_rows=(
+                {
+                    "origin": "o1",
+                    "destination": "d1",
+                    "departure_time_bin": "am",
+                    "assigned_demand": 1,
+                    "minimum_transfers": 0,
+                    "flow_semantics": "minimum_feasible_transfer",
+                },
+            ),
+        )
+
+
+def test_route_flow_references_must_match_network_snapshot(tmp_path):
+    result, report, _ = _inputs(tmp_path)
+    with pytest.raises(ValueError, match="route-flow line ID"):
+        write_gravity_viewer_bundle(
+            output_directory=tmp_path / "bad-network-route-bundle",
+            fit_result=result,
+            validation_result=report.adequacy,
+            report=report,
+            network_files=_network_files(tmp_path),
+            route_flow_rows=(
+                {
+                    "origin": "o1",
+                    "destination": "d1",
+                    "departure_time_bin": "am",
+                    "line": "L2",
+                    "trip": "T1",
+                    "assigned_demand": 1,
+                    "flow_semantics": "service_marginal",
+                },
+            ),
+        )
+
+
+def test_route_sections_expand_paths_and_query_selected_interval(tmp_path):
+    result, report, _ = _inputs(tmp_path)
+    network = _network_files(tmp_path)
+    trips = tmp_path / "trips.csv"
+    trips.write_text("trip_id,line_id,direction_id\nT1,L1,0\n", encoding="utf-8")
+    stop_times = tmp_path / "stop_times.csv"
+    stop_times.write_text(
+        "trip_id,stop_id,stop_sequence\nT1,o1,1\nT1,d1,2\nT1,d2,3\n",
+        encoding="utf-8",
+    )
+    network.update({"trips.csv": trips, "stop_times.csv": stop_times})
+    bundle = write_gravity_viewer_bundle(
+        output_directory=tmp_path / "section-bundle",
+        fit_result=result,
+        validation_result=report.adequacy,
+        report=report,
+        network_files=network,
+        route_flow_rows=(
+            {"origin": "o1", "destination": "d2", "departure_time_bin": "t0",
+             "line": "L1", "trip": "T1", "boarding_stop": "o1", "alighting_stop": "d2",
+             "route_path_id": "path-1", "assigned_demand": 2, "path_share": 1,
+             "transfer_count": 0, "flow_semantics": "path_probability"},
+        ),
+    )
+    assert bundle.route_section_available
+    sections = bundle.viewer_summary["route_sections"]
+    section_id = next(row["section_id"] for row in csv.DictReader(
+        (bundle.path / sections["catalog_path"]).open(encoding="utf-8")
+    ) if row["from_stop_id"] == "o1")
+    contributors = bundle.query_section_od(section_id, departure_time_bin="t0")
+    assert contributors.shape[0] == 1
+    assert contributors.iloc[0]["route_path_id"] == "path-1"
+    assert float(contributors.iloc[0]["assigned_demand"]) == pytest.approx(2)
+    load = bundle.query_section_load(section_id, departure_time_bin="t0")
+    assert float(load.iloc[0]["assigned_flow"]) == pytest.approx(2)
+    assert int(load.iloc[0]["distinct_od_count"]) == 1
+
+
+def test_route_flow_assignment_fingerprint_mismatch_fails_closed(tmp_path):
+    result, report, _ = _inputs(tmp_path)
+    with pytest.raises(ValueError, match="assignment fingerprint"):
+        write_gravity_viewer_bundle(
+            output_directory=tmp_path / "mismatched-route-bundle",
+            fit_result=result,
+            validation_result=report.adequacy,
+            report=report,
+            route_flow_rows=(
+                {"origin": "o1", "destination": "d1", "departure_time_bin": "am",
+                 "assigned_demand": 1, "flow_semantics": "path_probability",
+                 "assignment_fingerprint": "different"},
+            ),
+        )
+
+
 def test_bundle_rejects_validation_model_mismatch(tmp_path):
     result, report, _ = _inputs(tmp_path)
     mismatched = replace(report.adequacy, model_fingerprint="other-model")
