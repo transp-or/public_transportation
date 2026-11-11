@@ -213,6 +213,13 @@ from .gravity import (  # noqa: F401
     write_persisted_gravity_viewer_bundle,
     export_gravity_route_flows,
     plan_gravity_route_flow_export,
+    export_od_section_marginals,
+    export_gravity_od_section_marginals,
+    plan_od_section_marginal_export,
+    plan_gravity_od_section_marginal_export,
+    ODSectionCell,
+    ODSectionExportPlan,
+    RideLinkSectionMetadata,
     load_gravity_boundary_artifact,
     write_gravity_boundary_artifact,
 )

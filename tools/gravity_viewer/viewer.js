@@ -163,7 +163,13 @@
     options($('flow-transfers'), route.transfer_counts || ['0', '1', '2', '3'], 'All transfers');
     if ((od.bins || []).length) $('flow-bin').value = od.bins[0];
     const definition = route.transfer_count_definition || 'No realized route-assignment transfer count is present.';
-    $('flow-semantics').textContent = route.available ? `Estimated OD demand is separate from route-assignment flow. ${definition}. A service total is expected assigned demand or passenger-leg usage, not unique passengers when a journey uses multiple legs.` : `${definition} Existing bundles without route-flow partitions support the OD destination view only.`;
+    const semantics = route.flow_semantics || [];
+    const serviceMarginal = semantics.includes('service_marginal');
+    $('flow-semantics').textContent = route.available
+      ? (serviceMarginal
+        ? 'Expected OD use of a scheduled section is a service marginal: each value is the fitted OD demand times its cached probability of using that ride link. It is not an enumerated passenger path or an exact transfer-count distribution.'
+        : `Estimated OD demand is separate from route-assignment flow. ${definition}. A service total is expected assigned demand or passenger-leg usage, not unique passengers when a journey uses multiple legs.`)
+      : `${definition} Existing bundles without route-flow partitions support the OD destination view only.`;
   }
 
   function sectionSummary() { return viewer.summary.route_sections || {}; }
@@ -225,7 +231,11 @@
     try {
       const load = await readSectionPartition('section_loads', bin, filters, 1000); const contributors = await readSectionPartition('contributors', bin, filters, viewer.sectionPageSize, viewer.sectionPage * viewer.sectionPageSize);
       viewer.selectedSection = properties; const loadRow = load.rows[0] || {}; const distinct = loadRow.distinct_od_count || new Set(contributors.rows.map((row) => `${row.origin_stop_id}|${row.destination_stop_id}`)).size;
-      $('section-detail').innerHTML = `<dl><dt>Section</dt><dd>${esc(properties.line_id)} / ${esc(properties.pattern_id)}: ${esc(properties.from_stop_id)} → ${esc(properties.to_stop_id)}</dd><dt>Interval</dt><dd>${esc(bin)} (OD departure interval)</dd><dt>Assigned section flow</dt><dd>${display(loadRow.assigned_flow || contributors.rows.reduce((sum, row) => sum + (num(row.assigned_demand) || 0), 0))}</dd><dt>Distinct ODs</dt><dd>${esc(distinct)}</dd><dt>Meaning</dt><dd>Saved path contribution per traversed section; transfer journeys may contribute on multiple legs.</dd></dl>`;
+      const serviceMarginal = (summary.flow_semantics || []).includes('service_marginal');
+      const meaning = serviceMarginal
+        ? 'Expected OD use of this scheduled section from cached fixed-routing probabilities; this is not an enumerated route alternative or an exact transfer-count distribution.'
+        : 'Saved path contribution per traversed section; transfer journeys may contribute on multiple legs.';
+      $('section-detail').innerHTML = `<dl><dt>Section</dt><dd>${esc(properties.line_id)} / ${esc(properties.pattern_id)}: ${esc(properties.from_stop_id)} → ${esc(properties.to_stop_id)}</dd><dt>Interval</dt><dd>${esc(bin)} (OD departure interval)</dd><dt>Assigned section flow</dt><dd>${display(loadRow.assigned_flow || contributors.rows.reduce((sum, row) => sum + (num(row.assigned_demand) || 0), 0))}</dd><dt>Distinct ODs</dt><dd>${esc(distinct)}</dd><dt>Meaning</dt><dd>${meaning}</dd></dl>`;
       renderSectionTable(contributors.rows); $('section-page-label').textContent = `Page ${viewer.sectionPage + 1} of ${Math.max(1, Math.ceil(contributors.total / viewer.sectionPageSize))} (${contributors.total} matching ODs/contributions)`; $('section-status').textContent = `${contributors.cached ? 'Cache hit' : 'Read selected partition'}: selected interval/section only.`;
     } catch (error) { $('section-status').textContent = `Could not load section: ${error.message}`; }
   }

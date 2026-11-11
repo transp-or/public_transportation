@@ -180,6 +180,23 @@ bundle.query_section_load("s-…", departure_time_bin="t3")
 bundle.query_section_od("s-…", departure_time_bin="t3", page=0, page_size=100)
 ```
 
+### Expected OD use of scheduled sections
+
+For a completed fixed-routing fit, the public producer
+`export_gravity_od_section_marginals` replays the persisted destination-group
+probabilities one OD cell at a time. It emits only scheduled ride links, with
+`flow_semantics="service_marginal"` and the OD's departure-time slot. Each row
+means fitted OD demand multiplied by the cached probability of using that
+adjacent-stop ride link. It is therefore expected OD use of a section, not an
+enumerated passenger route and not an exact transfer-count distribution.
+
+The producer validates the assignment identity, every routing-shard descriptor
+and content hash, and the canonical/compact OD ordering before consuming the
+fit. It writes one durable checkpoint unit per destination group and publishes
+the final CSV atomically. A representative dry-run/pilot should be recorded
+before scheduling the full export; no routing preparation or model estimation
+is triggered by this API.
+
 `query_section_od` streams the selected interval and section only, and pages
 the returned rows without truncating the underlying contributor data. Older
 schema-1 bundles explicitly report section data as unavailable and continue to

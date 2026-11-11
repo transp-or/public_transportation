@@ -57,10 +57,15 @@ def plan_gravity_route_flow_export(
         reason = "no persisted routing cache was found; route computation is required"
     metadata = {} if cache_metadata is None else dict(cache_metadata)
     cache_fingerprint = metadata.get("assignment_fingerprint")
-    if expected_assignment_fingerprint is not None and cache_fingerprint != expected_assignment_fingerprint:
+    if expected_assignment_fingerprint is not None and cache_fingerprint is not None and cache_fingerprint != expected_assignment_fingerprint:
         available = False
         reason = (
-            "routing cache assignment fingerprint is missing or differs from the fitted result"
+            "routing cache assignment fingerprint differs from the fitted result"
+        )
+    elif expected_assignment_fingerprint is not None and cache_fingerprint is None and available:
+        reason = (
+            "routing cache is present; assignment compatibility must be validated "
+            "against reconstructed assignment inputs before export"
         )
     if available and metadata.get("contains_od_path_contributions") is False:
         available = False

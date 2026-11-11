@@ -32,6 +32,18 @@ def test_route_export_plan_fails_closed_on_fingerprint_mismatch(tmp_path):
     assert "fingerprint" in plan.reason
 
 
+def test_route_export_plan_does_not_reject_missing_cache_fit_identity(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    plan = plan_gravity_route_flow_export(
+        routing_cache=cache,
+        expected_assignment_fingerprint="fit",
+        cache_metadata={},
+    )
+    assert plan.available
+    assert "reconstructed assignment inputs" in plan.reason
+
+
 def test_route_export_streams_rows_and_checkpoints(tmp_path):
     progress: list[int] = []
     output = tmp_path / "route_flows.csv"

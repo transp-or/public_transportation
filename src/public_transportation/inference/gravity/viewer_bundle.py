@@ -677,6 +677,7 @@ def _write_route_section_products(staging: Path, geometry: Mapping[str, object])
     counts: dict[str, int] = {}
     paths: dict[str, Path] = {}
     section_index: dict[str, dict[str, dict[str, int]]] = {}
+    flow_semantics_seen: set[str] = set()
     load_db_path = contributors_dir / ".section_loads.sqlite"
     load_db = sqlite3.connect(load_db_path)
     load_db.execute(
@@ -686,6 +687,7 @@ def _write_route_section_products(staging: Path, geometry: Mapping[str, object])
     try:
         for raw in _iter_csv_rows(route_source):
             row = _route_flow_row(raw)
+            flow_semantics_seen.add(str(row["flow_semantics"]))
             leg_rows: list[dict[str, object]] = [row]
             if (not row["boarding_stop_id"] or not row["alighting_stop_id"]) and row["route_legs"]:
                 try:
@@ -823,7 +825,13 @@ def _write_route_section_products(staging: Path, geometry: Mapping[str, object])
         "geometry_path": geometry.get("geometry_path"),
         "catalog_path": geometry.get("catalog_path"),
         "geometry_mode": geometry.get("geometry_mode"),
-        "message": "assigned flow is summed saved path contribution once per traversed section; transfer legs are passenger-section usages",
+        "message": (
+            "expected OD use of a scheduled section from cached fixed-routing probabilities; "
+            "not an enumerated route alternative or an exact transfer-count distribution"
+            if flow_semantics_seen == {"service_marginal"}
+            else "assigned flow is summed saved path contribution once per traversed section; "
+            "transfer legs are passenger-section usages"
+        ),
     }
 
 

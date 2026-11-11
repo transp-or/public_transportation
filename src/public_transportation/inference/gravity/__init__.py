@@ -131,6 +131,16 @@ from .boundary_artifact import (
     load_gravity_boundary_artifact,
     write_gravity_boundary_artifact,
 )
+from .od_section_export import (
+    EXPORT_SCHEMA_VERSION,
+    ODSectionCell,
+    ODSectionExportPlan,
+    RideLinkSectionMetadata,
+    export_od_section_marginals,
+    export_gravity_od_section_marginals,
+    plan_od_section_marginal_export,
+    plan_gravity_od_section_marginal_export,
+)
 from .operator import (
     GravityLinearMeasurementOperator,
     GravityMeasurementOperator,
