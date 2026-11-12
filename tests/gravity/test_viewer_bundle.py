@@ -24,6 +24,7 @@ from public_transportation.inference.gravity import (
     write_persisted_gravity_viewer_bundle,
 )
 from public_transportation.inference.od_parameter_layout import ODParameterLayout
+from public_transportation.inference.gravity.section_usage import write_section_usage_dataset
 
 
 def _inputs(tmp_path, specification=None):
@@ -599,6 +600,37 @@ def test_route_sections_expand_paths_and_query_selected_interval(tmp_path):
     load = bundle.query_section_load(section_id, departure_time_bin="t0")
     assert float(load.iloc[0]["assigned_flow"]) == pytest.approx(2)
     assert int(load.iloc[0]["distinct_od_count"]) == 1
+
+
+def test_compact_section_dataset_is_consumed_without_path_expansion(tmp_path):
+    result, report, provenance = _inputs(tmp_path)
+    dataset = tmp_path / "section-usage"
+    write_section_usage_dataset(
+        (
+            {"departure_time_bin": "am", "section_id": "S1", "origin_stop_id": "o1",
+             "destination_stop_id": "d1", "line_id": "L1", "trip_id": "T1",
+             "assigned_contribution": 1.25},
+            {"departure_time_bin": "am", "section_id": "S1", "origin_stop_id": "o1",
+             "destination_stop_id": "d1", "line_id": "L1", "trip_id": "T2",
+             "assigned_contribution": 0.75},
+        ),
+        dataset,
+        format="csv",
+        source_identity={"fit_assignment_fingerprint": provenance["assignment_fingerprint"]},
+    )
+    bundle = write_gravity_viewer_bundle(
+        output_directory=tmp_path / "compact-section-bundle",
+        fit_result=result,
+        validation_result=report.adequacy,
+        report=report,
+        section_usage_dataset=dataset,
+    )
+    assert bundle.route_section_available
+    selected = bundle.query_section_od("S1", departure_time_bin="am", line="L1", trip="T2")
+    assert selected["trip_id"].tolist() == ["T2"]
+    assert float(selected.iloc[0]["assigned_contribution"]) == pytest.approx(0.75)
+    aggregated = bundle.query_section_od("S1", departure_time_bin="am", aggregate_by_od=True)
+    assert float(aggregated.iloc[0]["assigned_contribution"]) == pytest.approx(2.0)
 
 
 def test_route_flow_assignment_fingerprint_mismatch_fails_closed(tmp_path):

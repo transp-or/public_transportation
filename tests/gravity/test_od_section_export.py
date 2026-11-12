@@ -20,6 +20,10 @@ from public_transportation.inference.gravity import (
     export_od_section_marginals,
     plan_od_section_marginal_export,
 )
+from public_transportation.inference.gravity.section_usage import (
+    SECTION_USAGE_COLUMNS,
+    read_section_usage_manifest,
+)
 from public_transportation.inference.gravity.od_section_export import _PlanCheckpointLock
 from public_transportation.inference.sharded_fixed_routing import (
     FixedRoutingShard,
@@ -145,6 +149,38 @@ def test_expected_od_section_marginals_match_hand_calculation(tmp_path):
     assert {row["assignment_fingerprint"] for row in rows} == {"fit-123"}
     assert sum(float(row["assigned_demand"]) for row in rows if row["trip_id"] == "T1") == pytest.approx(9.0, rel=1e-6)
     assert sum(float(row["assigned_demand"]) for row in rows if row["trip_id"] == "T2") == pytest.approx(6.0, rel=1e-6)
+
+
+def test_compact_section_usage_export_has_exact_seven_column_grain(tmp_path):
+    inputs, routing, metadata, cells = _problem(tmp_path)
+    compact_metadata = {
+        link: replace(item, section_id=f"S-{item.trip_id}")
+        for link, item in metadata.items()
+    }
+    result = export_od_section_marginals(
+        assignment_inputs=inputs,
+        routing=routing,
+        fitted_demand=np.asarray([10.0, 5.0]),
+        od_cells=cells,
+        output_path=tmp_path / "section-usage",
+        checkpoint_directory=tmp_path / "section-usage-checkpoint",
+        fit_assignment_fingerprint="fit-123",
+        ride_link_metadata=compact_metadata,
+        output_format="section_usage_csv",
+        section_usage_shard_rows=2,
+    )
+    manifest = read_section_usage_manifest(tmp_path / "section-usage")
+    assert result["output_format"] == "section_usage"
+    assert tuple(manifest["columns"]) == SECTION_USAGE_COLUMNS
+    assert manifest["rows_written"] == 4
+    all_rows = []
+    for descriptor in manifest["partitions"]:
+        partition = tmp_path / "section-usage" / descriptor["path"]
+        with partition.open(newline="", encoding="utf-8") as stream:
+            all_rows.extend(csv.DictReader(stream))
+    assert tuple(all_rows[0]) == SECTION_USAGE_COLUMNS
+    assert "route_path_id" not in all_rows[0]
+    assert sum(float(row["assigned_contribution"]) for row in all_rows) == pytest.approx(15.0)
 
 
 def test_vectorized_route_kernel_matches_scalar_reference(tmp_path):

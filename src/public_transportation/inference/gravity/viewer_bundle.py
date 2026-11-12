@@ -177,6 +177,15 @@ _SECTION_LOAD_COLUMNS = (
     "assigned_flow",
     "distinct_od_count",
 )
+_SECTION_USAGE_COLUMNS = (
+    "departure_time_bin",
+    "section_id",
+    "origin_stop_id",
+    "destination_stop_id",
+    "line_id",
+    "trip_id",
+    "assigned_contribution",
+)
 
 
 def _json_safe(value: object) -> object:
@@ -835,7 +844,54 @@ def _write_route_section_products(staging: Path, geometry: Mapping[str, object])
     }
 
 
-def _write_viewer_partitions(staging: Path) -> dict[str, object]:
+def _copy_section_usage_dataset(staging: Path, source: str | Path) -> dict[str, object]:
+    """Copy and validate a compact section dataset without expanding paths."""
+    from .section_usage import read_section_usage_manifest
+
+    source_path = Path(source).expanduser().resolve()
+    manifest = read_section_usage_manifest(source_path)
+    target = staging / "section_usage"
+    shutil.copytree(source_path, target)
+    descriptors = []
+    for raw in manifest.get("partitions", ()):
+        descriptor = dict(raw)
+        descriptor["path"] = (Path("section_usage") / str(raw["path"])).as_posix()
+        descriptor["file"] = descriptor["path"]
+        descriptors.append(descriptor)
+    source_identity = manifest.get("source_identity", {})
+    return {
+        "available": bool(descriptors),
+        "schema_version": GRAVITY_VIEWER_ROUTE_SECTION_SCHEMA_VERSION,
+        "cache_format_version": GRAVITY_VIEWER_CACHE_FORMAT_VERSION,
+        "dataset_path": "section_usage",
+        "dataset_format": manifest.get("format"),
+        "dataset_manifest": "section_usage/manifest.json",
+        "dataset_manifest_sha256": _sha256(target / "manifest.json"),
+        "lines": list(manifest.get("lines", ())),
+        "trips": list(manifest.get("trips", ())),
+        "flow_semantics": ["service_marginal"],
+        "interval_semantics": "OD departure-time interval; not vehicle passage time at the section",
+        "contributors": {
+            "partition_field": "departure_time_bin",
+            "partitions": descriptors,
+            "bins": sorted({str(item.get("key")) for item in descriptors}, key=_time_bin_sort_key),
+            "columns": list(_SECTION_USAGE_COLUMNS),
+            "format": manifest.get("format"),
+        },
+        "section_loads": {"available": False, "partitions": [], "columns": list(_SECTION_LOAD_COLUMNS)},
+        "source_identity": source_identity,
+        "message": (
+            "exact expected OD use of a scheduled section from service-marginal probabilities; "
+            "compact section/OD/line/trip grain"
+        ),
+    }
+
+
+def _write_viewer_partitions(
+    staging: Path,
+    *,
+    section_usage_dataset: str | Path | None = None,
+) -> dict[str, object]:
     """Create compact per-time-bin indexes for OD, routes, and route sections."""
     od_fields = _csv_fieldnames(staging / "full_od.csv")
     od_descriptors, values = _write_partitioned_table(
@@ -890,7 +946,11 @@ def _write_viewer_partitions(staging: Path) -> dict[str, object]:
         }
     geometry = _write_line_geometry(staging)
     summary["line_geometry"] = geometry
-    summary["route_sections"] = _write_route_section_products(staging, geometry)
+    summary["route_sections"] = (
+        _copy_section_usage_dataset(staging, section_usage_dataset)
+        if section_usage_dataset is not None
+        else _write_route_section_products(staging, geometry)
+    )
     _write_json(staging / _VIEWER_SUMMARY_FILE, summary)
     return summary
 
@@ -1770,30 +1830,55 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
         if isinstance(section_payload, Mapping) and section_payload.get("available"):
             if section_payload.get("schema_version") != GRAVITY_VIEWER_ROUTE_SECTION_SCHEMA_VERSION:
                 raise ValueError("unsupported viewer route-section schema version.")
-            for group_name, expected_columns in (
-                ("contributors", _SECTION_CONTRIBUTION_COLUMNS),
-                ("section_loads", _SECTION_LOAD_COLUMNS),
-            ):
-                group = section_payload.get(group_name, {})
-                if not isinstance(group, Mapping):
-                    raise ValueError(f"viewer summary route_sections {group_name!r} is invalid.")
-                for descriptor in group.get("partitions", ()):
+            if section_payload.get("dataset_path"):
+                from .section_usage import read_section_usage_manifest
+
+                dataset_root = root / str(section_payload["dataset_path"])
+                dataset_manifest = read_section_usage_manifest(dataset_root)
+                if section_payload.get("dataset_manifest_sha256") != _sha256(dataset_root / "manifest.json"):
+                    raise ValueError("viewer compact section dataset manifest checksum mismatch.")
+                expected_assignment = manifest.get("assignment_fingerprint")
+                source_identity = dataset_manifest.get("source_identity", {})
+                if expected_assignment and isinstance(source_identity, Mapping):
+                    supplied = source_identity.get("fit_assignment_fingerprint")
+                    if supplied and supplied != expected_assignment:
+                        raise ValueError("viewer compact section assignment fingerprint mismatch.")
+                for descriptor in section_payload.get("contributors", {}).get("partitions", ()):
                     relative = Path(str(descriptor.get("path") or descriptor.get("file") or ""))
                     if relative.is_absolute() or ".." in relative.parts:
-                        raise ValueError("viewer route-section partition path is unsafe.")
+                        raise ValueError("viewer compact section partition path is unsafe.")
                     path = root / relative
-                    if not path.is_file():
-                        raise ValueError(f"viewer route-section partition is missing: {relative}")
-                    _require_columns(path, _csv_fieldnames(path), expected_columns)
-                    if descriptor.get("row_count") != _csv_row_count(path):
-                        raise ValueError(f"viewer route-section row count mismatch for {relative!s}.")
-                    if group_name == "contributors":
-                        expected_assignment = manifest.get("assignment_fingerprint")
-                        if expected_assignment:
-                            for row in _iter_csv_rows(path):
-                                supplied = str(row.get("assignment_fingerprint", ""))
-                                if supplied and supplied != str(expected_assignment):
-                                    raise ValueError("viewer route-section assignment fingerprint mismatch.")
+                    if not path.is_file() or descriptor.get("sha256") != _sha256(path):
+                        raise ValueError("viewer compact section partition checksum mismatch.")
+                    if descriptor.get("row_count") is None:
+                        raise ValueError("viewer compact section partition row count is missing.")
+                    if path.suffix == ".csv":
+                        _require_columns(path, _csv_fieldnames(path), _SECTION_USAGE_COLUMNS)
+            if not section_payload.get("dataset_path"):
+                for group_name, expected_columns in (
+                    ("contributors", _SECTION_CONTRIBUTION_COLUMNS),
+                    ("section_loads", _SECTION_LOAD_COLUMNS),
+                ):
+                    group = section_payload.get(group_name, {})
+                    if not isinstance(group, Mapping):
+                        raise ValueError(f"viewer summary route_sections {group_name!r} is invalid.")
+                    for descriptor in group.get("partitions", ()):
+                        relative = Path(str(descriptor.get("path") or descriptor.get("file") or ""))
+                        if relative.is_absolute() or ".." in relative.parts:
+                            raise ValueError("viewer route-section partition path is unsafe.")
+                        path = root / relative
+                        if not path.is_file():
+                            raise ValueError(f"viewer route-section partition is missing: {relative}")
+                        _require_columns(path, _csv_fieldnames(path), expected_columns)
+                        if descriptor.get("row_count") != _csv_row_count(path):
+                            raise ValueError(f"viewer route-section row count mismatch for {relative!s}.")
+                        if group_name == "contributors":
+                            expected_assignment = manifest.get("assignment_fingerprint")
+                            if expected_assignment:
+                                for row in _iter_csv_rows(path):
+                                    supplied = str(row.get("assignment_fingerprint", ""))
+                                    if supplied and supplied != str(expected_assignment):
+                                        raise ValueError("viewer route-section assignment fingerprint mismatch.")
         _validate_route_flow_network(root, summary_payload)
     identifiability = manifest.get("identifiability", {})
     if not isinstance(identifiability, Mapping):
@@ -2134,6 +2219,7 @@ class GravityViewerBundle:
         *,
         departure_time_bin: str,
         line: str | None = None,
+        trip: str | None = None,
         pattern: str | None = None,
         direction: str | None = None,
         chunksize: int = 100_000,
@@ -2141,9 +2227,32 @@ class GravityViewerBundle:
         """Stream every saved OD/path contribution traversing one directed section."""
         if not self.route_section_available:
             return
+        route_sections = self.viewer_summary.get("route_sections", {})
+        if isinstance(route_sections, Mapping) and route_sections.get("dataset_path"):
+            if pattern is not None or direction is not None:
+                raise ValueError("pattern/direction filters are unavailable in compact section usage data.")
+            from .section_usage import iter_section_usage_rows
+
+            dataset = self.path / str(route_sections["dataset_path"])
+            try:
+                import pandas as pd
+            except ImportError as error:  # pragma: no cover
+                raise RuntimeError("pandas is required for viewer access.") from error
+            for batch in iter_section_usage_rows(
+                dataset,
+                departure_time_bin=departure_time_bin,
+                section_id=section_id,
+                line_id=line,
+                trip_id=trip,
+                batch_size=chunksize,
+            ):
+                yield pd.DataFrame(batch, columns=_SECTION_USAGE_COLUMNS)
+            return
         filters: dict[str, object] = {"section_id": section_id}
         if line is not None:
             filters["line_id"] = line
+        if trip is not None:
+            filters["trip_id"] = trip
         if pattern is not None:
             filters["pattern_id"] = pattern
         if direction is not None:
@@ -2165,6 +2274,7 @@ class GravityViewerBundle:
         *,
         departure_time_bin: str,
         line: str | None = None,
+        trip: str | None = None,
         pattern: str | None = None,
         direction: str | None = None,
         page: int | None = None,
@@ -2181,23 +2291,91 @@ class GravityViewerBundle:
             import pandas as pd
         except ImportError as error:  # pragma: no cover
             raise RuntimeError("pandas is required for viewer access.") from error
-        chunks = list(self.iter_section_od(
-            section_id, departure_time_bin=departure_time_bin, line=line,
+        route_sections = self.viewer_summary.get("route_sections", {})
+        compact = isinstance(route_sections, Mapping) and bool(route_sections.get("dataset_path"))
+        output_columns = _SECTION_USAGE_COLUMNS if compact else _SECTION_CONTRIBUTION_COLUMNS
+        start = 0 if page is None else page * (page_size or 1)
+        remaining = page_size
+        chunks: list[Any] = []
+        totals: dict[tuple[str, str, str], dict[str, object]] = {}
+        for chunk in self.iter_section_od(
+            section_id, departure_time_bin=departure_time_bin, line=line, trip=trip,
             pattern=pattern, direction=direction, chunksize=chunksize,
-        ))
-        if not chunks:
-            result = pd.DataFrame(columns=_SECTION_CONTRIBUTION_COLUMNS)
+        ):
+            if aggregate_by_od and not chunk.empty:
+                for row in chunk.itertuples(index=False):
+                    key = (str(row.origin_stop_id), str(row.destination_stop_id), str(row.departure_time_bin))
+                    if compact:
+                        item = totals.setdefault(key, {"assigned_contribution": 0.0, "trip_count": 0})
+                        item["assigned_contribution"] = float(item["assigned_contribution"]) + float(
+                            getattr(row, "assigned_contribution", 0.0)
+                        )
+                        item["trip_count"] = int(item["trip_count"]) + 1
+                    else:
+                        item = totals.setdefault(
+                            key,
+                            {"assigned_contribution": 0.0, "path_ids": set(), "transfer_count": ""},
+                        )
+                        item["assigned_contribution"] = float(item["assigned_contribution"]) + float(
+                            getattr(row, "assigned_demand", 0.0)
+                        )
+                        path_id = str(getattr(row, "route_path_id", ""))
+                        if path_id:
+                            cast_ids = item["path_ids"]
+                            assert isinstance(cast_ids, set)
+                            cast_ids.add(path_id)
+                        if not item["transfer_count"]:
+                            item["transfer_count"] = str(getattr(row, "transfer_count", ""))
+                continue
+            if page_size is None:
+                chunks.append(chunk)
+                continue
+            if start >= len(chunk):
+                start -= len(chunk)
+                continue
+            selected = chunk.iloc[start: start + (remaining or 0)].copy()
+            chunks.append(selected)
+            consumed = len(selected)
+            start = 0
+            remaining = None if remaining is None else remaining - consumed
+            if remaining == 0:
+                break
+        if aggregate_by_od:
+            if compact:
+                rows = [
+                    {"origin_stop_id": key[0], "destination_stop_id": key[1],
+                     "departure_time_bin": key[2], **values}
+                    for key, values in sorted(totals.items())
+                ]
+                result = pd.DataFrame(
+                    rows,
+                    columns=["origin_stop_id", "destination_stop_id", "departure_time_bin",
+                             "assigned_contribution", "trip_count"],
+                )
+            else:
+                rows = []
+                for key, values in sorted(totals.items()):
+                    path_ids = values.get("path_ids", set())
+                    rows.append({
+                        "origin_stop_id": key[0], "destination_stop_id": key[1],
+                        "departure_time_bin": key[2],
+                        "assigned_contribution": values["assigned_contribution"],
+                        "path_count": len(path_ids) if isinstance(path_ids, set) else 0,
+                        "transfer_count": values.get("transfer_count", ""),
+                    })
+                result = pd.DataFrame(
+                    rows,
+                    columns=["origin_stop_id", "destination_stop_id", "departure_time_bin",
+                             "assigned_contribution", "path_count", "transfer_count"],
+                )
+            if page_size is not None:
+                result = result.iloc[(page or 0) * page_size:(page or 0) * page_size + page_size]
+        elif not chunks:
+            result = pd.DataFrame(columns=output_columns)
         else:
             result = pd.concat(chunks, ignore_index=True)
         if aggregate_by_od and not result.empty:
-            numeric = pd.to_numeric(result["assigned_demand"], errors="coerce").fillna(0.0)
-            result = result.assign(assigned_contribution=numeric)
             group = ["origin_stop_id", "destination_stop_id", "departure_time_bin"]
-            result = result.groupby(group, as_index=False, sort=False).agg(
-                assigned_contribution=("assigned_contribution", "sum"),
-                path_count=("route_path_id", "nunique"),
-                transfer_count=("transfer_count", "first"),
-            )
             od = self.read_table(
                 "full_od.csv",
                 columns=("origin_stop_id", "destination_stop_id", "departure_time_bin", "estimated_demand"),
@@ -2212,8 +2390,7 @@ class GravityViewerBundle:
             else:
                 result["total_od_demand"] = np.nan
         if page_size is not None:
-            start = 0 if page is None else page * page_size
-            result = result.iloc[start:start + page_size].reset_index(drop=True)
+            result = result.reset_index(drop=True)
         return result
 
     def query_section_load(
@@ -2353,6 +2530,7 @@ def write_gravity_viewer_bundle(
     require_identifiability: bool = False,
     model_specification: GravityModelSpecification | Mapping[str, object] | None = None,
     route_flow_rows: Iterable[Mapping[str, object]] | str | Path | None = None,
+    section_usage_dataset: str | Path | None = None,
 ) -> GravityViewerBundle:
     """Export validated fit/report data for an independent graphical viewer."""
     if not isinstance(fit_result, GravityEstimationResult):
@@ -2473,7 +2651,10 @@ def write_gravity_viewer_bundle(
                     None if expected_assignment is None else str(expected_assignment)
                 ),
             )
-        viewer_summary = _write_viewer_partitions(staging)
+        viewer_summary = _write_viewer_partitions(
+            staging,
+            section_usage_dataset=section_usage_dataset,
+        )
         route_source = staging / "route_flows.csv"
         if route_source.exists():
             route_source.unlink()
@@ -2589,6 +2770,9 @@ def write_gravity_viewer_bundle(
                 "available": bool(viewer_summary.get("route_sections", {}).get("available")),
                 "schema_version": GRAVITY_VIEWER_ROUTE_SECTION_SCHEMA_VERSION,
                 "cache_format_version": GRAVITY_VIEWER_CACHE_FORMAT_VERSION,
+                "dataset_path": viewer_summary.get("route_sections", {}).get("dataset_path"),
+                "dataset_format": viewer_summary.get("route_sections", {}).get("dataset_format"),
+                "dataset_manifest": viewer_summary.get("route_sections", {}).get("dataset_manifest"),
                 "interval_semantics": viewer_summary.get("route_sections", {}).get("interval_semantics"),
                 "geometry_path": viewer_summary.get("route_sections", {}).get("geometry_path"),
                 "catalog_path": viewer_summary.get("route_sections", {}).get("catalog_path"),
@@ -2624,6 +2808,7 @@ def write_persisted_gravity_viewer_bundle(
     model_specification: GravityModelSpecification | Mapping[str, object] | None = None,
     report_output_directory: str | Path | None = None,
     route_flow_rows: Iterable[Mapping[str, object]] | str | Path | None = None,
+    section_usage_dataset: str | Path | None = None,
 ) -> GravityViewerBundle:
     """Export a viewer bundle directly from persisted fit/validation artifacts.
 
@@ -2682,6 +2867,7 @@ def write_persisted_gravity_viewer_bundle(
             require_identifiability=require_identifiability,
             model_specification=model_specification,
             route_flow_rows=route_flow_rows,
+            section_usage_dataset=section_usage_dataset,
         )
     finally:
         if temporary_report is not None:

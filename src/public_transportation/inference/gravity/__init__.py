@@ -145,6 +145,22 @@ from .od_section_export import (
     plan_od_section_marginal_export,
     plan_gravity_od_section_marginal_export,
 )
+from .section_usage import (
+    SECTION_USAGE_ALGORITHM_VERSION,
+    SECTION_USAGE_COLUMNS,
+    SECTION_USAGE_FORMAT_VERSION,
+    SECTION_USAGE_KEY_COLUMNS,
+    SECTION_USAGE_SCHEMA_VERSION,
+    SectionUsageCheckpointError,
+    SectionUsageStorageBudgetExceeded,
+    aggregate_line_usage_rows,
+    aggregate_section_usage_rows,
+    iter_section_usage_rows,
+    migrate_od_section_checkpoint,
+    read_section_usage_manifest,
+    write_section_usage_dataset,
+    write_line_usage_dataset,
+)
 from .operator import (
     GravityLinearMeasurementOperator,
     GravityMeasurementOperator,

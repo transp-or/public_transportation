@@ -323,6 +323,52 @@ The resulting CSV can be supplied as `route_flow_rows` to the bundle writer;
 the writer partitions it by departure-time bin and records checksums and row
 counts in the manifest.
 
+## Compact OD-to-section product
+
+For Model 6 exports that only need section/OD/service queries, use the compact
+product instead of the path-level CSV:
+
+```python
+from public_transportation.inference.gravity import export_od_section_marginals
+
+export_od_section_marginals(
+    ..., output_path="section_usage", output_format="section_usage",
+    section_usage_format="auto", section_usage_shard_rows=100_000,
+    storage_budget_bytes=<optional-budget>,
+)
+```
+
+Each durable row is exactly
+`(departure_time_bin, section_id, origin_stop_id, destination_stop_id,
+line_id, trip_id, assigned_contribution)`. Duplicate contributions are summed
+without changing `service_marginal` semantics or assignment identities. The
+dataset is partitioned by departure interval and published only after its
+manifest is complete. `auto` uses Parquet/Zstandard when the optional
+`pyarrow` dependency is installed and otherwise uses checksummed CSV shards;
+the CSV fallback remains directly queryable by the viewer.
+
+An existing completed route-flow checkpoint can be migrated without deleting
+the old chunks:
+
+```python
+from public_transportation.inference.gravity import migrate_od_section_checkpoint
+
+migrate_od_section_checkpoint(
+    "route_flows.checkpoint", "section_usage",
+    section_resolver=lambda row: section_id_for(row),
+)
+```
+
+Only manifest-referenced, checksum-verified chunks are read; orphan temporary
+files are ignored and retained. The bundle writer accepts the resulting
+directory through `section_usage_dataset=...`, so section queries stream only
+the selected departure partition and bounded batches.
+
+When trip-level detail is not needed, `write_line_usage_dataset(...)` produces
+the exact line aggregate from the same compact rows (with an intentionally
+blank `trip_id`); it is a separate manifest/product and never replaces the
+trip-level dataset silently.
+
 ## Short checklist
 
 Before interpreting a result, confirm:

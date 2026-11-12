@@ -188,8 +188,12 @@
     }
     const route = viewer.summary.route_flows || {};
     const lineSelect = $('section-lines');
-    lineSelect.innerHTML = (route.lines || []).map((line) => `<option value="${esc(line)}" selected>${esc(line)}</option>`).join('');
+    const sectionLines = route.lines?.length ? route.lines : (summary.lines || []);
+    lineSelect.innerHTML = sectionLines.map((line) => `<option value="${esc(line)}" selected>${esc(line)}</option>`).join('');
     options($('section-pattern'), route.patterns || [], 'All patterns'); options($('section-direction'), route.directions || [], 'All directions');
+    if (summary.dataset_path) {
+      $('section-pattern').disabled = true; $('section-direction').disabled = true;
+    }
     const bins = canonicalBins((viewer.summary.od || {}).bins || []); const slider = $('section-bin');
     slider.max = Math.max(0, bins.length - 1); slider.value = 0; slider.dataset.bins = JSON.stringify(bins); updateSectionBinLabel();
     const catalogFile = findFile(summary.catalog_path); if (catalogFile) catalogFile.text().then((source) => { const rows = parseSmallCsv(source); $('section-id').innerHTML = '<option value="">Choose a directed section</option>' + rows.map((row) => `<option value="${esc(row.section_id)}">${esc(row.line_id)} / ${esc(row.from_stop_id)} → ${esc(row.to_stop_id)}</option>`).join(''); }).catch(() => {});
@@ -226,16 +230,18 @@
     const summary = sectionSummary(); if (!summary.available) return;
     const bins = sectionBins(); const bin = bins[Number($('section-bin').value || 0)]; const properties = feature.properties || feature || {};
     const filters = {section_id: properties.section_id}; const lines = selectedSectionLines(); if (lines.length === 1) filters.line_id = lines[0];
-    if ($('section-pattern').value) filters.pattern_id = $('section-pattern').value; if ($('section-direction').value) filters.direction = $('section-direction').value;
+    if (!summary.dataset_path && $('section-pattern').value) filters.pattern_id = $('section-pattern').value;
+    if (!summary.dataset_path && $('section-direction').value) filters.direction = $('section-direction').value;
     $('section-status').textContent = `Loading section ${properties.section_id} for ${bin}…`;
     try {
-      const load = await readSectionPartition('section_loads', bin, filters, 1000); const contributors = await readSectionPartition('contributors', bin, filters, viewer.sectionPageSize, viewer.sectionPage * viewer.sectionPageSize);
+      const load = summary.dataset_path ? {rows: [], total: 0} : await readSectionPartition('section_loads', bin, filters, 1000);
+      const contributors = await readSectionPartition('contributors', bin, filters, viewer.sectionPageSize, viewer.sectionPage * viewer.sectionPageSize);
       viewer.selectedSection = properties; const loadRow = load.rows[0] || {}; const distinct = loadRow.distinct_od_count || new Set(contributors.rows.map((row) => `${row.origin_stop_id}|${row.destination_stop_id}`)).size;
       const serviceMarginal = (summary.flow_semantics || []).includes('service_marginal');
       const meaning = serviceMarginal
         ? 'Expected OD use of this scheduled section from cached fixed-routing probabilities; this is not an enumerated route alternative or an exact transfer-count distribution.'
         : 'Saved path contribution per traversed section; transfer journeys may contribute on multiple legs.';
-      $('section-detail').innerHTML = `<dl><dt>Section</dt><dd>${esc(properties.line_id)} / ${esc(properties.pattern_id)}: ${esc(properties.from_stop_id)} → ${esc(properties.to_stop_id)}</dd><dt>Interval</dt><dd>${esc(bin)} (OD departure interval)</dd><dt>Assigned section flow</dt><dd>${display(loadRow.assigned_flow || contributors.rows.reduce((sum, row) => sum + (num(row.assigned_demand) || 0), 0))}</dd><dt>Distinct ODs</dt><dd>${esc(distinct)}</dd><dt>Meaning</dt><dd>${meaning}</dd></dl>`;
+      $('section-detail').innerHTML = `<dl><dt>Section</dt><dd>${esc(properties.line_id)} / ${esc(properties.pattern_id || '')}: ${esc(properties.from_stop_id || '')} → ${esc(properties.to_stop_id || '')}</dd><dt>Interval</dt><dd>${esc(bin)} (OD departure interval)</dd><dt>Assigned section flow</dt><dd>${display(loadRow.assigned_flow || contributors.rows.reduce((sum, row) => sum + (num(row.assigned_demand ?? row.assigned_contribution) || 0), 0))}</dd><dt>Distinct ODs</dt><dd>${esc(distinct)}</dd><dt>Meaning</dt><dd>${meaning}</dd></dl>`;
       renderSectionTable(contributors.rows); $('section-page-label').textContent = `Page ${viewer.sectionPage + 1} of ${Math.max(1, Math.ceil(contributors.total / viewer.sectionPageSize))} (${contributors.total} matching ODs/contributions)`; $('section-status').textContent = `${contributors.cached ? 'Cache hit' : 'Read selected partition'}: selected interval/section only.`;
     } catch (error) { $('section-status').textContent = `Could not load section: ${error.message}`; }
   }
@@ -256,6 +262,10 @@
     if (!sectionSummary().available) return;
     const bins = sectionBins(); const bin = bins[Number($('section-bin').value || 0)];
     try {
+      if (sectionSummary().dataset_path) {
+        $('section-status').textContent = `Compact section dataset ready for ${bin}. Contributors remain unopened until a section is selected.`;
+        return;
+      }
       const summary = await readSectionPartition('section_loads', bin, {}, 100000);
       $('section-status').textContent = `${summary.cached ? 'Cache hit' : 'Read selected interval'}: ${summary.total} directed section loads for ${bin}. Contributors remain unopened until a section is selected.`;
     } catch (error) { $('section-status').textContent = `Could not load section summary: ${error.message}`; }

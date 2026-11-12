@@ -16,7 +16,7 @@ import os
 import signal
 import tempfile
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import perf_counter
@@ -37,6 +37,7 @@ from ..sharded_fixed_routing import (
 )
 from ..block_coordinate._canonical import fingerprint
 from .viewer_bundle import _ROUTE_FLOW_COLUMNS, _route_flow_row
+from .section_usage import SectionUsageStorageBudgetExceeded
 
 
 ODSectionProgress = Callable[[Mapping[str, object]], None]
@@ -150,12 +151,21 @@ class RideLinkSectionMetadata:
     alighting_stop_id: str
     pattern_id: str = ""
     direction: str = ""
+    section_id: str = ""
 
     def __post_init__(self) -> None:
         for name in ("line_id", "trip_id", "boarding_stop_id", "alighting_stop_id"):
             if not str(getattr(self, name)).strip():
                 raise ValueError(f"{name} must be nonempty for a ride link.")
-        for name in ("line_id", "trip_id", "boarding_stop_id", "alighting_stop_id", "pattern_id", "direction"):
+        for name in (
+            "line_id",
+            "trip_id",
+            "boarding_stop_id",
+            "alighting_stop_id",
+            "pattern_id",
+            "direction",
+            "section_id",
+        ):
             object.__setattr__(self, name, str(getattr(self, name)))
 
 
@@ -845,7 +855,12 @@ def _emit_plan_progress(
     )
 
 
-def _write_chunk_csv(path: Path, rows: Sequence[Mapping[str, object]]) -> str:
+def _write_chunk_csv(
+    path: Path,
+    rows: Sequence[Mapping[str, object]],
+    *,
+    fieldnames: Sequence[str] = _ROUTE_FLOW_COLUMNS,
+) -> str:
     """Write one bounded chunk durably and return its checksum."""
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -853,9 +868,7 @@ def _write_chunk_csv(path: Path, rows: Sequence[Mapping[str, object]]) -> str:
     )
     try:
         with os.fdopen(descriptor, "w", newline="", encoding="utf-8") as stream:
-            writer = csv.DictWriter(
-                stream, fieldnames=list(_ROUTE_FLOW_COLUMNS), extrasaction="raise"
-            )
+            writer = csv.DictWriter(stream, fieldnames=list(fieldnames), extrasaction="raise")
             writer.writeheader()
             writer.writerows(rows)
             stream.flush()
@@ -1256,15 +1269,46 @@ def export_od_section_marginals(
     od_chunk_size: int = 256,
     progress_interval_seconds: float = 60.0,
     use_vectorized_route_kernel: bool = True,
+    output_format: str = "route_flow_csv",
+    section_usage_format: str = "auto",
+    section_usage_shard_rows: int = 100_000,
+    storage_budget_bytes: int | None = None,
     progress: ODSectionProgress | None = None,
 ) -> dict[str, object]:
-    """Export sparse expected OD use of ride sections with chunk checkpoints."""
+    """Export sparse expected OD use of ride sections with chunk checkpoints.
+
+    ``output_format='section_usage'`` publishes the compact seven-column
+    section product. The historical ``route_flow_csv`` output remains the
+    default for compatibility.
+    """
     if not np.isfinite(zero_tolerance) or zero_tolerance < 0.0:
         raise ValueError("zero_tolerance must be finite and non-negative.")
     if od_chunk_size <= 0:
         raise ValueError("od_chunk_size must be positive.")
     if not np.isfinite(progress_interval_seconds) or progress_interval_seconds < 0.0:
         raise ValueError("progress_interval_seconds must be finite and non-negative.")
+    normalized_output_format = str(output_format).strip().lower()
+    compact_output = normalized_output_format in {
+        "section_usage", "section_usage_csv", "section_usage_parquet",
+        "compact", "compact_csv", "compact_parquet",
+    }
+    if not compact_output and normalized_output_format not in {"route_flow_csv", "csv"}:
+        raise ValueError("output_format must be route_flow_csv or section_usage.")
+    if compact_output and section_usage_shard_rows <= 0:
+        raise ValueError("section_usage_shard_rows must be positive.")
+    if storage_budget_bytes is not None and storage_budget_bytes <= 0:
+        raise ValueError("storage_budget_bytes must be positive when provided.")
+    if normalized_output_format.endswith("parquet"):
+        section_usage_format = "parquet"
+    elif normalized_output_format.endswith("csv") and compact_output:
+        section_usage_format = "csv"
+    if compact_output:
+        if section_usage_format not in {"auto", "csv", "parquet"}:
+            raise ValueError("section_usage_format must be auto, csv, or parquet.")
+        if section_usage_format == "parquet":
+            from .section_usage import _pyarrow
+
+            _pyarrow()
     destination = Path(output_path).expanduser().resolve()
     checkpoint = Path(checkpoint_directory or destination.with_name(f".{destination.name}.checkpoint")).expanduser().resolve()
     state_path = checkpoint / "manifest.json"
@@ -1291,6 +1335,13 @@ def export_od_section_marginals(
         raise ValueError("fit_assignment_fingerprint must be provided or present in routing identity.")
     ride_links = _ride_links(assignment_inputs.graph)
     metadata = _normalise_link_metadata(assignment_inputs.graph, ride_link_metadata, ride_links, stop_ids)
+    if compact_output:
+        missing_sections = [link for link, item in metadata.items() if not item.section_id.strip()]
+        if missing_sections:
+            raise ValueError(
+                "compact section usage requires section_id for every ride link; "
+                f"missing links: {missing_sections[:10]}"
+            )
     total_groups = int(group_indices.shape[0])
     total_active_cells = int(np.count_nonzero(group_mask))
     cell_durations: deque[float] = deque(maxlen=64)
@@ -1324,10 +1375,27 @@ def export_od_section_marginals(
         "num_destination_groups": total_groups,
         "num_ride_links": int(ride_links.size),
         "flow_semantics": "service_marginal",
-        "output_columns": list(_ROUTE_FLOW_COLUMNS),
+        "output_columns": (
+            [
+                "departure_time_bin", "section_id", "origin_stop_id", "destination_stop_id",
+                "line_id", "trip_id", "assigned_contribution",
+            ]
+            if compact_output else list(_ROUTE_FLOW_COLUMNS)
+        ),
+        "output_format": "section_usage" if compact_output else "route_flow_csv",
         "zero_tolerance": float(zero_tolerance),
         "od_chunk_size": int(od_chunk_size),
     }
+    if compact_output:
+        provenance.update(
+            {
+                "section_usage_schema_version": 1,
+                "section_usage_format": section_usage_format,
+                "section_metadata_fingerprint": fingerprint(
+                    tuple((int(link), asdict(item)) for link, item in sorted(metadata.items()))
+                ),
+            }
+        )
 
     def _progress_event(
         *,
@@ -1388,6 +1456,7 @@ def export_od_section_marginals(
                 "completed_units": {},
                 "completed_groups": [],
                 "rows_written": 0,
+                "bytes_written": 0,
                 "completed_od_cells": 0,
                 "total_od_cells": total_active_cells,
                 "elapsed_seconds": 0.0,
@@ -1483,6 +1552,14 @@ def export_od_section_marginals(
 
     def _run() -> dict[str, object]:
         state, migrated = _read_or_initialize_state()
+        if destination.exists() and state.get("status") == "completed":
+            if compact_output:
+                from .section_usage import read_section_usage_manifest
+
+                read_section_usage_manifest(destination)
+            elif state.get("output_sha256") != _sha256(destination):
+                raise ValueError("completed OD section export output checksum differs from its manifest.")
+            return state
         if destination.exists() and state.get("status") != "completed":
             raise FileExistsError("output_path already exists for an incomplete OD section export.")
         units_directory.mkdir(parents=True, exist_ok=True)
@@ -1496,6 +1573,7 @@ def export_od_section_marginals(
         }
         completed_cells = int(state.get("completed_od_cells", 0))
         rows_written = int(state.get("rows_written", 0))
+        bytes_written = int(state.get("bytes_written", 0))
         elapsed_before = float(state.get("elapsed_seconds", 0.0))
         run_started = perf_counter()
         for record in completed_units.values():
@@ -1505,6 +1583,8 @@ def export_od_section_marginals(
                     for chunk in chunks:
                         if isinstance(chunk, Mapping):
                             od_start, od_stop, _ = _validate_chunk_record(chunk, group=-1)
+                            if bytes_written == 0:
+                                bytes_written += (checkpoint / str(chunk.get("path", ""))).stat().st_size
                             if od_stop > od_start:
                                 cell_durations.append(
                                     float(chunk.get("duration_seconds", 0.0)) / (od_stop - od_start)
@@ -1589,20 +1669,31 @@ def export_od_section_marginals(
                                 if value <= zero_tolerance:
                                     continue
                                 link_meta = metadata[link]
-                                rows.append(_route_flow_row({
-                                    "origin_stop_id": cells[od_index].origin_stop_id,
-                                    "destination_stop_id": cells[od_index].destination_stop_id,
-                                    "departure_time_bin": cells[od_index].departure_time_bin,
-                                    "line_id": link_meta.line_id,
-                                    "trip_id": link_meta.trip_id,
-                                    "boarding_stop_id": link_meta.boarding_stop_id,
-                                    "alighting_stop_id": link_meta.alighting_stop_id,
-                                    "assigned_demand": value,
-                                    "flow_semantics": "service_marginal",
-                                    "pattern_id": link_meta.pattern_id,
-                                    "direction": link_meta.direction,
-                                    "assignment_fingerprint": fit_fingerprint,
-                                }))
+                                if compact_output:
+                                    rows.append({
+                                        "departure_time_bin": cells[od_index].departure_time_bin,
+                                        "section_id": link_meta.section_id,
+                                        "origin_stop_id": cells[od_index].origin_stop_id,
+                                        "destination_stop_id": cells[od_index].destination_stop_id,
+                                        "line_id": link_meta.line_id,
+                                        "trip_id": link_meta.trip_id,
+                                        "assigned_contribution": value,
+                                    })
+                                else:
+                                    rows.append(_route_flow_row({
+                                        "origin_stop_id": cells[od_index].origin_stop_id,
+                                        "destination_stop_id": cells[od_index].destination_stop_id,
+                                        "departure_time_bin": cells[od_index].departure_time_bin,
+                                        "line_id": link_meta.line_id,
+                                        "trip_id": link_meta.trip_id,
+                                        "boarding_stop_id": link_meta.boarding_stop_id,
+                                        "alighting_stop_id": link_meta.alighting_stop_id,
+                                        "assigned_demand": value,
+                                        "flow_semantics": "service_marginal",
+                                        "pattern_id": link_meta.pattern_id,
+                                        "direction": link_meta.direction,
+                                        "assignment_fingerprint": fit_fingerprint,
+                                    }))
 
                         while next_cell < total_group_cells:
                             chunk_start = next_cell
@@ -1701,20 +1792,30 @@ def export_od_section_marginals(
                                     next_cell += 1
                                     guard.check()
                             chunk_duration = perf_counter() - chunk_started
+                            output_rows = chunk_rows
+                            output_columns = _ROUTE_FLOW_COLUMNS
+                            if compact_output:
+                                from .section_usage import SECTION_USAGE_COLUMNS, aggregate_section_usage_rows
+
+                                output_rows = aggregate_section_usage_rows(chunk_rows)
+                                output_columns = SECTION_USAGE_COLUMNS
                             chunk_path = units_directory / f"group-{group:08d}" / f"chunk-{len(chunks):08d}.csv"
-                            chunk_sha = _write_chunk_csv(chunk_path, chunk_rows)
+                            chunk_sha = _write_chunk_csv(
+                                chunk_path, output_rows, fieldnames=output_columns
+                            )
                             chunk_record = {
                                 "chunk_index": len(chunks),
                                 "od_start": chunk_start,
                                 "od_stop": chunk_cells,
-                                "rows": len(chunk_rows),
+                                "rows": len(output_rows),
                                 "duration_seconds": float(chunk_duration),
                                 "path": str(chunk_path.relative_to(checkpoint)),
                                 "sha256": chunk_sha,
                             }
                             chunks.append(chunk_record)
-                            group_rows += len(chunk_rows)
-                            rows_written += len(chunk_rows)
+                            group_rows += len(output_rows)
+                            rows_written += len(output_rows)
+                            bytes_written += chunk_path.stat().st_size
                             group_elapsed += chunk_duration
                             completed_units[unit_key] = {
                                 "unit_type": "group_chunks",
@@ -1732,6 +1833,7 @@ def export_od_section_marginals(
                                 "completed_units": completed_units,
                                 "completed_groups": sorted(completed_groups),
                                 "rows_written": rows_written,
+                                "bytes_written": bytes_written,
                                 "completed_od_cells": completed_cells,
                                 "total_od_cells": total_active_cells,
                                 "elapsed_seconds": elapsed_before + perf_counter() - run_started,
@@ -1752,7 +1854,27 @@ def export_od_section_marginals(
                                 durable=True,
                                 chunk_index=len(chunks) - 1,
                                 resumed=resumed,
+                                durable_bytes_written=bytes_written,
+                                rows_per_completed_od_cell=(
+                                    rows_written / completed_cells if completed_cells else None
+                                ),
+                                projected_final_rows=(
+                                    rows_written * total_active_cells / completed_cells
+                                    if completed_cells else None
+                                ),
+                                bytes_per_completed_od_cell=(
+                                    bytes_written / completed_cells if completed_cells else None
+                                ),
+                                projected_final_bytes=(
+                                    bytes_written * total_active_cells / completed_cells
+                                    if completed_cells else None
+                                ),
                             )
+                            if compact_output and storage_budget_bytes is not None and bytes_written > storage_budget_bytes:
+                                raise SectionUsageStorageBudgetExceeded(
+                                    "compact section checkpoint storage budget exceeded at a durable shard boundary: "
+                                    f"{bytes_written} bytes > {storage_budget_bytes}."
+                                )
                         completed_groups.add(group)
                         if unit_key not in completed_units:
                             completed_units[unit_key] = {
@@ -1772,6 +1894,7 @@ def export_od_section_marginals(
                             "completed_units": completed_units,
                             "completed_groups": sorted(completed_groups),
                             "rows_written": rows_written,
+                            "bytes_written": bytes_written,
                             "completed_od_cells": completed_cells,
                             "elapsed_seconds": elapsed_before + perf_counter() - run_started,
                         })
@@ -1792,12 +1915,17 @@ def export_od_section_marginals(
                     if len(completed_groups) >= total_groups:
                         break
                 guard.check()
-                temporary_output = destination.with_name(f".{destination.name}.tmp")
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    with temporary_output.open("w", newline="", encoding="utf-8") as output:
-                        writer = csv.DictWriter(output, fieldnames=list(_ROUTE_FLOW_COLUMNS), extrasaction="raise")
-                        writer.writeheader()
+                if compact_output:
+                    from .section_usage import write_section_usage_dataset
+
+                    temporary_dataset = destination.with_name(f".{destination.name}.staging")
+                    if temporary_dataset.exists():
+                        raise FileExistsError(
+                            f"incomplete section usage staging directory already exists: {temporary_dataset}"
+                        )
+
+                    def compact_rows() -> Iterator[Mapping[str, object]]:
                         for group in range(total_groups):
                             record = completed_units.get(str(group))
                             if not isinstance(record, Mapping) or record.get("status") != "completed":
@@ -1816,25 +1944,71 @@ def export_od_section_marginals(
                             for path in paths:
                                 with path.open(newline="", encoding="utf-8") as stream:
                                     reader = csv.DictReader(stream)
-                                    for row in reader:
-                                        writer.writerow(row)
-                        output.flush()
-                        os.fsync(output.fileno())
-                    os.replace(temporary_output, destination)
-                except BaseException:
-                    temporary_output.unlink(missing_ok=True)
-                    raise
+                                    yield from reader
+
+                    try:
+                        dataset_manifest = write_section_usage_dataset(
+                            compact_rows(),
+                            temporary_dataset,
+                            source_identity=provenance,
+                            format=section_usage_format,
+                            shard_rows=section_usage_shard_rows,
+                            storage_budget_bytes=storage_budget_bytes,
+                        )
+                        os.replace(temporary_dataset, destination)
+                    except BaseException:
+                        # Keep the failed staging directory for post-mortem and
+                        # safe restart; no production data is deleted here.
+                        raise
+                    output_sha256 = _sha256(destination / "manifest.json")
+                else:
+                    temporary_output = destination.with_name(f".{destination.name}.tmp")
+                    try:
+                        with temporary_output.open("w", newline="", encoding="utf-8") as output:
+                            writer = csv.DictWriter(output, fieldnames=list(_ROUTE_FLOW_COLUMNS), extrasaction="raise")
+                            writer.writeheader()
+                            for group in range(total_groups):
+                                record = completed_units.get(str(group))
+                                if not isinstance(record, Mapping) or record.get("status") != "completed":
+                                    raise ValueError(f"OD section export group {group} is incomplete.")
+                                if record.get("unit_type") == "legacy_group":
+                                    legacy_path = Path(str(record["path"])).expanduser()
+                                    if not legacy_path.is_absolute():
+                                        legacy_path = checkpoint / legacy_path
+                                    paths = (legacy_path,)
+                                else:
+                                    paths = tuple(
+                                        checkpoint / str(chunk["path"])
+                                        for chunk in record.get("chunks", [])
+                                        if isinstance(chunk, Mapping)
+                                    )
+                                for path in paths:
+                                    with path.open(newline="", encoding="utf-8") as stream:
+                                        reader = csv.DictReader(stream)
+                                        for row in reader:
+                                            writer.writerow(row)
+                            output.flush()
+                            os.fsync(output.fileno())
+                        os.replace(temporary_output, destination)
+                    except BaseException:
+                        temporary_output.unlink(missing_ok=True)
+                        raise
+                    dataset_manifest = None
+                    output_sha256 = _sha256(destination)
                 final = {
                     **provenance,
                     "provenance": provenance,
                     "status": "completed",
                     "output_path": str(destination),
-                    "output_sha256": _sha256(destination),
+                    "output_sha256": output_sha256,
                     "rows_written": rows_written,
+                    "bytes_written": bytes_written,
                     "completed_units": completed_units,
                     "completed_groups": sorted(completed_groups),
                     "completed_od_cells": completed_cells,
                 }
+                if dataset_manifest is not None:
+                    final["section_usage_manifest"] = dataset_manifest
                 if "migration" in state:
                     final["migration"] = state["migration"]
                 state.update(final)
@@ -1851,18 +2025,25 @@ def export_od_section_marginals(
                     elapsed=float(state.get("elapsed_seconds", elapsed_before + perf_counter() - run_started)),
                     durable=True,
                     resumed=resumed,
+                    durable_bytes_written=bytes_written,
+                    output_bytes=(None if dataset_manifest is None else dataset_manifest.get("bytes_written")),
                 )
                 return final
         except BaseException as error:
             if state.get("status") == "completed":
                 raise
             state.update({
-                "status": "interrupted"
-                if guard.requested or isinstance(error, (ODSectionPlanInterrupted, KeyboardInterrupt, InterruptedError))
-                else "failed",
+                "status": "storage_budget_exceeded"
+                if isinstance(error, SectionUsageStorageBudgetExceeded)
+                else (
+                    "interrupted"
+                    if guard.requested or isinstance(error, (ODSectionPlanInterrupted, KeyboardInterrupt, InterruptedError))
+                    else "failed"
+                ),
                 "completed_units": completed_units,
                 "completed_groups": sorted(completed_groups),
                 "rows_written": rows_written,
+                "bytes_written": bytes_written,
                 "completed_od_cells": completed_cells,
                 "total_od_cells": total_active_cells,
                 "elapsed_seconds": elapsed_before + perf_counter() - run_started,
