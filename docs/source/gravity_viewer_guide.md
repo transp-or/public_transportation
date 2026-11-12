@@ -197,6 +197,14 @@ the final CSV atomically. A representative dry-run/pilot should be recorded
 before scheduling the full export; no routing preparation or model estimation
 is triggered by this API.
 
+The planning API accepts `checkpoint_directory`, `resume=True`,
+`checkpoint_batch_size`, `checkpoint_identity`, and a progress callback. A
+checkpoint is stored as `plan_checkpoint.json` plus atomic per-group records;
+resume validates the schema, algorithm version, scientific-input identity, and
+pilot settings before skipping verified groups. The completed checkpoint is
+distinct from the private case runner's final `status: awaiting_review` plan
+file, so interrupted pilots cannot be approved accidentally.
+
 `query_section_od` streams the selected interval and section only, and pages
 the returned rows without truncating the underlying contributor data. Older
 schema-1 bundles explicitly report section data as unavailable and continue to

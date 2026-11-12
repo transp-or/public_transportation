@@ -219,6 +219,8 @@ from .gravity import (  # noqa: F401
     plan_gravity_od_section_marginal_export,
     ODSectionCell,
     ODSectionExportPlan,
+    ODSectionPlanCheckpointError,
+    ODSectionPlanInterrupted,
     RideLinkSectionMetadata,
     load_gravity_boundary_artifact,
     write_gravity_boundary_artifact,

@@ -135,6 +135,8 @@ from .od_section_export import (
     EXPORT_SCHEMA_VERSION,
     ODSectionCell,
     ODSectionExportPlan,
+    ODSectionPlanCheckpointError,
+    ODSectionPlanInterrupted,
     RideLinkSectionMetadata,
     export_od_section_marginals,
     export_gravity_od_section_marginals,
