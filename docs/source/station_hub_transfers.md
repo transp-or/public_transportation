@@ -91,9 +91,9 @@ A case-specific preparation process may derive station membership from its own
 source data and compute each hub coordinate as the centroid of its platforms
 in a suitable projected coordinate reference system. Straight-line distance
 from that centroid is only a proxy, not a pedestrian-network route. The
-private TPG case uses LV03 coordinates for this centroid and distance
-calculation; its stop-ID convention and any coordinate-audit rules remain in
-the private preparation layer, not in this package.
+The case-owned preparation layer chooses its coordinate reference system and
+stop-ID convention; those choices and any coordinate-audit rules remain outside
+this package.
 
 ## Cache identity and migration
 

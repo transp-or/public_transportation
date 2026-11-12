@@ -1,7 +1,8 @@
 """Benchmark direct fixed-routing measurement operators on a package example.
 
 This intentionally uses a short synthetic objective and never runs a complete
-estimation. The external TPG repository can reuse the same reported metrics.
+estimation. An external case-study repository can reuse the same reported
+metrics.
 """
 
 from __future__ import annotations

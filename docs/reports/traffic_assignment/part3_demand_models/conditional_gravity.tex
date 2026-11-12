@@ -81,7 +81,7 @@ The public package receives the positive cell-level vector through
 \texttt{GravityFeatures.destination\_attractiveness}.  The feature provider or
 case adapter constructs this vector and records its provenance; there is no
 universal package-side calculation from observations.  In the current
-medium-network adapter, the baseline is constructed as
+case-specific adapter, the baseline is constructed as
 \begin{equation}
     A^{(0)}_{dt}
       = \sum_{o:(o,d,t)\in C_{\mathrm{free}}}q^{(0)}_{odt},

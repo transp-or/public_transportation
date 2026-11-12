@@ -13,7 +13,7 @@ An isolated investigation showed that a previously observed 29.484 s first-call
 delay was not XLA compilation. Fixed-routing preparation had launched unused
 asynchronous device work before the valid operator cache was loaded, and the
 first objective result synchronized that work. The pipeline now validates and
-loads the cached operator before preparing routing. On the TPG case, isolated
+loads the cached operator before preparing routing. On the measured case, isolated
 tracing takes about 0.026 s, lowering 0.011 s, cold XLA compilation
 0.120--0.129 s, executable loading below 0.00001 s, and first execution about
 0.0014 s.
@@ -44,10 +44,10 @@ Iter. & Cache & Compile/load & Warm V\&G & Optimizer & Process & Objective \\
 20 & hit      & 0.0070 & 0.000996 & 5.820 & 11.047 & 49140.4258 \\
 \hline
 \end{tabular}
-\caption{Fresh-process TPG compilation-cache and optimizer measurements. The
+\caption{Fresh-process compilation-cache and optimizer measurements. The
 compile column is cold compilation or persistent executable loading; process
 time also includes scenario and assignment preparation.}
-\label{tab:tpg-ml-compilation-cache}
+\label{tab:case-specific-ml-compilation-cache}
 \end{table}
 
 The JAX persistent compilation cache is configured before computation through

@@ -14,7 +14,7 @@ class Trip:
     It can later be extended with shape/calendar concepts.
 
     :param trip_id: Unique trip identifier.
-    :param line_ref: Line identifier (references Line.line_id, e.g., "TPG_12"). Required.
+    :param line_ref: Line identifier (references Line.line_id, e.g., "L12"). Required.
     :param capacity: Optional passenger capacity for this trip (vehicle run). Must be non-negative when provided.
     :param service_id: Optional service identifier (calendar applicability).
     :param headsign: Optional passenger-facing destination label.

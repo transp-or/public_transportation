@@ -1,7 +1,7 @@
 # Geneva gravity integration validation
 
 The public Geneva snapshot now exercises the reduced-dimensional gravity workflow
-end to end. The OD truth and prior are synthetic; no private TPG demand data is
+end to end. The OD truth and prior are synthetic; no private demand data is
 included.
 
 Scheduled path preprocessing supplies minimum journey time and transfer count.

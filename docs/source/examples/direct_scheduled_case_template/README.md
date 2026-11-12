@@ -1,6 +1,6 @@
 # Direct-scheduled case-study template
 
-This directory is a current-version, TPG-agnostic starting point for a
+This directory is a current-version, case-study-agnostic starting point for a
 private case-study driver. Copy it into a private case repository and replace
 the example paths and scientific choices in `config/case.toml`,
 `config/structural_zeros.toml`, and `config/model.toml`. The template does not

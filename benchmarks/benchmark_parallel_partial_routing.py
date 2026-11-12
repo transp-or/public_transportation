@@ -210,7 +210,7 @@ def run(args) -> dict[str, object]:
             "notes": [
                 "Compilation warm-up is excluded from steady-state timings.",
                 "Every parallel case executes 100% of routing work.",
-                "This is a public synthetic CPU benchmark, not a TPG result.",
+                "This is a public synthetic CPU benchmark, not a private-case result.",
             ],
         }
 

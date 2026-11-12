@@ -54,7 +54,7 @@ The generic persisted-artifact residual audit is documented in
 [residual_audit.md](docs/source/residual_audit.md); it supports grouped
 residuals, support-failure diagnostics, contribution accounting, and
 cross-run comparison without rerunning a model.
-The matching TPG-agnostic driver skeleton and Slurm wrappers are in
+The matching case-study-agnostic driver skeleton and Slurm wrappers are in
 [direct_scheduled_case_template](docs/source/examples/direct_scheduled_case_template/).
 
 Named gravity production/destination specifications, including models that

@@ -268,7 +268,7 @@ read the selected folder.
 
 **The bundle is very large.** Select only the bundle directory. Startup reads
 only small metadata, and active memory is bounded by the selected partition and
-display sample. Safari should be tested with the complete Model 6 bundle; a
+display sample. Safari should be tested with a complete large bundle; a
 reload indicates that the chosen partition or network snapshot is still too
 large and should be split further rather than loading the legacy CSV.
 
@@ -325,8 +325,8 @@ counts in the manifest.
 
 ## Compact OD-to-section product
 
-For Model 6 exports that only need section/OD/service queries, use the compact
-product instead of the path-level CSV:
+For exports that only need section/OD/service queries, use the compact product
+instead of the path-level CSV:
 
 ```python
 from public_transportation.inference.gravity import export_od_section_marginals

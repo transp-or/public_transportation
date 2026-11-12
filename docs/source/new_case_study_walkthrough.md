@@ -898,8 +898,8 @@ such as `target_nonzeros_per_storage_shard` and
 `manifest_checkpoint_shards`, and `maximum_construction_dispatches`. These
 control operator construction. They do not control timetable routing.
 
-For the current medium-network case, the following values are a
-case-specific example, not package defaults:
+The following values illustrate a case-specific configuration; they are not
+package defaults:
 
 ```toml
 od_chunk_size = 64
@@ -2405,8 +2405,8 @@ uv run --frozen python docs/source/examples/direct_scheduled_gravity_validation.
   --cache-directory /path/to/persistent/direct-scheduled-cache
 ```
 
-This is a reference activation/equivalence run, not a generic medium-network
-case runner. A private driver must perform the same assembly for its own data.
+This is a reference activation/equivalence run, not a generic case runner. A
+private driver must perform the same assembly for its own data.
 
 A completed direct-scheduled artifact contains:
 
@@ -2968,8 +2968,8 @@ convergence.
 `maximum_iterations` is an upper bound, not evidence that the optimizer
 converged. Ten iterations may be used for a smoke test or debugging run only;
 ten iterations are not sufficient for production estimation and must not
-support substantive scientific conclusions. For the medium-network case, the
-case-owned production configuration uses:
+support substantive scientific conclusions. A case-owned production
+configuration may use:
 
 ```toml
 maximum_iterations = 1000

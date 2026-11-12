@@ -17,7 +17,7 @@
   "notes": [
     "Preparation and compilation warm-up are excluded from steady-state timings.",
     "Approximation errors are measured against the exact adjoint at identical parameters.",
-    "Synthetic topology is public and reproducible; it is not a claim about TPG runtime."
+    "Synthetic topology is public and reproducible; it is not a claim about private-case runtime."
   ],
   "peak_rss_bytes": 671760384,
   "preparation_seconds": 0.2361194589175284,

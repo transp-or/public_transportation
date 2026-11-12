@@ -228,7 +228,7 @@ def run(args) -> dict[str, object]:
             "notes": [
                 "Preparation and compilation warm-up are excluded from steady-state timings.",
                 "Approximation errors are measured against the exact adjoint at identical parameters.",
-                "Synthetic topology is public and reproducible; it is not a claim about TPG runtime.",
+                "Synthetic topology is public and reproducible; it is not a claim about private-case runtime.",
             ],
         }
 

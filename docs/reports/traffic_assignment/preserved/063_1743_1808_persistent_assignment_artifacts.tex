@@ -18,7 +18,7 @@ incompatible entries rebuild under \texttt{auto}, and \texttt{readonly} never
 writes. The measurement-operator cache retains its own compact-input content
 hash, so a valid assignment archive cannot validate an incompatible operator.
 
-Internal TPG profiling initially assigned 3.142 s of a 3.313 s preparation to
+Internal profiling initially assigned 3.142 s of a 3.313 s preparation to
 destination grouping. The cause was repeated Python scalar extraction from JAX
 node arrays, which introduced thousands of small device synchronizations. One
 NumPy view is now reused for immutable node indexing and validation, and all
@@ -27,7 +27,7 @@ assignment construction consequently fell to 0.097 s: graph construction took
 about 0.049 s, OD indexing and grouping 0.022 s, and cost construction plus
 synchronization 0.026 s in the compilation-cache-enabled run.
 
-The TPG artifact contains 36,478 nodes, 11,259 links, 22,022 OD records, and 113
+The measured artifact contains 36,478 nodes, 11,259 links, 22,022 OD records, and 113
 destination groups. Its explicit arrays occupy 6,909,418 bytes and compress to
 576,227 bytes. A representative strict cache hit spent 0.00044 s opening the
 archive, 0.00460 s decompressing arrays, 0.01473 s in combined validation and
@@ -50,9 +50,9 @@ Mismatch/rebuild & 0.3321 & 1.3463 & 0.001048 & 0.3166 & 2.3935 \\
 Read-only hit & 0.1128 & 1.1242 & 0.000972 & 0.2922 & 2.1872 \\
 \hline
 \end{tabular}
-\caption{Fresh-process TPG assignment-cache measurements in seconds with the
+\caption{Fresh-process assignment-cache measurements in seconds with the
 measurement-operator and JAX compilation caches enabled.}
-\label{tab:tpg-assignment-cache}
+\label{tab:case-specific-assignment-cache}
 \end{table}
 
 After eliminating scalar synchronization, uncached reconstruction is already

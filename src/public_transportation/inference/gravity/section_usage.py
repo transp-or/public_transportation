@@ -1,7 +1,7 @@
 """Compact, restartable OD-to-section products.
 
 The historical route-flow export stores one row for every saved path/leg.  This
-module provides the smaller product used by the Model 6 viewer: one exact row
+module provides a compact viewer product: one exact row
 per departure interval, directed section, OD pair, line and trip.  The module
 is deliberately independent from routing; it can consume a completed route
 export or a stream produced by an exporter.
