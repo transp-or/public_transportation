@@ -132,6 +132,8 @@ from .boundary_artifact import (
     write_gravity_boundary_artifact,
 )
 from .od_section_export import (
+    EXPORT_CHECKPOINT_ALGORITHM_VERSION,
+    EXPORT_CHECKPOINT_SCHEMA_VERSION,
     EXPORT_SCHEMA_VERSION,
     ODSectionCell,
     ODSectionExportPlan,

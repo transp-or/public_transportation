@@ -15,6 +15,7 @@ import os
 import signal
 import tempfile
 from collections.abc import Mapping, Sequence
+from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import perf_counter
@@ -42,6 +43,8 @@ EXPORT_SCHEMA_VERSION = 1
 PLAN_CHECKPOINT_SCHEMA_VERSION = 1
 PLAN_ALGORITHM_VERSION = "od-section-plan-pilot-v1"
 PLAN_CHECKPOINT_FILE = "plan_checkpoint.json"
+EXPORT_CHECKPOINT_SCHEMA_VERSION = 2
+EXPORT_CHECKPOINT_ALGORITHM_VERSION = "od-section-export-chunked-v2"
 
 
 class ODSectionPlanInterrupted(RuntimeError):
@@ -504,7 +507,13 @@ def _ride_links(graph: Any) -> np.ndarray:
 
 
 def _group_ride_probabilities(
-    *, graph: Any, probability: np.ndarray, enabled: np.ndarray, origin_node: int
+    *,
+    graph: Any,
+    probability: np.ndarray,
+    enabled: np.ndarray,
+    origin_node: int,
+    progress: Callable[[Mapping[str, object]], None] | None = None,
+    progress_interval_seconds: float = 60.0,
 ) -> dict[int, float]:
     """Propagate unit mass through one group without retaining OD×link state."""
     node_mass = np.zeros(int(graph.num_nodes), dtype=np.float64)
@@ -514,20 +523,38 @@ def _group_ride_probabilities(
     out_mask = np.asarray(graph.out_mask, dtype=bool)
     ride = np.asarray(graph.link_type) == LINK_TYPE_RIDE
     result: dict[int, float] = {}
+    started = perf_counter()
+    last_progress = started
+    nodes_visited = 0
     for node in np.asarray(graph.topo_order, dtype=np.int64):
+        nodes_visited += 1
         mass = float(node_mass[int(node)])
-        if mass == 0.0:
-            continue
-        for link in out_links[int(node)][out_mask[int(node)]]:
-            link_index = int(link)
-            if not bool(enabled[link_index]):
-                continue
-            flow = mass * float(probability[link_index])
-            if flow == 0.0:
-                continue
-            if bool(ride[link_index]):
-                result[link_index] = result.get(link_index, 0.0) + flow
-            node_mass[int(head[link_index])] += flow
+        if mass != 0.0:
+            for link in out_links[int(node)][out_mask[int(node)]]:
+                link_index = int(link)
+                if not bool(enabled[link_index]):
+                    continue
+                flow = mass * float(probability[link_index])
+                if flow == 0.0:
+                    continue
+                if bool(ride[link_index]):
+                    result[link_index] = result.get(link_index, 0.0) + flow
+                node_mass[int(head[link_index])] += flow
+        now = perf_counter()
+        if progress is not None and (
+            progress_interval_seconds <= 0.0
+            or now - last_progress >= progress_interval_seconds
+        ):
+            progress(
+                {
+                    "status": "od_heartbeat",
+                    "durable_checkpoint": False,
+                    "nodes_visited": int(nodes_visited),
+                    "total_nodes": int(graph.num_nodes),
+                    "od_elapsed_seconds": float(now - started),
+                }
+            )
+            last_progress = now
     return result
 
 
@@ -692,6 +719,56 @@ def _emit_plan_progress(
             "resumed": resumed,
         }
     )
+
+
+def _write_chunk_csv(path: Path, rows: Sequence[Mapping[str, object]]) -> str:
+    """Write one bounded chunk durably and return its checksum."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(
+                stream, fieldnames=list(_ROUTE_FLOW_COLUMNS), extrasaction="raise"
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_name, path)
+    except BaseException:
+        Path(temporary_name).unlink(missing_ok=True)
+        raise
+    return _sha256(path)
+
+
+def _export_eta(
+    *,
+    durations: deque[float],
+    completed_cells: int,
+    total_cells: int,
+    elapsed_seconds: float,
+) -> tuple[float | None, float | None, str, str]:
+    if not durations or completed_cells <= 0:
+        return None, None, "unavailable", "no completed OD-cell timing observations"
+    # A rolling median avoids a single unusually expensive cell creating false
+    # precision while still adapting to the current network and hardware.
+    observations = np.asarray(tuple(durations), dtype=np.float64)
+    seconds_per_cell = float(np.median(observations))
+    throughput = 1.0 / seconds_per_cell if seconds_per_cell > 0.0 else None
+    remaining = max(0, total_cells - completed_cells)
+    eta = None if throughput is None else remaining / throughput
+    if len(durations) < 3:
+        confidence = "low"
+        reason = "fewer than three completed OD-cell observations"
+    elif len(durations) < 10:
+        confidence = "medium"
+        reason = "rolling median from a limited OD-cell sample"
+    else:
+        confidence = "high"
+        reason = "rolling median from at least ten OD-cell observations"
+    return throughput, eta, confidence, reason
 
 
 def plan_od_section_marginal_export(
@@ -1052,11 +1129,17 @@ def export_od_section_marginals(
     node_stop_ids: Mapping[int, str] | Sequence[str] | None = None,
     ride_link_metadata: Mapping[int, RideLinkSectionMetadata | Mapping[str, object]] | None = None,
     zero_tolerance: float = 0.0,
+    od_chunk_size: int = 256,
+    progress_interval_seconds: float = 60.0,
     progress: ODSectionProgress | None = None,
 ) -> dict[str, object]:
-    """Export sparse expected OD use of ride sections with group checkpoints."""
+    """Export sparse expected OD use of ride sections with chunk checkpoints."""
     if not np.isfinite(zero_tolerance) or zero_tolerance < 0.0:
         raise ValueError("zero_tolerance must be finite and non-negative.")
+    if od_chunk_size <= 0:
+        raise ValueError("od_chunk_size must be positive.")
+    if not np.isfinite(progress_interval_seconds) or progress_interval_seconds < 0.0:
+        raise ValueError("progress_interval_seconds must be finite and non-negative.")
     destination = Path(output_path).expanduser().resolve()
     checkpoint = Path(checkpoint_directory or destination.with_name(f".{destination.name}.checkpoint")).expanduser().resolve()
     state_path = checkpoint / "manifest.json"
@@ -1083,123 +1166,539 @@ def export_od_section_marginals(
         raise ValueError("fit_assignment_fingerprint must be provided or present in routing identity.")
     ride_links = _ride_links(assignment_inputs.graph)
     metadata = _normalise_link_metadata(assignment_inputs.graph, ride_link_metadata, ride_links, stop_ids)
+    total_groups = int(group_indices.shape[0])
+    total_active_cells = int(np.count_nonzero(group_mask))
+    cell_durations: deque[float] = deque(maxlen=64)
+    routing_identity = sharded_fixed_routing_identity(
+        inputs=assignment_inputs,
+        theta=routing.theta,
+        shard_partition=routing.shard_partition,
+    )
+    od_cell_fingerprint = fingerprint(
+        tuple(
+            (cell.origin_stop_id, cell.destination_stop_id, cell.departure_time_bin)
+            for cell in cells
+        )
+    )
     provenance = {
         "schema_version": EXPORT_SCHEMA_VERSION,
+        "checkpoint_schema_version": EXPORT_CHECKPOINT_SCHEMA_VERSION,
+        "checkpoint_algorithm_version": EXPORT_CHECKPOINT_ALGORITHM_VERSION,
+        "package_revision": __version__,
+        "graph_fingerprint": routing_identity["graph_fingerprint"],
         "routing_preparation_fingerprint": preparation_fingerprint,
         "fit_assignment_fingerprint": fit_fingerprint,
         "fitted_demand_fingerprint": _demand_fingerprint(demand),
+        "od_cell_fingerprint": od_cell_fingerprint,
+        "compact_layout_fingerprint": (
+            None if compact_layout is None else compact_layout.fingerprint
+        ),
         "routing_cache_directory": str(routing.provenance.cache_directory),
         "routing_cache_identity": f"{preparation_fingerprint}:{routing.provenance.schema_version}",
         "num_od": int(origins.size),
-        "num_destination_groups": int(group_indices.shape[0]),
+        "num_destination_groups": total_groups,
         "num_ride_links": int(ride_links.size),
+        "flow_semantics": "service_marginal",
+        "output_columns": list(_ROUTE_FLOW_COLUMNS),
+        "zero_tolerance": float(zero_tolerance),
+        "od_chunk_size": int(od_chunk_size),
     }
-    state: dict[str, object] = {}
-    if state_path.exists():
+
+    def _progress_event(
+        *,
+        status: str,
+        group: int | None,
+        shard_index: int | None,
+        completed_groups: int,
+        completed_group_cells: int | None,
+        total_group_cells: int | None,
+        completed_cells: int,
+        rows: int,
+        elapsed: float,
+        cell: int | None = None,
+        durable: bool = False,
+        chunk_index: int | None = None,
+        resumed: bool = False,
+        **extra: object,
+    ) -> None:
+        if progress is None:
+            return
+        throughput, eta, confidence, reason = _export_eta(
+            durations=cell_durations,
+            completed_cells=completed_cells,
+            total_cells=total_active_cells,
+            elapsed_seconds=elapsed,
+        )
+        progress(
+            {
+                "status": status,
+                "current_group": group,
+                "group": group,
+                "shard_index": shard_index,
+                "completed_groups": int(completed_groups),
+                "total_groups": total_groups,
+                "completed_group_od_cells": completed_group_cells,
+                "total_group_od_cells": total_group_cells,
+                "completed_od_cells": int(completed_cells),
+                "total_od_cells": total_active_cells,
+                "current_od_cell": cell,
+                "rows_written": int(rows),
+                "elapsed_seconds": float(elapsed),
+                "cells_per_second": throughput,
+                "estimated_remaining_seconds": eta,
+                "eta_confidence": confidence,
+                "eta_reason": reason,
+                "durable_checkpoint": durable,
+                "chunk_index": chunk_index,
+                "resumed": resumed,
+                **extra,
+            }
+        )
+
+    def _read_or_initialize_state() -> tuple[dict[str, object], bool]:
+        if not state_path.exists():
+            state = {
+                "status": "running",
+                "provenance": provenance,
+                "completed_units": {},
+                "completed_groups": [],
+                "rows_written": 0,
+                "completed_od_cells": 0,
+                "total_od_cells": total_active_cells,
+                "elapsed_seconds": 0.0,
+            }
+            _atomic_json(state_path, state)
+            return state, False
         try:
             state = json.loads(state_path.read_text(encoding="utf-8"))
         except (OSError, ValueError, json.JSONDecodeError) as error:
             raise ValueError("OD section export checkpoint is corrupt.") from error
-        if state.get("provenance") != provenance:
-            raise ValueError("OD section export checkpoint provenance differs from current inputs.")
-    else:
-        state = {"status": "running", "provenance": provenance, "completed_units": {}, "rows_written": 0}
-        _atomic_json(state_path, state)
-    completed = dict(state.get("completed_units", {}))
-    if destination.exists() and state.get("status") != "completed":
-        raise FileExistsError("output_path already exists for an incomplete OD section export.")
-    units_directory.mkdir(parents=True, exist_ok=True)
-    total_groups = int(group_indices.shape[0])
-    rows_written = sum(int(item.get("rows", 0)) for item in completed.values() if isinstance(item, Mapping))
-    started = perf_counter()
-    for descriptor in routing.shard_partition:
-        # At most one routing shard is retained while processing its groups.
-        shard = load_fixed_routing_shard(routing=routing, descriptor=descriptor)
-        for group in descriptor.destination_group_indices:
-            unit_key = str(group)
-            unit_path = units_directory / f"group-{group:08d}.csv"
-            record = completed.get(unit_key)
-            if isinstance(record, Mapping) and unit_path.exists() and record.get("sha256") == _sha256(unit_path):
-                continue
-            local = group - descriptor.group_start
-            valid_indices = group_indices[group][group_mask[group]]
-            descriptor_fd, temporary_name = tempfile.mkstemp(prefix=f".{unit_path.name}.", dir=units_directory)
-            unit_rows = 0
-            try:
-                with os.fdopen(descriptor_fd, "w", newline="", encoding="utf-8") as stream:
-                    writer = csv.DictWriter(stream, fieldnames=list(_ROUTE_FLOW_COLUMNS), extrasaction="raise")
-                    writer.writeheader()
-                    for od_index in valid_indices.tolist():
-                        contributions = _group_ride_probabilities(
-                            graph=assignment_inputs.graph,
-                            probability=np.asarray(shard.group_link_probability[local]),
-                            enabled=np.asarray(shard.effective_group_link_mask[local], dtype=bool),
-                            origin_node=int(origins[od_index]),
-                        )
-                        for link, probability in contributions.items():
-                            value = float(demand[od_index]) * probability
-                            if value <= zero_tolerance:
+        if not isinstance(state, dict):
+            raise ValueError("OD section export checkpoint must contain a JSON object.")
+        legacy_keys = {
+            "schema_version",
+            "routing_preparation_fingerprint",
+            "fit_assignment_fingerprint",
+            "fitted_demand_fingerprint",
+            "routing_cache_directory",
+            "routing_cache_identity",
+            "num_od",
+            "num_destination_groups",
+            "num_ride_links",
+        }
+        saved_provenance = state.get("provenance")
+        if not isinstance(saved_provenance, Mapping):
+            # Schema-1 completed manifests stamped provenance at the top level.
+            # Accept that shape only when every legacy identity field is present;
+            # all other missing-provenance manifests fail closed.
+            legacy_top_level = {
+                key: state[key] for key in legacy_keys if key in state
+            }
+            if set(legacy_top_level) != legacy_keys:
+                raise ValueError("OD section export checkpoint has no provenance.")
+            saved_provenance = legacy_top_level
+        migrated = False
+        if dict(saved_provenance) != provenance:
+            legacy_compatible = (
+                set(saved_provenance).issubset(legacy_keys)
+                and all(provenance.get(key) == saved_provenance.get(key) for key in saved_provenance)
+                and zero_tolerance == 0.0
+            )
+            if not legacy_compatible:
+                raise ValueError("OD section export checkpoint provenance differs from current inputs.")
+            migrated = True
+            legacy_units = state.get("completed_units", {})
+            if not isinstance(legacy_units, dict):
+                raise ValueError("legacy OD section export checkpoint units are corrupt.")
+            migrated_units: dict[str, dict[str, object]] = {}
+            for key, record in legacy_units.items():
+                if not isinstance(record, Mapping):
+                    raise ValueError("legacy OD section export checkpoint contains an invalid group record.")
+                path = Path(str(record.get("path", ""))).expanduser()
+                if not path.is_absolute():
+                    path = checkpoint / path
+                if not path.is_file() or record.get("sha256") != _sha256(path):
+                    raise ValueError(f"legacy OD section group checkpoint is missing or corrupt: {path}")
+                try:
+                    group = int(key)
+                except (TypeError, ValueError) as error:
+                    raise ValueError("legacy OD section export contains an invalid group index.") from error
+                if group < 0 or group >= total_groups:
+                    raise ValueError(f"legacy OD section export group index is out of range: {group}")
+                active_count = int(np.count_nonzero(group_mask[group]))
+                migrated_units[str(group)] = {
+                    "unit_type": "legacy_group",
+                    "status": "completed",
+                    "path": str(path),
+                    "rows": int(record.get("rows", 0)),
+                    "sha256": str(record["sha256"]),
+                    "completed_od_cells": active_count,
+                    "total_od_cells": active_count,
+                    "duration_seconds": float(record.get("duration_seconds", 0.0)),
+                }
+            state["completed_units"] = migrated_units
+            state["completed_groups"] = sorted(int(key) for key in migrated_units)
+            state["rows_written"] = sum(int(item["rows"]) for item in migrated_units.values())
+            state["completed_od_cells"] = sum(int(item["completed_od_cells"]) for item in migrated_units.values())
+            state["total_od_cells"] = total_active_cells
+            state["provenance"] = provenance
+            state["migration"] = "verified_group_units_to_chunked_checkpoint"
+            _atomic_json(state_path, state)
+        return state, migrated
+
+    def _validate_chunk_record(record: Mapping[str, object], *, group: int) -> tuple[int, int, int]:
+        path = checkpoint / str(record.get("path", ""))
+        if not path.is_file() or record.get("sha256") != _sha256(path):
+            raise ValueError(f"OD section export chunk is missing or corrupt: {path}")
+        return (
+            int(record.get("od_start", -1)),
+            int(record.get("od_stop", -1)),
+            int(record.get("rows", 0)),
+        )
+
+    def _run() -> dict[str, object]:
+        state, migrated = _read_or_initialize_state()
+        if destination.exists() and state.get("status") != "completed":
+            raise FileExistsError("output_path already exists for an incomplete OD section export.")
+        units_directory.mkdir(parents=True, exist_ok=True)
+        completed_units = state.get("completed_units", {})
+        if not isinstance(completed_units, dict):
+            raise ValueError("OD section export checkpoint units are corrupt.")
+        completed_groups = {
+            int(key)
+            for key, record in completed_units.items()
+            if isinstance(record, Mapping) and record.get("status") == "completed"
+        }
+        completed_cells = int(state.get("completed_od_cells", 0))
+        rows_written = int(state.get("rows_written", 0))
+        elapsed_before = float(state.get("elapsed_seconds", 0.0))
+        run_started = perf_counter()
+        for record in completed_units.values():
+            if isinstance(record, Mapping):
+                chunks = record.get("chunks", [])
+                if isinstance(chunks, list):
+                    for chunk in chunks:
+                        if isinstance(chunk, Mapping):
+                            od_start, od_stop, _ = _validate_chunk_record(chunk, group=-1)
+                            if od_stop > od_start:
+                                cell_durations.append(
+                                    float(chunk.get("duration_seconds", 0.0)) / (od_stop - od_start)
+                                )
+        resumed = bool(completed_units) or migrated
+        guard = _PlanSignalGuard()
+        try:
+            with guard:
+                for descriptor in routing.shard_partition:
+                    shard = load_fixed_routing_shard(routing=routing, descriptor=descriptor)
+                    for local, group in enumerate(descriptor.destination_group_indices):
+                        local_indices = np.asarray(group_indices[group][group_mask[group]], dtype=np.int64)
+                        total_group_cells = int(local_indices.size)
+                        unit_key = str(group)
+                        record = completed_units.get(unit_key)
+                        chunks: list[dict[str, object]] = []
+                        next_cell = 0
+                        group_rows = 0
+                        group_elapsed = 0.0
+                        if isinstance(record, Mapping) and record.get("unit_type") == "legacy_group":
+                            path = Path(str(record["path"])).expanduser()
+                            if not path.is_absolute():
+                                path = checkpoint / path
+                            if not path.is_file() or record.get("sha256") != _sha256(path):
+                                raise ValueError(f"legacy OD section group checkpoint is missing or corrupt: {path}")
+                            completed_groups.add(group)
+                            continue
+                        if isinstance(record, Mapping):
+                            raw_chunks = record.get("chunks", [])
+                            if not isinstance(raw_chunks, list):
+                                raise ValueError(f"OD section export chunks are corrupt for group {group}.")
+                            expected_start = 0
+                            for raw_chunk in raw_chunks:
+                                if not isinstance(raw_chunk, Mapping):
+                                    raise ValueError(f"OD section export chunk record is corrupt for group {group}.")
+                                od_start, od_stop, rows = _validate_chunk_record(raw_chunk, group=group)
+                                if od_start != expected_start or od_stop <= od_start or od_stop > total_group_cells:
+                                    raise ValueError(f"OD section export chunk ranges are corrupt for group {group}.")
+                                expected_start = od_stop
+                                chunk = dict(raw_chunk)
+                                chunks.append(chunk)
+                                next_cell = od_stop
+                                group_rows += rows
+                                group_elapsed += float(chunk.get("duration_seconds", 0.0))
+                                cell_durations.append(float(chunk.get("duration_seconds", 0.0)) / (od_stop - od_start))
+                            if int(record.get("completed_od_cells", next_cell)) != next_cell:
+                                raise ValueError(f"OD section export completed cell count is corrupt for group {group}.")
+                            if str(record.get("status", "running")) == "completed":
+                                if next_cell != total_group_cells:
+                                    raise ValueError(f"OD section export completed group {group} has missing chunks.")
+                                completed_groups.add(group)
                                 continue
-                            link_meta = metadata[link]
-                            writer.writerow(_route_flow_row({
-                                "origin_stop_id": cells[od_index].origin_stop_id,
-                                "destination_stop_id": cells[od_index].destination_stop_id,
-                                "departure_time_bin": cells[od_index].departure_time_bin,
-                                "line_id": link_meta.line_id,
-                                "trip_id": link_meta.trip_id,
-                                "boarding_stop_id": link_meta.boarding_stop_id,
-                                "alighting_stop_id": link_meta.alighting_stop_id,
-                                "assigned_demand": value,
-                                "flow_semantics": "service_marginal",
-                                "pattern_id": link_meta.pattern_id,
-                                "direction": link_meta.direction,
-                                "assignment_fingerprint": fit_fingerprint,
-                            }))
-                            unit_rows += 1
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temporary_name, unit_path)
-            except BaseException:
-                Path(temporary_name).unlink(missing_ok=True)
+                        _progress_event(
+                            status="group_started",
+                            group=group,
+                            shard_index=descriptor.shard_index,
+                            completed_groups=len(completed_groups),
+                            completed_group_cells=next_cell,
+                            total_group_cells=total_group_cells,
+                            completed_cells=completed_cells,
+                            rows=rows_written,
+                            elapsed=elapsed_before + perf_counter() - run_started,
+                            resumed=resumed,
+                        )
+                        probabilities = np.asarray(shard.group_link_probability[local])
+                        enabled = np.asarray(shard.effective_group_link_mask[local], dtype=bool)
+                        while next_cell < total_group_cells:
+                            chunk_start = next_cell
+                            chunk_rows: list[dict[str, object]] = []
+                            chunk_started = perf_counter()
+                            chunk_cells = min(total_group_cells, chunk_start + int(od_chunk_size))
+                            while next_cell < chunk_cells:
+                                od_index = int(local_indices[next_cell])
+                                od_started = perf_counter()
+
+                                def on_od_heartbeat(event: Mapping[str, object]) -> None:
+                                    guard.check()
+                                    heartbeat_fields = {
+                                        key: value
+                                        for key, value in event.items()
+                                        if key not in {"status", "durable_checkpoint"}
+                                    }
+                                    _progress_event(
+                                        status="od_heartbeat",
+                                        group=group,
+                                        shard_index=descriptor.shard_index,
+                                        completed_groups=len(completed_groups),
+                                        completed_group_cells=next_cell,
+                                        total_group_cells=total_group_cells,
+                                        completed_cells=completed_cells,
+                                        rows=rows_written,
+                                        elapsed=elapsed_before + perf_counter() - run_started,
+                                        cell=next_cell,
+                                        resumed=resumed,
+                                        current_od_index=od_index,
+                                        **heartbeat_fields,
+                                    )
+
+                                contributions = _group_ride_probabilities(
+                                    graph=assignment_inputs.graph,
+                                    probability=probabilities,
+                                    enabled=enabled,
+                                    origin_node=int(origins[od_index]),
+                                    progress=on_od_heartbeat,
+                                    progress_interval_seconds=progress_interval_seconds,
+                                )
+                                for link, probability in contributions.items():
+                                    value = float(demand[od_index]) * probability
+                                    if value <= zero_tolerance:
+                                        continue
+                                    link_meta = metadata[link]
+                                    chunk_rows.append(_route_flow_row({
+                                        "origin_stop_id": cells[od_index].origin_stop_id,
+                                        "destination_stop_id": cells[od_index].destination_stop_id,
+                                        "departure_time_bin": cells[od_index].departure_time_bin,
+                                        "line_id": link_meta.line_id,
+                                        "trip_id": link_meta.trip_id,
+                                        "boarding_stop_id": link_meta.boarding_stop_id,
+                                        "alighting_stop_id": link_meta.alighting_stop_id,
+                                        "assigned_demand": value,
+                                        "flow_semantics": "service_marginal",
+                                        "pattern_id": link_meta.pattern_id,
+                                        "direction": link_meta.direction,
+                                        "assignment_fingerprint": fit_fingerprint,
+                                    }))
+                                cell_duration = perf_counter() - od_started
+                                cell_durations.append(cell_duration)
+                                completed_cells += 1
+                                next_cell += 1
+                                guard.check()
+                            chunk_duration = perf_counter() - chunk_started
+                            chunk_path = units_directory / f"group-{group:08d}" / f"chunk-{len(chunks):08d}.csv"
+                            chunk_sha = _write_chunk_csv(chunk_path, chunk_rows)
+                            chunk_record = {
+                                "chunk_index": len(chunks),
+                                "od_start": chunk_start,
+                                "od_stop": chunk_cells,
+                                "rows": len(chunk_rows),
+                                "duration_seconds": float(chunk_duration),
+                                "path": str(chunk_path.relative_to(checkpoint)),
+                                "sha256": chunk_sha,
+                            }
+                            chunks.append(chunk_record)
+                            group_rows += len(chunk_rows)
+                            rows_written += len(chunk_rows)
+                            group_elapsed += chunk_duration
+                            completed_units[unit_key] = {
+                                "unit_type": "group_chunks",
+                                "status": "running",
+                                "group_index": group,
+                                "shard_index": descriptor.shard_index,
+                                "completed_od_cells": chunk_cells,
+                                "total_od_cells": total_group_cells,
+                                "rows": group_rows,
+                                "duration_seconds": group_elapsed,
+                                "chunks": chunks,
+                            }
+                            state.update({
+                                "status": "running",
+                                "completed_units": completed_units,
+                                "completed_groups": sorted(completed_groups),
+                                "rows_written": rows_written,
+                                "completed_od_cells": completed_cells,
+                                "total_od_cells": total_active_cells,
+                                "elapsed_seconds": elapsed_before + perf_counter() - run_started,
+                            })
+                            _atomic_json(state_path, state)
+                            _progress_event(
+                                status="chunk_checkpointed",
+                                group=group,
+                                shard_index=descriptor.shard_index,
+                                completed_groups=len(completed_groups),
+                                completed_group_cells=chunk_cells,
+                                total_group_cells=total_group_cells,
+                                completed_cells=completed_cells,
+                                rows=rows_written,
+                                elapsed=float(state["elapsed_seconds"]),
+                                cell=chunk_cells - 1,
+                                current_od_index=int(local_indices[chunk_cells - 1]),
+                                durable=True,
+                                chunk_index=len(chunks) - 1,
+                                resumed=resumed,
+                            )
+                        completed_groups.add(group)
+                        if unit_key not in completed_units:
+                            completed_units[unit_key] = {
+                                "unit_type": "group_chunks",
+                                "status": "running",
+                                "group_index": group,
+                                "shard_index": descriptor.shard_index,
+                                "completed_od_cells": 0,
+                                "total_od_cells": total_group_cells,
+                                "rows": 0,
+                                "duration_seconds": 0.0,
+                                "chunks": [],
+                            }
+                        completed_units[unit_key]["status"] = "completed"
+                        state.update({
+                            "status": "running",
+                            "completed_units": completed_units,
+                            "completed_groups": sorted(completed_groups),
+                            "rows_written": rows_written,
+                            "completed_od_cells": completed_cells,
+                            "elapsed_seconds": elapsed_before + perf_counter() - run_started,
+                        })
+                        _atomic_json(state_path, state)
+                        _progress_event(
+                            status="group_completed",
+                            group=group,
+                            shard_index=descriptor.shard_index,
+                            completed_groups=len(completed_groups),
+                            completed_group_cells=total_group_cells,
+                            total_group_cells=total_group_cells,
+                            completed_cells=completed_cells,
+                            rows=rows_written,
+                            elapsed=float(state["elapsed_seconds"]),
+                            durable=True,
+                            resumed=resumed,
+                        )
+                    if len(completed_groups) >= total_groups:
+                        break
+                guard.check()
+                temporary_output = destination.with_name(f".{destination.name}.tmp")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    with temporary_output.open("w", newline="", encoding="utf-8") as output:
+                        writer = csv.DictWriter(output, fieldnames=list(_ROUTE_FLOW_COLUMNS), extrasaction="raise")
+                        writer.writeheader()
+                        for group in range(total_groups):
+                            record = completed_units.get(str(group))
+                            if not isinstance(record, Mapping) or record.get("status") != "completed":
+                                raise ValueError(f"OD section export group {group} is incomplete.")
+                            if record.get("unit_type") == "legacy_group":
+                                legacy_path = Path(str(record["path"])).expanduser()
+                                if not legacy_path.is_absolute():
+                                    legacy_path = checkpoint / legacy_path
+                                paths = (legacy_path,)
+                            else:
+                                paths = tuple(
+                                    checkpoint / str(chunk["path"])
+                                    for chunk in record.get("chunks", [])
+                                    if isinstance(chunk, Mapping)
+                                )
+                            for path in paths:
+                                with path.open(newline="", encoding="utf-8") as stream:
+                                    reader = csv.DictReader(stream)
+                                    for row in reader:
+                                        writer.writerow(row)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    os.replace(temporary_output, destination)
+                except BaseException:
+                    temporary_output.unlink(missing_ok=True)
+                    raise
+                final = {
+                    **provenance,
+                    "provenance": provenance,
+                    "status": "completed",
+                    "output_path": str(destination),
+                    "output_sha256": _sha256(destination),
+                    "rows_written": rows_written,
+                    "completed_units": completed_units,
+                    "completed_groups": sorted(completed_groups),
+                    "completed_od_cells": completed_cells,
+                }
+                if "migration" in state:
+                    final["migration"] = state["migration"]
+                state.update(final)
+                _atomic_json(state_path, final)
+                _progress_event(
+                    status="completed",
+                    group=None,
+                    shard_index=None,
+                    completed_groups=len(completed_groups),
+                    completed_group_cells=None,
+                    total_group_cells=None,
+                    completed_cells=completed_cells,
+                    rows=rows_written,
+                    elapsed=float(state.get("elapsed_seconds", elapsed_before + perf_counter() - run_started)),
+                    durable=True,
+                    resumed=resumed,
+                )
+                return final
+        except BaseException as error:
+            if state.get("status") == "completed":
                 raise
-            completed[unit_key] = {"path": str(unit_path), "rows": unit_rows, "sha256": _sha256(unit_path)}
-            rows_written = sum(int(item.get("rows", 0)) for item in completed.values() if isinstance(item, Mapping))
-            state.update({"status": "running", "completed_units": completed, "rows_written": rows_written})
+            state.update({
+                "status": "interrupted"
+                if guard.requested or isinstance(error, (ODSectionPlanInterrupted, KeyboardInterrupt, InterruptedError))
+                else "failed",
+                "completed_units": completed_units,
+                "completed_groups": sorted(completed_groups),
+                "rows_written": rows_written,
+                "completed_od_cells": completed_cells,
+                "total_od_cells": total_active_cells,
+                "elapsed_seconds": elapsed_before + perf_counter() - run_started,
+                "last_error": str(error),
+            })
             _atomic_json(state_path, state)
             if progress is not None:
-                progress({"group": group, "groups_completed": len(completed), "total_groups": total_groups, "rows_written": rows_written, "elapsed_seconds": perf_counter() - started})
-    temporary_output = destination.with_name(f".{destination.name}.tmp")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with temporary_output.open("w", newline="", encoding="utf-8") as output:
-            writer = csv.DictWriter(output, fieldnames=list(_ROUTE_FLOW_COLUMNS), extrasaction="raise")
-            writer.writeheader()
-            for group in range(total_groups):
-                unit_path = units_directory / f"group-{group:08d}.csv"
-                if not unit_path.exists() or _sha256(unit_path) != completed[str(group)]["sha256"]:
-                    raise ValueError(f"OD section export unit {group} is missing or corrupt.")
-                with unit_path.open(newline="", encoding="utf-8") as stream:
-                    reader = csv.DictReader(stream)
-                    for row in reader:
-                        writer.writerow(row)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary_output, destination)
-    except BaseException:
-        temporary_output.unlink(missing_ok=True)
-        raise
-    final = {
-        **provenance,
-        "status": "completed",
-        "output_path": str(destination),
-        "output_sha256": _sha256(destination),
-        "rows_written": rows_written,
-        "completed_units": completed,
-    }
-    _atomic_json(state_path, final)
-    if progress is not None:
-        progress({"status": "completed", "groups_completed": total_groups, "total_groups": total_groups, "rows_written": rows_written, "elapsed_seconds": perf_counter() - started})
-    return final
+                _progress_event(
+                    status=state["status"],
+                    group=None,
+                    shard_index=None,
+                    completed_groups=len(completed_groups),
+                    completed_group_cells=None,
+                    total_group_cells=None,
+                    completed_cells=completed_cells,
+                    rows=rows_written,
+                    elapsed=float(state["elapsed_seconds"]),
+                    durable=True,
+                    resumed=resumed,
+                    error=str(error),
+                )
+            raise
+
+    checkpoint.mkdir(parents=True, exist_ok=True)
+    with _PlanCheckpointLock(checkpoint):
+        return _run()
 
 
 # Naming aliases matching the existing gravity route-flow export facade.
@@ -1211,6 +1710,8 @@ __all__ = [
     "EXPORT_SCHEMA_VERSION",
     "PLAN_ALGORITHM_VERSION",
     "PLAN_CHECKPOINT_SCHEMA_VERSION",
+    "EXPORT_CHECKPOINT_SCHEMA_VERSION",
+    "EXPORT_CHECKPOINT_ALGORITHM_VERSION",
     "ODSectionCell",
     "ODSectionExportPlan",
     "ODSectionPlanCheckpointError",

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
+import shutil
 from dataclasses import replace
 
 import jax.numpy as jnp
@@ -25,6 +27,10 @@ from public_transportation.inference.sharded_fixed_routing import (
     build_sharded_fixed_routing_inputs,
     save_fixed_routing_shard,
 )
+
+
+def _sha256_file_for_test(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _problem(tmp_path):
@@ -325,11 +331,11 @@ def test_export_resumes_from_verified_group_unit(tmp_path):
             fit_assignment_fingerprint="fit-123",
             ride_link_metadata=metadata,
             progress=lambda event: (_ for _ in ()).throw(RuntimeError("stop"))
-            if event["group"] == 0
+            if event["group"] == 0 and event["status"] == "chunk_checkpointed"
             else None,
         )
-    # The unit was durably published before the progress callback ran.
-    assert (tmp_path / "checkpoint" / "units" / "group-00000000.csv").exists()
+    # The first bounded chunk was durably published before the progress callback ran.
+    assert (tmp_path / "checkpoint" / "units" / "group-00000000" / "chunk-00000000.csv").exists()
     result = export_od_section_marginals(
         assignment_inputs=inputs,
         routing=routing,
@@ -341,3 +347,121 @@ def test_export_resumes_from_verified_group_unit(tmp_path):
         ride_link_metadata=metadata,
     )
     assert result["rows_written"] == 4
+
+
+def test_within_group_chunks_report_eta_and_preserve_final_checksum(tmp_path):
+    inputs, routing, metadata, cells = _problem(tmp_path)
+    events: list[dict[str, object]] = []
+    export_od_section_marginals(
+        assignment_inputs=inputs,
+        routing=routing,
+        fitted_demand=np.asarray([10.0, 5.0]),
+        od_cells=cells,
+        output_path=tmp_path / "complete.csv",
+        checkpoint_directory=tmp_path / "complete-checkpoint",
+        fit_assignment_fingerprint="fit-123",
+        ride_link_metadata=metadata,
+        od_chunk_size=1,
+        progress_interval_seconds=0.0,
+        progress=lambda event: events.append(dict(event)),
+    )
+    durable = [event for event in events if event["status"] == "chunk_checkpointed"]
+    assert durable
+    assert durable[0]["estimated_remaining_seconds"] is not None
+    assert durable[0]["eta_confidence"] == "low"
+    assert durable[0]["completed_group_od_cells"] == 1
+
+    interrupted_checkpoint = tmp_path / "interrupted-checkpoint"
+
+    def stop_after_first_chunk(event):
+        if event["status"] == "chunk_checkpointed" and event["chunk_index"] == 0:
+            raise ODSectionPlanInterrupted("stop after first chunk")
+
+    with pytest.raises(ODSectionPlanInterrupted):
+        export_od_section_marginals(
+            assignment_inputs=inputs,
+            routing=routing,
+            fitted_demand=np.asarray([10.0, 5.0]),
+            od_cells=cells,
+            output_path=tmp_path / "resumed.csv",
+            checkpoint_directory=interrupted_checkpoint,
+            fit_assignment_fingerprint="fit-123",
+            ride_link_metadata=metadata,
+            od_chunk_size=1,
+            progress=stop_after_first_chunk,
+        )
+    resumed = export_od_section_marginals(
+        assignment_inputs=inputs,
+        routing=routing,
+        fitted_demand=np.asarray([10.0, 5.0]),
+        od_cells=cells,
+        output_path=tmp_path / "resumed.csv",
+        checkpoint_directory=interrupted_checkpoint,
+        fit_assignment_fingerprint="fit-123",
+        ride_link_metadata=metadata,
+        od_chunk_size=1,
+        progress=lambda _event: None,
+    )
+    assert resumed["output_sha256"] == _sha256_file_for_test(tmp_path / "complete.csv")
+
+
+def test_legacy_group_checkpoint_is_migrated_safely(tmp_path):
+    inputs, routing, metadata, cells = _problem(tmp_path)
+    source = export_od_section_marginals(
+        assignment_inputs=inputs,
+        routing=routing,
+        fitted_demand=np.asarray([10.0, 5.0]),
+        od_cells=cells,
+        output_path=tmp_path / "source.csv",
+        checkpoint_directory=tmp_path / "source-checkpoint",
+        fit_assignment_fingerprint="fit-123",
+        ride_link_metadata=metadata,
+    )
+    legacy = tmp_path / "legacy-checkpoint"
+    legacy_units = legacy / "units"
+    legacy_units.mkdir(parents=True)
+    legacy_group = legacy_units / "group-00000000.csv"
+    shutil.copyfile(tmp_path / "source.csv", legacy_group)
+    current_state = json.loads((tmp_path / "source-checkpoint" / "manifest.json").read_text())
+    old_provenance = {
+        key: value
+        for key, value in current_state["provenance"].items()
+        if key in {
+            "schema_version",
+            "routing_preparation_fingerprint",
+            "fit_assignment_fingerprint",
+            "fitted_demand_fingerprint",
+            "routing_cache_directory",
+            "routing_cache_identity",
+            "num_od",
+            "num_destination_groups",
+            "num_ride_links",
+        }
+    }
+    legacy_state = {
+        "status": "completed",
+        "completed_units": {
+            "0": {
+                "path": str(legacy_group),
+                "rows": int(source["rows_written"]),
+                "sha256": _sha256_file_for_test(legacy_group),
+            }
+        },
+        "rows_written": int(source["rows_written"]),
+        **old_provenance,
+    }
+    legacy.mkdir(parents=True, exist_ok=True)
+    (legacy / "manifest.json").write_text(json.dumps(legacy_state), encoding="utf-8")
+    migrated = export_od_section_marginals(
+        assignment_inputs=inputs,
+        routing=routing,
+        fitted_demand=np.asarray([10.0, 5.0]),
+        od_cells=cells,
+        output_path=tmp_path / "migrated.csv",
+        checkpoint_directory=legacy,
+        fit_assignment_fingerprint="fit-123",
+        ride_link_metadata=metadata,
+    )
+    assert migrated["output_sha256"] == _sha256_file_for_test(tmp_path / "source.csv")
+    migrated_state = json.loads((legacy / "manifest.json").read_text())
+    assert migrated_state["migration"] == "verified_group_units_to_chunked_checkpoint"

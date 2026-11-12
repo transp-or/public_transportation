@@ -192,7 +192,7 @@ enumerated passenger route and not an exact transfer-count distribution.
 
 The producer validates the assignment identity, every routing-shard descriptor
 and content hash, and the canonical/compact OD ordering before consuming the
-fit. It writes one durable checkpoint unit per destination group and publishes
+fit. It writes bounded durable checkpoints within each destination group and publishes
 the final CSV atomically. A representative dry-run/pilot should be recorded
 before scheduling the full export; no routing preparation or model estimation
 is triggered by this API.
@@ -204,6 +204,14 @@ resume validates the schema, algorithm version, scientific-input identity, and
 pilot settings before skipping verified groups. The completed checkpoint is
 distinct from the private case runner's final `status: awaiting_review` plan
 file, so interrupted pilots cannot be approved accidentally.
+
+The export itself accepts `od_chunk_size` and
+`progress_interval_seconds`. Each chunk is fsynced and then recorded in the
+checkpoint manifest with its OD range, row count, elapsed time, and checksum.
+Progress callbacks distinguish non-durable OD traversal heartbeats from
+`chunk_checkpointed` events and include inner-cell counts, rolling ETA, and ETA
+confidence. Existing verified group-level checkpoints are migrated as legacy
+completed units; uncommitted groups are recomputed safely.
 
 `query_section_od` streams the selected interval and section only, and pages
 the returned rows without truncating the underlying contributor data. Older
