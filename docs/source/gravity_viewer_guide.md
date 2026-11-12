@@ -213,6 +213,12 @@ Progress callbacks distinguish non-durable OD traversal heartbeats from
 confidence. Existing verified group-level checkpoints are migrated as legacy
 completed units; uncommitted groups are recomputed safely.
 
+By default, the exporter uses the same batched forward-reachability and edge
+gather kernels as the linear-mapping builder: one graph traversal serves a
+bounded batch of OD origins, while output remains streamed in the existing
+chunk order. Set `use_vectorized_route_kernel=False` only for a scalar
+reference comparison; this does not change the scientific flow semantics.
+
 `query_section_od` streams the selected interval and section only, and pages
 the returned rows without truncating the underlying contributor data. Older
 schema-1 bundles explicitly report section data as unavailable and continue to

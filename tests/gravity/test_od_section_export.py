@@ -147,6 +147,104 @@ def test_expected_od_section_marginals_match_hand_calculation(tmp_path):
     assert sum(float(row["assigned_demand"]) for row in rows if row["trip_id"] == "T2") == pytest.approx(6.0, rel=1e-6)
 
 
+def test_vectorized_route_kernel_matches_scalar_reference(tmp_path):
+    inputs, routing, metadata, cells = _problem(tmp_path / "vectorized")
+    vectorized = export_od_section_marginals(
+        assignment_inputs=inputs,
+        routing=routing,
+        fitted_demand=np.asarray([10.0, 5.0]),
+        od_cells=cells,
+        output_path=tmp_path / "vectorized.csv",
+        checkpoint_directory=tmp_path / "vectorized-checkpoint",
+        fit_assignment_fingerprint="fit-123",
+        ride_link_metadata=metadata,
+        use_vectorized_route_kernel=True,
+    )
+    scalar_inputs, scalar_routing, scalar_metadata, scalar_cells = _problem(
+        tmp_path / "scalar"
+    )
+    scalar = export_od_section_marginals(
+        assignment_inputs=scalar_inputs,
+        routing=scalar_routing,
+        fitted_demand=np.asarray([10.0, 5.0]),
+        od_cells=scalar_cells,
+        output_path=tmp_path / "scalar.csv",
+        checkpoint_directory=tmp_path / "scalar-checkpoint",
+        fit_assignment_fingerprint="fit-123",
+        ride_link_metadata=scalar_metadata,
+        use_vectorized_route_kernel=False,
+    )
+    assert vectorized["rows_written"] == scalar["rows_written"]
+    with (tmp_path / "vectorized.csv").open(newline="", encoding="utf-8") as stream:
+        vectorized_rows = list(csv.DictReader(stream))
+    with (tmp_path / "scalar.csv").open(newline="", encoding="utf-8") as stream:
+        scalar_rows = list(csv.DictReader(stream))
+    assert [row["trip_id"] for row in vectorized_rows] == [
+        row["trip_id"] for row in scalar_rows
+    ]
+    assert [float(row["assigned_demand"]) for row in vectorized_rows] == pytest.approx(
+        [float(row["assigned_demand"]) for row in scalar_rows], rel=1e-6
+    )
+
+
+def test_vectorized_resume_reuses_scalar_checkpoint_units(tmp_path):
+    inputs, routing, metadata, cells = _problem(tmp_path / "interrupted")
+
+    def interrupt(event):
+        if event["status"] == "chunk_checkpointed" and event["chunk_index"] == 0:
+            raise ODSectionPlanInterrupted("stop after scalar chunk")
+
+    with pytest.raises(ODSectionPlanInterrupted):
+        export_od_section_marginals(
+            assignment_inputs=inputs,
+            routing=routing,
+            fitted_demand=np.asarray([10.0, 5.0]),
+            od_cells=cells,
+            output_path=tmp_path / "resumed.csv",
+            checkpoint_directory=tmp_path / "checkpoint",
+            fit_assignment_fingerprint="fit-123",
+            ride_link_metadata=metadata,
+            od_chunk_size=1,
+            use_vectorized_route_kernel=False,
+            progress=interrupt,
+        )
+    resumed = export_od_section_marginals(
+        assignment_inputs=inputs,
+        routing=routing,
+        fitted_demand=np.asarray([10.0, 5.0]),
+        od_cells=cells,
+        output_path=tmp_path / "resumed.csv",
+        checkpoint_directory=tmp_path / "checkpoint",
+        fit_assignment_fingerprint="fit-123",
+        ride_link_metadata=metadata,
+        od_chunk_size=1,
+        use_vectorized_route_kernel=True,
+    )
+    uninterrupted_inputs, uninterrupted_routing, uninterrupted_metadata, uninterrupted_cells = _problem(
+        tmp_path / "uninterrupted"
+    )
+    uninterrupted = export_od_section_marginals(
+        assignment_inputs=uninterrupted_inputs,
+        routing=uninterrupted_routing,
+        fitted_demand=np.asarray([10.0, 5.0]),
+        od_cells=uninterrupted_cells,
+        output_path=tmp_path / "uninterrupted.csv",
+        checkpoint_directory=tmp_path / "uninterrupted-checkpoint",
+        fit_assignment_fingerprint="fit-123",
+        ride_link_metadata=uninterrupted_metadata,
+        od_chunk_size=1,
+        use_vectorized_route_kernel=False,
+    )
+    assert resumed["rows_written"] == uninterrupted["rows_written"]
+    with (tmp_path / "resumed.csv").open(newline="", encoding="utf-8") as stream:
+        resumed_rows = list(csv.DictReader(stream))
+    with (tmp_path / "uninterrupted.csv").open(newline="", encoding="utf-8") as stream:
+        uninterrupted_rows = list(csv.DictReader(stream))
+    assert [float(row["assigned_demand"]) for row in resumed_rows] == pytest.approx(
+        [float(row["assigned_demand"]) for row in uninterrupted_rows], rel=1e-6
+    )
+
+
 def test_export_rejects_incomplete_routing_shard(tmp_path):
     inputs, routing, metadata, cells = _problem(tmp_path)
     (tmp_path / "routing" / "routing-shard-000000.npz").unlink()

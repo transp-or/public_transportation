@@ -1,9 +1,10 @@
 """Restartable export of expected OD use of scheduled ride sections.
 
 The fixed-routing cache stores one outgoing-link probability vector per
-destination group.  This module replays those probabilities for one OD cell at
-a time and writes sparse ``service_marginal`` rows for the scheduled ride
+destination group.  This module replays those probabilities in bounded OD
+batches and writes sparse ``service_marginal`` rows for the scheduled ride
 links.  It deliberately does not reconstruct passenger paths or run routing.
+The scalar cell-by-cell traversal remains available as a diagnostic reference.
 """
 
 from __future__ import annotations
@@ -14,8 +15,8 @@ import json
 import os
 import signal
 import tempfile
-from collections.abc import Mapping, Sequence
 from collections import deque
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import perf_counter
@@ -556,6 +557,129 @@ def _group_ride_probabilities(
             )
             last_progress = now
     return result
+
+
+@dataclass(slots=True)
+class _VectorizedRouteRunner:
+    """Batch the same forward reachability pass used by linear-map construction."""
+
+    batch_size: int
+    edge_block_size: int
+    section_links: np.ndarray
+    reach_kernel: Any
+    gather_kernel: Any
+    graph_arrays: tuple[Any, ...]
+    tail: Any
+    jax: Any
+    jnp: Any
+
+    # Match the default OD dispatch size and support-edge block used by the
+    # linear-mapping builder.  The cap keeps the retained reachability matrix
+    # bounded even when an output checkpoint chunk is configured larger.
+    MAX_BATCH_SIZE = 128
+    EDGE_BLOCK_SIZE = 2048
+
+    @classmethod
+    def build(cls, *, graph: Any, batch_size: int) -> "_VectorizedRouteRunner":
+        # Keep the implementation shared with the sharded linear-mapping
+        # builder.  The kernels perform one graph traversal for a batch of OD
+        # origins, then gather only the ride links needed by the exporter.
+        from ..fixed_routing_sharded_builder import (
+            _make_edge_gather_kernel,
+            _make_forward_reachability_kernel,
+        )
+
+        import jax
+        import jax.numpy as jnp
+
+        link_type = np.asarray(graph.link_type)
+        ride = link_type == LINK_TYPE_RIDE
+        out_links = np.asarray(graph.out_links, dtype=np.int64)
+        out_mask = np.asarray(graph.out_mask, dtype=bool)
+        topo_order = np.asarray(graph.topo_order, dtype=np.int64)
+        ordered: list[int] = []
+        seen: set[int] = set()
+        for node in topo_order:
+            for link in out_links[int(node)][out_mask[int(node)]]:
+                link_index = int(link)
+                if ride[link_index] and link_index not in seen:
+                    seen.add(link_index)
+                    ordered.append(link_index)
+        return cls(
+            batch_size=int(batch_size),
+            edge_block_size=cls.EDGE_BLOCK_SIZE,
+            section_links=np.asarray(ordered, dtype=np.int32),
+            reach_kernel=_make_forward_reachability_kernel(
+                chunk_size=int(batch_size), num_nodes=int(graph.num_nodes)
+            ),
+            gather_kernel=_make_edge_gather_kernel(
+                chunk_size=int(batch_size), edge_block_size=cls.EDGE_BLOCK_SIZE
+            ),
+            graph_arrays=(
+                jnp.asarray(graph.topo_order),
+                jnp.asarray(graph.out_links),
+                jnp.asarray(graph.out_mask),
+                jnp.asarray(graph.head),
+            ),
+            tail=jnp.asarray(graph.tail),
+            jax=jax,
+            jnp=jnp,
+        )
+
+    def __call__(
+        self,
+        *,
+        origin_nodes: np.ndarray,
+        probability: np.ndarray,
+        enabled: np.ndarray,
+    ) -> list[dict[int, float]]:
+        count = int(origin_nodes.size)
+        if count <= 0 or count > self.batch_size:
+            raise ValueError("vectorized route batch has an invalid size")
+        selected = self.section_links[np.asarray(enabled[self.section_links], dtype=bool)]
+        results: list[dict[int, float]] = [dict() for _ in range(count)]
+        if selected.size == 0:
+            return results
+        padded_origins = np.zeros(self.batch_size, dtype=np.int32)
+        padded_origins[:count] = np.asarray(origin_nodes, dtype=np.int32)
+        valid = np.zeros(self.batch_size, dtype=bool)
+        valid[:count] = True
+        probability_device = self.jnp.asarray(probability)
+        enabled_device = self.jnp.asarray(enabled)
+        reach = self.reach_kernel(
+            self.jnp.asarray(padded_origins),
+            self.jnp.asarray(valid),
+            probability_device,
+            enabled_device,
+            *self.graph_arrays,
+        )
+        blocks: list[tuple[Any, np.ndarray]] = []
+        devices: list[Any] = []
+        for start in range(0, selected.size, self.edge_block_size):
+            links = selected[start : start + self.edge_block_size]
+            padded_links = np.zeros(self.edge_block_size, dtype=np.int32)
+            padded_links[: links.size] = links
+            link_mask = np.zeros(self.edge_block_size, dtype=bool)
+            link_mask[: links.size] = True
+            devices.append(
+                self.gather_kernel(
+                    reach,
+                    probability_device,
+                    enabled_device,
+                    self.jnp.asarray(padded_links),
+                    self.jnp.asarray(link_mask),
+                    self.tail,
+                )
+            )
+            blocks.append((devices[-1], links))
+        self.jax.block_until_ready(devices)
+        for device, links in blocks:
+            values = np.asarray(device)[:count, : links.size]
+            for local, result in enumerate(results):
+                nonzero = np.flatnonzero(values[local])
+                for position in nonzero:
+                    result[int(links[position])] = float(values[local, position])
+        return results
 
 
 def _plan_from_dict(payload: Mapping[str, object]) -> ODSectionExportPlan:
@@ -1131,6 +1255,7 @@ def export_od_section_marginals(
     zero_tolerance: float = 0.0,
     od_chunk_size: int = 256,
     progress_interval_seconds: float = 60.0,
+    use_vectorized_route_kernel: bool = True,
     progress: ODSectionProgress | None = None,
 ) -> dict[str, object]:
     """Export sparse expected OD use of ride sections with chunk checkpoints."""
@@ -1385,6 +1510,12 @@ def export_od_section_marginals(
                                     float(chunk.get("duration_seconds", 0.0)) / (od_stop - od_start)
                                 )
         resumed = bool(completed_units) or migrated
+        vectorized_runner = None
+        if use_vectorized_route_kernel:
+            vectorized_runner = _VectorizedRouteRunner.build(
+                graph=assignment_inputs.graph,
+                batch_size=min(int(od_chunk_size), _VectorizedRouteRunner.MAX_BATCH_SIZE),
+            )
         guard = _PlanSignalGuard()
         try:
             with guard:
@@ -1446,70 +1577,129 @@ def export_od_section_marginals(
                         )
                         probabilities = np.asarray(shard.group_link_probability[local])
                         enabled = np.asarray(shard.effective_group_link_mask[local], dtype=bool)
+
+                        def append_cell_rows(
+                            *,
+                            od_index: int,
+                            contributions: Mapping[int, float],
+                            rows: list[dict[str, object]],
+                        ) -> None:
+                            for link, probability in contributions.items():
+                                value = float(demand[od_index]) * probability
+                                if value <= zero_tolerance:
+                                    continue
+                                link_meta = metadata[link]
+                                rows.append(_route_flow_row({
+                                    "origin_stop_id": cells[od_index].origin_stop_id,
+                                    "destination_stop_id": cells[od_index].destination_stop_id,
+                                    "departure_time_bin": cells[od_index].departure_time_bin,
+                                    "line_id": link_meta.line_id,
+                                    "trip_id": link_meta.trip_id,
+                                    "boarding_stop_id": link_meta.boarding_stop_id,
+                                    "alighting_stop_id": link_meta.alighting_stop_id,
+                                    "assigned_demand": value,
+                                    "flow_semantics": "service_marginal",
+                                    "pattern_id": link_meta.pattern_id,
+                                    "direction": link_meta.direction,
+                                    "assignment_fingerprint": fit_fingerprint,
+                                }))
+
                         while next_cell < total_group_cells:
                             chunk_start = next_cell
                             chunk_rows: list[dict[str, object]] = []
                             chunk_started = perf_counter()
                             chunk_cells = min(total_group_cells, chunk_start + int(od_chunk_size))
-                            while next_cell < chunk_cells:
-                                od_index = int(local_indices[next_cell])
-                                od_started = perf_counter()
-
-                                def on_od_heartbeat(event: Mapping[str, object]) -> None:
+                            if vectorized_runner is not None:
+                                while next_cell < chunk_cells:
+                                    batch_start = next_cell
+                                    batch_stop = min(
+                                        chunk_cells,
+                                        batch_start + vectorized_runner.batch_size,
+                                    )
+                                    batch_indices = np.asarray(
+                                        local_indices[batch_start:batch_stop],
+                                        dtype=np.int64,
+                                    )
+                                    batch_started = perf_counter()
+                                    batch_contributions = vectorized_runner(
+                                        origin_nodes=np.asarray(origins[batch_indices], dtype=np.int32),
+                                        probability=probabilities,
+                                        enabled=enabled,
+                                    )
+                                    batch_duration = perf_counter() - batch_started
+                                    for local_batch, od_index in enumerate(batch_indices):
+                                        append_cell_rows(
+                                            od_index=int(od_index),
+                                            contributions=batch_contributions[local_batch],
+                                            rows=chunk_rows,
+                                        )
+                                    count = batch_stop - batch_start
+                                    cell_durations.extend([batch_duration / count] * count)
+                                    completed_cells += count
+                                    next_cell = batch_stop
                                     guard.check()
-                                    heartbeat_fields = {
-                                        key: value
-                                        for key, value in event.items()
-                                        if key not in {"status", "durable_checkpoint"}
-                                    }
                                     _progress_event(
-                                        status="od_heartbeat",
+                                        status="od_batch_completed",
                                         group=group,
                                         shard_index=descriptor.shard_index,
                                         completed_groups=len(completed_groups),
                                         completed_group_cells=next_cell,
                                         total_group_cells=total_group_cells,
                                         completed_cells=completed_cells,
-                                        rows=rows_written,
+                                        rows=rows_written + len(chunk_rows),
                                         elapsed=elapsed_before + perf_counter() - run_started,
-                                        cell=next_cell,
+                                        cell=next_cell - 1,
+                                        current_od_index=int(batch_indices[-1]),
                                         resumed=resumed,
-                                        current_od_index=od_index,
-                                        **heartbeat_fields,
+                                        batch_size=count,
+                                        vectorized_route_kernel=True,
                                     )
+                            else:
+                                while next_cell < chunk_cells:
+                                    od_index = int(local_indices[next_cell])
+                                    od_started = perf_counter()
 
-                                contributions = _group_ride_probabilities(
-                                    graph=assignment_inputs.graph,
-                                    probability=probabilities,
-                                    enabled=enabled,
-                                    origin_node=int(origins[od_index]),
-                                    progress=on_od_heartbeat,
-                                    progress_interval_seconds=progress_interval_seconds,
-                                )
-                                for link, probability in contributions.items():
-                                    value = float(demand[od_index]) * probability
-                                    if value <= zero_tolerance:
-                                        continue
-                                    link_meta = metadata[link]
-                                    chunk_rows.append(_route_flow_row({
-                                        "origin_stop_id": cells[od_index].origin_stop_id,
-                                        "destination_stop_id": cells[od_index].destination_stop_id,
-                                        "departure_time_bin": cells[od_index].departure_time_bin,
-                                        "line_id": link_meta.line_id,
-                                        "trip_id": link_meta.trip_id,
-                                        "boarding_stop_id": link_meta.boarding_stop_id,
-                                        "alighting_stop_id": link_meta.alighting_stop_id,
-                                        "assigned_demand": value,
-                                        "flow_semantics": "service_marginal",
-                                        "pattern_id": link_meta.pattern_id,
-                                        "direction": link_meta.direction,
-                                        "assignment_fingerprint": fit_fingerprint,
-                                    }))
-                                cell_duration = perf_counter() - od_started
-                                cell_durations.append(cell_duration)
-                                completed_cells += 1
-                                next_cell += 1
-                                guard.check()
+                                    def on_od_heartbeat(event: Mapping[str, object]) -> None:
+                                        guard.check()
+                                        heartbeat_fields = {
+                                            key: value
+                                            for key, value in event.items()
+                                            if key not in {"status", "durable_checkpoint"}
+                                        }
+                                        _progress_event(
+                                            status="od_heartbeat",
+                                            group=group,
+                                            shard_index=descriptor.shard_index,
+                                            completed_groups=len(completed_groups),
+                                            completed_group_cells=next_cell,
+                                            total_group_cells=total_group_cells,
+                                            completed_cells=completed_cells,
+                                            rows=rows_written,
+                                            elapsed=elapsed_before + perf_counter() - run_started,
+                                            cell=next_cell,
+                                            resumed=resumed,
+                                            current_od_index=od_index,
+                                            **heartbeat_fields,
+                                        )
+
+                                    contributions = _group_ride_probabilities(
+                                        graph=assignment_inputs.graph,
+                                        probability=probabilities,
+                                        enabled=enabled,
+                                        origin_node=int(origins[od_index]),
+                                        progress=on_od_heartbeat,
+                                        progress_interval_seconds=progress_interval_seconds,
+                                    )
+                                    append_cell_rows(
+                                        od_index=od_index,
+                                        contributions=contributions,
+                                        rows=chunk_rows,
+                                    )
+                                    cell_duration = perf_counter() - od_started
+                                    cell_durations.append(cell_duration)
+                                    completed_cells += 1
+                                    next_cell += 1
+                                    guard.check()
                             chunk_duration = perf_counter() - chunk_started
                             chunk_path = units_directory / f"group-{group:08d}" / f"chunk-{len(chunks):08d}.csv"
                             chunk_sha = _write_chunk_csv(chunk_path, chunk_rows)
