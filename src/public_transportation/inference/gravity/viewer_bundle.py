@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -47,6 +48,12 @@ from .measurement_od_contributions import (
     validate_dataset as _validate_measurement_od_dataset,
     write_measurement_od_contributions_dataset,
 )
+from .measurement_location_lookup import (
+    MEASUREMENT_LOCATION_COLUMNS,
+    read_measurement_location_manifest,
+    validate_measurement_location_lookup,
+    write_measurement_location_lookup,
+)
 
 
 GRAVITY_VIEWER_BUNDLE_SCHEMA_VERSION = 1
@@ -62,10 +69,8 @@ _ROUTE_FLOW_PARTITION_ROOT = "partitions/route_flows"
 _ROUTE_SECTION_PARTITION_ROOT = "partitions/route_sections"
 _SECTION_LOAD_PARTITION_ROOT = "partitions/section_loads"
 _MEASUREMENT_OD_QUERY_LIMIT = 5_000
-_IDENTIFIABILITY_MESSAGE = (
-    "OD identifiability diagnostics were not available; inference_score remains "
-    "only a structural fixed/free indicator."
-)
+_MEASUREMENT_LOCATION_PAGE_LIMIT = 500
+_IDENTIFIABILITY_MESSAGE = "OD identifiability diagnostics were not available; inference_score remains only a structural fixed/free indicator."
 _TABLE_FILES = (
     "full_od.csv",
     "predicted_measurements.csv",
@@ -106,8 +111,18 @@ _PREDICTED_COLUMNS = (
     "observed",
     "modeled",
 )
-_RESIDUAL_COLUMNS = (*_PREDICTED_COLUMNS, "residual", "variance", "standardized_residual")
-_PARAMETER_COLUMNS = ("parameter_index", "parameter_name", "raw_value", "physical_value")
+_RESIDUAL_COLUMNS = (
+    *_PREDICTED_COLUMNS,
+    "residual",
+    "variance",
+    "standardized_residual",
+)
+_PARAMETER_COLUMNS = (
+    "parameter_index",
+    "parameter_name",
+    "raw_value",
+    "physical_value",
+)
 _OD_MAP_COLUMNS = (
     "origin_stop_id",
     "destination_stop_id",
@@ -312,9 +327,7 @@ def _finite_optional(value: object) -> str:
 def _route_flow_row(raw: Mapping[str, object]) -> dict[str, object]:
     """Normalize one sparse route-flow record without changing its semantics."""
     if "minimum_transfers" in raw:
-        raise ValueError(
-            "minimum_transfers is a demand feature and cannot be used as route-flow transfer_count."
-        )
+        raise ValueError("minimum_transfers is a demand feature and cannot be used as route-flow transfer_count.")
     aliases = {
         "origin": "origin_stop_id",
         "destination": "destination_stop_id",
@@ -341,11 +354,7 @@ def _route_flow_row(raw: Mapping[str, object]) -> dict[str, object]:
                     value = raw[alias]
                     break
         values[column] = value
-    missing = [
-        column
-        for column in _ROUTE_FLOW_REQUIRED_COLUMNS
-        if values[column] is None or str(values[column]).strip() == ""
-    ]
+    missing = [column for column in _ROUTE_FLOW_REQUIRED_COLUMNS if values[column] is None or str(values[column]).strip() == ""]
     if missing:
         raise ValueError("route-flow row is missing required fields: " + ", ".join(missing))
     semantics = str(values["flow_semantics"]).strip()
@@ -356,10 +365,7 @@ def _route_flow_row(raw: Mapping[str, object]) -> dict[str, object]:
     }.get(semantics, semantics)
     allowed = {"path_probability", "service_marginal", "passenger_leg_usage"}
     if semantics not in allowed:
-        raise ValueError(
-            "flow_semantics must be path_probability, service_marginal, "
-            "or passenger_leg_usage."
-        )
+        raise ValueError("flow_semantics must be path_probability, service_marginal, or passenger_leg_usage.")
     assigned = float(values["assigned_demand"])
     if not np.isfinite(assigned) or assigned < 0:
         raise ValueError("assigned_demand must be a finite non-negative number.")
@@ -390,9 +396,7 @@ def _route_flow_row(raw: Mapping[str, object]) -> dict[str, object]:
         "route_leg_index": str(values["route_leg_index"] or ""),
         "route_leg_count": str(values["route_leg_count"] or ""),
         "route_legs": (
-            json.dumps(values["route_legs"], separators=(",", ":"))
-            if isinstance(values["route_legs"], (list, tuple))
-            else str(values["route_legs"] or "")
+            json.dumps(values["route_legs"], separators=(",", ":")) if isinstance(values["route_legs"], (list, tuple)) else str(values["route_legs"] or "")
         ),
         "assigned_demand": format(assigned, ".17g"),
         "path_share": path_share,
@@ -479,10 +483,7 @@ def _write_partitioned_table(
         descriptors.append(
             {
                 "key": next(
-                    (
-                        str(row.get(partition_field, "") or "unassigned")
-                        for row in _iter_csv_rows(path)
-                    ),
+                    (str(row.get(partition_field, "") or "unassigned") for row in _iter_csv_rows(path)),
                     "unassigned",
                 ),
                 "path": path.relative_to(destination.parent.parent).as_posix(),
@@ -499,9 +500,9 @@ def _network_column(fieldnames: Sequence[str], candidates: Sequence[str]) -> str
     return _first_column(fieldnames, candidates)
 
 
-def _read_network_patterns(root: Path) -> tuple[
-    dict[str, dict[str, object]], dict[str, tuple[str, ...]], dict[tuple[str, str], str]
-]:
+def _read_network_patterns(
+    root: Path,
+) -> tuple[dict[str, dict[str, object]], dict[str, tuple[str, ...]], dict[tuple[str, str], str]]:
     """Return validated trip patterns, ordered stops, and trip-to-pattern IDs."""
     network = root / "network"
     trips_path = network / "trips.csv"
@@ -552,12 +553,24 @@ def _read_network_patterns(root: Path) -> tuple[
         if len(sequence) < 2:
             continue
         line, direction, shape_id = trip_meta.get(trip, ("", "", ""))
-        key = canonical_json({"line_id": line, "direction": direction, "shape_id": shape_id, "stops": sequence})
+        key = canonical_json(
+            {
+                "line_id": line,
+                "direction": direction,
+                "shape_id": shape_id,
+                "stops": sequence,
+            }
+        )
         pattern_id = "p-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
         patterns.setdefault(
             pattern_id,
-            {"line_id": line, "direction": direction, "shape_id": shape_id,
-             "stops": sequence, "trips": []},
+            {
+                "line_id": line,
+                "direction": direction,
+                "shape_id": shape_id,
+                "stops": sequence,
+                "trips": [],
+            },
         )["trips"].append(trip)
         trip_patterns[(trip, line)] = pattern_id
         trip_sequences[trip] = sequence
@@ -614,7 +627,8 @@ def _write_line_geometry(staging: Path) -> dict[str, object]:
                 grouped_shapes.setdefault(str(row[shape_id_field]), []).append((sequence, ordinal, point))
             shape_geometries = {
                 key: [point for _sequence, _ordinal, point in sorted(points, key=lambda item: (item[0], item[1]))]
-                for key, points in grouped_shapes.items() if len(points) >= 2
+                for key, points in grouped_shapes.items()
+                if len(points) >= 2
             }
     catalog_rows: list[dict[str, object]] = []
     features: list[dict[str, object]] = []
@@ -624,8 +638,14 @@ def _write_line_geometry(staging: Path) -> dict[str, object]:
         direction = str(pattern.get("direction", ""))
         for index, (from_stop, to_stop) in enumerate(zip(stops, stops[1:], strict=False)):
             section_key = canonical_json(
-                {"line_id": line, "pattern_id": pattern_id, "direction": direction,
-                 "sequence": index, "from_stop_id": from_stop, "to_stop_id": to_stop}
+                {
+                    "line_id": line,
+                    "pattern_id": pattern_id,
+                    "direction": direction,
+                    "sequence": index,
+                    "from_stop_id": from_stop,
+                    "to_stop_id": to_stop,
+                }
             )
             section_id = "s-" + hashlib.sha256(section_key.encode("utf-8")).hexdigest()[:20]
             from_xy = coordinates.get(from_stop)
@@ -637,34 +657,66 @@ def _write_line_geometry(staging: Path) -> dict[str, object]:
                 geometry = {"type": "LineString", "coordinates": shape_points}
                 geometry_mode = "source_route_shape"
             elif from_xy is not None and to_xy is not None:
-                geometry = {"type": "LineString", "coordinates": [list(from_xy), list(to_xy)]}
+                geometry = {
+                    "type": "LineString",
+                    "coordinates": [list(from_xy), list(to_xy)],
+                }
                 geometry_mode = "stop_to_stop_approximation"
             else:
                 geometry_mode = "unavailable"
             if geometry is not None:
                 features.append(
-                    {"type": "Feature", "id": section_id,
-                     "properties": {"section_id": section_id, "line_id": line,
-                                    "pattern_id": pattern_id, "direction": direction,
-                                    "sequence": index, "from_stop_id": from_stop,
-                                    "to_stop_id": to_stop, "geometry_mode": geometry_mode},
-                     "geometry": geometry}
+                    {
+                        "type": "Feature",
+                        "id": section_id,
+                        "properties": {
+                            "section_id": section_id,
+                            "line_id": line,
+                            "pattern_id": pattern_id,
+                            "direction": direction,
+                            "sequence": index,
+                            "from_stop_id": from_stop,
+                            "to_stop_id": to_stop,
+                            "geometry_mode": geometry_mode,
+                        },
+                        "geometry": geometry,
+                    }
                 )
             catalog_rows.append(
-                {"section_id": section_id, "line_id": line, "pattern_id": pattern_id,
-                 "direction": direction, "sequence": index, "from_stop_id": from_stop,
-                 "to_stop_id": to_stop, "geometry_ref": section_id if geometry else ""}
+                {
+                    "section_id": section_id,
+                    "line_id": line,
+                    "pattern_id": pattern_id,
+                    "direction": direction,
+                    "sequence": index,
+                    "from_stop_id": from_stop,
+                    "to_stop_id": to_stop,
+                    "geometry_ref": section_id if geometry else "",
+                }
             )
     geometry_dir = staging / "line_geometry"
     geometry_dir.mkdir(parents=True, exist_ok=True)
-    _write_csv(geometry_dir / "sections.csv", (
-        "section_id", "line_id", "pattern_id", "direction", "sequence",
-        "from_stop_id", "to_stop_id", "geometry_ref"
-    ), catalog_rows)
+    _write_csv(
+        geometry_dir / "sections.csv",
+        (
+            "section_id",
+            "line_id",
+            "pattern_id",
+            "direction",
+            "sequence",
+            "from_stop_id",
+            "to_stop_id",
+            "geometry_ref",
+        ),
+        catalog_rows,
+    )
     _write_json(
         geometry_dir / "lines.geojson",
-        {"type": "FeatureCollection", "geometry_mode": "stop_to_stop_approximation",
-         "features": features},
+        {
+            "type": "FeatureCollection",
+            "geometry_mode": "stop_to_stop_approximation",
+            "features": features,
+        },
     )
     catalog_path = geometry_dir / "sections.csv"
     geometry_path = geometry_dir / "lines.geojson"
@@ -672,8 +724,7 @@ def _write_line_geometry(staging: Path) -> dict[str, object]:
         "available": bool(catalog_rows),
         "schema_version": GRAVITY_VIEWER_ROUTE_SECTION_SCHEMA_VERSION,
         "geometry_mode": "source_route_shape" if shape_geometries else "stop_to_stop_approximation",
-        "message": ("validated source route-shape geometry" if shape_geometries else
-                    "straight stop-to-stop approximation; not a road-following vehicle shape"),
+        "message": ("validated source route-shape geometry" if shape_geometries else "straight stop-to-stop approximation; not a road-following vehicle shape"),
         "catalog_path": "line_geometry/sections.csv",
         "geometry_path": "line_geometry/lines.geojson",
         "catalog_sha256": _sha256(catalog_path),
@@ -700,7 +751,14 @@ def _write_route_section_products(staging: Path, geometry: Mapping[str, object])
     for row in _iter_csv_rows(staging / str(geometry["catalog_path"])):
         section_id = str(row["section_id"])
         section_meta[section_id] = dict(row)
-        section_lookup[(str(row["line_id"]), str(row["pattern_id"]), str(row["from_stop_id"]), str(row["to_stop_id"]))] = section_id
+        section_lookup[
+            (
+                str(row["line_id"]),
+                str(row["pattern_id"]),
+                str(row["from_stop_id"]),
+                str(row["to_stop_id"]),
+            )
+        ] = section_id
     contributors_dir = staging / _ROUTE_SECTION_PARTITION_ROOT
     loads_dir = staging / _SECTION_LOAD_PARTITION_ROOT
     contributors_dir.mkdir(parents=True, exist_ok=True)
@@ -714,8 +772,7 @@ def _write_route_section_products(staging: Path, geometry: Mapping[str, object])
     load_db_path = contributors_dir / ".section_loads.sqlite"
     load_db = sqlite3.connect(load_db_path)
     load_db.execute(
-        "CREATE TABLE section_od (bin TEXT, section_id TEXT, origin TEXT, destination TEXT, assigned REAL, "
-        "PRIMARY KEY (bin, section_id, origin, destination))"
+        "CREATE TABLE section_od (bin TEXT, section_id TEXT, origin TEXT, destination TEXT, assigned REAL, PRIMARY KEY (bin, section_id, origin, destination))"
     )
     try:
         for raw in _iter_csv_rows(route_source):
@@ -733,14 +790,19 @@ def _write_route_section_products(staging: Path, geometry: Mapping[str, object])
                         if not isinstance(leg, Mapping):
                             continue
                         leg_row = dict(row)
-                        for source, target in (("line", "line_id"), ("line_id", "line_id"),
-                                               ("trip", "trip_id"), ("trip_id", "trip_id"),
-                                               ("boarding_stop", "boarding_stop_id"),
-                                               ("boarding_stop_id", "boarding_stop_id"),
-                                               ("alighting_stop", "alighting_stop_id"),
-                                               ("alighting_stop_id", "alighting_stop_id"),
-                                               ("pattern", "pattern_id"), ("pattern_id", "pattern_id"),
-                                               ("direction", "direction")):
+                        for source, target in (
+                            ("line", "line_id"),
+                            ("line_id", "line_id"),
+                            ("trip", "trip_id"),
+                            ("trip_id", "trip_id"),
+                            ("boarding_stop", "boarding_stop_id"),
+                            ("boarding_stop_id", "boarding_stop_id"),
+                            ("alighting_stop", "alighting_stop_id"),
+                            ("alighting_stop_id", "alighting_stop_id"),
+                            ("pattern", "pattern_id"),
+                            ("pattern_id", "pattern_id"),
+                            ("direction", "direction"),
+                        ):
                             if source in leg:
                                 leg_row[target] = str(leg[source])
                         leg_row["route_leg_index"] = str(leg.get("route_leg_index", leg_number))
@@ -748,12 +810,27 @@ def _write_route_section_products(staging: Path, geometry: Mapping[str, object])
             if row["route_path_id"]:
                 base_path_id = row["route_path_id"]
             else:
-                path_identity = {key: row[key] for key in (
-                    "origin_stop_id", "destination_stop_id", "departure_time_bin", "assigned_demand"
-                )}
+                path_identity = {
+                    key: row[key]
+                    for key in (
+                        "origin_stop_id",
+                        "destination_stop_id",
+                        "departure_time_bin",
+                        "assigned_demand",
+                    )
+                }
                 path_identity.update(
-                    {"route_legs": row.get("route_legs", "")} if row.get("route_legs") else
-                    {key: row[key] for key in ("line_id", "trip_id", "boarding_stop_id", "alighting_stop_id")}
+                    {"route_legs": row.get("route_legs", "")}
+                    if row.get("route_legs")
+                    else {
+                        key: row[key]
+                        for key in (
+                            "line_id",
+                            "trip_id",
+                            "boarding_stop_id",
+                            "alighting_stop_id",
+                        )
+                    }
                 )
                 base_path_id = "rp-" + hashlib.sha256(canonical_json(path_identity).encode("utf-8")).hexdigest()[:20]
             for leg_row in leg_rows:
@@ -788,22 +865,38 @@ def _write_route_section_products(staging: Path, geometry: Mapping[str, object])
                     if key not in writers:
                         path = contributors_dir / f"{_partition_slug(key)}.csv"
                         stream = path.open("w", newline="", encoding="utf-8")
-                        writers[key] = csv.DictWriter(stream, fieldnames=list(_SECTION_CONTRIBUTION_COLUMNS), extrasaction="raise")
+                        writers[key] = csv.DictWriter(
+                            stream,
+                            fieldnames=list(_SECTION_CONTRIBUTION_COLUMNS),
+                            extrasaction="raise",
+                        )
                         writers[key].writeheader()
                         streams[key] = stream
                         counts[key] = 0
                         paths[key] = path
                     contribution = {name: row.get(name, "") for name in _SECTION_CONTRIBUTION_COLUMNS}
-                    contribution.update({"section_id": section_id, "route_path_id": path_id,
-                                         "pattern_id": pattern, "line_id": line,
-                                         "assigned_contribution": row["assigned_demand"]})
+                    contribution.update(
+                        {
+                            "section_id": section_id,
+                            "route_path_id": path_id,
+                            "pattern_id": pattern,
+                            "line_id": line,
+                            "assigned_contribution": row["assigned_demand"],
+                        }
+                    )
                     writers[key].writerow(contribution)
                     section_index.setdefault(key, {}).setdefault(section_id, {"row_start": counts[key], "row_count": 0})["row_count"] += 1
                     counts[key] += 1
                     load_db.execute(
                         "INSERT INTO section_od VALUES (?, ?, ?, ?, ?) "
                         "ON CONFLICT(bin, section_id, origin, destination) DO UPDATE SET assigned = assigned + excluded.assigned",
-                        (key, section_id, row["origin_stop_id"], row["destination_stop_id"], float(row["assigned_demand"])),
+                        (
+                            key,
+                            section_id,
+                            row["origin_stop_id"],
+                            row["destination_stop_id"],
+                            float(row["assigned_demand"]),
+                        ),
                     )
     finally:
         for stream in streams.values():
@@ -812,13 +905,25 @@ def _write_route_section_products(staging: Path, geometry: Mapping[str, object])
         load_db.close()
     contributor_descriptors = []
     for key, path in sorted(paths.items()):
-        contributor_descriptors.append({"key": key, "path": path.relative_to(staging).as_posix(),
-                                        "file": path.relative_to(staging).as_posix(),
-                                        "row_count": counts[key], "sha256": _sha256(path),
-                                        "size_bytes": path.stat().st_size})
+        contributor_descriptors.append(
+            {
+                "key": key,
+                "path": path.relative_to(staging).as_posix(),
+                "file": path.relative_to(staging).as_posix(),
+                "row_count": counts[key],
+                "sha256": _sha256(path),
+                "size_bytes": path.stat().st_size,
+            }
+        )
     index_path = contributors_dir / "index.json"
-    _write_json(index_path, {"schema_version": GRAVITY_VIEWER_ROUTE_SECTION_SCHEMA_VERSION,
-                             "partition_field": "departure_time_bin", "sections": section_index})
+    _write_json(
+        index_path,
+        {
+            "schema_version": GRAVITY_VIEWER_ROUTE_SECTION_SCHEMA_VERSION,
+            "partition_field": "departure_time_bin",
+            "sections": section_index,
+        },
+    )
     load_descriptors = []
     load_connection = sqlite3.connect(load_db_path)
     load_bins = [row[0] for row in load_connection.execute("SELECT DISTINCT bin FROM section_od ORDER BY bin")]
@@ -829,17 +934,30 @@ def _write_route_section_products(staging: Path, geometry: Mapping[str, object])
             (key,),
         ):
             meta = section_meta[section_id]
-            rows.append({"section_id": section_id, "line_id": meta["line_id"],
-                         "pattern_id": meta["pattern_id"], "direction": meta["direction"],
-                         "from_stop_id": meta["from_stop_id"], "to_stop_id": meta["to_stop_id"],
-                         "assigned_flow": format(float(assigned_flow), ".17g"),
-                         "distinct_od_count": int(distinct_od_count)})
+            rows.append(
+                {
+                    "section_id": section_id,
+                    "line_id": meta["line_id"],
+                    "pattern_id": meta["pattern_id"],
+                    "direction": meta["direction"],
+                    "from_stop_id": meta["from_stop_id"],
+                    "to_stop_id": meta["to_stop_id"],
+                    "assigned_flow": format(float(assigned_flow), ".17g"),
+                    "distinct_od_count": int(distinct_od_count),
+                }
+            )
         path = loads_dir / f"{_partition_slug(key)}.csv"
         _write_csv(path, _SECTION_LOAD_COLUMNS, rows)
-        load_descriptors.append({"key": key, "path": path.relative_to(staging).as_posix(),
-                                "file": path.relative_to(staging).as_posix(),
-                                "row_count": len(rows), "sha256": _sha256(path),
-                                "size_bytes": path.stat().st_size})
+        load_descriptors.append(
+            {
+                "key": key,
+                "path": path.relative_to(staging).as_posix(),
+                "file": path.relative_to(staging).as_posix(),
+                "row_count": len(rows),
+                "sha256": _sha256(path),
+                "size_bytes": path.stat().st_size,
+            }
+        )
     load_connection.close()
     load_db_path.unlink(missing_ok=True)
     return {
@@ -847,14 +965,23 @@ def _write_route_section_products(staging: Path, geometry: Mapping[str, object])
         "schema_version": GRAVITY_VIEWER_ROUTE_SECTION_SCHEMA_VERSION,
         "cache_format_version": GRAVITY_VIEWER_CACHE_FORMAT_VERSION,
         "interval_semantics": "OD departure-time interval; not vehicle passage time at the section",
-        "contributors": {"partition_field": "departure_time_bin", "partitions": contributor_descriptors,
-                         "bins": sorted({str(item["key"]) for item in contributor_descriptors}, key=_time_bin_sort_key),
-                         "columns": list(_SECTION_CONTRIBUTION_COLUMNS),
-                         "index_path": index_path.relative_to(staging).as_posix(),
-                         "index_sha256": _sha256(index_path)},
-        "section_loads": {"partition_field": "departure_time_bin", "partitions": load_descriptors,
-                          "bins": sorted({str(item["key"]) for item in load_descriptors}, key=_time_bin_sort_key),
-                          "columns": list(_SECTION_LOAD_COLUMNS)},
+        "contributors": {
+            "partition_field": "departure_time_bin",
+            "partitions": contributor_descriptors,
+            "bins": sorted(
+                {str(item["key"]) for item in contributor_descriptors},
+                key=_time_bin_sort_key,
+            ),
+            "columns": list(_SECTION_CONTRIBUTION_COLUMNS),
+            "index_path": index_path.relative_to(staging).as_posix(),
+            "index_sha256": _sha256(index_path),
+        },
+        "section_loads": {
+            "partition_field": "departure_time_bin",
+            "partitions": load_descriptors,
+            "bins": sorted({str(item["key"]) for item in load_descriptors}, key=_time_bin_sort_key),
+            "columns": list(_SECTION_LOAD_COLUMNS),
+        },
         "geometry_path": geometry.get("geometry_path"),
         "catalog_path": geometry.get("catalog_path"),
         "geometry_mode": geometry.get("geometry_mode"),
@@ -862,8 +989,7 @@ def _write_route_section_products(staging: Path, geometry: Mapping[str, object])
             "expected OD use of a scheduled section from cached fixed-routing probabilities; "
             "not an enumerated route alternative or an exact transfer-count distribution"
             if flow_semantics_seen == {"service_marginal"}
-            else "assigned flow is summed saved path contribution once per traversed section; "
-            "transfer legs are passenger-section usages"
+            else "assigned flow is summed saved path contribution once per traversed section; transfer legs are passenger-section usages"
         ),
     }
 
@@ -902,12 +1028,13 @@ def _copy_section_usage_dataset(staging: Path, source: str | Path) -> dict[str, 
             "columns": list(_SECTION_USAGE_COLUMNS),
             "format": manifest.get("format"),
         },
-        "section_loads": {"available": False, "partitions": [], "columns": list(_SECTION_LOAD_COLUMNS)},
+        "section_loads": {
+            "available": False,
+            "partitions": [],
+            "columns": list(_SECTION_LOAD_COLUMNS),
+        },
         "source_identity": source_identity,
-        "message": (
-            "exact expected OD use of a scheduled section from service-marginal probabilities; "
-            "compact section/OD/line/trip grain"
-        ),
+        "message": ("exact expected OD use of a scheduled section from service-marginal probabilities; compact section/OD/line/trip grain"),
     }
 
 
@@ -938,8 +1065,11 @@ def _write_viewer_partitions(
             "available": False,
             "message": "No post-fit route-flow export was supplied.",
         },
-        "route_sections": {"available": False, "schema_version": GRAVITY_VIEWER_ROUTE_SECTION_SCHEMA_VERSION,
-                           "message": "route-section data unavailable until an explicit route export is supplied."},
+        "route_sections": {
+            "available": False,
+            "schema_version": GRAVITY_VIEWER_ROUTE_SECTION_SCHEMA_VERSION,
+            "message": "route-section data unavailable until an explicit route export is supplied.",
+        },
     }
     route_source = staging / "route_flows.csv"
     if route_source.is_file():
@@ -964,16 +1094,13 @@ def _write_viewer_partitions(
             "patterns": sorted(route_values["patterns"]),
             "directions": sorted(route_values["directions"]),
             "transfer_count_definition": (
-                "realized route-assignment transfer_count; absent values mean the "
-                "routing artifact did not provide realized transfer counts"
+                "realized route-assignment transfer_count; absent values mean the routing artifact did not provide realized transfer counts"
             ),
         }
     geometry = _write_line_geometry(staging)
     summary["line_geometry"] = geometry
     summary["route_sections"] = (
-        _copy_section_usage_dataset(staging, section_usage_dataset)
-        if section_usage_dataset is not None
-        else _write_route_section_products(staging, geometry)
+        _copy_section_usage_dataset(staging, section_usage_dataset) if section_usage_dataset is not None else _write_route_section_products(staging, geometry)
     )
     _write_json(staging / _VIEWER_SUMMARY_FILE, summary)
     return summary
@@ -1039,13 +1166,17 @@ def _write_od_map(
     """Write the optional display-oriented OD aggregation."""
     rows_iter = iter(full_od_rows)
     first = next(rows_iter, None)
-    required = {"origin_stop_id", "destination_stop_id", "departure_time_bin", "estimated_demand"}
+    required = {
+        "origin_stop_id",
+        "destination_stop_id",
+        "departure_time_bin",
+        "estimated_demand",
+    }
     if first is None or not required.issubset(first.keys()):
         return 0
     report_values = report_payload.get("observed_od_demand")
-    report_values_available = isinstance(report_values, Sequence) and not isinstance(
-        report_values, (str, bytes)
-    )
+    report_values_available = isinstance(report_values, Sequence) and not isinstance(report_values, (str, bytes))
+
     def all_rows() -> Iterator[Mapping[str, str]]:
         yield first
         yield from rows_iter
@@ -1088,6 +1219,7 @@ def _write_od_map(
     temporary.replace(destination)
     return count
 
+
 def _write_stop_summary(
     destination: Path,
     *,
@@ -1110,7 +1242,12 @@ def _write_stop_summary(
             continue
         item = totals.setdefault(
             stop,
-            {"observed_total": 0.0, "modeled_total": 0.0, "incoming_total": 0.0, "outgoing_total": 0.0},
+            {
+                "observed_total": 0.0,
+                "modeled_total": 0.0,
+                "incoming_total": 0.0,
+                "outgoing_total": 0.0,
+            },
         )
         item["observed_total"] += observed
         item["modeled_total"] += modeled
@@ -1124,7 +1261,12 @@ def _write_stop_summary(
         if stop_id:
             totals.setdefault(
                 stop_id,
-                {"observed_total": 0.0, "modeled_total": 0.0, "incoming_total": 0.0, "outgoing_total": 0.0},
+                {
+                    "observed_total": 0.0,
+                    "modeled_total": 0.0,
+                    "incoming_total": 0.0,
+                    "outgoing_total": 0.0,
+                },
             )
     if not totals:
         return 0
@@ -1198,10 +1340,7 @@ def _result_specification(
     fit_raw = fit_result.model_specification
     raw = explicit if explicit is not None else fit_raw
     if raw is None:
-        raise ValueError(
-            "fit_result does not contain an exact model specification; supply "
-            "model_specification explicitly before exporting a viewer bundle."
-        )
+        raise ValueError("fit_result does not contain an exact model specification; supply model_specification explicitly before exporting a viewer bundle.")
     if isinstance(raw, GravityModelSpecification):
         specification = raw.to_dict()
         computed_fingerprint = raw.fingerprint
@@ -1213,9 +1352,7 @@ def _result_specification(
             raise ValueError("model_specification is not a valid gravity specification.") from error
         specification = parsed.to_dict()
         if canonical_json(payload) != canonical_json(specification):
-            raise ValueError(
-                "model_specification is not the canonical serialized specification."
-            )
+            raise ValueError("model_specification is not the canonical serialized specification.")
         computed_fingerprint = parsed.fingerprint
     else:
         raise TypeError("model_specification must be a GravityModelSpecification or mapping.")
@@ -1228,29 +1365,18 @@ def _result_specification(
             try:
                 fit_parsed = GravityModelSpecification.from_dict(fit_payload)
             except (TypeError, ValueError) as error:
-                raise ValueError(
-                    "fit_result model_specification is not a valid gravity specification."
-                ) from error
+                raise ValueError("fit_result model_specification is not a valid gravity specification.") from error
             fit_specification = fit_parsed.to_dict()
             if canonical_json(fit_payload) != canonical_json(fit_specification):
-                raise ValueError(
-                    "fit_result model_specification is not the canonical serialized specification."
-                )
+                raise ValueError("fit_result model_specification is not the canonical serialized specification.")
             fit_fingerprint = fit_parsed.fingerprint
         else:
-            raise TypeError(
-                "fit_result model_specification must be a GravityModelSpecification or mapping."
-            )
+            raise TypeError("fit_result model_specification must be a GravityModelSpecification or mapping.")
         if fit_specification != specification or fit_fingerprint != computed_fingerprint:
-            raise ValueError(
-                "explicit model_specification differs from the fitted result."
-            )
+            raise ValueError("explicit model_specification differs from the fitted result.")
     stored = str(fit_result.specification_fingerprint or "")
     if stored and stored != computed_fingerprint:
-        raise ValueError(
-            "model specification fingerprint differs from the fitted result: "
-            f"result={stored!r}, specification={computed_fingerprint!r}."
-        )
+        raise ValueError(f"model specification fingerprint differs from the fitted result: result={stored!r}, specification={computed_fingerprint!r}.")
     return specification, stored or computed_fingerprint
 
 
@@ -1268,22 +1394,19 @@ def _source_provenance(
     result_fallbacks: dict[str, object] = {
         "model_fingerprint": fit_result.model_fingerprint,
         "specification_fingerprint": fit_result.specification_fingerprint or None,
-        "artifact_identity_fingerprint": (
-            fit_result.direct_operator_artifact_fingerprint or None
-        ),
     }
     result: dict[str, object] = {}
     for field in _CANONICAL_PROVENANCE:
-        result[field] = report_provenance.get(
-            field, metadata_provenance.get(field, None)
-        )
+        result[field] = report_provenance.get(field, metadata_provenance.get(field, None))
     for field, value in result_fallbacks.items():
         if value is not None:
             result[field] = value
+    if not result.get("artifact_identity_fingerprint"):
+        result["artifact_identity_fingerprint"] = (
+            fit_result.direct_operator_artifact_fingerprint or None
+        )
     result["model_fingerprint"] = fit_result.model_fingerprint
-    result["specification_fingerprint"] = fit_result.specification_fingerprint or result.get(
-        "specification_fingerprint"
-    )
+    result["specification_fingerprint"] = fit_result.specification_fingerprint or result.get("specification_fingerprint")
     return result
 
 
@@ -1299,14 +1422,9 @@ def _validate_linear_mapping_for_bundle(
     provenance = _source_provenance(report_payload, fit_result, metadata)
     index = artifact.canonical_index
     identity = artifact.identity
-    expected_artifact = (
-        fit_result.direct_operator_artifact_fingerprint
-        or provenance.get("artifact_identity_fingerprint")
-    )
+    expected_artifact = provenance.get("artifact_identity_fingerprint") or fit_result.direct_operator_artifact_fingerprint
     if not expected_artifact or expected_artifact != identity.fingerprint:
-        raise ValueError(
-            "linear mapping artifact identity does not match the fitted operator."
-        )
+        raise ValueError("linear mapping artifact identity does not match the fitted operator.")
     for provenance_name, artifact_value in (
         ("assignment_fingerprint", identity.timetable_fingerprint),
         ("mapping_fingerprint", identity.measurement_mapping_fingerprint),
@@ -1316,18 +1434,11 @@ def _validate_linear_mapping_for_bundle(
     ):
         expected = provenance.get(provenance_name)
         if expected is None or expected == "":
-            raise ValueError(
-                f"fit/report provenance is missing {provenance_name!r} required by the linear mapping."
-            )
+            raise ValueError(f"fit/report provenance is missing {provenance_name!r} required by the linear mapping.")
         if artifact_value is None or str(expected) != str(artifact_value):
-            raise ValueError(
-                f"linear mapping {provenance_name} does not match the fitted result."
-            )
+            raise ValueError(f"linear mapping {provenance_name} does not match the fitted result.")
     compact_fingerprint = provenance.get("compact_layout_fingerprint")
-    if (
-        index.source_compact_layout_fingerprint is not None
-        and compact_fingerprint != index.source_compact_layout_fingerprint
-    ):
+    if index.source_compact_layout_fingerprint is not None and compact_fingerprint != index.source_compact_layout_fingerprint:
         raise ValueError("linear mapping compact OD layout differs from the fitted result.")
     if (
         artifact.number_of_demand_cells != fit_result.free_od_demand.size
@@ -1369,22 +1480,14 @@ def _validate_linear_mapping_for_bundle(
         try:
             row_index = int(row["row_index"])
         except (KeyError, TypeError, ValueError) as error:
-            raise ValueError(
-                "predicted_measurements.csv cannot be aligned to canonical measurement rows."
-            ) from error
+            raise ValueError("predicted_measurements.csv cannot be aligned to canonical measurement rows.") from error
         if row_index != expected_row or row_index >= len(index.measurements):
-            raise ValueError(
-                "predicted_measurements.csv has invalid canonical measurement row indices."
-            )
+            raise ValueError("predicted_measurements.csv has invalid canonical measurement row indices.")
         expected_row += 1
     if expected_row != len(index.measurements):
-        raise ValueError(
-            "predicted_measurements.csv does not cover canonical measurement rows."
-        )
+        raise ValueError("predicted_measurements.csv does not cover canonical measurement rows.")
 
-    if tuple(cell.operator_column for cell in index.demand_cells if cell.operator_column is not None) != tuple(
-        range(fit_result.free_od_demand.size)
-    ):
+    if tuple(cell.operator_column for cell in index.demand_cells if cell.operator_column is not None) != tuple(range(fit_result.free_od_demand.size)):
         raise ValueError("canonical free-OD columns are not aligned to fitted demand.")
 
 
@@ -1450,17 +1553,13 @@ def _validate_table_inputs(
 
     fields, predictions = _read_csv(staging / "predicted_measurements.csv")
     _require_columns(staging / "predicted_measurements.csv", fields, _PREDICTED_COLUMNS)
-    row_indices = _integer_column(
-        predictions, "row_index", staging / "predicted_measurements.csv"
-    )
+    row_indices = _integer_column(predictions, "row_index", staging / "predicted_measurements.csv")
     if len(np.unique(row_indices)) != len(row_indices):
         raise ValueError("predicted_measurements.csv contains duplicate row_index values.")
     modeled = _float_column(predictions, "modeled", staging / "predicted_measurements.csv")
     if modeled.shape != np.asarray(fit_result.predicted_measurements).shape:
         raise ValueError("predicted_measurements.csv length does not match fitted predictions.")
-    np.testing.assert_allclose(
-        modeled, np.asarray(fit_result.predicted_measurements), rtol=1e-8, atol=1e-8
-    )
+    np.testing.assert_allclose(modeled, np.asarray(fit_result.predicted_measurements), rtol=1e-8, atol=1e-8)
     counts["predicted_measurements.csv"] = len(predictions)
 
     fields, residuals = _read_csv(staging / "residuals.csv")
@@ -1487,73 +1586,41 @@ def _validate_table_inputs(
     raw = _float_column(parameters, "raw_value", staging / "parameters.csv")
     physical = _float_column(parameters, "physical_value", staging / "parameters.csv")
     np.testing.assert_allclose(raw, np.asarray(fit_result.raw_parameters), rtol=1e-8, atol=1e-8)
-    np.testing.assert_allclose(
-        physical, np.asarray(fit_result.physical_parameters), rtol=1e-8, atol=1e-8
-    )
+    np.testing.assert_allclose(physical, np.asarray(fit_result.physical_parameters), rtol=1e-8, atol=1e-8)
     counts["parameters.csv"] = len(parameters)
 
     report_model = report_payload.get("model_fingerprint")
     if report_model != fit_result.model_fingerprint:
-        raise ValueError(
-            "report.json model_fingerprint differs from the fitted result: "
-            f"report={report_model!r}, fit={fit_result.model_fingerprint!r}."
-        )
+        raise ValueError(f"report.json model_fingerprint differs from the fitted result: report={report_model!r}, fit={fit_result.model_fingerprint!r}.")
     validation_provenance = _validation_provenance(validation_result)
     validation_model = validation_provenance.get("model_fingerprint")
     if validation_model is not None and validation_model != fit_result.model_fingerprint:
         raise ValueError(
-            "validation provenance model_fingerprint differs from the fitted result: "
-            f"validation={validation_model!r}, fit={fit_result.model_fingerprint!r}."
+            f"validation provenance model_fingerprint differs from the fitted result: validation={validation_model!r}, fit={fit_result.model_fingerprint!r}."
         )
-    fit_specification, fit_specification_fingerprint = _result_specification(
-        fit_result, None
-    )
+    fit_specification, fit_specification_fingerprint = _result_specification(fit_result, None)
     report_specification = report_payload.get("model_specification")
     if not isinstance(report_specification, Mapping):
         raise ValueError("report.json is missing model_specification.")
     try:
-        parsed_report_specification = GravityModelSpecification.from_dict(
-            dict(report_specification)
-        )
+        parsed_report_specification = GravityModelSpecification.from_dict(dict(report_specification))
     except (TypeError, ValueError) as error:
         raise ValueError("report.json model_specification is invalid.") from error
-    if canonical_json(dict(report_specification)) != canonical_json(
-        parsed_report_specification.to_dict()
-    ):
+    if canonical_json(dict(report_specification)) != canonical_json(parsed_report_specification.to_dict()):
         raise ValueError("report.json model_specification is not canonical.")
-    report_specification_fingerprint = report_payload.get(
-        "specification_fingerprint"
-    )
+    report_specification_fingerprint = report_payload.get("specification_fingerprint")
     if report_specification_fingerprint != parsed_report_specification.fingerprint:
-        raise ValueError(
-            "report.json specification_fingerprint does not match its "
-            "serialized model_specification."
-        )
-    if (
-        report_specification_fingerprint != fit_specification_fingerprint
-        or canonical_json(dict(report_specification))
-        != canonical_json(fit_specification)
-    ):
-        raise ValueError(
-            "report.json model specification differs from the fitted result."
-        )
+        raise ValueError("report.json specification_fingerprint does not match its serialized model_specification.")
+    if report_specification_fingerprint != fit_specification_fingerprint or canonical_json(dict(report_specification)) != canonical_json(fit_specification):
+        raise ValueError("report.json model specification differs from the fitted result.")
     validation_specification = validation_provenance.get("model_specification")
-    validation_specification_fingerprint = validation_provenance.get(
-        "specification_fingerprint"
-    )
+    validation_specification_fingerprint = validation_provenance.get("specification_fingerprint")
     if not isinstance(validation_specification, Mapping):
         raise ValueError("validation provenance is missing model_specification.")
     if validation_specification_fingerprint != fit_specification_fingerprint:
-        raise ValueError(
-            "validation provenance specification_fingerprint differs from the "
-            "fitted result."
-        )
-    if canonical_json(dict(validation_specification)) != canonical_json(
-        fit_specification
-    ):
-        raise ValueError(
-            "validation provenance model_specification differs from the fitted result."
-        )
+        raise ValueError("validation provenance specification_fingerprint differs from the fitted result.")
+    if canonical_json(dict(validation_specification)) != canonical_json(fit_specification):
+        raise ValueError("validation provenance model_specification differs from the fitted result.")
     return counts
 
 
@@ -1578,27 +1645,16 @@ def _validate_network(
         raise ValueError("network/stops.csv contains duplicate stop_id values.")
     lat = _float_column(stops, "lat", network_dir / "stops.csv")
     lon = _float_column(stops, "lon", network_dir / "stops.csv")
-    if (
-        np.any(~np.isfinite(lat))
-        or np.any(~np.isfinite(lon))
-        or np.any((lat < -90) | (lat > 90))
-        or np.any((lon < -180) | (lon > 180))
-    ):
+    if np.any(~np.isfinite(lat)) or np.any(~np.isfinite(lon)) or np.any((lat < -90) | (lat > 90)) or np.any((lon < -180) | (lon > 180)):
         raise ValueError("network/stops.csv contains invalid latitude/longitude values.")
     stop_set = set(stop_ids)
 
-    report_stops = _nonempty_values(
-        _iter_csv_rows(staging / "full_od.csv"), "origin_stop_id"
-    ) | _nonempty_values(_iter_csv_rows(staging / "full_od.csv"), "destination_stop_id")
-    report_stops |= _nonempty_values(
-        _iter_csv_rows(staging / "predicted_measurements.csv"), "stop"
+    report_stops = _nonempty_values(_iter_csv_rows(staging / "full_od.csv"), "origin_stop_id") | _nonempty_values(
+        _iter_csv_rows(staging / "full_od.csv"), "destination_stop_id"
     )
     missing_stops = sorted(report_stops - stop_set)
     if missing_stops:
-        raise ValueError(
-            "report references stop IDs absent from network/stops.csv: "
-            + ", ".join(missing_stops[:10])
-        )
+        raise ValueError("report references stop IDs absent from network/stops.csv: " + ", ".join(missing_stops[:10]))
 
     counts = {"network/stops.csv": len(stops)}
     line_ids: set[str] = set()
@@ -1612,15 +1668,10 @@ def _validate_network(
         if len(line_ids) != line_count:
             raise ValueError("network/lines.csv contains duplicate or empty line identifiers.")
         counts["network/lines.csv"] = line_count
-        measurement_lines = _nonempty_values(
-            _iter_csv_rows(staging / "predicted_measurements.csv"), "line"
-        )
+        measurement_lines = _nonempty_values(_iter_csv_rows(staging / "predicted_measurements.csv"), "line")
         missing_lines = sorted(measurement_lines - line_ids)
         if missing_lines:
-            raise ValueError(
-                "predicted measurements reference line IDs absent from network/lines.csv: "
-                + ", ".join(missing_lines[:10])
-            )
+            raise ValueError("predicted measurements reference line IDs absent from network/lines.csv: " + ", ".join(missing_lines[:10]))
     trip_ids: set[str] = set()
     if "trips.csv" in files:
         fields = _csv_fieldnames(network_dir / "trips.csv")
@@ -1634,15 +1685,9 @@ def _validate_network(
         if line_ids:
             line_column = _first_column(fields, ("line_id", "route_id", "line"))
             if line_column is not None:
-                missing = sorted(
-                    _nonempty_values(_iter_csv_rows(network_dir / "trips.csv"), line_column)
-                    - line_ids
-                )
+                missing = sorted(_nonempty_values(_iter_csv_rows(network_dir / "trips.csv"), line_column) - line_ids)
                 if missing:
-                    raise ValueError(
-                        "network/trips.csv references line IDs absent from lines.csv: "
-                        + ", ".join(missing[:10])
-                    )
+                    raise ValueError("network/trips.csv references line IDs absent from lines.csv: " + ", ".join(missing[:10]))
         counts["network/trips.csv"] = trip_count
     if "stop_times.csv" in files:
         fields = _csv_fieldnames(network_dir / "stop_times.csv")
@@ -1651,24 +1696,12 @@ def _validate_network(
         if trip_column is None or stop_column is None:
             raise ValueError("network/stop_times.csv must contain trip_id and stop_id.")
         if trip_ids:
-            missing = sorted(
-                _nonempty_values(_iter_csv_rows(network_dir / "stop_times.csv"), trip_column)
-                - trip_ids
-            )
+            missing = sorted(_nonempty_values(_iter_csv_rows(network_dir / "stop_times.csv"), trip_column) - trip_ids)
             if missing:
-                raise ValueError(
-                    "network/stop_times.csv references unknown trip IDs: "
-                    + ", ".join(missing[:10])
-                )
-        missing = sorted(
-            _nonempty_values(_iter_csv_rows(network_dir / "stop_times.csv"), stop_column)
-            - stop_set
-        )
+                raise ValueError("network/stop_times.csv references unknown trip IDs: " + ", ".join(missing[:10]))
+        missing = sorted(_nonempty_values(_iter_csv_rows(network_dir / "stop_times.csv"), stop_column) - stop_set)
         if missing:
-            raise ValueError(
-                "network/stop_times.csv references unknown stop IDs: "
-                + ", ".join(missing[:10])
-            )
+            raise ValueError("network/stop_times.csv references unknown stop IDs: " + ", ".join(missing[:10]))
         counts["network/stop_times.csv"] = _csv_row_count(network_dir / "stop_times.csv")
     return counts
 
@@ -1752,25 +1785,16 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
             raise ValueError(f"bundle file is missing: {name}")
         expected_size = record.get("size_bytes")
         if expected_size != path.stat().st_size:
-            raise ValueError(
-                f"bundle file size mismatch for {name!r}: "
-                f"manifest={expected_size!r}, actual={path.stat().st_size!r}."
-            )
+            raise ValueError(f"bundle file size mismatch for {name!r}: manifest={expected_size!r}, actual={path.stat().st_size!r}.")
         expected_digest = record.get("sha256")
         actual_digest = _sha256(path)
         if expected_digest != actual_digest:
-            raise ValueError(
-                f"bundle file checksum mismatch for {name!r}: "
-                f"manifest={expected_digest!r}, actual={actual_digest!r}."
-            )
+            raise ValueError(f"bundle file checksum mismatch for {name!r}: manifest={expected_digest!r}, actual={actual_digest!r}.")
         if "row_count" in record and path.suffix.lower() == ".csv":
             with path.open(newline="", encoding="utf-8") as stream:
                 actual_rows = max(0, sum(1 for _ in stream) - 1)
             if record.get("row_count") != actual_rows:
-                raise ValueError(
-                    f"bundle file row count mismatch for {name!r}: "
-                    f"manifest={record.get('row_count')!r}, actual={actual_rows!r}."
-                )
+                raise ValueError(f"bundle file row count mismatch for {name!r}: manifest={record.get('row_count')!r}, actual={actual_rows!r}.")
     report_payload = json.loads((root / "report.json").read_text(encoding="utf-8"))
     if not isinstance(report_payload, Mapping):
         raise ValueError("bundle report.json must contain an object.")
@@ -1796,14 +1820,10 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
     if not isinstance(report_specification, Mapping):
         raise ValueError("bundle report.json is missing model_specification.")
     try:
-        parsed_report_specification = GravityModelSpecification.from_dict(
-            dict(report_specification)
-        )
+        parsed_report_specification = GravityModelSpecification.from_dict(dict(report_specification))
     except (TypeError, ValueError) as error:
         raise ValueError("bundle report model specification is invalid.") from error
-    if canonical_json(dict(report_specification)) != canonical_json(
-        parsed_report_specification.to_dict()
-    ):
+    if canonical_json(dict(report_specification)) != canonical_json(parsed_report_specification.to_dict()):
         raise ValueError("bundle report model specification is not canonical.")
     if report_payload.get("specification_fingerprint") != spec_fingerprint:
         raise ValueError("bundle report specification provenance mismatch.")
@@ -1812,27 +1832,16 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
     provenance = manifest.get("provenance")
     if not isinstance(provenance, Mapping):
         raise ValueError("bundle provenance is missing or invalid.")
-    missing_provenance = [
-        field for field in _CANONICAL_PROVENANCE if field not in provenance
-    ]
+    missing_provenance = [field for field in _CANONICAL_PROVENANCE if field not in provenance]
     if missing_provenance:
-        raise ValueError(
-            "bundle provenance is missing fields: "
-            + ", ".join(missing_provenance)
-        )
+        raise ValueError("bundle provenance is missing fields: " + ", ".join(missing_provenance))
     report_model = report_payload.get("model_fingerprint")
     if report_model != provenance.get("model_fingerprint"):
-        raise ValueError(
-            "bundle report/model provenance mismatch: "
-            f"report={report_model!r}, bundle={provenance.get('model_fingerprint')!r}."
-        )
+        raise ValueError(f"bundle report/model provenance mismatch: report={report_model!r}, bundle={provenance.get('model_fingerprint')!r}.")
     report_provenance = manifest.get("report_provenance", {})
     if not isinstance(report_provenance, Mapping):
         raise ValueError("bundle report provenance is missing or invalid.")
-    if (
-        report_provenance.get("report_fingerprint") is not None
-        and report_payload.get("report_fingerprint") != report_provenance.get("report_fingerprint")
-    ):
+    if report_provenance.get("report_fingerprint") is not None and report_payload.get("report_fingerprint") != report_provenance.get("report_fingerprint"):
         raise ValueError(
             "bundle report_fingerprint mismatch: "
             f"report={report_payload.get('report_fingerprint')!r}, "
@@ -1843,25 +1852,18 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
         raise ValueError("bundle fit provenance is missing or invalid.")
     if fit_provenance.get("model_fingerprint") != provenance.get("model_fingerprint"):
         raise ValueError(
-            "bundle fit/model provenance mismatch: "
-            f"fit={fit_provenance.get('model_fingerprint')!r}, "
-            f"bundle={provenance.get('model_fingerprint')!r}."
+            f"bundle fit/model provenance mismatch: fit={fit_provenance.get('model_fingerprint')!r}, bundle={provenance.get('model_fingerprint')!r}."
         )
     if fit_provenance.get("specification_fingerprint") != spec_fingerprint:
         raise ValueError(
-            "bundle fit/specification provenance mismatch: "
-            f"fit={fit_provenance.get('specification_fingerprint')!r}, "
-            f"specification={spec_fingerprint!r}."
+            f"bundle fit/specification provenance mismatch: fit={fit_provenance.get('specification_fingerprint')!r}, specification={spec_fingerprint!r}."
         )
     validation_provenance = manifest.get("validation_provenance", {})
     if not isinstance(validation_provenance, Mapping):
         raise ValueError("bundle validation provenance is missing or invalid.")
     validation_model = validation_provenance.get("model_fingerprint")
     if validation_model is not None and validation_model != provenance.get("model_fingerprint"):
-        raise ValueError(
-            "bundle validation/model provenance mismatch: "
-            f"validation={validation_model!r}, bundle={provenance.get('model_fingerprint')!r}."
-        )
+        raise ValueError(f"bundle validation/model provenance mismatch: validation={validation_model!r}, bundle={provenance.get('model_fingerprint')!r}.")
     if validation_provenance.get("specification_fingerprint") != spec_fingerprint:
         raise ValueError(
             "bundle validation/specification provenance mismatch: "
@@ -1869,22 +1871,15 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
             f"specification={spec_fingerprint!r}."
         )
     validation_specification = validation_provenance.get("model_specification")
-    if not isinstance(validation_specification, Mapping) or dict(
-        validation_specification
-    ) != dict(specification):
+    if not isinstance(validation_specification, Mapping) or dict(validation_specification) != dict(specification):
         raise ValueError("bundle validation model specification provenance mismatch.")
     report_model_provenance = report_provenance.get("model_fingerprint")
     if report_model_provenance is not None and report_model_provenance != provenance.get("model_fingerprint"):
-        raise ValueError(
-            "bundle report/model provenance mismatch: "
-            f"report={report_model_provenance!r}, bundle={provenance.get('model_fingerprint')!r}."
-        )
+        raise ValueError(f"bundle report/model provenance mismatch: report={report_model_provenance!r}, bundle={provenance.get('model_fingerprint')!r}.")
     if report_provenance.get("specification_fingerprint") != spec_fingerprint:
         raise ValueError("bundle report/specification provenance mismatch.")
     report_specification_provenance = report_provenance.get("model_specification")
-    if not isinstance(report_specification_provenance, Mapping) or dict(
-        report_specification_provenance
-    ) != dict(specification):
+    if not isinstance(report_specification_provenance, Mapping) or dict(report_specification_provenance) != dict(specification):
         raise ValueError("bundle report model specification provenance mismatch.")
     counts = manifest.get("row_counts", {})
     if not isinstance(counts, Mapping):
@@ -1894,9 +1889,7 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
         actual_rows = _csv_row_count(root / name)
         expected = counts.get(name)
         if expected != actual_rows:
-            raise ValueError(
-                f"bundle row count mismatch for {name!r}: manifest={expected!r}, actual={actual_rows!r}."
-            )
+            raise ValueError(f"bundle row count mismatch for {name!r}: manifest={expected!r}, actual={actual_rows!r}.")
         if name == "full_od.csv":
             _require_columns(root / name, fields, _FULL_OD_COLUMNS)
         elif name == "predicted_measurements.csv":
@@ -1915,19 +1908,22 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
         actual_rows = _csv_row_count(root / name)
         expected = counts.get(name)
         if expected != actual_rows:
-            raise ValueError(
-                f"bundle row count mismatch for {name!r}: "
-                f"manifest={expected!r}, actual={actual_rows!r}."
-            )
+            raise ValueError(f"bundle row count mismatch for {name!r}: manifest={expected!r}, actual={actual_rows!r}.")
         _require_columns(root / name, fields, columns)
     summary_path = root / _VIEWER_SUMMARY_FILE
     if summary_path.is_file():
         summary_payload = json.loads(summary_path.read_text(encoding="utf-8"))
         if not isinstance(summary_payload, Mapping):
             raise ValueError("viewer_summary.json must contain an object.")
-        if summary_payload.get("cache_format_version") not in (1, GRAVITY_VIEWER_CACHE_FORMAT_VERSION):
+        if summary_payload.get("cache_format_version") not in (
+            1,
+            GRAVITY_VIEWER_CACHE_FORMAT_VERSION,
+        ):
             raise ValueError("unsupported viewer cache format version.")
-        for kind, expected_columns in (("od", _FULL_OD_COLUMNS), ("route_flows", _ROUTE_FLOW_REQUIRED_COLUMNS)):
+        for kind, expected_columns in (
+            ("od", _FULL_OD_COLUMNS),
+            ("route_flows", _ROUTE_FLOW_REQUIRED_COLUMNS),
+        ):
             kind_payload = summary_payload.get(kind, {})
             if not isinstance(kind_payload, Mapping) or not kind_payload.get("available"):
                 continue
@@ -2026,13 +2022,33 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
             ):
                 if expected is not None and contribution_payload.get(field) != expected:
                     raise ValueError(
-                            f"viewer measurement OD contribution {field} differs from bundle provenance: "
-                            f"dataset={contribution_payload.get(field)!r}, bundle={expected!r}."
+                        f"viewer measurement OD contribution {field} differs from bundle provenance: "
+                        f"dataset={contribution_payload.get(field)!r}, bundle={expected!r}."
                     )
         elif contribution_payload and not contribution_payload.get("message"):
-            raise ValueError(
-                "unavailable measurement OD contributions require an explanatory message."
-            )
+            raise ValueError("unavailable measurement OD contributions require an explanatory message.")
+        location_payload = summary_payload.get("measurement_locations")
+        if isinstance(location_payload, Mapping) and location_payload.get("available"):
+            location_manifest = validate_measurement_location_lookup(root, location_payload)
+            if location_manifest.get("number_of_measurements") != counts.get("predicted_measurements.csv"):
+                raise ValueError("measurement location lookup row count differs from predicted measurements.")
+            source_identity = location_payload.get("source_identity", {})
+            if not isinstance(source_identity, Mapping):
+                raise ValueError("measurement location lookup source identity is invalid.")
+            for field, expected in (
+                ("fit_fingerprint", manifest.get("model_fingerprint")),
+                ("assignment_fingerprint", manifest.get("assignment_fingerprint")),
+                (
+                    "canonical_index_fingerprint",
+                    manifest.get("canonical_index_fingerprint"),
+                ),
+                ("binding_fingerprint", manifest.get("binding_fingerprint")),
+                ("od_layout_fingerprint", manifest.get("od_layout_fingerprint")),
+            ):
+                if expected is not None and source_identity.get(field) != expected:
+                    raise ValueError(f"measurement location lookup {field} differs from bundle provenance.")
+        elif isinstance(location_payload, Mapping) and not location_payload.get("message"):
+            raise ValueError("unavailable measurement location lookup requires an explanatory message.")
     identifiability = manifest.get("identifiability", {})
     if not isinstance(identifiability, Mapping):
         raise ValueError("bundle identifiability metadata is invalid.")
@@ -2046,9 +2062,7 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
     network_counts = _validate_network(root, counts)
     for name, count in network_counts.items():
         if counts.get(name) != count:
-            raise ValueError(
-                f"bundle row count mismatch for {name!r}: manifest={counts.get(name)!r}, actual={count!r}."
-            )
+            raise ValueError(f"bundle row count mismatch for {name!r}: manifest={counts.get(name)!r}, actual={count!r}.")
 
 
 def _write_route_flow_source(
@@ -2071,14 +2085,8 @@ def _write_route_flow_source(
         for raw in rows:
             normalized = _route_flow_row(raw)
             supplied_fingerprint = normalized.get("assignment_fingerprint", "")
-            if (
-                expected_assignment_fingerprint
-                and supplied_fingerprint
-                and supplied_fingerprint != expected_assignment_fingerprint
-            ):
-                raise ValueError(
-                    "route-flow assignment fingerprint differs from the fitted bundle identity."
-                )
+            if expected_assignment_fingerprint and supplied_fingerprint and supplied_fingerprint != expected_assignment_fingerprint:
+                raise ValueError("route-flow assignment fingerprint differs from the fitted bundle identity.")
             writer.writerow(normalized)
             count += 1
     temporary.replace(destination)
@@ -2098,9 +2106,7 @@ class GravityViewerBundle:
 
     @property
     def model_specification(self) -> Mapping[str, object]:
-        payload = json.loads(
-            (self.path / _MODEL_SPECIFICATION_FILE).read_text(encoding="utf-8")
-        )
+        payload = json.loads((self.path / _MODEL_SPECIFICATION_FILE).read_text(encoding="utf-8"))
         specification = payload.get("specification")
         if not isinstance(specification, Mapping):
             raise ValueError("bundle model specification is missing.")
@@ -2108,7 +2114,10 @@ class GravityViewerBundle:
 
     @property
     def table_names(self) -> tuple[str, ...]:
-        return (*_TABLE_FILES, *tuple(name for name in _OPTIONAL_DERIVED_FILES if (self.path / name).is_file()))
+        return (
+            *_TABLE_FILES,
+            *tuple(name for name in _OPTIONAL_DERIVED_FILES if (self.path / name).is_file()),
+        )
 
     def table_path(self, name: str) -> Path:
         if name not in _TABLE_FILES and name not in _OPTIONAL_DERIVED_FILES:
@@ -2363,38 +2372,96 @@ class GravityViewerBundle:
         payload = self.viewer_summary.get("measurement_od_contributions", {})
         return isinstance(payload, Mapping) and bool(payload.get("available"))
 
+    @property
+    def measurement_locations_available(self) -> bool:
+        payload = self.viewer_summary.get("measurement_locations", {})
+        return isinstance(payload, Mapping) and bool(payload.get("available"))
+
+    def query_measurements_at_stop(
+        self,
+        stop_id: str,
+        *,
+        page: int = 0,
+        page_size: int = 50,
+    ) -> Any:
+        """Return one bounded page of measurement rows for an exact stop ID."""
+        if page < 0 or page_size <= 0 or page_size > _MEASUREMENT_LOCATION_PAGE_LIMIT:
+            raise ValueError(f"page must be non-negative and page_size must be between 1 and {_MEASUREMENT_LOCATION_PAGE_LIMIT}.")
+        payload = self.viewer_summary.get("measurement_locations", {})
+        if not isinstance(payload, Mapping) or not payload.get("available"):
+            message = payload.get("message") if isinstance(payload, Mapping) else None
+            raise RuntimeError(str(message or "Measurement location lookup is unavailable in this bundle."))
+        location_manifest = read_measurement_location_manifest(self.path, payload)
+        stops = location_manifest.get("stops", {})
+        entry = stops.get(str(stop_id)) if isinstance(stops, Mapping) else None
+        try:
+            import pandas as pd
+        except ImportError as error:  # pragma: no cover
+            raise RuntimeError("pandas is required for viewer access.") from error
+        if not isinstance(entry, Mapping):
+            return pd.DataFrame(columns=MEASUREMENT_LOCATION_COLUMNS)
+        descriptors = entry.get("partitions", ())
+        if not isinstance(descriptors, Sequence):
+            raise ValueError("measurement location lookup partitions are invalid.")
+        start = page * page_size
+        end = min(int(entry.get("row_count", 0)), start + page_size)
+        if start >= end:
+            return pd.DataFrame(columns=MEASUREMENT_LOCATION_COLUMNS)
+        rows: list[dict[str, str]] = []
+        partition_start = 0
+        for descriptor in descriptors:
+            if not isinstance(descriptor, Mapping):
+                raise ValueError("measurement location lookup partition is invalid.")
+            count = int(descriptor.get("row_count", -1))
+            partition_end = partition_start + count
+            if partition_end > start and partition_start < end:
+                relative = Path(str(descriptor.get("path", "")))
+                if (
+                    relative.is_absolute()
+                    or ".." in relative.parts
+                    or not relative.as_posix().startswith("partitions/measurement_locations/")
+                    or descriptor.get("key") != str(stop_id)
+                ):
+                    raise ValueError("measurement location lookup partition path is unsafe.")
+                path = self.path / relative
+                if not path.is_file() or path.stat().st_size != descriptor.get("size_bytes") or _sha256(path) != descriptor.get("sha256"):
+                    raise ValueError("measurement location lookup partition checksum mismatch.")
+                local_start = max(0, start - partition_start)
+                local_end = min(count, end - partition_start)
+                with path.open(newline="", encoding="utf-8") as stream:
+                    reader = csv.DictReader(stream)
+                    if tuple(reader.fieldnames or ()) != MEASUREMENT_LOCATION_COLUMNS:
+                        raise ValueError("measurement location lookup columns are invalid.")
+                    rows.extend(dict(row) for row in itertools.islice(reader, local_start, local_end))
+            partition_start = partition_end
+            if partition_start >= end:
+                break
+        if len(rows) != end - start or any(row.get("stop") != str(stop_id) for row in rows):
+            raise ValueError("measurement location lookup page is incomplete or inconsistent.")
+        frame = pd.DataFrame(rows, columns=MEASUREMENT_LOCATION_COLUMNS)
+        frame["measurement_index"] = frame["measurement_index"].astype(np.int64)
+        for column in ("observed", "modeled"):
+            frame[column] = pd.to_numeric(frame[column], errors="raise")
+        return frame
+
     def _measurement_od_payload(self) -> Mapping[str, object]:
         payload = self.viewer_summary.get("measurement_od_contributions", {})
         if not isinstance(payload, Mapping) or not payload.get("available"):
-            message = (
-                payload.get("message")
-                if isinstance(payload, Mapping)
-                else None
-            )
-            raise RuntimeError(
-                str(message or "OD-by-measurement contributions are unavailable.")
-            )
+            message = payload.get("message") if isinstance(payload, Mapping) else None
+            raise RuntimeError(str(message or "OD-by-measurement contributions are unavailable."))
         return payload
 
     @staticmethod
-    def _measurement_od_query_window(
-        *, top_n: int | None, page: int, page_size: int
-    ) -> int:
+    def _measurement_od_query_window(*, top_n: int | None, page: int, page_size: int) -> int:
         if page < 0 or page_size <= 0:
             raise ValueError("page must be non-negative and page_size positive.")
         if page_size > _MEASUREMENT_OD_QUERY_LIMIT:
-            raise ValueError(
-                f"page_size must not exceed {_MEASUREMENT_OD_QUERY_LIMIT}."
-            )
+            raise ValueError(f"page_size must not exceed {_MEASUREMENT_OD_QUERY_LIMIT}.")
         if top_n is not None and (top_n <= 0 or top_n > _MEASUREMENT_OD_QUERY_LIMIT):
-            raise ValueError(
-                f"top_n must be positive and no greater than {_MEASUREMENT_OD_QUERY_LIMIT}."
-            )
+            raise ValueError(f"top_n must be positive and no greater than {_MEASUREMENT_OD_QUERY_LIMIT}.")
         limit = top_n if top_n is not None else (page + 1) * page_size
         if limit > _MEASUREMENT_OD_QUERY_LIMIT:
-            raise ValueError(
-                "requested ranked page exceeds the bounded contribution-query window."
-            )
+            raise ValueError("requested ranked page exceeds the bounded contribution-query window.")
         return limit
 
     def _measurement_od_rows_with_labels(self, rows: list[dict[str, object]]) -> Any:
@@ -2426,9 +2493,7 @@ class GravityViewerBundle:
         if frame.empty:
             return pd.DataFrame(columns=columns)
         od_ids = tuple(sorted({int(value) for value in frame["od_index"]}))
-        measurement_ids = tuple(
-            sorted({int(value) for value in frame["measurement_index"]})
-        )
+        measurement_ids = tuple(sorted({int(value) for value in frame["measurement_index"]}))
         od = self.read_table(
             "full_od.csv",
             columns=(
@@ -2484,9 +2549,7 @@ class GravityViewerBundle:
             ):
                 if chunk.empty:
                     continue
-                chunk["modeled_mean_contribution"] = pd.to_numeric(
-                    chunk["modeled_mean_contribution"], errors="raise"
-                )
+                chunk["modeled_mean_contribution"] = pd.to_numeric(chunk["modeled_mean_contribution"], errors="raise")
                 chunk["_rank"] = chunk["modeled_mean_contribution"].abs()
                 best = pd.concat((best, chunk), ignore_index=True)
                 best = best.nlargest(limit, "_rank", keep="first")
@@ -2508,9 +2571,7 @@ class GravityViewerBundle:
         page_size: int = 100,
     ) -> Any:
         """Return ranked OD contributors to one measured row, with bounded output."""
-        limit = self._measurement_od_query_window(
-            top_n=top_n, page=page, page_size=page_size
-        )
+        limit = self._measurement_od_query_window(top_n=top_n, page=page, page_size=page_size)
         payload = self._measurement_od_payload()
         number_of_measurements = int(payload.get("number_of_measurements", -1))
         if measurement_index < 0 or measurement_index >= number_of_measurements:
@@ -2539,9 +2600,7 @@ class GravityViewerBundle:
         page_size: int = 100,
     ) -> Any:
         """Return ranked measured rows affected by one fitted OD-time cell."""
-        fetch = self._measurement_od_query_window(
-            top_n=top_n, page=page, page_size=page_size
-        )
+        fetch = self._measurement_od_query_window(top_n=top_n, page=page, page_size=page_size)
         payload = self._measurement_od_payload()
         od_rows = int(self.manifest.get("row_counts", {}).get("full_od.csv", -1))
         if od_index < 0 or od_index >= od_rows:
@@ -2557,12 +2616,7 @@ class GravityViewerBundle:
         descriptors = payload.get("partitions", ())
         if not isinstance(descriptors, Sequence):
             raise ValueError("measurement OD contribution partitions are invalid.")
-        selected = tuple(
-            descriptor
-            for descriptor in descriptors
-            if isinstance(descriptor, Mapping)
-            and str(descriptor.get("key")) == departure_bin
-        )
+        selected = tuple(descriptor for descriptor in descriptors if isinstance(descriptor, Mapping) and str(descriptor.get("key")) == departure_bin)
         rows = self._rank_measurement_od_rows(
             selected,
             filter_column="od_index",
@@ -2575,9 +2629,7 @@ class GravityViewerBundle:
             rows = rows[page * page_size : page * page_size + page_size]
         return self._measurement_od_rows_with_labels(rows)
 
-    def query_measurement_contribution_components(
-        self, measurement_index: int
-    ) -> Mapping[str, object] | None:
+    def query_measurement_contribution_components(self, measurement_index: int) -> Mapping[str, object] | None:
         """Return the separate fixed, additive, floor, and total row components."""
         payload = self._measurement_od_payload()
         number_of_measurements = int(payload.get("number_of_measurements", -1))
@@ -2586,9 +2638,35 @@ class GravityViewerBundle:
         component = payload.get("component_table")
         if not isinstance(component, Mapping):
             return None
+        component_partitions = component.get("partitions")
+        if isinstance(component_partitions, Sequence):
+            descriptor = next(
+                (
+                    item
+                    for item in component_partitions
+                    if isinstance(item, Mapping)
+                    and int(item.get("start_index", -1)) <= measurement_index < int(item.get("start_index", -1)) + int(item.get("row_count", 0))
+                ),
+                None,
+            )
+            if descriptor is None:
+                return None
+            relative = Path(str(descriptor.get("path", "")))
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError("measurement OD component partition path is unsafe.")
+            component_path = self.path / relative
+            if (
+                not component_path.is_file()
+                or component_path.stat().st_size != descriptor.get("size_bytes")
+                or _sha256(component_path) != descriptor.get("sha256")
+            ):
+                raise ValueError("measurement OD component partition checksum mismatch.")
+            partition_name = relative.as_posix()
+        else:
+            partition_name = str(component.get("path", ""))
         chunks = list(
             self.iter_partition(
-                str(component.get("path", "")),
+                partition_name,
                 columns=_MEASUREMENT_COMPONENT_COLUMNS,
                 filters={"measurement_index": measurement_index},
                 chunksize=1,
@@ -2608,12 +2686,8 @@ class GravityViewerBundle:
         return {
             **components,
             **measurement.iloc[0].to_dict(),
-            "fixed_positive_od_attribution_available": payload.get(
-                "fixed_positive_od_attribution_available", True
-            ),
-            "fixed_positive_od_attribution_message": payload.get(
-                "fixed_positive_od_attribution_message"
-            ),
+            "fixed_positive_od_attribution_available": payload.get("fixed_positive_od_attribution_available", True),
+            "fixed_positive_od_attribution_message": payload.get("fixed_positive_od_attribution_message"),
         }
 
     def _section_group_descriptors(self, group_name: str) -> tuple[Mapping[str, object], ...]:
@@ -2675,8 +2749,10 @@ class GravityViewerBundle:
             path = descriptor.get("path") or descriptor.get("file")
             if path:
                 yield from self.iter_partition(
-                    str(path), columns=_SECTION_CONTRIBUTION_COLUMNS,
-                    chunksize=chunksize, filters=filters
+                    str(path),
+                    columns=_SECTION_CONTRIBUTION_COLUMNS,
+                    chunksize=chunksize,
+                    filters=filters,
                 )
 
     def query_section_od(
@@ -2710,26 +2786,35 @@ class GravityViewerBundle:
         chunks: list[Any] = []
         totals: dict[tuple[str, str, str], dict[str, object]] = {}
         for chunk in self.iter_section_od(
-            section_id, departure_time_bin=departure_time_bin, line=line, trip=trip,
-            pattern=pattern, direction=direction, chunksize=chunksize,
+            section_id,
+            departure_time_bin=departure_time_bin,
+            line=line,
+            trip=trip,
+            pattern=pattern,
+            direction=direction,
+            chunksize=chunksize,
         ):
             if aggregate_by_od and not chunk.empty:
                 for row in chunk.itertuples(index=False):
-                    key = (str(row.origin_stop_id), str(row.destination_stop_id), str(row.departure_time_bin))
+                    key = (
+                        str(row.origin_stop_id),
+                        str(row.destination_stop_id),
+                        str(row.departure_time_bin),
+                    )
                     if compact:
                         item = totals.setdefault(key, {"assigned_contribution": 0.0, "trip_count": 0})
-                        item["assigned_contribution"] = float(item["assigned_contribution"]) + float(
-                            getattr(row, "assigned_contribution", 0.0)
-                        )
+                        item["assigned_contribution"] = float(item["assigned_contribution"]) + float(getattr(row, "assigned_contribution", 0.0))
                         item["trip_count"] = int(item["trip_count"]) + 1
                     else:
                         item = totals.setdefault(
                             key,
-                            {"assigned_contribution": 0.0, "path_ids": set(), "transfer_count": ""},
+                            {
+                                "assigned_contribution": 0.0,
+                                "path_ids": set(),
+                                "transfer_count": "",
+                            },
                         )
-                        item["assigned_contribution"] = float(item["assigned_contribution"]) + float(
-                            getattr(row, "assigned_demand", 0.0)
-                        )
+                        item["assigned_contribution"] = float(item["assigned_contribution"]) + float(getattr(row, "assigned_demand", 0.0))
                         path_id = str(getattr(row, "route_path_id", ""))
                         if path_id:
                             cast_ids = item["path_ids"]
@@ -2744,7 +2829,7 @@ class GravityViewerBundle:
             if start >= len(chunk):
                 start -= len(chunk)
                 continue
-            selected = chunk.iloc[start: start + (remaining or 0)].copy()
+            selected = chunk.iloc[start : start + (remaining or 0)].copy()
             chunks.append(selected)
             consumed = len(selected)
             start = 0
@@ -2754,33 +2839,51 @@ class GravityViewerBundle:
         if aggregate_by_od:
             if compact:
                 rows = [
-                    {"origin_stop_id": key[0], "destination_stop_id": key[1],
-                     "departure_time_bin": key[2], **values}
+                    {
+                        "origin_stop_id": key[0],
+                        "destination_stop_id": key[1],
+                        "departure_time_bin": key[2],
+                        **values,
+                    }
                     for key, values in sorted(totals.items())
                 ]
                 result = pd.DataFrame(
                     rows,
-                    columns=["origin_stop_id", "destination_stop_id", "departure_time_bin",
-                             "assigned_contribution", "trip_count"],
+                    columns=[
+                        "origin_stop_id",
+                        "destination_stop_id",
+                        "departure_time_bin",
+                        "assigned_contribution",
+                        "trip_count",
+                    ],
                 )
             else:
                 rows = []
                 for key, values in sorted(totals.items()):
                     path_ids = values.get("path_ids", set())
-                    rows.append({
-                        "origin_stop_id": key[0], "destination_stop_id": key[1],
-                        "departure_time_bin": key[2],
-                        "assigned_contribution": values["assigned_contribution"],
-                        "path_count": len(path_ids) if isinstance(path_ids, set) else 0,
-                        "transfer_count": values.get("transfer_count", ""),
-                    })
+                    rows.append(
+                        {
+                            "origin_stop_id": key[0],
+                            "destination_stop_id": key[1],
+                            "departure_time_bin": key[2],
+                            "assigned_contribution": values["assigned_contribution"],
+                            "path_count": len(path_ids) if isinstance(path_ids, set) else 0,
+                            "transfer_count": values.get("transfer_count", ""),
+                        }
+                    )
                 result = pd.DataFrame(
                     rows,
-                    columns=["origin_stop_id", "destination_stop_id", "departure_time_bin",
-                             "assigned_contribution", "path_count", "transfer_count"],
+                    columns=[
+                        "origin_stop_id",
+                        "destination_stop_id",
+                        "departure_time_bin",
+                        "assigned_contribution",
+                        "path_count",
+                        "transfer_count",
+                    ],
                 )
             if page_size is not None:
-                result = result.iloc[(page or 0) * page_size:(page or 0) * page_size + page_size]
+                result = result.iloc[(page or 0) * page_size : (page or 0) * page_size + page_size]
         elif not chunks:
             result = pd.DataFrame(columns=output_columns)
         else:
@@ -2789,15 +2892,18 @@ class GravityViewerBundle:
             group = ["origin_stop_id", "destination_stop_id", "departure_time_bin"]
             od = self.read_table(
                 "full_od.csv",
-                columns=("origin_stop_id", "destination_stop_id", "departure_time_bin", "estimated_demand"),
+                columns=(
+                    "origin_stop_id",
+                    "destination_stop_id",
+                    "departure_time_bin",
+                    "estimated_demand",
+                ),
                 filters={"departure_time_bin": departure_time_bin},
                 chunksize=chunksize,
             )
             if not od.empty:
                 od["estimated_demand"] = pd.to_numeric(od["estimated_demand"], errors="coerce")
-                result = result.merge(od, on=group, how="left").rename(
-                    columns={"estimated_demand": "total_od_demand"}
-                )
+                result = result.merge(od, on=group, how="left").rename(columns={"estimated_demand": "total_od_demand"})
             else:
                 result["total_od_demand"] = np.nan
         if page_size is not None:
@@ -2830,8 +2936,7 @@ class GravityViewerBundle:
                 continue
             path = descriptor.get("path") or descriptor.get("file")
             if path:
-                chunks = list(self.iter_partition(str(path), columns=_SECTION_LOAD_COLUMNS,
-                                                  filters=filters))
+                chunks = list(self.iter_partition(str(path), columns=_SECTION_LOAD_COLUMNS, filters=filters))
                 return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=_SECTION_LOAD_COLUMNS)
         return pd.DataFrame(columns=_SECTION_LOAD_COLUMNS)
 
@@ -2890,7 +2995,10 @@ class GravityViewerBundle:
                 group_by = ["destination_stop_id", "departure_time_bin"]
             totals = result.groupby(group_by, dropna=False)["estimated_demand"].transform("sum")
             result["demand_share"] = np.divide(
-                result["estimated_demand"], totals, out=np.zeros_like(totals), where=totals != 0
+                result["estimated_demand"],
+                totals,
+                out=np.zeros_like(totals),
+                where=totals != 0,
             )
         if top_n is not None:
             if top_n <= 0:
@@ -2922,11 +3030,7 @@ class GravityViewerBundle:
         if not chunks:
             return pd.DataFrame(columns=[*group_by, "observed", "modeled"])
         combined = pd.concat(chunks, ignore_index=True)
-        return (
-            combined.groupby(list(group_by), dropna=False, sort=True)[["observed", "modeled"]]
-            .sum()
-            .reset_index()
-        )
+        return combined.groupby(list(group_by), dropna=False, sort=True)[["observed", "modeled"]].sum().reset_index()
 
 
 def write_gravity_viewer_bundle(
@@ -2960,14 +3064,10 @@ def write_gravity_viewer_bundle(
     if require_identifiability and identifiability is None:
         raise ValueError("OD identifiability diagnostics are required for this bundle.")
     metadata = {} if metadata is None else dict(metadata)
-    specification, specification_fingerprint = _result_specification(
-        fit_result, model_specification
-    )
+    specification, specification_fingerprint = _result_specification(fit_result, model_specification)
     destination = Path(output_directory).expanduser().resolve()
     if destination.exists():
-        raise FileExistsError(
-            f"refusing to overwrite an existing viewer bundle directory: {destination}"
-        )
+        raise FileExistsError(f"refusing to overwrite an existing viewer bundle directory: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
     try:
@@ -2981,9 +3081,7 @@ def write_gravity_viewer_bundle(
         report_payload = json.loads((staging / "report.json").read_text(encoding="utf-8"))
         if not isinstance(report_payload, Mapping):
             raise ValueError("report.json must contain an object.")
-        table_counts = _validate_table_inputs(
-            staging, fit_result, report_payload, validation_result
-        )
+        table_counts = _validate_table_inputs(staging, fit_result, report_payload, validation_result)
 
         _write_json(
             staging / _MODEL_SPECIFICATION_FILE,
@@ -3049,30 +3147,44 @@ def write_gravity_viewer_bundle(
         ):
             table_counts["stop_summary.csv"] = _csv_row_count(staging / "stop_summary.csv")
 
+        measurement_location_source_identity = _source_provenance(report_payload, fit_result, metadata)
+        if stops_path.is_file():
+            location_identity = {
+                "fit_fingerprint": fit_result.model_fingerprint,
+                "assignment_fingerprint": measurement_location_source_identity.get("assignment_fingerprint"),
+                "canonical_index_fingerprint": measurement_location_source_identity.get("canonical_index_fingerprint"),
+                "binding_fingerprint": measurement_location_source_identity.get("binding_fingerprint"),
+                "od_layout_fingerprint": measurement_location_source_identity.get("od_layout_fingerprint"),
+            }
+            measurement_location_summary = write_measurement_location_lookup(
+                destination=staging / _PARTITION_ROOT / "measurement_locations",
+                predicted_measurements_path=staging / "predicted_measurements.csv",
+                network_stops_path=stops_path,
+                source_identity=location_identity,
+            )
+        else:
+            measurement_location_summary = {
+                "available": False,
+                "schema_version": 1,
+                "message": ("A network/stops.csv snapshot is required to select measurement rows from map locations."),
+            }
+
         if route_flow_rows is not None:
             report_provenance = report_payload.get("provenance", {})
-            expected_assignment = (
-                report_provenance.get("assignment_fingerprint")
-                if isinstance(report_provenance, Mapping)
-                else None
-            )
+            expected_assignment = report_provenance.get("assignment_fingerprint") if isinstance(report_provenance, Mapping) else None
             if expected_assignment is None:
                 metadata_provenance = metadata.get("provenance", {})
-                expected_assignment = (
-                    metadata_provenance.get("assignment_fingerprint")
-                    if isinstance(metadata_provenance, Mapping)
-                    else None
-                )
+                expected_assignment = metadata_provenance.get("assignment_fingerprint") if isinstance(metadata_provenance, Mapping) else None
             _write_route_flow_source(
-                staging / "route_flows.csv", route_flow_rows,
-                expected_assignment_fingerprint=(
-                    None if expected_assignment is None else str(expected_assignment)
-                ),
+                staging / "route_flows.csv",
+                route_flow_rows,
+                expected_assignment_fingerprint=(None if expected_assignment is None else str(expected_assignment)),
             )
         viewer_summary = _write_viewer_partitions(
             staging,
             section_usage_dataset=section_usage_dataset,
         )
+        viewer_summary["measurement_locations"] = measurement_location_summary
         if linear_mapping_artifact is None:
             if rho is not None:
                 raise ValueError("rho is only used with linear_mapping_artifact.")
@@ -3112,10 +3224,7 @@ def write_gravity_viewer_bundle(
         validation_prov = _validation_provenance(validation_result)
         for field, value in validation_prov.items():
             if field in provenance and provenance[field] is not None and value is not None and provenance[field] != value:
-                raise ValueError(
-                    f"validation provenance field {field!r} differs from fit/report: "
-                    f"validation={value!r}, fit={provenance[field]!r}."
-                )
+                raise ValueError(f"validation provenance field {field!r} differs from fit/report: validation={value!r}, fit={provenance[field]!r}.")
 
         ident_summary: dict[str, object]
         if identifiability is None:
@@ -3131,15 +3240,11 @@ def write_gravity_viewer_bundle(
                 "classification_counts": identifiability.classification_counts,
             }
         route_summary = viewer_summary["route_flows"]
-        route_flow_fingerprint = hashlib.sha256(
-            canonical_json(route_summary).encode("utf-8")
-        ).hexdigest()
+        route_flow_fingerprint = hashlib.sha256(canonical_json(route_summary).encode("utf-8")).hexdigest()
         bundle_metadata = dict(metadata)
         bundle_metadata.pop("provenance", None)
         coordinate_convention = {
-            "coordinate_system": str(
-                bundle_metadata.pop("coordinate_system", "latitude_longitude")
-            ),
+            "coordinate_system": str(bundle_metadata.pop("coordinate_system", "latitude_longitude")),
             "x_column": str(bundle_metadata.pop("x_column", "lon")),
             "y_column": str(bundle_metadata.pop("y_column", "lat")),
         }
@@ -3188,9 +3293,8 @@ def write_gravity_viewer_bundle(
                 "od": viewer_summary["od"]["partitions"],
                 "route_flows": viewer_summary["route_flows"].get("partitions", []),
                 "route_sections": viewer_summary.get("route_sections", {}),
-                "measurement_od_contributions": viewer_summary.get(
-                    "measurement_od_contributions", {}
-                ),
+                "measurement_od_contributions": viewer_summary.get("measurement_od_contributions", {}),
+                "measurement_locations": viewer_summary.get("measurement_locations", {}),
                 "cache_format_version": GRAVITY_VIEWER_CACHE_FORMAT_VERSION,
             },
             "viewer_summary": {
@@ -3199,9 +3303,8 @@ def write_gravity_viewer_bundle(
                 "od_partitions": len(viewer_summary["od"]["partitions"]),
                 "route_flows_available": bool(viewer_summary["route_flows"]["available"]),
                 "route_sections_available": bool(viewer_summary.get("route_sections", {}).get("available")),
-                "measurement_od_contributions_available": bool(
-                    viewer_summary.get("measurement_od_contributions", {}).get("available")
-                ),
+                "measurement_od_contributions_available": bool(viewer_summary.get("measurement_od_contributions", {}).get("available")),
+                "measurement_locations_available": bool(viewer_summary.get("measurement_locations", {}).get("available")),
             },
             "route_flow_provenance": {
                 "available": bool(viewer_summary["route_flows"]["available"]),
@@ -3211,14 +3314,9 @@ def write_gravity_viewer_bundle(
                 "fit_fingerprint": fit_result.model_fingerprint,
                 "specification_fingerprint": specification_fingerprint,
                 "package_revision": provenance.get("package_revision"),
-                "transfer_count_definition": viewer_summary["route_flows"].get(
-                    "transfer_count_definition"
-                ),
+                "transfer_count_definition": viewer_summary["route_flows"].get("transfer_count_definition"),
                 "flow_semantics": viewer_summary["route_flows"].get("flow_semantics", []),
-                "partition_row_counts": {
-                    str(item.get("path")): item.get("row_count")
-                    for item in viewer_summary["route_flows"].get("partitions", [])
-                },
+                "partition_row_counts": {str(item.get("path")): item.get("row_count") for item in viewer_summary["route_flows"].get("partitions", [])},
             },
             "route_section_provenance": {
                 "available": bool(viewer_summary.get("route_sections", {}).get("available")),

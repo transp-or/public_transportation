@@ -102,8 +102,15 @@
 
     <section id="network-map" class="panel hidden">
       <h2>Network map</h2>
-      <p class="muted">Bundled stops and approximate route paths over an OpenStreetMap background.</p>
+      <p class="muted">Bundled stops and approximate route paths over an OpenStreetMap background. Teal stops have measurement rows.</p>
       <div id="interactive-notice" class="notice hidden"></div>
+      <div id="measurement-unmatched-notice" class="notice hidden"></div>
+      <div id="map-click-toolbar" class="toolbar">
+        <span class="muted">Map click mode</span>
+        <button id="map-od-mode" type="button" class="active">OD selection</button>
+        <button id="map-measurement-mode" type="button">Measurement</button>
+        <span id="map-click-status" class="muted">Click a stop to select an OD origin or destination.</span>
+      </div>
       <div id="map-toolbar" class="toolbar hidden">
         <button id="stops-mode" type="button" class="active">Stops</button>
         <button id="od-mode" type="button">OD pairs</button>
@@ -186,13 +193,20 @@
     <section id="measurement-od" class="panel hidden">
       <h2>Measured flows by OD pair</h2>
       <p id="measurement-od-unavailable" class="notice hidden"></p>
-      <p class="muted">Inspect the sparse linear-mapping contribution of each fitted OD pair to a measured row, or the measured rows affected by one OD pair. Values stay in the model's units; fixed offsets, additive terms, and any mean-floor adjustment are shown separately.</p>
+      <p class="muted">Select a stop in Measurement map mode, then choose one of its measured rows. The decomposition is of that row’s modeled mean, not its observed count. Observation time and OD departure interval are different time concepts.</p>
+      <div id="measurement-row-picker" class="toolbar">
+        <span id="measurement-stop-label" class="muted">No measured stop selected.</span>
+        <label>Measurement row
+          <select id="measurement-row-select" disabled></select>
+        </label>
+        <button id="measurement-row-previous" type="button" disabled>Previous rows</button>
+        <button id="measurement-row-next" type="button" disabled>Next rows</button>
+        <span id="measurement-row-page" class="muted"></span>
+      </div>
+      <div id="measurement-row-detail" class="detail">Choose Measurement mode and click a stop.</div>
       <div class="toolbar">
         <label>Query direction
           <select id="measurement-od-direction"><option value="measurement">OD contributors to a measurement</option><option value="od">Measurements affected by an OD pair</option></select>
-        </label>
-        <label id="measurement-row-label">Measurement row index
-          <input id="measurement-row-index" type="number" min="0" step="1" value="0">
         </label>
         <label id="measurement-bin-label" class="hidden">OD departure interval
           <select id="measurement-bin"></select>
@@ -203,10 +217,15 @@
         <label id="measurement-destination-label" class="hidden">Destination
           <select id="measurement-destination"></select>
         </label>
-        <label>Top contributors
+        <label>Rows per page
           <input id="measurement-od-limit" type="number" min="1" max="500" value="50">
         </label>
         <button id="measurement-od-load" type="button">Load contributions</button>
+      </div>
+      <div class="toolbar">
+        <button id="measurement-contribution-previous" type="button" disabled>Previous contributors</button>
+        <button id="measurement-contribution-next" type="button" disabled>Next contributors</button>
+        <span id="measurement-contribution-page" class="muted"></span>
       </div>
       <div id="measurement-od-status" class="status">No contribution query selected.</div>
       <div id="measurement-od-detail" class="detail"></div>

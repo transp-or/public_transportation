@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 
 import numpy as np
@@ -221,11 +222,35 @@ def test_sparse_mapping_decomposes_measurements_by_od_and_closes_components(tmp_
     assert reopened.query_measurement_od_contributions(1)["od_index"].tolist() == [0]
 
 
-def test_mapping_identity_mismatch_and_corrupt_payload_fail_closed(tmp_path):
-    result, report, provenance, mismatched = _mapping_bundle_inputs(
-        tmp_path / "mismatch", changed_network=True
+def test_mapping_identity_uses_persisted_operator_provenance_when_fit_has_wrapper_id(tmp_path):
+    result, report, provenance, artifact = _mapping_bundle_inputs(tmp_path)
+    result = replace(
+        result,
+        direct_operator_artifact_fingerprint="higher-level-mapping-wrapper",
     )
-    result = replace(result, direct_operator_artifact_fingerprint="different-fit-artifact")
+    bundle = write_gravity_viewer_bundle(
+        output_directory=tmp_path / "bundle-wrapper-identity",
+        fit_result=result,
+        validation_result=report.adequacy,
+        report=report,
+        metadata={"provenance": provenance},
+        linear_mapping_artifact=artifact,
+    )
+    assert bundle.manifest["artifact_identity_fingerprint"] == provenance[
+        "artifact_identity_fingerprint"
+    ]
+    assert bundle.viewer_summary["measurement_od_contributions"][
+        "mapping_artifact_fingerprint"
+    ] == provenance["artifact_identity_fingerprint"]
+
+
+def test_mapping_identity_mismatch_and_corrupt_payload_fail_closed(tmp_path):
+    result, report, provenance, artifact = _mapping_bundle_inputs(tmp_path / "mismatch")
+    report_payload = json.loads(report.files["report.json"].read_text(encoding="utf-8"))
+    report_payload["provenance"]["artifact_identity_fingerprint"] = "different-fit-artifact"
+    report.files["report.json"].write_text(
+        json.dumps(report_payload), encoding="utf-8"
+    )
     with pytest.raises(ValueError, match="identity does not match"):
         write_gravity_viewer_bundle(
             output_directory=tmp_path / "mismatch-bundle",
@@ -233,7 +258,7 @@ def test_mapping_identity_mismatch_and_corrupt_payload_fail_closed(tmp_path):
             validation_result=report.adequacy,
             report=report,
             metadata={"provenance": provenance},
-            linear_mapping_artifact=mismatched,
+            linear_mapping_artifact=artifact,
         )
 
     result, report, provenance, artifact = _mapping_bundle_inputs(tmp_path / "corrupt")

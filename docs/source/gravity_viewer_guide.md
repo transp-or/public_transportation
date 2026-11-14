@@ -37,8 +37,11 @@ viewer_bundle/
   partitions/od/                   one CSV per departure-time bin
   partitions/measurement_od_contributions/  optional sparse OD-to-measurement map
     manifest.json
-    measurement_components.csv
+    components/                      bounded measurement-row component shards
     bins/                           bounded CSV partitions by OD departure interval
+  partitions/measurement_locations/ optional per-stop measured-row lookup
+    manifest.json
+    stops/                          checksummed bounded per-stop pages
   partitions/route_flows/          optional sparse post-fit route flows
   partitions/route_sections/       optional OD-to-directed-section contributors
   partitions/section_loads/        optional section-load summaries by OD interval
@@ -159,6 +162,32 @@ export is produced.
 
 ## Measured rows by OD pair
 
+When the bundle includes a network stop snapshot, the map has an explicit
+**Measurement** click mode alongside its default **OD selection** mode. Stops
+with measurement rows are highlighted. Click one to load only that stop's
+checksummed lookup page; choose among the listed measurement type, line,
+direction, observation time/period, and stop. Stops with no rows say
+“No measurements at this location.” The viewer matches stop identifiers
+exactly; unmatched measurement IDs are reported rather than silently mapped to
+nearby or similarly named stops. The small stop index is read at startup, but
+measurement rows themselves are fetched only for the clicked stop and are
+page-limited.
+
+For the selected row, the viewer shows the observation and modeled mean. If a
+compatible contribution dataset is present, OD contributors are ranked by
+absolute modeled-mean contribution, retain their signed modeled-mean and raw
+linear-flow values, and can be browsed in bounded pages. The browser streams
+the selected measurement's matching entries into its local IndexedDB cache in
+batches; it does not load the full contribution dataset into memory. Fixed
+offset, additive contribution, and mean-floor adjustment remain separate and
+are not attributed to an OD pair. OD contributions decompose the modeled mean,
+not the observed count. Observation time is not the OD departure-time bin.
+
+Bundles made before the stop lookup was added remain readable. Map-based row
+selection is reported unavailable when the network snapshot or lookup is
+missing; an unavailable contribution dataset does not prevent inspection of
+the observed and modeled row values when the stop lookup exists.
+
 When a validated sparse linear-mapping artifact was supplied during bundle
 creation, the **Measured flows by OD pair** panel lets you inspect the
 contributions in either direction: the OD pairs contributing to a selected
@@ -180,7 +209,8 @@ the fit persists its observation-scale vector, no extra scale is needed. For a
 fit whose measurement scale is specified only by `rho`, pass that same fitted
 `rho`; otherwise the contribution panel is marked unavailable. Python queries
 keep at most 5,000 ranked rows in memory per request; `top_n` and pagination
-are bounded to that ranked window.
+are bounded to that ranked window. In the browser, the selected measurement
+can be browsed page-by-page from its local indexed cache.
 
 The contribution is calculated from the saved sparse mapping and fitted OD
 demand, without rerunning routing. It decomposes measured channels only; it is

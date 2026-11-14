@@ -3,9 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 
-VIEWER = (
-    Path(__file__).resolve().parents[2] / "tools" / "gravity_viewer" / "index.html"
-)
+VIEWER = Path(__file__).resolve().parents[2] / "tools" / "gravity_viewer" / "index.html"
 
 
 def test_viewer_exposes_stop_and_od_pair_interaction_controls() -> None:
@@ -29,7 +27,10 @@ def test_viewer_exposes_stop_and_od_pair_interaction_controls() -> None:
         'id="section-page-next"',
         'id="measurement-od"',
         'id="measurement-od-direction"',
-        'id="measurement-row-index"',
+        'id="map-measurement-mode"',
+        'id="measurement-row-select"',
+        'id="measurement-row-next"',
+        'id="measurement-contribution-next"',
         'id="measurement-bin"',
         'id="measurement-od-load"',
     ):
@@ -58,3 +59,10 @@ def test_viewer_starts_from_manifest_and_streams_selected_partitions() -> None:
     assert "measurement_od_contributions" in viewer_source
     assert "refreshMeasurementOd" in viewer_source
     assert "rankBy" in viewer_source
+    assert "measurementLocationIndex" in viewer_source
+    assert "query_measurement_od_contributions" in source or "measurementContributionPage" in viewer_source
+    assert "No measurements at this location" in viewer_source
+    assert "observation_time" in viewer_source and "departure_time_bin" in viewer_source
+    assert "streamMatches: true" in viewer_source
+    assert "measurementContributions" in viewer_source
+    assert 'id="measurement-row-index"' not in source

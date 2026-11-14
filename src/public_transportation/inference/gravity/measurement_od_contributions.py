@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 _SCHEMA_VERSION = 1
 _WRITE_BATCH_SIZE = 32_768
 _MAX_PARTITION_ROWS = 100_000
+_COMPONENT_PARTITION_ROWS = 500
 _CONTRIBUTION_COLUMNS = (
     "measurement_index",
     "od_index",
@@ -65,19 +66,12 @@ def _journey_scale(result: GravityEstimationResult) -> float:
     if not model.parameter_names:
         raw = np.empty(0, dtype=np.float64)
     else:
-        name_to_position = {
-            name: index for index, name in enumerate(result.parameter_names)
-        }
+        name_to_position = {name: index for index, name in enumerate(result.parameter_names)}
         missing = [name for name in model.parameter_names if name not in name_to_position]
         if missing:
-            raise ValueError(
-                "fitted measurement-model parameters are missing from parameter_names."
-            )
+            raise ValueError("fitted measurement-model parameters are missing from parameter_names.")
         raw = np.asarray(
-            [
-                result.raw_parameters[name_to_position[name]]
-                for name in model.parameter_names
-            ],
+            [result.raw_parameters[name_to_position[name]] for name in model.parameter_names],
             dtype=np.float64,
         )
     scale = float(np.asarray(model.aggregate_scale(raw, dtype=np.float64)))
@@ -115,10 +109,7 @@ def write_measurement_od_contributions_dataset(
         if rho is None:
             return {
                 "available": False,
-                "message": (
-                    "The fit does not persist its measurement-scale vector; pass rho "
-                    "to generate exact modeled-mean contributions."
-                ),
+                "message": ("The fit does not persist its measurement-scale vector; pass rho to generate exact modeled-mean contributions."),
                 "schema_version": _SCHEMA_VERSION,
             }
         scale = float(rho)
@@ -130,27 +121,15 @@ def write_measurement_od_contributions_dataset(
         if rho is not None:
             raise ValueError("rho must be omitted when the fit stores observation_scales.")
         observation_scales = np.asarray(fit_result.observation_scales, dtype=np.float64)
-        if observation_scales.shape != (row_count,) or not np.all(
-            np.isfinite(observation_scales)
-        ) or np.any(observation_scales <= 0.0):
+        if observation_scales.shape != (row_count,) or not np.all(np.isfinite(observation_scales)) or np.any(observation_scales <= 0.0):
             raise ValueError("fitted observation_scales are invalid.")
         observation_scale_source = "fit_result.observation_scales"
 
     journey_scale = _journey_scale(fit_result)
-    additive_vectors = tuple(
-        np.asarray(value, dtype=np.float64)
-        for value in fit_result.additive_measurement_contributions
-    )
-    if any(
-        value.shape != (row_count,) or not np.all(np.isfinite(value))
-        for value in additive_vectors
-    ):
+    additive_vectors = tuple(np.asarray(value, dtype=np.float64) for value in fit_result.additive_measurement_contributions)
+    if any(value.shape != (row_count,) or not np.all(np.isfinite(value)) for value in additive_vectors):
         raise ValueError("fitted additive measurement contributions are invalid.")
-    additive = (
-        np.sum(np.stack(additive_vectors), axis=0)
-        if additive_vectors
-        else np.zeros(row_count, dtype=np.float64)
-    )
+    additive = np.sum(np.stack(additive_vectors), axis=0) if additive_vectors else np.zeros(row_count, dtype=np.float64)
 
     target.mkdir(parents=True, exist_ok=False)
     partition_root = target / "bins"
@@ -165,9 +144,7 @@ def write_measurement_od_contributions_dataset(
         if cell.operator_column is not None:
             departure_interval_by_column[cell.operator_column] = cell.departure_interval_id
             full_index_by_column[cell.operator_column] = cell.full_index
-    if any(not value for value in departure_interval_by_column) or any(
-        value < 0 for value in full_index_by_column
-    ):
+    if any(not value for value in departure_interval_by_column) or any(value < 0 for value in full_index_by_column):
         raise ValueError("canonical free-OD departure intervals are incomplete.")
 
     connection = sqlite3.connect(working_database)
@@ -182,10 +159,7 @@ def write_measurement_od_contributions_dataset(
             "modeled_mean_contribution REAL NOT NULL, "
             "PRIMARY KEY (measurement_index, od_index)) WITHOUT ROWID"
         )
-        connection.execute(
-            "CREATE INDEX contributions_by_interval "
-            "ON contributions (departure_time_bin, measurement_index, od_index)"
-        )
+        connection.execute("CREATE INDEX contributions_by_interval ON contributions (departure_time_bin, measurement_index, od_index)")
         for block in artifact.iter_blocks():
             for start in range(0, block.nonzero_entries, _WRITE_BATCH_SIZE):
                 stop = min(block.nonzero_entries, start + _WRITE_BATCH_SIZE)
@@ -224,18 +198,12 @@ def write_measurement_od_contributions_dataset(
         persisted_od = fit_result.od_measurement_contribution
         if persisted_od is not None:
             persisted_od_array = np.asarray(persisted_od, dtype=np.float64)
-            if persisted_od_array.shape != (row_count,) or not np.allclose(
-                raw_od, persisted_od_array, rtol=1e-6, atol=1e-8
-            ):
-                raise ValueError(
-                    "mapping OD contribution differs from the fitted OD measurement component."
-                )
+            if persisted_od_array.shape != (row_count,) or not np.allclose(raw_od, persisted_od_array, rtol=1e-6, atol=1e-8):
+                raise ValueError("mapping OD contribution differs from the fitted OD measurement component.")
 
         if fit_result.latent_measurements is None:
             if additive_vectors:
-                raise ValueError(
-                    "fit is missing latent measurements required to separate fixed and additive components."
-                )
+                raise ValueError("fit is missing latent measurements required to separate fixed and additive components.")
             fixed_offset = np.asarray(artifact.fixed_measurement_offset, dtype=np.float64)
         else:
             latent = np.asarray(fit_result.latent_measurements, dtype=np.float64)
@@ -256,9 +224,7 @@ def write_measurement_od_contributions_dataset(
         floor_adjustment = modeled - fixed_mean - additive_mean - od_mean
         tolerance = 1e-6 + 1e-6 * np.abs(modeled)
         if np.any(floor_adjustment < -tolerance):
-            raise ValueError(
-                "OD, fixed, and additive components exceed the saved modeled mean."
-            )
+            raise ValueError("OD, fixed, and additive components exceed the saved modeled mean.")
         floor_adjustment = np.maximum(floor_adjustment, 0.0)
         if not np.allclose(
             fixed_mean + additive_mean + od_mean + floor_adjustment,
@@ -288,13 +254,7 @@ def write_measurement_od_contributions_dataset(
         )
         connection.commit()
 
-        bins = tuple(
-            str(row[0])
-            for row in connection.execute(
-                "SELECT DISTINCT departure_time_bin FROM contributions "
-                "ORDER BY departure_time_bin"
-            )
-        )
+        bins = tuple(str(row[0]) for row in connection.execute("SELECT DISTINCT departure_time_bin FROM contributions ORDER BY departure_time_bin"))
         descriptors: list[dict[str, object]] = []
         total_rows = 0
         for departure_bin in bins:
@@ -336,13 +296,9 @@ def write_measurement_od_contributions_dataset(
                 for row in batch:
                     if stream is None or chunk_count >= _MAX_PARTITION_ROWS:
                         finish_partition()
-                        output = partition_root / (
-                            f"departure-{_slug(departure_bin)}-{chunk_index:05d}.csv"
-                        )
+                        output = partition_root / (f"departure-{_slug(departure_bin)}-{chunk_index:05d}.csv")
                         stream = output.open("w", newline="", encoding="utf-8")
-                        writer = csv.DictWriter(
-                            stream, fieldnames=_CONTRIBUTION_COLUMNS
-                        )
+                        writer = csv.DictWriter(stream, fieldnames=_CONTRIBUTION_COLUMNS)
                         writer.writeheader()
                     assert writer is not None
                     writer.writerow(dict(zip(_CONTRIBUTION_COLUMNS, row, strict=True)))
@@ -350,19 +306,30 @@ def write_measurement_od_contributions_dataset(
                     total_rows += 1
             finish_partition()
 
-        component_path = target / "measurement_components.csv"
-        with component_path.open("w", newline="", encoding="utf-8") as stream:
-            writer = csv.DictWriter(stream, fieldnames=_COMPONENT_COLUMNS)
-            writer.writeheader()
-            cursor = connection.execute(
-                "SELECT measurement_index, fixed_offset_contribution, "
-                "additive_contribution, mean_floor_adjustment, modeled_mean "
-                "FROM components ORDER BY measurement_index"
+        component_root = target / "components"
+        component_root.mkdir()
+        component_partitions: list[dict[str, object]] = []
+        cursor = connection.execute(
+            "SELECT measurement_index, fixed_offset_contribution, "
+            "additive_contribution, mean_floor_adjustment, modeled_mean "
+            "FROM components ORDER BY measurement_index"
+        )
+        while batch := cursor.fetchmany(_COMPONENT_PARTITION_ROWS):
+            start_index = int(batch[0][0])
+            output = component_root / f"measurements-{start_index:09d}.csv"
+            with output.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=_COMPONENT_COLUMNS)
+                writer.writeheader()
+                writer.writerows(dict(zip(_COMPONENT_COLUMNS, row, strict=True)) for row in batch)
+            component_partitions.append(
+                {
+                    "start_index": start_index,
+                    "row_count": len(batch),
+                    "path": output.relative_to(target.parent.parent).as_posix(),
+                    "size_bytes": output.stat().st_size,
+                    "sha256": _sha256(output),
+                }
             )
-            while batch := cursor.fetchmany(50_000):
-                writer.writerows(
-                    dict(zip(_COMPONENT_COLUMNS, row, strict=True)) for row in batch
-                )
         connection.close()
         connection = None
     finally:
@@ -370,10 +337,7 @@ def write_measurement_od_contributions_dataset(
             connection.close()
         shutil.rmtree(working_directory, ignore_errors=True)
 
-    fixed_positive_cells = sum(
-        cell.role == "fixed_positive"
-        for cell in artifact.canonical_index.demand_cells
-    )
+    fixed_positive_cells = sum(cell.role == "fixed_positive" for cell in artifact.canonical_index.demand_cells)
     manifest: dict[str, object] = {
         "schema_version": _SCHEMA_VERSION,
         "dataset_type": "gravity_measurement_od_contributions",
@@ -396,19 +360,15 @@ def write_measurement_od_contributions_dataset(
         "contribution_columns": list(_CONTRIBUTION_COLUMNS),
         "component_columns": list(_COMPONENT_COLUMNS),
         "component_table": {
-            "path": component_path.relative_to(target.parent.parent).as_posix(),
+            "partition_rows": _COMPONENT_PARTITION_ROWS,
+            "partitions": component_partitions,
             "row_count": row_count,
-            "size_bytes": component_path.stat().st_size,
-            "sha256": _sha256(component_path),
         },
         "fixed_positive_od_attribution_available": fixed_positive_cells == 0,
         "fixed_positive_od_attribution_message": (
             None
             if fixed_positive_cells == 0
-            else (
-                "Fixed-positive OD demand is aggregated in the mapping's fixed offset; "
-                "the artifact has no per-cell coefficients for those cells."
-            )
+            else ("Fixed-positive OD demand is aggregated in the mapping's fixed offset; the artifact has no per-cell coefficients for those cells.")
         ),
         "partitions": descriptors,
     }
@@ -431,9 +391,7 @@ def write_measurement_od_contributions_dataset(
         "nonzero_pairs": total_rows,
         "partitions": descriptors,
         "fixed_positive_od_attribution_available": fixed_positive_cells == 0,
-        "fixed_positive_od_attribution_message": manifest[
-            "fixed_positive_od_attribution_message"
-        ],
+        "fixed_positive_od_attribution_message": manifest["fixed_positive_od_attribution_message"],
         "fit_fingerprint": fit_result.model_fingerprint,
         "assignment_fingerprint": artifact.identity.timetable_fingerprint,
         "mapping_artifact_fingerprint": artifact.identity.fingerprint,
@@ -475,16 +433,12 @@ def validate_dataset(root: str | Path, payload: Mapping[str, object]) -> None:
         raise ValueError("measurement OD contribution manifest schema is invalid.")
     if (
         manifest.get("fit_fingerprint") != payload.get("fit_fingerprint")
-        or manifest.get("assignment_fingerprint")
-        != payload.get("assignment_fingerprint")
-        or manifest.get("mapping_artifact_fingerprint")
-        != payload.get("mapping_artifact_fingerprint")
-        or manifest.get("canonical_index_fingerprint")
-        != payload.get("canonical_index_fingerprint")
+        or manifest.get("assignment_fingerprint") != payload.get("assignment_fingerprint")
+        or manifest.get("mapping_artifact_fingerprint") != payload.get("mapping_artifact_fingerprint")
+        or manifest.get("canonical_index_fingerprint") != payload.get("canonical_index_fingerprint")
         or manifest.get("binding_fingerprint") != payload.get("binding_fingerprint")
         or manifest.get("od_layout_fingerprint") != payload.get("od_layout_fingerprint")
-        or manifest.get("observation_scale_source")
-        != payload.get("observation_scale_source")
+        or manifest.get("observation_scale_source") != payload.get("observation_scale_source")
         or manifest.get("explicit_rho") != payload.get("explicit_rho")
     ):
         raise ValueError("measurement OD contribution provenance differs from its manifest.")
@@ -499,11 +453,7 @@ def validate_dataset(root: str | Path, payload: Mapping[str, object]) -> None:
         if relative.is_absolute() or ".." in relative.parts:
             raise ValueError("measurement OD contribution partition path is unsafe.")
         path = bundle_root / relative
-        if (
-            not path.is_file()
-            or path.stat().st_size != descriptor.get("size_bytes")
-            or _sha256(path) != descriptor.get("sha256")
-        ):
+        if not path.is_file() or path.stat().st_size != descriptor.get("size_bytes") or _sha256(path) != descriptor.get("sha256"):
             raise ValueError("measurement OD contribution partition checksum mismatch.")
         with path.open(newline="", encoding="utf-8") as stream:
             reader = csv.DictReader(stream)
@@ -540,36 +490,68 @@ def validate_dataset(root: str | Path, payload: Mapping[str, object]) -> None:
     component = manifest.get("component_table")
     if not isinstance(component, Mapping):
         raise ValueError("measurement OD component table descriptor is invalid.")
-    relative = Path(str(component.get("path", "")))
-    if relative.is_absolute() or ".." in relative.parts:
-        raise ValueError("measurement OD component table path is unsafe.")
-    component_path = bundle_root / relative
-    if (
-        not component_path.is_file()
-        or component_path.stat().st_size != component.get("size_bytes")
-        or _sha256(component_path) != component.get("sha256")
-    ):
-        raise ValueError("measurement OD component table checksum mismatch.")
-    with component_path.open(newline="", encoding="utf-8") as stream:
-        reader = csv.DictReader(stream)
-        if tuple(reader.fieldnames or ()) != _COMPONENT_COLUMNS:
-            raise ValueError("measurement OD component table columns are invalid.")
-        count = 0
-        for row in reader:
-            try:
-                index = int(row["measurement_index"])
-                values = [
-                    float(row[name])
-                    for name in _COMPONENT_COLUMNS[1:]
-                ]
-            except (KeyError, TypeError, ValueError) as error:
-                raise ValueError("measurement OD component row is invalid.") from error
+    component_partitions = component.get("partitions")
+    if isinstance(component_partitions, list):
+        partition_limit = component.get("partition_rows")
+        if partition_limit != _COMPONENT_PARTITION_ROWS:
+            raise ValueError("measurement OD component partition bound is invalid.")
+        expected_index = 0
+        for descriptor in component_partitions:
+            if not isinstance(descriptor, Mapping):
+                raise ValueError("measurement OD component partition descriptor is invalid.")
+            relative = Path(str(descriptor.get("path", "")))
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError("measurement OD component partition path is unsafe.")
+            component_path = bundle_root / relative
             if (
-                index != count
-                or not np.all(np.isfinite(values))
-                or index >= int(manifest.get("number_of_measurements", -1))
+                not component_path.is_file()
+                or component_path.stat().st_size != descriptor.get("size_bytes")
+                or _sha256(component_path) != descriptor.get("sha256")
             ):
-                raise ValueError("measurement OD component row is invalid.")
-            count += 1
+                raise ValueError("measurement OD component partition checksum mismatch.")
+            with component_path.open(newline="", encoding="utf-8") as stream:
+                reader = csv.DictReader(stream)
+                if tuple(reader.fieldnames or ()) != _COMPONENT_COLUMNS:
+                    raise ValueError("measurement OD component table columns are invalid.")
+                count = 0
+                for row in reader:
+                    try:
+                        index = int(row["measurement_index"])
+                        values = [float(row[name]) for name in _COMPONENT_COLUMNS[1:]]
+                    except (KeyError, TypeError, ValueError) as error:
+                        raise ValueError("measurement OD component row is invalid.") from error
+                    if index != expected_index + count or not np.all(np.isfinite(values)):
+                        raise ValueError("measurement OD component row is invalid.")
+                    count += 1
+            if count != descriptor.get("row_count") or count <= 0 or count > partition_limit:
+                raise ValueError("measurement OD component partition row count mismatch.")
+            if descriptor.get("start_index") != expected_index:
+                raise ValueError("measurement OD component partition index is invalid.")
+            expected_index += count
+        count = expected_index
+    else:
+        relative = Path(str(component.get("path", "")))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("measurement OD component table path is unsafe.")
+        component_path = bundle_root / relative
+        if not component_path.is_file() or component_path.stat().st_size != component.get("size_bytes") or _sha256(component_path) != component.get("sha256"):
+            raise ValueError("measurement OD component table checksum mismatch.")
+        with component_path.open(newline="", encoding="utf-8") as stream:
+            reader = csv.DictReader(stream)
+            if tuple(reader.fieldnames or ()) != _COMPONENT_COLUMNS:
+                raise ValueError("measurement OD component table columns are invalid.")
+            count = 0
+            for row in reader:
+                try:
+                    index = int(row["measurement_index"])
+                    values = [float(row[name]) for name in _COMPONENT_COLUMNS[1:]]
+                except (KeyError, TypeError, ValueError) as error:
+                    raise ValueError("measurement OD component row is invalid.") from error
+                if index != count or not np.all(np.isfinite(values)) or index >= int(manifest.get("number_of_measurements", -1)):
+                    raise ValueError("measurement OD component row is invalid.")
+                count += 1
     if count != component.get("row_count") or count != manifest.get("number_of_measurements"):
         raise ValueError("measurement OD component table row count mismatch.")
+    payload_component = payload.get("component_table")
+    if not isinstance(payload_component, Mapping) or payload_component.get("row_count") != component.get("row_count"):
+        raise ValueError("measurement OD component table metadata differs from its manifest.")

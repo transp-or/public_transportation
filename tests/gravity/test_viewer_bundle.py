@@ -24,7 +24,9 @@ from public_transportation.inference.gravity import (
     write_persisted_gravity_viewer_bundle,
 )
 from public_transportation.inference.od_parameter_layout import ODParameterLayout
-from public_transportation.inference.gravity.section_usage import write_section_usage_dataset
+from public_transportation.inference.gravity.section_usage import (
+    write_section_usage_dataset,
+)
 
 
 def _inputs(tmp_path, specification=None):
@@ -119,7 +121,10 @@ def _identifiability(result):
         local_information_variance=np.asarray((1.0, 2.0)),
         classification=np.asarray(("count_dominated", "mixed_information")),
         diagnostic_reason=np.asarray(
-            ("count_information_dominates_local_curvature", "counts_and_assumptions_both_contribute")
+            (
+                "count_information_dominates_local_curvature",
+                "counts_and_assumptions_both_contribute",
+            )
         ),
         effective_hessian_rank=1,
         total_hessian_dimension=result.raw_parameters.size,
@@ -148,9 +153,7 @@ def test_viewer_bundle_contains_exact_model_specification_and_round_trips(tmp_pa
     assert bundle.manifest["files"]["full_od.csv"]["row_count"] == 2
     assert bundle.manifest["files"]["od_map.csv"]["row_count"] == 2
     assert bundle.manifest["files"]["stop_summary.csv"]["row_count"] == 3
-    assert set(
-        bundle.read_table("od_map.csv").columns
-    ) == {
+    assert set(bundle.read_table("od_map.csv").columns) == {
         "origin_stop_id",
         "destination_stop_id",
         "departure_time_bin",
@@ -168,9 +171,93 @@ def test_viewer_bundle_contains_exact_model_specification_and_round_trips(tmp_pa
     assert queried["od_index"].tolist() == [1]
     grouped = loaded.aggregate_measurements("line")
     assert grouped["observed"].tolist() == [15.0]
-    assert loaded.manifest["provenance"]["od_layout_fingerprint"] == provenance[
-        "od_layout_fingerprint"
-    ]
+    assert loaded.manifest["provenance"]["od_layout_fingerprint"] == provenance["od_layout_fingerprint"]
+
+
+def test_measurement_location_lookup_is_exact_checksummed_and_paged(tmp_path):
+    result, report, _ = _inputs(tmp_path)
+    source = report.files["predicted_measurements.csv"]
+    with source.open(newline="", encoding="utf-8") as stream:
+        reader = csv.DictReader(stream)
+        fields = reader.fieldnames
+        rows = list(reader)
+    rows[0]["stop"] = "o1"
+    rows[1]["stop"] = "o1"
+    rows[2]["stop"] = "Ghost stop"
+    with source.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    bundle = write_gravity_viewer_bundle(
+        output_directory=tmp_path / "bundle",
+        fit_result=result,
+        validation_result=report.adequacy,
+        report=report,
+        network_files=_network_files(tmp_path),
+    )
+    lookup = bundle.viewer_summary["measurement_locations"]
+    assert lookup["available"] is True
+    assert lookup["number_of_measurements"] == 3
+    assert lookup["unmatched_stop_count"] == 1
+    assert lookup["source_identity"]["fit_fingerprint"] == result.model_fingerprint
+    assert lookup["source_identity"]["assignment_fingerprint"] == bundle.manifest["assignment_fingerprint"]
+    location_manifest = json.loads((bundle.path / lookup["manifest_path"]).read_text(encoding="utf-8"))
+    assert location_manifest["unmatched_stop_ids"] == ["Ghost stop"]
+
+    first = bundle.query_measurements_at_stop("o1", page=0, page_size=1)
+    second = bundle.query_measurements_at_stop("o1", page=1, page_size=1)
+    assert first["measurement_index"].tolist() == [0]
+    assert second["measurement_index"].tolist() == [1]
+    assert first.iloc[0]["measurement_type"] == "boarding"
+    assert first.iloc[0]["observed"] == 3.0
+    assert first.iloc[0]["modeled"] == 4.0
+    assert bundle.query_measurements_at_stop("d2").empty
+    assert bundle.query_measurements_at_stop("Ghost stop")["measurement_index"].tolist() == [2]
+    with pytest.raises(ValueError, match="page_size"):
+        bundle.query_measurements_at_stop("o1", page_size=501)
+
+    descriptor = location_manifest["stops"]["o1"]["partitions"][0]
+    (bundle.path / descriptor["path"]).write_text("corrupt\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        bundle.query_measurements_at_stop("o1")
+
+
+def test_single_measurement_row_remains_inspectable_without_mapping(tmp_path):
+    result, report, _ = _inputs(tmp_path)
+    bundle = write_gravity_viewer_bundle(
+        output_directory=tmp_path / "bundle",
+        fit_result=result,
+        validation_result=report.adequacy,
+        report=report,
+        network_files=_network_files(tmp_path),
+    )
+    row = bundle.query_measurements_at_stop("d1")
+    assert row["measurement_index"].tolist() == [1]
+    assert {
+        "measurement_type",
+        "line",
+        "direction",
+        "observation_time",
+        "time_period",
+        "stop",
+    }.issubset(row.columns)
+    assert bundle.viewer_summary["measurement_od_contributions"]["available"] is False
+
+
+def test_measurement_location_lookup_is_unavailable_without_network_snapshot(tmp_path):
+    result, report, _ = _inputs(tmp_path)
+    bundle = write_gravity_viewer_bundle(
+        output_directory=tmp_path / "bundle",
+        fit_result=result,
+        validation_result=report.adequacy,
+        report=report,
+    )
+    lookup = bundle.viewer_summary["measurement_locations"]
+    assert lookup["available"] is False
+    assert "stops.csv" in lookup["message"]
+    with pytest.raises(RuntimeError, match="stops.csv"):
+        bundle.query_measurements_at_stop("o1")
 
 
 def test_display_derived_files_aggregate_observations_and_preserve_status(tmp_path):
@@ -194,10 +281,7 @@ def test_display_derived_files_aggregate_observations_and_preserve_status(tmp_pa
     assert [row["residual"] for row in od_rows] == ["1.5", "2"]
     assert [row["fixed_free_status"] for row in od_rows] == ["free", "free"]
 
-    stop_rows = {
-        row["stop_id"]: row
-        for row in csv.DictReader((bundle.path / "stop_summary.csv").open(encoding="utf-8"))
-    }
+    stop_rows = {row["stop_id"]: row for row in csv.DictReader((bundle.path / "stop_summary.csv").open(encoding="utf-8"))}
     assert stop_rows["o1"]["observed_total"] == "3"
     assert stop_rows["o1"]["modeled_total"] == "4"
     assert stop_rows["o1"]["residual"] == "-1"
@@ -251,9 +335,7 @@ def test_bundle_round_trips_identifiability_payload(tmp_path):
     from public_transportation.inference.gravity import read_gravity_od_identifiability
 
     round_trip = read_gravity_od_identifiability(persisted)
-    np.testing.assert_array_equal(
-        round_trip.count_information_share, diagnostic.count_information_share
-    )
+    np.testing.assert_array_equal(round_trip.count_information_share, diagnostic.count_information_share)
     assert loaded.manifest["identifiability"]["provenance"]["model_fingerprint"] == result.model_fingerprint
 
 
@@ -321,16 +403,11 @@ def test_persisted_bundle_export_restores_report_and_cleans_staging(tmp_path):
 
     assert bundle.path.is_dir()
     assert not list(tmp_path.glob(".bundle.report-*"))
-    assert (
-        read_gravity_viewer_bundle(bundle.path).manifest["bundle_type"]
-        == "gravity_viewer_bundle"
-    )
+    assert read_gravity_viewer_bundle(bundle.path).manifest["bundle_type"] == "gravity_viewer_bundle"
 
 
 def test_persisted_bundle_export_accepts_json_normalized_tuple_specification(tmp_path):
-    specification = GravityModelSpecification(
-        time=GravityTimeSpecification(bin_labels=("morning", "evening"))
-    )
+    specification = GravityModelSpecification(time=GravityTimeSpecification(bin_labels=("morning", "evening")))
     result, _report, provenance = _inputs(tmp_path, specification)
     layout = ODParameterLayout(
         num_od_total=2,
@@ -582,17 +659,27 @@ def test_route_sections_expand_paths_and_query_selected_interval(tmp_path):
         report=report,
         network_files=network,
         route_flow_rows=(
-            {"origin": "o1", "destination": "d2", "departure_time_bin": "t0",
-             "line": "L1", "trip": "T1", "boarding_stop": "o1", "alighting_stop": "d2",
-             "route_path_id": "path-1", "assigned_demand": 2, "path_share": 1,
-             "transfer_count": 0, "flow_semantics": "path_probability"},
+            {
+                "origin": "o1",
+                "destination": "d2",
+                "departure_time_bin": "t0",
+                "line": "L1",
+                "trip": "T1",
+                "boarding_stop": "o1",
+                "alighting_stop": "d2",
+                "route_path_id": "path-1",
+                "assigned_demand": 2,
+                "path_share": 1,
+                "transfer_count": 0,
+                "flow_semantics": "path_probability",
+            },
         ),
     )
     assert bundle.route_section_available
     sections = bundle.viewer_summary["route_sections"]
-    section_id = next(row["section_id"] for row in csv.DictReader(
-        (bundle.path / sections["catalog_path"]).open(encoding="utf-8")
-    ) if row["from_stop_id"] == "o1")
+    section_id = next(
+        row["section_id"] for row in csv.DictReader((bundle.path / sections["catalog_path"]).open(encoding="utf-8")) if row["from_stop_id"] == "o1"
+    )
     contributors = bundle.query_section_od(section_id, departure_time_bin="t0")
     assert contributors.shape[0] == 1
     assert contributors.iloc[0]["route_path_id"] == "path-1"
@@ -607,12 +694,24 @@ def test_compact_section_dataset_is_consumed_without_path_expansion(tmp_path):
     dataset = tmp_path / "section-usage"
     write_section_usage_dataset(
         (
-            {"departure_time_bin": "am", "section_id": "S1", "origin_stop_id": "o1",
-             "destination_stop_id": "d1", "line_id": "L1", "trip_id": "T1",
-             "assigned_contribution": 1.25},
-            {"departure_time_bin": "am", "section_id": "S1", "origin_stop_id": "o1",
-             "destination_stop_id": "d1", "line_id": "L1", "trip_id": "T2",
-             "assigned_contribution": 0.75},
+            {
+                "departure_time_bin": "am",
+                "section_id": "S1",
+                "origin_stop_id": "o1",
+                "destination_stop_id": "d1",
+                "line_id": "L1",
+                "trip_id": "T1",
+                "assigned_contribution": 1.25,
+            },
+            {
+                "departure_time_bin": "am",
+                "section_id": "S1",
+                "origin_stop_id": "o1",
+                "destination_stop_id": "d1",
+                "line_id": "L1",
+                "trip_id": "T2",
+                "assigned_contribution": 0.75,
+            },
         ),
         dataset,
         format="csv",
@@ -642,9 +741,14 @@ def test_route_flow_assignment_fingerprint_mismatch_fails_closed(tmp_path):
             validation_result=report.adequacy,
             report=report,
             route_flow_rows=(
-                {"origin": "o1", "destination": "d1", "departure_time_bin": "am",
-                 "assigned_demand": 1, "flow_semantics": "path_probability",
-                 "assignment_fingerprint": "different"},
+                {
+                    "origin": "o1",
+                    "destination": "d1",
+                    "departure_time_bin": "am",
+                    "assigned_demand": 1,
+                    "flow_semantics": "path_probability",
+                    "assignment_fingerprint": "different",
+                },
             ),
         )
 
