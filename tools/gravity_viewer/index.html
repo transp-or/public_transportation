@@ -183,6 +183,36 @@
       <div class="table-wrap"><table id="flow-table"><thead></thead><tbody></tbody></table></div>
     </section>
 
+    <section id="measurement-od" class="panel hidden">
+      <h2>Measured flows by OD pair</h2>
+      <p id="measurement-od-unavailable" class="notice hidden"></p>
+      <p class="muted">Inspect the sparse linear-mapping contribution of each fitted OD pair to a measured row, or the measured rows affected by one OD pair. Values stay in the model's units; fixed offsets, additive terms, and any mean-floor adjustment are shown separately.</p>
+      <div class="toolbar">
+        <label>Query direction
+          <select id="measurement-od-direction"><option value="measurement">OD contributors to a measurement</option><option value="od">Measurements affected by an OD pair</option></select>
+        </label>
+        <label id="measurement-row-label">Measurement row index
+          <input id="measurement-row-index" type="number" min="0" step="1" value="0">
+        </label>
+        <label id="measurement-bin-label" class="hidden">OD departure interval
+          <select id="measurement-bin"></select>
+        </label>
+        <label id="measurement-origin-label" class="hidden">Origin
+          <select id="measurement-origin"></select>
+        </label>
+        <label id="measurement-destination-label" class="hidden">Destination
+          <select id="measurement-destination"></select>
+        </label>
+        <label>Top contributors
+          <input id="measurement-od-limit" type="number" min="1" max="500" value="50">
+        </label>
+        <button id="measurement-od-load" type="button">Load contributions</button>
+      </div>
+      <div id="measurement-od-status" class="status">No contribution query selected.</div>
+      <div id="measurement-od-detail" class="detail"></div>
+      <div class="table-wrap"><table id="measurement-od-table"><thead></thead><tbody></tbody></table></div>
+    </section>
+
     <section id="route-sections" class="panel hidden">
       <h2>Line sections and OD contributors</h2>
       <p id="section-unavailable" class="notice hidden"></p>

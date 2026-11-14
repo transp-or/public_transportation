@@ -35,6 +35,10 @@ viewer_bundle/
   stop_summary.csv                 optional display summary
   viewer_summary.json              partition/index metadata
   partitions/od/                   one CSV per departure-time bin
+  partitions/measurement_od_contributions/  optional sparse OD-to-measurement map
+    manifest.json
+    measurement_components.csv
+    bins/                           bounded CSV partitions by OD departure interval
   partitions/route_flows/          optional sparse post-fit route flows
   partitions/route_sections/       optional OD-to-directed-section contributors
   partitions/section_loads/        optional section-load summaries by OD interval
@@ -153,6 +157,41 @@ readable. They expose the validated legacy tables and clearly report that
 lazy time-slot and route-level exploration is unavailable until a refreshed
 export is produced.
 
+## Measured rows by OD pair
+
+When a validated sparse linear-mapping artifact was supplied during bundle
+creation, the **Measured flows by OD pair** panel lets you inspect the
+contributions in either direction: the OD pairs contributing to a selected
+measurement row, or the measured rows affected by one OD-time cell. Results are
+ranked by absolute modeled contribution and the browser reads only bounded CSV
+partitions. The Python bundle API provides the same queries:
+
+```python
+bundle.query_measurement_od_contributions(measurement_index=123, top_n=50)
+bundle.query_od_measurement_contributions(od_index=456, top_n=50)
+bundle.query_measurement_contribution_components(measurement_index=123)
+```
+
+Enable the dataset by passing the supported persisted sparse mapping artifact
+as `linear_mapping_artifact` to either viewer-bundle writer. The writer
+validates fit and assignment fingerprints, canonical coordinates, and payload
+checksums, then streams stored sparse entries; it does not rerun routing. When
+the fit persists its observation-scale vector, no extra scale is needed. For a
+fit whose measurement scale is specified only by `rho`, pass that same fitted
+`rho`; otherwise the contribution panel is marked unavailable. Python queries
+keep at most 5,000 ranked rows in memory per request; `top_n` and pagination
+are bounded to that ranked window.
+
+The contribution is calculated from the saved sparse mapping and fitted OD
+demand, without rerunning routing. It decomposes measured channels only; it is
+not a flow on every route section unless those sections are rows of that
+mapping. The row-component query keeps fixed offsets, additive terms, and a
+mean-floor adjustment separate from OD contributions. If the mapping contains
+fixed-positive OD demand only as an aggregate fixed offset, that component is
+shown separately and is not divided among OD pairs. Bundles without a
+compatible mapping or the exact measurement scale report this feature as
+unavailable rather than estimating missing contributions.
+
 ## Directed line sections
 
 Bundles produced with an explicit post-fit route export may also contain a
@@ -179,45 +218,6 @@ The Python API mirrors the viewer:
 bundle.query_section_load("s-…", departure_time_bin="t3")
 bundle.query_section_od("s-…", departure_time_bin="t3", page=0, page_size=100)
 ```
-
-### Expected OD use of scheduled sections
-
-For a completed fixed-routing fit, the public producer
-`export_gravity_od_section_marginals` replays the persisted destination-group
-probabilities one OD cell at a time. It emits only scheduled ride links, with
-`flow_semantics="service_marginal"` and the OD's departure-time slot. Each row
-means fitted OD demand multiplied by the cached probability of using that
-adjacent-stop ride link. It is therefore expected OD use of a section, not an
-enumerated passenger route and not an exact transfer-count distribution.
-
-The producer validates the assignment identity, every routing-shard descriptor
-and content hash, and the canonical/compact OD ordering before consuming the
-fit. It writes bounded durable checkpoints within each destination group and publishes
-the final CSV atomically. A representative dry-run/pilot should be recorded
-before scheduling the full export; no routing preparation or model estimation
-is triggered by this API.
-
-The planning API accepts `checkpoint_directory`, `resume=True`,
-`checkpoint_batch_size`, `checkpoint_identity`, and a progress callback. A
-checkpoint is stored as `plan_checkpoint.json` plus atomic per-group records;
-resume validates the schema, algorithm version, scientific-input identity, and
-pilot settings before skipping verified groups. The completed checkpoint is
-distinct from the private case runner's final `status: awaiting_review` plan
-file, so interrupted pilots cannot be approved accidentally.
-
-The export itself accepts `od_chunk_size` and
-`progress_interval_seconds`. Each chunk is fsynced and then recorded in the
-checkpoint manifest with its OD range, row count, elapsed time, and checksum.
-Progress callbacks distinguish non-durable OD traversal heartbeats from
-`chunk_checkpointed` events and include inner-cell counts, rolling ETA, and ETA
-confidence. Existing verified group-level checkpoints are migrated as legacy
-completed units; uncommitted groups are recomputed safely.
-
-By default, the exporter uses the same batched forward-reachability and edge
-gather kernels as the linear-mapping builder: one graph traversal serves a
-bounded batch of OD origins, while output remains streamed in the existing
-chunk order. Set `use_vectorized_route_kernel=False` only for a scalar
-reference comparison; this does not change the scientific flow semantics.
 
 `query_section_od` streams the selected interval and section only, and pages
 the returned rows without truncating the underlying contributor data. Older
@@ -325,43 +325,28 @@ counts in the manifest.
 
 ## Compact OD-to-section product
 
-For exports that only need section/OD/service queries, use the compact product
-instead of the path-level CSV:
+Bundles may include a compact section-usage dataset when a case-specific
+producer has already materialized section-level rows. The viewer reads this
+dataset directly for bounded section/OD/service queries:
 
 ```python
-from public_transportation.inference.gravity import export_od_section_marginals
+from public_transportation.inference.gravity import iter_section_usage_rows
 
-export_od_section_marginals(
-    ..., output_path="section_usage", output_format="section_usage",
-    section_usage_format="auto", section_usage_shard_rows=100_000,
-    storage_budget_bytes=<optional-budget>,
+rows = iter_section_usage_rows(
+    "section_usage", departure_time_bin="t3", section_id="s-…"
 )
 ```
 
-Each durable row is exactly
+Each row is exactly
 `(departure_time_bin, section_id, origin_stop_id, destination_stop_id,
 line_id, trip_id, assigned_contribution)`. Duplicate contributions are summed
 without changing `service_marginal` semantics or assignment identities. The
-dataset is partitioned by departure interval and published only after its
-manifest is complete. `auto` uses Parquet/Zstandard when the optional
-`pyarrow` dependency is installed and otherwise uses checksummed CSV shards;
-the CSV fallback remains directly queryable by the viewer.
+dataset is partitioned by departure interval and carries a completed manifest.
+Parquet/Zstandard is supported when the optional `pyarrow` dependency is
+installed; checksummed CSV shards remain directly queryable by the viewer.
 
-An existing completed route-flow checkpoint can be migrated without deleting
-the old chunks:
-
-```python
-from public_transportation.inference.gravity import migrate_od_section_checkpoint
-
-migrate_od_section_checkpoint(
-    "route_flows.checkpoint", "section_usage",
-    section_resolver=lambda row: section_id_for(row),
-)
-```
-
-Only manifest-referenced, checksum-verified chunks are read; orphan temporary
-files are ignored and retained. The bundle writer accepts the resulting
-directory through `section_usage_dataset=...`, so section queries stream only
+The bundle writer accepts the resulting directory through
+`section_usage_dataset=...`, so section queries stream only
 the selected departure partition and bounded batches.
 
 When trip-level detail is not needed, `write_line_usage_dataset(...)` produces

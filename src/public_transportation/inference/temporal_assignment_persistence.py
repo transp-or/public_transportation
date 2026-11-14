@@ -10,8 +10,8 @@ import tempfile
 import uuid
 from datetime import datetime, timezone
 from collections import deque
-from dataclasses import asdict
-from collections.abc import Mapping
+from dataclasses import asdict, dataclass
+from collections.abc import Iterator, Mapping
 from contextlib import nullcontext
 from pathlib import Path
 from time import perf_counter
@@ -49,6 +49,157 @@ TEMPORAL_BLOCK_ARTIFACT_SCHEMA_VERSION = 2
 TEMPORAL_OPERATOR_CACHE_SCHEMA_VERSION = 2
 TEMPORAL_OPERATOR_VALIDATOR_VERSION = 1
 PREFLIGHT_ADOPTION_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True, slots=True)
+class TemporalBlockArtifactReader:
+    """Validated, bounded-memory reader for a persisted temporal mapping."""
+
+    directory: Path
+    identity: AssignmentArtifactIdentity
+    canonical_index: CanonicalAssignmentIndex
+    fixed_measurement_offset: np.ndarray
+    manifest_sha256: str
+    nonzero_entries: int
+    _block_items: tuple[Mapping[str, object], ...]
+
+    @property
+    def number_of_measurements(self) -> int:
+        return self.canonical_index.number_of_measurements
+
+    @property
+    def number_of_demand_cells(self) -> int:
+        return self.canonical_index.number_of_demand_cells
+
+    def iter_blocks(self) -> Iterator[TemporalSparseBlock]:
+        """Yield checksum-verified blocks one at a time."""
+        total_nonzeros = 0
+        for item in self._block_items:
+            filename = item.get("filename")
+            key_payload = item.get("key")
+            if (
+                not isinstance(filename, str)
+                or Path(filename).name != filename
+                or not isinstance(key_payload, Mapping)
+            ):
+                raise ValueError("temporal block artifact entry is invalid.")
+            try:
+                with np.load(
+                    self.directory / "blocks" / filename, allow_pickle=False
+                ) as data:
+                    rows = np.asarray(data["row_indices"])
+                    columns = np.asarray(data["column_indices"])
+                    values = np.asarray(data["values"])
+                if _block_content_hash(rows, columns, values) != item.get(
+                    "content_hash"
+                ):
+                    raise ValueError("temporal block content hash is invalid.")
+                block = TemporalSparseBlock(
+                    key=TemporalBlockKey(**key_payload),
+                    row_indices=rows,
+                    column_indices=columns,
+                    values=values,
+                    number_of_measurements=self.number_of_measurements,
+                    number_of_demand_cells=self.number_of_demand_cells,
+                )
+            except (KeyError, OSError, TypeError, ValueError) as error:
+                raise ValueError(
+                    "temporal block artifact payload is missing or corrupt."
+                ) from error
+            if block.nonzero_entries != item.get("nonzero_entries"):
+                raise ValueError("temporal block artifact nonzero count is invalid.")
+            total_nonzeros += block.nonzero_entries
+            yield block
+        if total_nonzeros != self.nonzero_entries:
+            raise ValueError(
+                "temporal block artifact aggregate nonzero count is invalid."
+            )
+
+
+def open_temporal_block_artifact(
+    directory: str | Path,
+) -> TemporalBlockArtifactReader:
+    """Validate an artifact header and return a bounded-memory block reader.
+
+    Payload block hashes are verified as :meth:`TemporalBlockArtifactReader.iter_blocks`
+    is consumed.  The manifest, file sizes, revision, canonical index,
+    completion marker, and fixed-offset checksum are validated immediately.
+    """
+    source = Path(directory).expanduser().resolve()
+    manifest_path = source / "manifest.json"
+    manifest = _read_json(manifest_path)
+    if manifest.get("schema_version") != TEMPORAL_BLOCK_ARTIFACT_SCHEMA_VERSION:
+        raise ValueError("temporal block artifact schema is incompatible.")
+    if manifest.get("complete") is not True:
+        raise ValueError("temporal block artifact is incomplete.")
+    if manifest.get("package_revision") != package_revision():
+        raise ValueError("temporal block artifact package revision is incompatible.")
+    file_sizes = manifest.get("file_sizes")
+    if not isinstance(file_sizes, Mapping):
+        raise ValueError("temporal block artifact file-size metadata is missing.")
+    for relative, expected_size in file_sizes.items():
+        relative_path = Path(str(relative))
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise ValueError("temporal block artifact contains an unsafe file path.")
+        path = source / relative_path
+        if not path.is_file() or path.stat().st_size != int(expected_size):
+            raise ValueError("temporal block artifact output size is invalid.")
+    try:
+        identity = AssignmentArtifactIdentity(**manifest["identity"])
+        canonical_index = _decode_canonical_index(manifest["canonical_index"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("temporal block artifact identity is invalid.") from error
+    if manifest.get("identity_fingerprint") != identity.fingerprint:
+        raise ValueError("temporal block artifact identity fingerprint is invalid.")
+    if identity.canonical_index_fingerprint != canonical_index.artifact_fingerprint:
+        raise AssignmentCompatibilityError(
+            "temporal block artifact identity and canonical index differ."
+        )
+    _validate_completion_marker(source, manifest)
+    number_of_measurements = canonical_index.number_of_measurements
+    number_of_demand_cells = canonical_index.number_of_demand_cells
+    if (
+        manifest.get("number_of_measurements") != number_of_measurements
+        or manifest.get("number_of_demand_cells") != number_of_demand_cells
+    ):
+        raise ValueError("temporal block artifact dimensions differ from its index.")
+    block_items = manifest.get("blocks")
+    if not isinstance(block_items, list) or any(
+        not isinstance(item, Mapping) for item in block_items
+    ):
+        raise ValueError("temporal block artifact block manifest is invalid.")
+    nonzero_entries = manifest.get("nonzero_entries")
+    if (
+        isinstance(nonzero_entries, bool)
+        or not isinstance(nonzero_entries, int)
+        or nonzero_entries < 0
+        or sum(int(item.get("nonzero_entries", -1)) for item in block_items)
+        != nonzero_entries
+    ):
+        raise ValueError("temporal block artifact aggregate nonzero count is invalid.")
+    try:
+        offset = np.load(source / "fixed_measurement_offset.npy", allow_pickle=False)
+    except (OSError, ValueError) as error:
+        raise ValueError(
+            "temporal block fixed measurement offset is missing or corrupt."
+        ) from error
+    if (
+        offset.shape != (number_of_measurements,)
+        or not np.all(np.isfinite(offset))
+        or _array_content_hash(offset) != manifest.get("fixed_measurement_offset_hash")
+    ):
+        raise ValueError("temporal block fixed measurement offset is invalid.")
+    offset = np.array(offset, copy=True)
+    offset.setflags(write=False)
+    return TemporalBlockArtifactReader(
+        directory=source,
+        identity=identity,
+        canonical_index=canonical_index,
+        fixed_measurement_offset=offset,
+        manifest_sha256=_file_sha256(manifest_path),
+        nonzero_entries=nonzero_entries,
+        _block_items=tuple(dict(item) for item in block_items),
+    )
 
 
 def temporal_block_cache_path(

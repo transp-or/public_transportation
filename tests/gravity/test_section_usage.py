@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import csv
-import hashlib
 import json
 
 import pytest
@@ -12,7 +10,6 @@ from public_transportation.inference.gravity.section_usage import (
     aggregate_line_usage_rows,
     aggregate_section_usage_rows,
     iter_section_usage_rows,
-    migrate_od_section_checkpoint,
     read_section_usage_manifest,
     write_line_usage_dataset,
     write_section_usage_dataset,
@@ -61,41 +58,6 @@ def test_line_dataset_is_an_exact_separate_aggregate(tmp_path):
     rows = list(iter_section_usage_rows(dataset, section_id="S1"))[0]
     assert rows[0]["trip_id"] == ""
     assert rows[0]["assigned_contribution"] == pytest.approx(7.0)
-
-
-def test_checkpoint_migration_reads_only_manifest_chunks(tmp_path):
-    checkpoint = tmp_path / "checkpoint"
-    chunk = checkpoint / "units" / "group-00000000" / "chunk-00000000.csv"
-    chunk.parent.mkdir(parents=True)
-    with chunk.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(
-            stream,
-            fieldnames=("departure_time_bin", "origin_stop_id", "destination_stop_id",
-                        "line_id", "trip_id", "boarding_stop_id", "alighting_stop_id",
-                        "assigned_demand"),
-        )
-        writer.writeheader()
-        writer.writerow({"departure_time_bin": "am", "origin_stop_id": "O",
-                         "destination_stop_id": "D", "line_id": "L", "trip_id": "T",
-                         "boarding_stop_id": "A", "alighting_stop_id": "B",
-                         "assigned_demand": "3"})
-    digest = hashlib.sha256(chunk.read_bytes()).hexdigest()
-    (checkpoint / "orphan.csv").write_text("must not be read\n", encoding="utf-8")
-    (checkpoint / "manifest.json").write_text(json.dumps({
-        "status": "completed",
-        "completed_units": {"0": {"unit_type": "group_chunks", "status": "completed",
-                                   "chunks": [{"path": str(chunk.relative_to(checkpoint)), "sha256": digest}]}}
-    }), encoding="utf-8")
-    output = tmp_path / "migrated"
-    manifest = migrate_od_section_checkpoint(
-        checkpoint,
-        output,
-        format="csv",
-        section_resolver=lambda row: f"{row['boarding_stop_id']}-{row['alighting_stop_id']}",
-    )
-    assert manifest["rows_written"] == 1
-    rows = list(iter_section_usage_rows(output, section_id="A-B"))[0]
-    assert rows[0]["assigned_contribution"] == pytest.approx(3.0)
 
 
 def test_storage_budget_stops_at_durable_shard_boundary(tmp_path):

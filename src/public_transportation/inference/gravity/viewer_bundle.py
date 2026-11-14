@@ -25,6 +25,10 @@ import numpy as np
 
 from public_transportation.inference.block_coordinate._canonical import canonical_json
 from public_transportation.inference.od_parameter_layout import ODParameterLayout
+from public_transportation.inference.temporal_assignment_persistence import (
+    TemporalBlockArtifactReader,
+    open_temporal_block_artifact,
+)
 
 from .estimator import GravityEstimationResult
 from .identifiability import (
@@ -39,6 +43,10 @@ from .reporting import (
 )
 from .specification import GravityModelSpecification
 from .validation import GravityAdequacyReport, GravityValidationMetadata
+from .measurement_od_contributions import (
+    validate_dataset as _validate_measurement_od_dataset,
+    write_measurement_od_contributions_dataset,
+)
 
 
 GRAVITY_VIEWER_BUNDLE_SCHEMA_VERSION = 1
@@ -53,6 +61,7 @@ _OD_PARTITION_ROOT = "partitions/od"
 _ROUTE_FLOW_PARTITION_ROOT = "partitions/route_flows"
 _ROUTE_SECTION_PARTITION_ROOT = "partitions/route_sections"
 _SECTION_LOAD_PARTITION_ROOT = "partitions/section_loads"
+_MEASUREMENT_OD_QUERY_LIMIT = 5_000
 _IDENTIFIABILITY_MESSAGE = (
     "OD identifiability diagnostics were not available; inference_score remains "
     "only a structural fixed/free indicator."
@@ -185,6 +194,21 @@ _SECTION_USAGE_COLUMNS = (
     "line_id",
     "trip_id",
     "assigned_contribution",
+)
+_MEASUREMENT_OD_COLUMNS = (
+    "measurement_index",
+    "od_index",
+    "departure_time_bin",
+    "operator_coefficient",
+    "linear_flow_contribution",
+    "modeled_mean_contribution",
+)
+_MEASUREMENT_COMPONENT_COLUMNS = (
+    "measurement_index",
+    "fixed_offset_contribution",
+    "additive_contribution",
+    "mean_floor_adjustment",
+    "modeled_mean",
 )
 
 
@@ -1263,6 +1287,107 @@ def _source_provenance(
     return result
 
 
+def _validate_linear_mapping_for_bundle(
+    *,
+    artifact: TemporalBlockArtifactReader,
+    fit_result: GravityEstimationResult,
+    report_payload: Mapping[str, object],
+    metadata: Mapping[str, object],
+    full_od_path: Path,
+) -> None:
+    """Bind sparse mapping coordinates and identity to this exact fitted result."""
+    provenance = _source_provenance(report_payload, fit_result, metadata)
+    index = artifact.canonical_index
+    identity = artifact.identity
+    expected_artifact = (
+        fit_result.direct_operator_artifact_fingerprint
+        or provenance.get("artifact_identity_fingerprint")
+    )
+    if not expected_artifact or expected_artifact != identity.fingerprint:
+        raise ValueError(
+            "linear mapping artifact identity does not match the fitted operator."
+        )
+    for provenance_name, artifact_value in (
+        ("assignment_fingerprint", identity.timetable_fingerprint),
+        ("mapping_fingerprint", identity.measurement_mapping_fingerprint),
+        ("canonical_index_fingerprint", index.artifact_fingerprint),
+        ("binding_fingerprint", index.binding_fingerprint),
+        ("od_layout_fingerprint", index.source_od_layout_fingerprint),
+    ):
+        expected = provenance.get(provenance_name)
+        if expected is None or expected == "":
+            raise ValueError(
+                f"fit/report provenance is missing {provenance_name!r} required by the linear mapping."
+            )
+        if artifact_value is None or str(expected) != str(artifact_value):
+            raise ValueError(
+                f"linear mapping {provenance_name} does not match the fitted result."
+            )
+    compact_fingerprint = provenance.get("compact_layout_fingerprint")
+    if (
+        index.source_compact_layout_fingerprint is not None
+        and compact_fingerprint != index.source_compact_layout_fingerprint
+    ):
+        raise ValueError("linear mapping compact OD layout differs from the fitted result.")
+    if (
+        artifact.number_of_demand_cells != fit_result.free_od_demand.size
+        or index.number_of_physical_demand_cells != fit_result.full_od_demand.size
+        or artifact.number_of_measurements != fit_result.predicted_measurements.size
+    ):
+        raise ValueError("linear mapping dimensions differ from the fitted result.")
+
+    seen = np.zeros(index.number_of_physical_demand_cells, dtype=bool)
+    for row in _iter_csv_rows(full_od_path):
+        try:
+            full_index = int(row["od_index"])
+            estimated = float(row["estimated_demand"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("full_od.csv cannot be aligned to the canonical mapping index.") from error
+        if full_index < 0 or full_index >= seen.size or seen[full_index]:
+            raise ValueError("full_od.csv has invalid or duplicate canonical OD indices.")
+        cell = index.demand_cells[full_index]
+        if (
+            cell.full_index != full_index
+            or row.get("origin_stop_id") != cell.origin_id
+            or row.get("destination_stop_id") != cell.destination_id
+            or row.get("departure_time_bin") != cell.departure_interval_id
+        ):
+            raise ValueError("canonical OD mapping coordinates differ from full_od.csv.")
+        if not np.isclose(
+            estimated,
+            float(fit_result.full_od_demand[full_index]),
+            rtol=1e-8,
+            atol=1e-8,
+        ):
+            raise ValueError("canonical OD demand differs from the fitted result.")
+        seen[full_index] = True
+    if not np.all(seen):
+        raise ValueError("full_od.csv does not cover the canonical OD mapping index.")
+
+    expected_row = 0
+    for row in _iter_csv_rows(full_od_path.parent / "predicted_measurements.csv"):
+        try:
+            row_index = int(row["row_index"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                "predicted_measurements.csv cannot be aligned to canonical measurement rows."
+            ) from error
+        if row_index != expected_row or row_index >= len(index.measurements):
+            raise ValueError(
+                "predicted_measurements.csv has invalid canonical measurement row indices."
+            )
+        expected_row += 1
+    if expected_row != len(index.measurements):
+        raise ValueError(
+            "predicted_measurements.csv does not cover canonical measurement rows."
+        )
+
+    if tuple(cell.operator_column for cell in index.demand_cells if cell.operator_column is not None) != tuple(
+        range(fit_result.free_od_demand.size)
+    ):
+        raise ValueError("canonical free-OD columns are not aligned to fitted demand.")
+
+
 def _validation_provenance(validation_result: object) -> dict[str, object]:
     if isinstance(validation_result, GravityAdequacyReport):
         return {
@@ -1880,6 +2005,34 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
                                     if supplied and supplied != str(expected_assignment):
                                         raise ValueError("viewer route-section assignment fingerprint mismatch.")
         _validate_route_flow_network(root, summary_payload)
+        contribution_payload = summary_payload.get("measurement_od_contributions", {})
+        if not isinstance(contribution_payload, Mapping):
+            raise ValueError("viewer measurement OD contribution metadata is invalid.")
+        if contribution_payload.get("available"):
+            _validate_measurement_od_dataset(root, contribution_payload)
+            for field, expected in (
+                ("fit_fingerprint", manifest.get("model_fingerprint")),
+                ("assignment_fingerprint", manifest.get("assignment_fingerprint")),
+                (
+                    "canonical_index_fingerprint",
+                    manifest.get("canonical_index_fingerprint"),
+                ),
+                ("binding_fingerprint", manifest.get("binding_fingerprint")),
+                ("od_layout_fingerprint", manifest.get("od_layout_fingerprint")),
+                (
+                    "mapping_artifact_fingerprint",
+                    manifest.get("artifact_identity_fingerprint"),
+                ),
+            ):
+                if expected is not None and contribution_payload.get(field) != expected:
+                    raise ValueError(
+                            f"viewer measurement OD contribution {field} differs from bundle provenance: "
+                            f"dataset={contribution_payload.get(field)!r}, bundle={expected!r}."
+                    )
+        elif contribution_payload and not contribution_payload.get("message"):
+            raise ValueError(
+                "unavailable measurement OD contributions require an explanatory message."
+            )
     identifiability = manifest.get("identifiability", {})
     if not isinstance(identifiability, Mapping):
         raise ValueError("bundle identifiability metadata is invalid.")
@@ -2204,6 +2357,264 @@ class GravityViewerBundle:
     def route_section_available(self) -> bool:
         payload = self.viewer_summary.get("route_sections", {})
         return isinstance(payload, Mapping) and bool(payload.get("available"))
+
+    @property
+    def measurement_od_contributions_available(self) -> bool:
+        payload = self.viewer_summary.get("measurement_od_contributions", {})
+        return isinstance(payload, Mapping) and bool(payload.get("available"))
+
+    def _measurement_od_payload(self) -> Mapping[str, object]:
+        payload = self.viewer_summary.get("measurement_od_contributions", {})
+        if not isinstance(payload, Mapping) or not payload.get("available"):
+            message = (
+                payload.get("message")
+                if isinstance(payload, Mapping)
+                else None
+            )
+            raise RuntimeError(
+                str(message or "OD-by-measurement contributions are unavailable.")
+            )
+        return payload
+
+    @staticmethod
+    def _measurement_od_query_window(
+        *, top_n: int | None, page: int, page_size: int
+    ) -> int:
+        if page < 0 or page_size <= 0:
+            raise ValueError("page must be non-negative and page_size positive.")
+        if page_size > _MEASUREMENT_OD_QUERY_LIMIT:
+            raise ValueError(
+                f"page_size must not exceed {_MEASUREMENT_OD_QUERY_LIMIT}."
+            )
+        if top_n is not None and (top_n <= 0 or top_n > _MEASUREMENT_OD_QUERY_LIMIT):
+            raise ValueError(
+                f"top_n must be positive and no greater than {_MEASUREMENT_OD_QUERY_LIMIT}."
+            )
+        limit = top_n if top_n is not None else (page + 1) * page_size
+        if limit > _MEASUREMENT_OD_QUERY_LIMIT:
+            raise ValueError(
+                "requested ranked page exceeds the bounded contribution-query window."
+            )
+        return limit
+
+    def _measurement_od_rows_with_labels(self, rows: list[dict[str, object]]) -> Any:
+        try:
+            import pandas as pd
+        except ImportError as error:  # pragma: no cover
+            raise RuntimeError("pandas is required for viewer access.") from error
+        columns = [
+            "measurement_index",
+            "od_index",
+            "operator_coefficient",
+            "linear_flow_contribution",
+            "modeled_mean_contribution",
+            "origin_stop_id",
+            "destination_stop_id",
+            "departure_time_bin",
+            "estimated_demand",
+            "identifiability_class",
+            "measurement_type",
+            "line",
+            "direction",
+            "stop",
+            "observation_time",
+            "time_period",
+            "observed",
+            "modeled",
+        ]
+        frame = pd.DataFrame(rows)
+        if frame.empty:
+            return pd.DataFrame(columns=columns)
+        od_ids = tuple(sorted({int(value) for value in frame["od_index"]}))
+        measurement_ids = tuple(
+            sorted({int(value) for value in frame["measurement_index"]})
+        )
+        od = self.read_table(
+            "full_od.csv",
+            columns=(
+                "od_index",
+                "origin_stop_id",
+                "destination_stop_id",
+                "departure_time_bin",
+                "estimated_demand",
+                "identifiability_class",
+            ),
+            filters={"od_index": od_ids},
+        )
+        measurements = self.read_table(
+            "predicted_measurements.csv",
+            columns=_PREDICTED_COLUMNS,
+            filters={"row_index": measurement_ids},
+        ).rename(columns={"row_index": "measurement_index"})
+        frame = frame.merge(od, on="od_index", how="left", validate="many_to_one")
+        frame = frame.merge(
+            measurements,
+            on="measurement_index",
+            how="left",
+            validate="many_to_one",
+        )
+        if frame["origin_stop_id"].isna().any() or frame["measurement_type"].isna().any():
+            raise ValueError("contribution indices could not be joined to viewer tables.")
+        return frame.reindex(columns=columns)
+
+    def _rank_measurement_od_rows(
+        self,
+        descriptors: Sequence[object],
+        *,
+        filter_column: str,
+        value: int,
+        limit: int,
+        chunksize: int = 50_000,
+    ) -> list[dict[str, object]]:
+        """Scan selected CSV partitions while retaining only the best ``limit`` rows."""
+        try:
+            import pandas as pd
+        except ImportError as error:  # pragma: no cover
+            raise RuntimeError("pandas is required for viewer access.") from error
+        best = pd.DataFrame(columns=_MEASUREMENT_OD_COLUMNS)
+        for descriptor in descriptors:
+            if not isinstance(descriptor, Mapping):
+                continue
+            path = str(descriptor.get("path") or descriptor.get("file") or "")
+            for chunk in self.iter_partition(
+                path,
+                columns=_MEASUREMENT_OD_COLUMNS,
+                chunksize=chunksize,
+                filters={filter_column: value},
+            ):
+                if chunk.empty:
+                    continue
+                chunk["modeled_mean_contribution"] = pd.to_numeric(
+                    chunk["modeled_mean_contribution"], errors="raise"
+                )
+                chunk["_rank"] = chunk["modeled_mean_contribution"].abs()
+                best = pd.concat((best, chunk), ignore_index=True)
+                best = best.nlargest(limit, "_rank", keep="first")
+        if best.empty:
+            return []
+        best = best.sort_values(
+            ["_rank", "measurement_index", "od_index"],
+            ascending=[False, True, True],
+            kind="stable",
+        ).drop(columns="_rank")
+        return best.to_dict(orient="records")
+
+    def query_measurement_od_contributions(
+        self,
+        measurement_index: int,
+        *,
+        top_n: int | None = None,
+        page: int = 0,
+        page_size: int = 100,
+    ) -> Any:
+        """Return ranked OD contributors to one measured row, with bounded output."""
+        limit = self._measurement_od_query_window(
+            top_n=top_n, page=page, page_size=page_size
+        )
+        payload = self._measurement_od_payload()
+        number_of_measurements = int(payload.get("number_of_measurements", -1))
+        if measurement_index < 0 or measurement_index >= number_of_measurements:
+            raise IndexError("measurement_index is outside the contribution dataset.")
+        descriptors = payload.get("partitions", ())
+        if not isinstance(descriptors, Sequence):
+            raise ValueError("measurement OD contribution partitions are invalid.")
+        rows = self._rank_measurement_od_rows(
+            descriptors,
+            filter_column="measurement_index",
+            value=measurement_index,
+            limit=limit,
+        )
+        if top_n is not None:
+            rows = rows[:top_n]
+        else:
+            rows = rows[page * page_size : page * page_size + page_size]
+        return self._measurement_od_rows_with_labels(rows)
+
+    def query_od_measurement_contributions(
+        self,
+        od_index: int,
+        *,
+        top_n: int | None = None,
+        page: int = 0,
+        page_size: int = 100,
+    ) -> Any:
+        """Return ranked measured rows affected by one fitted OD-time cell."""
+        fetch = self._measurement_od_query_window(
+            top_n=top_n, page=page, page_size=page_size
+        )
+        payload = self._measurement_od_payload()
+        od_rows = int(self.manifest.get("row_counts", {}).get("full_od.csv", -1))
+        if od_index < 0 or od_index >= od_rows:
+            raise IndexError("od_index is outside the viewer bundle.")
+        od_record = self.read_table(
+            "full_od.csv",
+            columns=("od_index", "departure_time_bin"),
+            filters={"od_index": od_index},
+        )
+        if od_record.empty:
+            raise ValueError("OD index has no row in full_od.csv.")
+        departure_bin = str(od_record.iloc[0]["departure_time_bin"])
+        descriptors = payload.get("partitions", ())
+        if not isinstance(descriptors, Sequence):
+            raise ValueError("measurement OD contribution partitions are invalid.")
+        selected = tuple(
+            descriptor
+            for descriptor in descriptors
+            if isinstance(descriptor, Mapping)
+            and str(descriptor.get("key")) == departure_bin
+        )
+        rows = self._rank_measurement_od_rows(
+            selected,
+            filter_column="od_index",
+            value=od_index,
+            limit=fetch,
+        )
+        if top_n is not None:
+            rows = rows[:top_n]
+        else:
+            rows = rows[page * page_size : page * page_size + page_size]
+        return self._measurement_od_rows_with_labels(rows)
+
+    def query_measurement_contribution_components(
+        self, measurement_index: int
+    ) -> Mapping[str, object] | None:
+        """Return the separate fixed, additive, floor, and total row components."""
+        payload = self._measurement_od_payload()
+        number_of_measurements = int(payload.get("number_of_measurements", -1))
+        if measurement_index < 0 or measurement_index >= number_of_measurements:
+            raise IndexError("measurement_index is outside the contribution dataset.")
+        component = payload.get("component_table")
+        if not isinstance(component, Mapping):
+            return None
+        chunks = list(
+            self.iter_partition(
+                str(component.get("path", "")),
+                columns=_MEASUREMENT_COMPONENT_COLUMNS,
+                filters={"measurement_index": measurement_index},
+                chunksize=1,
+            )
+        )
+        if not chunks or chunks[0].empty:
+            return None
+        components = chunks[0].iloc[0].to_dict()
+        measurement = self.read_table(
+            "predicted_measurements.csv",
+            columns=_PREDICTED_COLUMNS,
+            filters={"row_index": measurement_index},
+        )
+        if measurement.empty:
+            raise ValueError("measurement component index has no viewer-table row.")
+        payload = self._measurement_od_payload()
+        return {
+            **components,
+            **measurement.iloc[0].to_dict(),
+            "fixed_positive_od_attribution_available": payload.get(
+                "fixed_positive_od_attribution_available", True
+            ),
+            "fixed_positive_od_attribution_message": payload.get(
+                "fixed_positive_od_attribution_message"
+            ),
+        }
 
     def _section_group_descriptors(self, group_name: str) -> tuple[Mapping[str, object], ...]:
         payload = self.viewer_summary.get("route_sections", {})
@@ -2531,8 +2942,15 @@ def write_gravity_viewer_bundle(
     model_specification: GravityModelSpecification | Mapping[str, object] | None = None,
     route_flow_rows: Iterable[Mapping[str, object]] | str | Path | None = None,
     section_usage_dataset: str | Path | None = None,
+    linear_mapping_artifact: str | Path | None = None,
+    rho: float | None = None,
 ) -> GravityViewerBundle:
-    """Export validated fit/report data for an independent graphical viewer."""
+    """Export validated fit/report data for an independent graphical viewer.
+
+    ``linear_mapping_artifact`` optionally enables sparse OD-to-measurement
+    decomposition. ``rho`` is needed only when the fit does not persist its
+    exact observation-scale vector.
+    """
     if not isinstance(fit_result, GravityEstimationResult):
         raise TypeError("fit_result must be a GravityEstimationResult.")
     if not isinstance(report, GravityDetailedReport):
@@ -2655,6 +3073,36 @@ def write_gravity_viewer_bundle(
             staging,
             section_usage_dataset=section_usage_dataset,
         )
+        if linear_mapping_artifact is None:
+            if rho is not None:
+                raise ValueError("rho is only used with linear_mapping_artifact.")
+            viewer_summary["measurement_od_contributions"] = {
+                "available": False,
+                "schema_version": 1,
+                "message": "No validated sparse linear-mapping artifact was supplied.",
+            }
+        else:
+            mapping_reader = open_temporal_block_artifact(linear_mapping_artifact)
+            _validate_linear_mapping_for_bundle(
+                artifact=mapping_reader,
+                fit_result=fit_result,
+                report_payload=report_payload,
+                metadata=metadata,
+                full_od_path=staging / "full_od.csv",
+            )
+            contribution_summary = write_measurement_od_contributions_dataset(
+                destination=staging / _PARTITION_ROOT / "measurement_od_contributions",
+                artifact=mapping_reader,
+                fit_result=fit_result,
+                rho=rho,
+            )
+            if not contribution_summary.get("available"):
+                # Even when an exact model scale is absent, never publish an
+                # availability status before validating every source payload.
+                for _ in mapping_reader.iter_blocks():
+                    pass
+            viewer_summary["measurement_od_contributions"] = contribution_summary
+        _write_json(staging / _VIEWER_SUMMARY_FILE, viewer_summary)
         route_source = staging / "route_flows.csv"
         if route_source.exists():
             route_source.unlink()
@@ -2740,6 +3188,9 @@ def write_gravity_viewer_bundle(
                 "od": viewer_summary["od"]["partitions"],
                 "route_flows": viewer_summary["route_flows"].get("partitions", []),
                 "route_sections": viewer_summary.get("route_sections", {}),
+                "measurement_od_contributions": viewer_summary.get(
+                    "measurement_od_contributions", {}
+                ),
                 "cache_format_version": GRAVITY_VIEWER_CACHE_FORMAT_VERSION,
             },
             "viewer_summary": {
@@ -2748,6 +3199,9 @@ def write_gravity_viewer_bundle(
                 "od_partitions": len(viewer_summary["od"]["partitions"]),
                 "route_flows_available": bool(viewer_summary["route_flows"]["available"]),
                 "route_sections_available": bool(viewer_summary.get("route_sections", {}).get("available")),
+                "measurement_od_contributions_available": bool(
+                    viewer_summary.get("measurement_od_contributions", {}).get("available")
+                ),
             },
             "route_flow_provenance": {
                 "available": bool(viewer_summary["route_flows"]["available"]),
@@ -2809,6 +3263,8 @@ def write_persisted_gravity_viewer_bundle(
     report_output_directory: str | Path | None = None,
     route_flow_rows: Iterable[Mapping[str, object]] | str | Path | None = None,
     section_usage_dataset: str | Path | None = None,
+    linear_mapping_artifact: str | Path | None = None,
+    rho: float | None = None,
 ) -> GravityViewerBundle:
     """Export a viewer bundle directly from persisted fit/validation artifacts.
 
@@ -2868,6 +3324,8 @@ def write_persisted_gravity_viewer_bundle(
             model_specification=model_specification,
             route_flow_rows=route_flow_rows,
             section_usage_dataset=section_usage_dataset,
+            linear_mapping_artifact=linear_mapping_artifact,
+            rho=rho,
         )
     finally:
         if temporary_report is not None:

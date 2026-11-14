@@ -78,6 +78,7 @@ from public_transportation.preprocessing import (
     expansion_contract_fingerprint,
     generate_candidate_od_pairs,
     fingerprint_scenario,
+    feasibility_station_mapping_fingerprint,
     materialize_prior_demand_from_checkpoint,
     run_candidate_od_time_expansion,
     ScheduledFeasibilityContract,
@@ -482,6 +483,7 @@ def bootstrap_prior_demand(
     )
     scenario_fp = fingerprint_scenario(scenario)
     time_bins_fp = _time_bin_fingerprint(scenario)
+    station_mapping_fp = feasibility_station_mapping_fingerprint(scenario)
     expansion_config: dict[str, object] = {
         "chunk_size_pairs": settings.chunk_size_pairs,
         "progress_interval_seconds": settings.progress_interval_seconds,
@@ -490,6 +492,7 @@ def bootstrap_prior_demand(
         "maximum_initial_wait_seconds": settings.maximum_initial_wait_seconds,
         "maximum_journey_seconds": settings.maximum_journey_seconds,
         "maximum_waiting_seconds": settings.maximum_waiting_seconds,
+        "station_mapping_fingerprint": station_mapping_fp,
         "timetable_policy": "required",
         "package_revision": settings.package_revision,
         "approved_time_bins_fingerprint": time_bins_fp,
@@ -503,12 +506,21 @@ def bootstrap_prior_demand(
         maximum_initial_wait_seconds=settings.maximum_initial_wait_seconds,
         maximum_journey_seconds=settings.maximum_journey_seconds,
         maximum_waiting_seconds=settings.maximum_waiting_seconds,
+        station_mapping_fingerprint=station_mapping_fp,
     )
     expansion_config["feasibility_contract_version"] = feasibility_contract.version
     expansion_config["feasibility_contract_fingerprint"] = feasibility_contract.fingerprint
     config_identity = dict(expansion_config)
     expansion_config["configuration_fingerprint"] = hashlib.sha256(
         json.dumps(config_identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    checkpoint_configuration_fingerprint = hashlib.sha256(
+        json.dumps(
+            expansion_config,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
     ).hexdigest()
     expansion_fp = expansion_contract_fingerprint(
         universe, scenario.time_bins, expansion_config
@@ -555,7 +567,7 @@ def bootstrap_prior_demand(
         scenario=scenario,
         package_revision=settings.package_revision,
         expansion_fingerprint=expansion.expansion_fingerprint,
-        configuration_fingerprint=str(expansion_config["configuration_fingerprint"]),
+        configuration_fingerprint=checkpoint_configuration_fingerprint,
         approved_time_bins=scenario.time_bins,
         approved_time_bins_fingerprint=time_bins_fp,
         scenario_fingerprint=scenario_fp,
@@ -1031,6 +1043,7 @@ def load_context(
         maximum_initial_wait_seconds=settings.maximum_initial_wait_seconds,
         maximum_journey_seconds=settings.maximum_journey_seconds,
         maximum_waiting_seconds=settings.maximum_waiting_seconds,
+        station_mapping_fingerprint=feasibility_station_mapping_fingerprint(scenario),
     )
     features = _features(
         scenario,

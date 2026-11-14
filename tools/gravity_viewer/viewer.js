@@ -31,9 +31,35 @@
       cells.push(cell); return cells;
     };
     self.onmessage = async (event) => {
-      const {file, filters, limit, chunkSize, offset = 0, scanAll = false} = event.data;
-      let header = null; let carry = ''; let matched = 0; let sent = 0;
-      const accept = (row) => Object.entries(filters || {}).every(([key, value]) => String(row[key] ?? '') === String(value));
+      const {file, filters, limit, chunkSize, offset = 0, scanAll = false, rankBy = null, rankAbs = false} = event.data;
+      let header = null; let carry = ''; let matched = 0; let sent = 0; const ranked = [];
+      const accept = (row) => Object.entries(filters || {}).every(([key, value]) => Array.isArray(value) ? value.map(String).includes(String(row[key] ?? '')) : String(row[key] ?? '') === String(value));
+      const rank = (row) => { const value = Number(row[rankBy]); return rankAbs ? Math.abs(value) : value; };
+      const siftUp = (index) => {
+        while (index > 0) {
+          const parent = Math.floor((index - 1) / 2);
+          if (ranked[parent].score <= ranked[index].score) break;
+          [ranked[parent], ranked[index]] = [ranked[index], ranked[parent]];
+          index = parent;
+        }
+      };
+      const siftDown = (index) => {
+        while (true) {
+          const left = index * 2 + 1; const right = left + 1;
+          let smallest = index;
+          if (left < ranked.length && ranked[left].score < ranked[smallest].score) smallest = left;
+          if (right < ranked.length && ranked[right].score < ranked[smallest].score) smallest = right;
+          if (smallest === index) break;
+          [ranked[index], ranked[smallest]] = [ranked[smallest], ranked[index]];
+          index = smallest;
+        }
+      };
+      const retain = (row) => {
+        const score = rank(row); if (!Number.isFinite(score)) return;
+        const candidate = {row, score};
+        if (ranked.length < limit) { ranked.push(candidate); siftUp(ranked.length - 1); return; }
+        if (score > ranked[0].score) { ranked[0] = candidate; siftDown(0); }
+      };
       const emit = (lines, final = false) => {
         const rows = [];
         for (const line of lines) {
@@ -41,16 +67,20 @@
           const cells = parseLine(line);
           if (!header) { header = cells; continue; }
           const row = Object.fromEntries(header.map((name, index) => [name, cells[index] ?? '']));
-          if (accept(row)) { if (matched >= offset && sent < limit) { rows.push(row); sent += 1; } matched += 1; }
+          if (accept(row)) {
+            if (rankBy) { retain(row); matched += 1; }
+            else { if (matched >= offset && sent < limit) { rows.push(row); sent += 1; } matched += 1; }
+          }
         }
         if (rows.length) self.postMessage({type: 'rows', rows});
-        if (final) self.postMessage({type: 'done', truncated: matched > offset + sent, total: matched});
+        if (final && !rankBy) self.postMessage({type: 'done', truncated: matched > offset + sent, total: matched});
       };
-      for (let offset = 0; offset < file.size && (scanAll || sent < limit); offset += chunkSize) {
+      for (let offset = 0; offset < file.size && (scanAll || rankBy || sent < limit); offset += chunkSize) {
         carry += await file.slice(offset, Math.min(file.size, offset + chunkSize)).text();
         const lines = carry.split(/\\r?\\n/); carry = lines.pop() || ''; emit(lines);
       }
-      if (carry) emit([carry], true); else self.postMessage({type: 'done', truncated: matched > offset + sent, total: matched});
+      if (carry) emit([carry], true); else if (!rankBy) self.postMessage({type: 'done', truncated: matched > offset + sent, total: matched});
+      if (rankBy) { ranked.sort((a, b) => b.score - a.score); self.postMessage({type: 'rows', rows: ranked.map((item) => item.row)}); self.postMessage({type: 'done', truncated: matched > ranked.length, total: matched}); }
     };
   `;
   const workerUrl = URL.createObjectURL(new Blob([workerSource], {type: 'text/javascript'}));
@@ -115,25 +145,40 @@
       if (actual !== descriptor.sha256) throw new Error(`Partition checksum mismatch: ${descriptor.path || descriptor.file}`);
     }
   }
-  async function readPartition(kind, bin, filters = {}, limit = 5000) {
+  async function readPartition(kind, bin, filters = {}, limit = 5000, options = {}) {
     const group = viewer.summary[kind];
     if (!group?.available) return [];
-    const descriptor = (group.partitions || []).find((item) => item.key === bin) || (bin === 'all' ? null : undefined);
-    const descriptors = descriptor ? [descriptor] : (bin === 'all' ? (group.partitions || []) : []);
+    const matching = (group.partitions || []).filter((item) => item.key === bin);
+    const descriptors = bin === 'all'
+      ? (group.partitions || [])
+      : (kind === 'measurement_od_contributions' ? matching : matching.slice(0, 1));
     const output = [];
+    const rankOutput = () => {
+      output.sort((a, b) => {
+        const left = Math.abs(Number(a[options.rankBy]) || 0);
+        const right = Math.abs(Number(b[options.rankBy]) || 0);
+        return right - left;
+      });
+      if (output.length > limit) output.length = limit;
+    };
     for (const item of descriptors) {
       const path = item.path || item.file; const file = findFile(path); await validatePartition(file, item);
-      const identity = `${viewer.cacheIdentity}|${kind}|${path}|${item.sha256 || file.size}|${JSON.stringify(filters)}|v${CACHE_VERSION}`;
+      const identity = `${viewer.cacheIdentity}|${kind}|${path}|${item.sha256 || file.size}|${JSON.stringify(filters)}|${JSON.stringify(options)}|${limit}|v${CACHE_VERSION}`;
       const cacheKey = identity;
       const cached = await cacheGet(cacheKey);
-      if (cached && Array.isArray(cached.rows)) { output.push(...cached.rows); continue; }
+      if (cached && Array.isArray(cached.rows)) {
+        output.push(...cached.rows);
+        if (options.rankBy) rankOutput();
+        continue;
+      }
       const rows = await new Promise((resolve, reject) => {
         const worker = new Worker(workerUrl); const collected = [];
         worker.onmessage = (event) => { if (event.data.type === 'rows') collected.push(...event.data.rows); else { worker.terminate(); resolve(collected); } };
         worker.onerror = (event) => { worker.terminate(); reject(new Error(event.message || 'CSV worker failed.')); };
-        worker.postMessage({file, filters, limit: Math.max(limit, 5000), chunkSize: 1024 * 1024});
+        worker.postMessage({file, filters, limit: Math.max(limit, 1), chunkSize: 1024 * 1024, ...options});
       });
       await cachePut({key: cacheKey, identity, partition: path, rows}); output.push(...rows);
+      if (options.rankBy) rankOutput();
     }
     return output.slice(0, limit);
   }
@@ -170,6 +215,133 @@
         ? 'Expected OD use of a scheduled section is a service marginal: each value is the fitted OD demand times its cached probability of using that ride link. It is not an enumerated passenger path or an exact transfer-count distribution.'
         : `Estimated OD demand is separate from route-assignment flow. ${definition}. A service total is expected assigned demand or passenger-leg usage, not unique passengers when a journey uses multiple legs.`)
       : `${definition} Existing bundles without route-flow partitions support the OD destination view only.`;
+  }
+
+  function populateMeasurementOdControls() {
+    const summary = viewer.summary.measurement_od_contributions || {};
+    const panel = $('measurement-od'); panel.classList.remove('hidden');
+    if (!summary.available) {
+      $('measurement-od-unavailable').textContent = summary.message || 'OD-by-measurement contributions are unavailable in this bundle.';
+      $('measurement-od-unavailable').classList.remove('hidden');
+      [...panel.querySelectorAll('button, select, input')].forEach((element) => { element.disabled = true; });
+      return;
+    }
+    $('measurement-od-unavailable').classList.add('hidden');
+    const bins = canonicalBins((viewer.summary.od || {}).bins || []);
+    options($('measurement-bin'), bins, 'Select departure interval');
+    options($('measurement-origin'), (viewer.summary.od || {}).origins || [], 'Select origin');
+    options($('measurement-destination'), (viewer.summary.od || {}).destinations || [], 'Select destination');
+    if (bins.length) $('measurement-bin').value = bins[0];
+    updateMeasurementOdDirection();
+  }
+
+  function updateMeasurementOdDirection() {
+    const byMeasurement = $('measurement-od-direction').value === 'measurement';
+    $('measurement-row-label').classList.toggle('hidden', !byMeasurement);
+    ['measurement-bin-label', 'measurement-origin-label', 'measurement-destination-label'].forEach((id) => $(id).classList.toggle('hidden', byMeasurement));
+  }
+
+  async function readCsvFile(name, filters = {}, limit = 5000) {
+    const file = findFile(name); if (!file) throw new Error(`File is missing: ${name}`);
+    return new Promise((resolve, reject) => {
+      const worker = new Worker(workerUrl); const collected = [];
+      worker.onmessage = (event) => { if (event.data.type === 'rows') collected.push(...event.data.rows); else { worker.terminate(); resolve(collected); } };
+      worker.onerror = (event) => { worker.terminate(); reject(new Error(event.message || 'CSV worker failed.')); };
+      worker.postMessage({file, filters, limit: Math.max(1, limit), chunkSize: 1024 * 1024});
+    });
+  }
+
+  async function labelMeasurementOdRows(rows, direction) {
+    if (!rows.length) return rows;
+    if (direction === 'measurement') {
+      const byBin = new Map();
+      rows.forEach((row) => { const bin = row.departure_time_bin; if (!byBin.has(bin)) byBin.set(bin, []); byBin.get(bin).push(String(row.od_index)); });
+      const odLabels = new Map();
+      for (const [bin, ids] of byBin) {
+        const partitionRows = await readPartition('od', bin, {od_index: [...new Set(ids)]}, new Set(ids).size);
+        partitionRows.forEach((row) => odLabels.set(String(row.od_index), row));
+      }
+      const measurementRows = await readCsvFile('predicted_measurements.csv', {row_index: String(rows[0].measurement_index)}, 1);
+      const measurement = measurementRows[0] || {};
+      return rows.map((row) => ({
+        od_index: row.od_index,
+        origin_stop_id: odLabels.get(String(row.od_index))?.origin_stop_id || '',
+        destination_stop_id: odLabels.get(String(row.od_index))?.destination_stop_id || '',
+        departure_time_bin: row.departure_time_bin,
+        estimated_demand: odLabels.get(String(row.od_index))?.estimated_demand || '',
+        measurement_index: row.measurement_index,
+        measurement_type: measurement.measurement_type || '',
+        line: measurement.line || '',
+        stop: measurement.stop || '',
+        observed: measurement.observed || '',
+        modeled: measurement.modeled || '',
+        linear_flow_contribution: row.linear_flow_contribution,
+        modeled_mean_contribution: row.modeled_mean_contribution,
+      }));
+    }
+    const indices = [...new Set(rows.map((row) => String(row.measurement_index)))];
+    const measurements = await readCsvFile('predicted_measurements.csv', {row_index: indices}, indices.length);
+    const byIndex = new Map(measurements.map((row) => [String(row.row_index), row]));
+    return rows.map((row) => {
+      const measurement = byIndex.get(String(row.measurement_index)) || {};
+      return {
+        measurement_index: row.measurement_index,
+        measurement_type: measurement.measurement_type || '',
+        line: measurement.line || '',
+        stop: measurement.stop || '',
+        observation_time: measurement.observation_time || '',
+        observed: measurement.observed || '',
+        modeled: measurement.modeled || '',
+        departure_time_bin: row.departure_time_bin,
+        operator_coefficient: row.operator_coefficient,
+        linear_flow_contribution: row.linear_flow_contribution,
+        modeled_mean_contribution: row.modeled_mean_contribution,
+      };
+    });
+  }
+
+  function renderMeasurementOdRows(rows) {
+    const target = $('measurement-od-table');
+    if (!rows.length) { target.querySelector('thead').innerHTML = ''; target.querySelector('tbody').innerHTML = '<tr><td class="muted">No OD contribution entries match this selection.</td></tr>'; return; }
+    const headers = Object.keys(rows[0]);
+    target.querySelector('thead').innerHTML = `<tr>${headers.map((header) => `<th>${esc(header)}</th>`).join('')}</tr>`;
+    target.querySelector('tbody').innerHTML = rows.slice(0, 500).map((row) => `<tr>${headers.map((header) => `<td>${esc(row[header])}</td>`).join('')}</tr>`).join('');
+  }
+
+  async function refreshMeasurementOd() {
+    const summary = viewer.summary.measurement_od_contributions || {};
+    if (!summary.available) return;
+    const direction = $('measurement-od-direction').value;
+    const limit = Math.max(1, Math.min(500, Number($('measurement-od-limit').value) || 50));
+    $('measurement-od-status').textContent = 'Reading indexed sparse contribution partitions…';
+    try {
+      let rows; let measurementIndex = null; let selectedOd = null;
+      if (direction === 'measurement') {
+        measurementIndex = Number($('measurement-row-index').value);
+        if (!Number.isInteger(measurementIndex) || measurementIndex < 0 || measurementIndex >= Number(summary.number_of_measurements)) throw new Error('Choose a valid measurement row index.');
+        rows = await readPartition('measurement_od_contributions', 'all', {measurement_index: String(measurementIndex)}, limit, {rankBy: 'modeled_mean_contribution', rankAbs: true});
+      } else {
+        const bin = $('measurement-bin').value; const origin = $('measurement-origin').value; const destination = $('measurement-destination').value;
+        if (!bin || !origin || !destination) throw new Error('Choose a departure interval, origin, and destination.');
+        const odRows = await readPartition('od', bin, {origin_stop_id: origin, destination_stop_id: destination}, 100);
+        selectedOd = odRows.find((row) => row.departure_time_bin === bin);
+        if (!selectedOd) { renderMeasurementOdRows([]); $('measurement-od-status').textContent = 'No fitted OD cell matches that selection.'; return; }
+        rows = await readPartition('measurement_od_contributions', bin, {od_index: String(selectedOd.od_index)}, limit, {rankBy: 'modeled_mean_contribution', rankAbs: true});
+      }
+      rows = await labelMeasurementOdRows(rows, direction);
+      renderMeasurementOdRows(rows);
+      if (direction === 'measurement') {
+        const componentRows = await readCsvFile(summary.component_table.path, {measurement_index: String(measurementIndex)}, 1);
+        const components = componentRows[0] || {};
+        const fixedAttribution = summary.fixed_positive_od_attribution_available === false
+          ? `<p class="muted">${esc(summary.fixed_positive_od_attribution_message || 'Fixed-positive demand is aggregated in the mapping offset and cannot be assigned to individual OD pairs.')}</p>`
+          : '';
+        $('measurement-od-detail').innerHTML = `<dl><dt>Measurement row</dt><dd>${esc(measurementIndex)}</dd><dt>Modeled mean</dt><dd>${display(components.modeled_mean)}</dd><dt>Fixed offset</dt><dd>${display(components.fixed_offset_contribution)}</dd><dt>Additive component</dt><dd>${display(components.additive_contribution)}</dd><dt>Mean-floor adjustment</dt><dd>${display(components.mean_floor_adjustment)}</dd><dt>OD rows shown</dt><dd>${esc(rows.length)} (ranked by absolute modeled contribution)</dd></dl>${fixedAttribution}`;
+      } else {
+        $('measurement-od-detail').innerHTML = `<dl><dt>OD pair</dt><dd>${esc(selectedOd.origin_stop_id)} → ${esc(selectedOd.destination_stop_id)} (${esc(selectedOd.departure_time_bin)})</dd><dt>Estimated demand</dt><dd>${display(selectedOd.estimated_demand)}</dd><dt>Measurement rows shown</dt><dd>${esc(rows.length)} (ranked by absolute modeled contribution)</dd></dl>`;
+      }
+      $('measurement-od-status').textContent = `Loaded ${rows.length} bounded contribution rows.`;
+    } catch (error) { $('measurement-od-status').textContent = `Could not load OD contributions: ${error.message}`; }
   }
 
   function sectionSummary() { return viewer.summary.route_sections || {}; }
@@ -356,14 +528,16 @@
         viewer.summary = {
           od: {available: true, partition_field: 'legacy_full_table', bins: ['all'], origins: [], destinations: [], partitions: [{key: 'all', path: 'full_od.csv', size_bytes: legacyRecord.size_bytes, sha256: legacyRecord.sha256}]},
           route_flows: {available: false, message: 'Legacy bundle has no route-flow partitions.'},
+          measurement_od_contributions: {available: false, message: 'Legacy bundle has no OD-by-measurement contribution dataset.'},
         };
       }
+      if (!viewer.summary.measurement_od_contributions) viewer.summary.measurement_od_contributions = {available: false, message: 'This bundle predates OD-by-measurement contributions.'};
       viewer.cacheIdentity = `${viewer.manifest.model_fingerprint || ''}|${viewer.manifest.specification_fingerprint || ''}|${viewer.manifest.report_fingerprint || ''}|${JSON.stringify(viewer.manifest.provenance || {})}`;
       $('summary').classList.remove('hidden'); $('diagnostics').classList.remove('hidden'); $('tables').classList.remove('hidden'); $('flows').classList.remove('hidden');
-      const counts = viewer.manifest.row_counts || {}; $('metrics').innerHTML = [metric('Bundle type', viewer.manifest.bundle_type), metric('Schema', viewer.manifest.schema_version), metric('OD rows', counts['full_od.csv'] ?? 'unknown'), metric('Measurements', counts['predicted_measurements.csv'] ?? 'unknown'), metric('OD partitions', viewer.summary.od?.partitions?.length ?? 'legacy'), metric('Route flows', viewer.summary.route_flows?.available ? 'available' : 'absent'), metric('Identifiability', viewer.manifest.identifiability?.available ? 'available' : 'not available'), metric('Network files', Object.keys(viewer.manifest.files || {}).filter((key) => key.startsWith('network/')).length)].join('');
+      const counts = viewer.manifest.row_counts || {}; $('metrics').innerHTML = [metric('Bundle type', viewer.manifest.bundle_type), metric('Schema', viewer.manifest.schema_version), metric('OD rows', counts['full_od.csv'] ?? 'unknown'), metric('Measurements', counts['predicted_measurements.csv'] ?? 'unknown'), metric('OD partitions', viewer.summary.od?.partitions?.length ?? 'legacy'), metric('Route flows', viewer.summary.route_flows?.available ? 'available' : 'absent'), metric('OD contribution map', viewer.summary.measurement_od_contributions?.available ? 'available' : 'absent'), metric('Identifiability', viewer.manifest.identifiability?.available ? 'available' : 'not available'), metric('Network files', Object.keys(viewer.manifest.files || {}).filter((key) => key.startsWith('network/')).length)].join('');
       const modelLikelihood = viewer.model.likelihood || viewer.model.specification?.likelihood?.family; $('model').innerHTML = renderKeyValue({fingerprint: viewer.manifest.model_fingerprint, likelihood: modelLikelihood}); $('provenance').innerHTML = renderKeyValue(viewer.manifest.provenance || viewer.manifest.fit_provenance); const adequacy = viewer.report.adequacy || {}; $('diagnostic-metrics').innerHTML = [metric('Observed total', adequacy.observed_total), metric('Modeled total', adequacy.modeled_total), metric('MAE', adequacy.mae), metric('RMSE', adequacy.rmse), metric('Report fingerprint', viewer.report.report_fingerprint, 'fingerprint')].join('');
       $('table-content').innerHTML = '<p class="muted">Large tables are available through the partitioned explorer. No complete CSV is parsed at startup.</p>';
-      const executive = findFile('executive_summary.md'); $('executive').innerHTML = executive ? `<pre>${esc(await executive.text())}</pre>` : '<p>No executive summary supplied.</p>'; populateFlowSelectors(); populateSectionControls(); await renderNetwork(); if (viewer.summary.route_sections?.available) await loadSectionSummary(); else await refreshFlows();
+      const executive = findFile('executive_summary.md'); $('executive').innerHTML = executive ? `<pre>${esc(await executive.text())}</pre>` : '<p>No executive summary supplied.</p>'; populateFlowSelectors(); populateMeasurementOdControls(); populateSectionControls(); await renderNetwork(); if (viewer.summary.route_sections?.available) await loadSectionSummary(); else await refreshFlows();
       if (!viewer.summary.od) { $('interactive-notice').textContent = 'This is a legacy bundle without partition metadata. The validated tables remain available; route-flow and lazy time-slot exploration require a refreshed export.'; $('interactive-notice').classList.remove('hidden'); }
       if (problems.length) setStatus(`Bundle loaded with startup validation warnings:\n- ${problems.join('\n- ')}`, 'bad'); else setStatus('Bundle manifest and summary loaded. Partition checksums are verified when selected.', 'ok');
     } catch (error) { $('summary').classList.add('hidden'); $('diagnostics').classList.add('hidden'); $('flows').classList.add('hidden'); setStatus(`Could not load bundle: ${error.message}`, 'bad'); }
@@ -371,6 +545,7 @@
   function metric(label, value, extra = '') { return `<div class="metric"><label>${esc(label)}</label><strong class="${extra}">${esc(value)}</strong></div>`; }
   function renderKeyValue(value) { if (!value || typeof value !== 'object') return `<p>${esc(value)}</p>`; return `<div class="fingerprint">${Object.entries(value).map(([key, item]) => `<div><b>${esc(key)}:</b> ${esc(typeof item === 'object' ? JSON.stringify(item) : item)}</div>`).join('')}</div>`; }
   $('folder').addEventListener('change', (event) => load([...event.target.files])); $('flow-refresh').addEventListener('click', refreshFlows); $('flow-clear-cache').addEventListener('click', clearCache); ['flow-bin', 'flow-origin', 'flow-destination', 'flow-line', 'flow-trip', 'flow-transfers', 'flow-kind'].forEach((id) => { if ($(id)) $(id).addEventListener('change', refreshFlows); });
+  $('measurement-od-direction')?.addEventListener('change', updateMeasurementOdDirection); $('measurement-od-load')?.addEventListener('click', refreshMeasurementOd); ['measurement-bin', 'measurement-origin', 'measurement-destination'].forEach((id) => $(id)?.addEventListener('change', () => { if ($('measurement-od-direction').value === 'od') refreshMeasurementOd(); }));
   $('section-lines')?.addEventListener('change', refreshSectionLineChips); $('section-all-lines')?.addEventListener('click', () => { [...$('section-lines').options].forEach((option) => { option.selected = true; }); refreshSectionLineChips(); }); $('section-clear-lines')?.addEventListener('click', () => { [...$('section-lines').options].forEach((option) => { option.selected = false; }); refreshSectionLineChips(); });
   $('section-pattern')?.addEventListener('change', () => viewer.selectedSection && inspectSection(viewer.selectedSection)); $('section-direction')?.addEventListener('change', () => viewer.selectedSection && inspectSection(viewer.selectedSection)); $('section-bin')?.addEventListener('input', updateSectionBinLabel); $('section-bin')?.addEventListener('change', () => { updateSectionBinLabel(); viewer.sectionPage = 0; loadSectionSummary(); if (viewer.selectedSection) inspectSection(viewer.selectedSection); }); $('section-previous')?.addEventListener('click', () => { const slider = $('section-bin'); slider.value = Math.max(0, Number(slider.value) - 1); slider.dispatchEvent(new Event('change')); }); $('section-next')?.addEventListener('click', () => { const slider = $('section-bin'); slider.value = Math.min(Number(slider.max), Number(slider.value) + 1); slider.dispatchEvent(new Event('change')); }); $('section-page-previous')?.addEventListener('click', () => { viewer.sectionPage = Math.max(0, viewer.sectionPage - 1); if (viewer.selectedSection) inspectSection(viewer.selectedSection); }); $('section-page-next')?.addEventListener('click', () => { viewer.sectionPage += 1; if (viewer.selectedSection) inspectSection(viewer.selectedSection); }); $('section-clear-cache')?.addEventListener('click', clearCache);
   $('section-inspect')?.addEventListener('click', () => { const id = $('section-id').value; const feature = viewer.sectionFeatures.find((item) => item.properties?.section_id === id); if (feature) chooseSection(feature); else if (id) inspectSection({section_id: id}); });

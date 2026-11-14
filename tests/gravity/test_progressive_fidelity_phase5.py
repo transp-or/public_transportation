@@ -151,9 +151,12 @@ def test_real_persisted_sharded_operator_supports_progressive_products():
             operator_concurrency=1,
             repetitions=1,
             seed=20260804,
-            efforts=(50.0,),
+            # This deterministic seed selects one of the two persisted shards
+            # at 25%; a 50% Bernoulli request may validly select both.
+            efforts=(25.0,),
         )
     )
     assert report["problem"]["routing_shards"] == 2
     assert report["results"][0]["selected_shards"] == 1
+    assert report["results"][0]["effective_effort_percent"] < 100.0
     assert np.isfinite(report["results"][0]["median_wall_seconds"])

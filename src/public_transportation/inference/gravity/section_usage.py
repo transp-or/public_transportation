@@ -233,59 +233,6 @@ def _write_parquet_shard(path: Path, rows: Sequence[Mapping[str, object]]) -> No
     os.replace(temporary, path)
 
 
-def _source_rows_from_checkpoint(
-    checkpoint: Path,
-    *,
-    section_resolver: Callable[[Mapping[str, object]], str] | None,
-) -> Iterator[Mapping[str, object]]:
-    manifest_path = checkpoint / "manifest.json"
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError) as error:
-        raise SectionUsageCheckpointError(f"cannot read OD-section checkpoint: {manifest_path}") from error
-    if not isinstance(manifest, Mapping):
-        raise SectionUsageCheckpointError("OD-section checkpoint manifest must be an object.")
-    units = manifest.get("completed_units")
-    if not isinstance(units, Mapping):
-        raise SectionUsageCheckpointError("OD-section checkpoint has no completed_units manifest.")
-    if manifest.get("status") != "completed":
-        raise SectionUsageCheckpointError(
-            "only a completed OD-section checkpoint can be migrated; interrupted work is not an approved dataset."
-        )
-    for key in sorted(units, key=lambda item: int(item)):
-        record = units[key]
-        if not isinstance(record, Mapping) or record.get("status") != "completed":
-            raise SectionUsageCheckpointError(f"checkpoint unit {key!r} is not complete.")
-        if record.get("unit_type") == "legacy_group":
-            paths = (Path(str(record.get("path", ""))),)
-        else:
-            chunks = record.get("chunks", ())
-            if not isinstance(chunks, Sequence):
-                raise SectionUsageCheckpointError(f"checkpoint unit {key!r} chunks are corrupt.")
-            paths = tuple(checkpoint / str(chunk.get("path", "")) for chunk in chunks if isinstance(chunk, Mapping))
-        for path in paths:
-            if not path.is_absolute():
-                path = checkpoint / path
-            expected_sha = None
-            if record.get("unit_type") == "legacy_group":
-                expected_sha = record.get("sha256")
-            else:
-                for chunk in record.get("chunks", ()):
-                    if isinstance(chunk, Mapping) and str(checkpoint / str(chunk.get("path", ""))) == str(path):
-                        expected_sha = chunk.get("sha256")
-                        break
-            if not path.is_file() or expected_sha != _sha256(path):
-                raise SectionUsageCheckpointError(f"checkpoint chunk is missing or corrupt: {path}")
-            with path.open(newline="", encoding="utf-8") as stream:
-                reader = csv.DictReader(stream)
-                if reader.fieldnames is None:
-                    raise SectionUsageCheckpointError(f"checkpoint chunk has no header: {path}")
-                yield from (
-                    _normalise_compact_row(row, section_resolver=section_resolver)
-                    for row in reader
-                )
-
-
 def write_section_usage_dataset(
     rows: Iterable[Mapping[str, object]],
     destination: str | Path,
@@ -452,44 +399,6 @@ def write_section_usage_dataset(
         database_path.unlink(missing_ok=True)
 
 
-def migrate_od_section_checkpoint(
-    checkpoint_directory: str | Path,
-    destination: str | Path,
-    *,
-    source_identity: Mapping[str, object] | None = None,
-    format: str = "auto",
-    shard_rows: int = 100_000,
-    storage_budget_bytes: int | None = None,
-    section_resolver: Callable[[Mapping[str, object]], str] | None = None,
-    grain: str = "trip",
-) -> dict[str, object]:
-    """Stream only manifest-referenced completed chunks into a compact dataset."""
-    checkpoint = Path(checkpoint_directory).expanduser().resolve()
-    manifest_path = checkpoint / "manifest.json"
-    try:
-        source_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError) as error:
-        raise SectionUsageCheckpointError(f"cannot read OD-section checkpoint: {manifest_path}") from error
-    if not isinstance(source_manifest, Mapping):
-        raise SectionUsageCheckpointError("OD-section checkpoint manifest must be an object.")
-    migration_identity = {
-        "source_checkpoint": str(checkpoint),
-        "source_checkpoint_manifest_sha256": _sha256(manifest_path),
-        "source_checkpoint_provenance": source_manifest.get("provenance", {}),
-    }
-    if source_identity is not None:
-        migration_identity.update(dict(source_identity))
-    return write_section_usage_dataset(
-        _source_rows_from_checkpoint(checkpoint, section_resolver=section_resolver),
-        destination,
-        source_identity=migration_identity,
-        format=format,
-        shard_rows=shard_rows,
-        storage_budget_bytes=storage_budget_bytes,
-        grain=grain,
-    )
-
-
 def write_line_usage_dataset(
     rows: Iterable[Mapping[str, object]],
     destination: str | Path,
@@ -610,7 +519,6 @@ __all__ = [
     "aggregate_line_usage_rows",
     "aggregate_section_usage_rows",
     "iter_section_usage_rows",
-    "migrate_od_section_checkpoint",
     "read_section_usage_manifest",
     "write_section_usage_dataset",
     "write_line_usage_dataset",

@@ -27,6 +27,11 @@ def test_viewer_exposes_stop_and_od_pair_interaction_controls() -> None:
         'id="section-bin"',
         'id="section-id"',
         'id="section-page-next"',
+        'id="measurement-od"',
+        'id="measurement-od-direction"',
+        'id="measurement-row-index"',
+        'id="measurement-bin"',
+        'id="measurement-od-load"',
     ):
         assert text in source
 
@@ -50,3 +55,6 @@ def test_viewer_starts_from_manifest_and_streams_selected_partitions() -> None:
     assert "route-assignment flow" in viewer_source
     assert "query_section_od" in viewer_source or "route_sections" in viewer_source
     assert "section_loads" in viewer_source
+    assert "measurement_od_contributions" in viewer_source
+    assert "refreshMeasurementOd" in viewer_source
+    assert "rankBy" in viewer_source

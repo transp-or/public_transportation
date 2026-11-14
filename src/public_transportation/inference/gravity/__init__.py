@@ -131,20 +131,6 @@ from .boundary_artifact import (
     load_gravity_boundary_artifact,
     write_gravity_boundary_artifact,
 )
-from .od_section_export import (
-    EXPORT_CHECKPOINT_ALGORITHM_VERSION,
-    EXPORT_CHECKPOINT_SCHEMA_VERSION,
-    EXPORT_SCHEMA_VERSION,
-    ODSectionCell,
-    ODSectionExportPlan,
-    ODSectionPlanCheckpointError,
-    ODSectionPlanInterrupted,
-    RideLinkSectionMetadata,
-    export_od_section_marginals,
-    export_gravity_od_section_marginals,
-    plan_od_section_marginal_export,
-    plan_gravity_od_section_marginal_export,
-)
 from .section_usage import (
     SECTION_USAGE_ALGORITHM_VERSION,
     SECTION_USAGE_COLUMNS,
@@ -156,7 +142,6 @@ from .section_usage import (
     aggregate_line_usage_rows,
     aggregate_section_usage_rows,
     iter_section_usage_rows,
-    migrate_od_section_checkpoint,
     read_section_usage_manifest,
     write_section_usage_dataset,
     write_line_usage_dataset,

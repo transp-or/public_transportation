@@ -21,12 +21,13 @@ def test_quality_reports_estimated_objective_count_and_gradient_errors():
     with jax.enable_x64():
         item = problem()
         context = split_context(item, count=16)
+        request = GravityFidelityRequest(
+            effort_percent=40, seed=17, quality_groups=4
+        )
         result = gravity_value_and_gradient_progressive(
             np.asarray((0.2, -0.1, 1.0)),
             problem=item,
-            fidelity=GravityFidelityRequest(
-                effort_percent=40, seed=17, quality_groups=4
-            ),
+            fidelity=request,
             context=context,
         )
         quality = result.quality
@@ -41,7 +42,9 @@ def test_quality_reports_estimated_objective_count_and_gradient_errors():
         assert quality.gradient_relative_error_estimate is not None
         assert quality.predicted_count_relative_error_estimate is not None
         assert quality.gradient_cosine_lower_estimate is not None
-        assert result.fidelity.quality_groups_completed == 4
+        assert result.fidelity.quality_groups_completed == min(
+            request.quality_groups, result.fidelity.selected_shard_count
+        )
 
 
 def test_too_few_selected_shards_reports_insufficient_sample():
