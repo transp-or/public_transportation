@@ -49,6 +49,9 @@ TEMPORAL_BLOCK_ARTIFACT_SCHEMA_VERSION = 2
 TEMPORAL_OPERATOR_CACHE_SCHEMA_VERSION = 2
 TEMPORAL_OPERATOR_VALIDATOR_VERSION = 1
 PREFLIGHT_ADOPTION_SCHEMA_VERSION = 1
+_SUPPORTED_VIEWER_TEMPORAL_BLOCK_COMPATIBILITY = frozenset(
+    {("579a70af1e15a88d34ad8907b19740db11caff01", TEMPORAL_BLOCK_ARTIFACT_SCHEMA_VERSION)}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +64,8 @@ class TemporalBlockArtifactReader:
     fixed_measurement_offset: np.ndarray
     manifest_sha256: str
     nonzero_entries: int
+    artifact_schema_version: int
+    source_package_revision: str
     _block_items: tuple[Mapping[str, object], ...]
     _block_items_by_measurement_interval: Mapping[str, tuple[Mapping[str, object], ...]]
     _block_items_by_departure_interval: Mapping[str, tuple[Mapping[str, object], ...]]
@@ -153,6 +158,36 @@ class TemporalBlockArtifactReader:
 def open_temporal_block_artifact(
     directory: str | Path,
 ) -> TemporalBlockArtifactReader:
+    """Open a mapping only when its source revision matches this runtime."""
+    return _open_temporal_block_artifact(
+        directory,
+        fit_source_package_revision=None,
+        viewer_compatibility=False,
+    )
+
+
+def open_temporal_block_artifact_for_viewer(
+    directory: str | Path,
+    *,
+    fit_source_package_revision: str,
+) -> TemporalBlockArtifactReader:
+    """Open a mapping for the viewer under an explicit fit/source compatibility contract."""
+    fit_revision = str(fit_source_package_revision).strip()
+    if not fit_revision:
+        raise ValueError("fit source package revision is required for viewer mapping compatibility.")
+    return _open_temporal_block_artifact(
+        directory,
+        fit_source_package_revision=fit_revision,
+        viewer_compatibility=True,
+    )
+
+
+def _open_temporal_block_artifact(
+    directory: str | Path,
+    *,
+    fit_source_package_revision: str | None,
+    viewer_compatibility: bool,
+) -> TemporalBlockArtifactReader:
     """Validate an artifact header and return a bounded-memory block reader.
 
     Payload block hashes are verified as :meth:`TemporalBlockArtifactReader.iter_blocks`
@@ -166,7 +201,18 @@ def open_temporal_block_artifact(
         raise ValueError("temporal block artifact schema is incompatible.")
     if manifest.get("complete") is not True:
         raise ValueError("temporal block artifact is incomplete.")
-    if manifest.get("package_revision") != package_revision():
+    source_package_revision = manifest.get("package_revision")
+    runtime_package_revision = package_revision()
+    if viewer_compatibility:
+        if source_package_revision != fit_source_package_revision:
+            raise ValueError("fit and mapping source package revisions differ.")
+        compatibility = (source_package_revision, manifest.get("schema_version"))
+        if source_package_revision != runtime_package_revision and compatibility not in _SUPPORTED_VIEWER_TEMPORAL_BLOCK_COMPATIBILITY:
+            raise ValueError(
+                "viewer mapping source revision/schema compatibility is unsupported: "
+                f"revision={source_package_revision!r}, schema={manifest.get('schema_version')!r}."
+            )
+    elif source_package_revision != runtime_package_revision:
         raise ValueError("temporal block artifact package revision is incompatible.")
     file_sizes = manifest.get("file_sizes")
     if not isinstance(file_sizes, Mapping):
@@ -261,6 +307,8 @@ def open_temporal_block_artifact(
         fixed_measurement_offset=offset,
         manifest_sha256=_file_sha256(manifest_path),
         nonzero_entries=nonzero_entries,
+        artifact_schema_version=int(manifest["schema_version"]),
+        source_package_revision=str(source_package_revision),
         _block_items=tuple(dict(item) for item in block_items),
         _block_items_by_measurement_interval={
             interval_id: tuple(items)

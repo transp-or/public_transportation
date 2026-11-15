@@ -10,8 +10,9 @@ from urllib.parse import parse_qs, urlparse
 from typing import Any
 
 from public_transportation.inference.temporal_assignment_persistence import (
-    open_temporal_block_artifact,
+    open_temporal_block_artifact_for_viewer,
 )
+from public_transportation.inference.hierarchical_artifacts import package_revision
 
 from .estimator import GravityEstimationResult
 from .measurement_od_contributions import MeasurementODContributionQuery
@@ -60,13 +61,33 @@ class GravityViewerQueryService:
             or summary.get("query_mode") != "local_service"
         ):
             raise ValueError("viewer bundle is not configured for on-demand measurement queries.")
+        if summary.get("query_descriptor_version") != 2:
+            raise ValueError("viewer bundle uses an unsupported on-demand query descriptor version.")
+        runtime_revision = package_revision()
+        if (
+            summary.get("runtime_package_revision") != runtime_revision
+            or bundle_manifest.get("runtime_package_revision") != runtime_revision
+        ):
+            raise ValueError("viewer bundle runtime package revision differs from the query-service runtime.")
+        fit_source_revision = fit_payload.get("package_revision")
+        if not isinstance(fit_source_revision, str) or not fit_source_revision:
+            raise ValueError("fit manifest is missing its source package revision.")
 
-        artifact = open_temporal_block_artifact(mapping_artifact_path)
+        artifact = open_temporal_block_artifact_for_viewer(
+            mapping_artifact_path,
+            fit_source_package_revision=fit_source_revision,
+        )
         if summary.get("mapping_manifest_sha256") != artifact.manifest_sha256:
             raise ValueError("mapping manifest checksum differs from the selected viewer bundle.")
         for field, actual in (
             ("fit_fingerprint", fit_result.model_fingerprint),
-            ("assignment_fingerprint", artifact.identity.timetable_fingerprint),
+            ("assignment_fingerprint", bundle_provenance.get("assignment_fingerprint")),
+            ("mapping_fingerprint", bundle_provenance.get("mapping_fingerprint")),
+            ("artifact_timetable_fingerprint", artifact.identity.timetable_fingerprint),
+            (
+                "artifact_measurement_mapping_fingerprint",
+                artifact.identity.measurement_mapping_fingerprint,
+            ),
             ("mapping_artifact_fingerprint", artifact.identity.fingerprint),
             (
                 "canonical_index_fingerprint",
@@ -78,15 +99,22 @@ class GravityViewerQueryService:
                 artifact.canonical_index.source_od_layout_fingerprint,
             ),
         ):
-            bundle_expected = (
-                bundle_manifest.get("model_fingerprint")
-                if field == "fit_fingerprint"
-                else bundle_manifest.get("artifact_identity_fingerprint")
-                if field == "mapping_artifact_fingerprint"
-                else bundle_provenance.get(field)
-            )
-            if summary.get(field) != actual or bundle_expected != actual:
-                raise ValueError(f"mapping {field} differs from the selected fit and viewer bundle.")
+            if summary.get(field) != actual:
+                raise ValueError(f"mapping query {field} differs from the selected fit and viewer bundle.")
+        if bundle_manifest.get("model_fingerprint") != summary.get("fit_fingerprint"):
+            raise ValueError("viewer query fit fingerprint differs from bundle metadata.")
+        if bundle_manifest.get("artifact_identity_fingerprint") != summary.get("mapping_artifact_fingerprint"):
+            raise ValueError("viewer query full mapping-artifact identity differs from bundle metadata.")
+        if summary.get("mapping_artifact_schema_version") != artifact.artifact_schema_version:
+            raise ValueError("mapping artifact schema version differs from the viewer bundle.")
+        if (
+            summary.get("fit_source_package_revision") != fit_source_revision
+            or summary.get("mapping_source_package_revision") != artifact.source_package_revision
+            or artifact.source_package_revision != fit_source_revision
+            or bundle_manifest.get("fit_source_package_revision") != fit_source_revision
+            or bundle_manifest.get("mapping_source_package_revision") != artifact.source_package_revision
+        ):
+            raise ValueError("viewer fit and mapping source package revisions differ.")
 
         report_path = bundle.path / "report.json"
         try:
@@ -101,6 +129,7 @@ class GravityViewerQueryService:
             report_payload=report_payload,
             metadata={},
             full_od_path=bundle.path / "full_od.csv",
+            validate_block_payloads=False,
         )
         self.query = MeasurementODContributionQuery(
             artifact=artifact,

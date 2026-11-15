@@ -28,8 +28,9 @@ from public_transportation.inference.block_coordinate._canonical import canonica
 from public_transportation.inference.od_parameter_layout import ODParameterLayout
 from public_transportation.inference.temporal_assignment_persistence import (
     TemporalBlockArtifactReader,
-    open_temporal_block_artifact,
+    open_temporal_block_artifact_for_viewer,
 )
+from public_transportation.inference.hierarchical_artifacts import package_revision
 
 from .estimator import GravityEstimationResult
 from .identifiability import (
@@ -45,6 +46,7 @@ from .reporting import (
 from .specification import GravityModelSpecification
 from .validation import GravityAdequacyReport, GravityValidationMetadata
 from .measurement_od_contributions import (
+    _journey_scale,
     validate_dataset as _validate_measurement_od_dataset,
     measurement_od_query_descriptor,
 )
@@ -1417,6 +1419,7 @@ def _validate_linear_mapping_for_bundle(
     report_payload: Mapping[str, object],
     metadata: Mapping[str, object],
     full_od_path: Path,
+    validate_block_payloads: bool = True,
 ) -> None:
     """Bind sparse mapping coordinates and identity to this exact fitted result."""
     provenance = _source_provenance(report_payload, fit_result, metadata)
@@ -1425,9 +1428,12 @@ def _validate_linear_mapping_for_bundle(
     expected_artifact = provenance.get("artifact_identity_fingerprint") or fit_result.direct_operator_artifact_fingerprint
     if not expected_artifact or expected_artifact != identity.fingerprint:
         raise ValueError("linear mapping artifact identity does not match the fitted operator.")
+    fit_source_revision = provenance.get("package_revision")
+    if not isinstance(fit_source_revision, str) or not fit_source_revision:
+        raise ValueError("fit/report provenance is missing package_revision required by the linear mapping.")
+    if fit_source_revision != artifact.source_package_revision:
+        raise ValueError("fit and mapping source package revisions differ.")
     for provenance_name, artifact_value in (
-        ("assignment_fingerprint", identity.timetable_fingerprint),
-        ("mapping_fingerprint", identity.measurement_mapping_fingerprint),
         ("canonical_index_fingerprint", index.artifact_fingerprint),
         ("binding_fingerprint", index.binding_fingerprint),
         ("od_layout_fingerprint", index.source_od_layout_fingerprint),
@@ -1446,6 +1452,47 @@ def _validate_linear_mapping_for_bundle(
         or artifact.number_of_measurements != fit_result.predicted_measurements.size
     ):
         raise ValueError("linear mapping dimensions differ from the fitted result.")
+
+    if validate_block_payloads:
+        raw_od = np.zeros(artifact.number_of_measurements, dtype=np.float64)
+        demand = np.asarray(fit_result.free_od_demand, dtype=np.float64)
+        for block in artifact.iter_blocks():
+            flows = block.values * demand[block.column_indices]
+            np.add.at(raw_od, block.row_indices, flows)
+        if fit_result.od_measurement_contribution is not None:
+            persisted_od = np.asarray(fit_result.od_measurement_contribution, dtype=np.float64)
+            if persisted_od.shape != raw_od.shape or not np.allclose(
+                raw_od, persisted_od, rtol=1e-6, atol=1e-8
+            ):
+                raise ValueError("mapping OD contribution differs from the fitted OD measurement component.")
+        additive_vectors = tuple(
+            np.asarray(value, dtype=np.float64)
+            for value in fit_result.additive_measurement_contributions
+        )
+        if any(
+            value.shape != raw_od.shape or not np.all(np.isfinite(value))
+            for value in additive_vectors
+        ):
+            raise ValueError("fitted additive measurement contributions are invalid.")
+        if fit_result.latent_measurements is not None:
+            latent = np.asarray(fit_result.latent_measurements, dtype=np.float64)
+            if latent.shape != raw_od.shape or not np.all(np.isfinite(latent)):
+                raise ValueError("fitted latent measurements are invalid.")
+            additive = (
+                np.sum(np.stack(additive_vectors), axis=0)
+                if additive_vectors
+                else np.zeros_like(raw_od)
+            )
+            fixed_offset = latent - _journey_scale(fit_result) * (raw_od + additive)
+            if not np.allclose(
+                fixed_offset,
+                np.asarray(artifact.fixed_measurement_offset, dtype=np.float64),
+                rtol=1e-6,
+                atol=1e-8,
+            ):
+                raise ValueError("fitted fixed offset differs from the mapping artifact.")
+        elif additive_vectors:
+            raise ValueError("fit is missing latent measurements required to validate fixed offsets.")
 
     seen = np.zeros(index.number_of_physical_demand_cells, dtype=bool)
     for row in _iter_csv_rows(full_od_path):
@@ -2019,20 +2066,49 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
                 _validate_measurement_od_dataset(root, contribution_payload)
             else:
                 raise ValueError("viewer measurement OD contribution query mode is unsupported.")
-            for field, expected in (
+            expected_fields = [
                 ("fit_fingerprint", manifest.get("model_fingerprint")),
-                ("assignment_fingerprint", manifest.get("assignment_fingerprint")),
-                (
-                    "canonical_index_fingerprint",
-                    manifest.get("canonical_index_fingerprint"),
-                ),
+                ("canonical_index_fingerprint", manifest.get("canonical_index_fingerprint")),
                 ("binding_fingerprint", manifest.get("binding_fingerprint")),
                 ("od_layout_fingerprint", manifest.get("od_layout_fingerprint")),
-                (
-                    "mapping_artifact_fingerprint",
-                    manifest.get("artifact_identity_fingerprint"),
-                ),
-            ):
+                ("mapping_artifact_fingerprint", manifest.get("artifact_identity_fingerprint")),
+            ]
+            if query_mode is None:
+                # Legacy materialized datasets used this name for the mapping's
+                # timetable component. Keep reading them without changing their
+                # saved format.
+                expected_fields.append(("assignment_fingerprint", manifest.get("assignment_fingerprint")))
+            elif contribution_payload.get("query_descriptor_version") == 2:
+                bundle_provenance = manifest.get("provenance", {})
+                expected_fields.extend(
+                    (
+                        ("assignment_fingerprint", manifest.get("assignment_fingerprint")),
+                        ("mapping_fingerprint", bundle_provenance.get("mapping_fingerprint")),
+                    )
+                )
+                if contribution_payload.get("runtime_package_revision") != manifest.get("runtime_package_revision"):
+                    raise ValueError("viewer measurement query runtime package revision differs from bundle metadata.")
+                if (
+                    contribution_payload.get("fit_source_package_revision") != manifest.get("package_revision")
+                    or contribution_payload.get("fit_source_package_revision")
+                    != manifest.get("fit_source_package_revision")
+                ):
+                    raise ValueError("viewer measurement query fit source revision differs from bundle provenance.")
+                if (
+                    contribution_payload.get("mapping_source_package_revision")
+                    != manifest.get("mapping_source_package_revision")
+                    or contribution_payload.get("mapping_source_package_revision")
+                    != contribution_payload.get("fit_source_package_revision")
+                ):
+                    raise ValueError("viewer measurement query fit and mapping source revisions differ.")
+                for field in (
+                    "runtime_package_revision",
+                    "fit_source_package_revision",
+                    "mapping_source_package_revision",
+                ):
+                    if summary_payload.get(field) != manifest.get(field):
+                        raise ValueError(f"viewer summary {field} differs from bundle metadata.")
+            for field, expected in expected_fields:
                 if expected is not None and contribution_payload.get(field) != expected:
                     raise ValueError(
                         f"viewer measurement OD contribution {field} differs from bundle provenance: "
@@ -3210,6 +3286,10 @@ def write_gravity_viewer_bundle(
             section_usage_dataset=section_usage_dataset,
         )
         viewer_summary["measurement_locations"] = measurement_location_summary
+        fit_source_provenance = _source_provenance(report_payload, fit_result, metadata)
+        viewer_summary["runtime_package_revision"] = package_revision()
+        viewer_summary["fit_source_package_revision"] = fit_source_provenance.get("package_revision")
+        viewer_summary["mapping_source_package_revision"] = None
         if linear_mapping_artifact is None:
             if rho is not None:
                 raise ValueError("rho is only used with linear_mapping_artifact.")
@@ -3219,7 +3299,13 @@ def write_gravity_viewer_bundle(
                 "message": "No validated sparse linear-mapping artifact was supplied.",
             }
         else:
-            mapping_reader = open_temporal_block_artifact(linear_mapping_artifact)
+            fit_source_revision = fit_source_provenance.get("package_revision")
+            if not isinstance(fit_source_revision, str) or not fit_source_revision:
+                raise ValueError("fit/report provenance is missing package_revision required by the linear mapping.")
+            mapping_reader = open_temporal_block_artifact_for_viewer(
+                linear_mapping_artifact,
+                fit_source_package_revision=fit_source_revision,
+            )
             _validate_linear_mapping_for_bundle(
                 artifact=mapping_reader,
                 fit_result=fit_result,
@@ -3227,9 +3313,12 @@ def write_gravity_viewer_bundle(
                 metadata=metadata,
                 full_od_path=staging / "full_od.csv",
             )
+            viewer_summary["mapping_source_package_revision"] = mapping_reader.source_package_revision
             contribution_summary = measurement_od_query_descriptor(
                 artifact=mapping_reader,
                 fit_result=fit_result,
+                fit_provenance=fit_source_provenance,
+                runtime_package_revision=package_revision(),
                 rho=rho,
             )
             viewer_summary["measurement_od_contributions"] = contribution_summary
@@ -3304,6 +3393,9 @@ def write_gravity_viewer_bundle(
             "compact_layout_fingerprint": provenance.get("compact_layout_fingerprint"),
             "gravity_features_fingerprint": provenance.get("gravity_features_fingerprint"),
             "package_revision": provenance.get("package_revision"),
+            "runtime_package_revision": package_revision(),
+            "fit_source_package_revision": provenance.get("package_revision"),
+            "mapping_source_package_revision": viewer_summary.get("mapping_source_package_revision"),
             "time_zone": time_zone,
             "coordinate_convention": coordinate_convention,
             "metadata": bundle_metadata,

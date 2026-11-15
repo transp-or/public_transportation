@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict, replace
 from enum import Enum
@@ -34,15 +35,33 @@ from public_transportation.inference.temporal_assignment_blocks import (
 )
 from public_transportation.inference.temporal_assignment_persistence import (
     open_temporal_block_artifact,
+    open_temporal_block_artifact_for_viewer,
     save_temporal_block_operator,
 )
+from public_transportation.inference.hierarchical_artifacts import package_revision
 from public_transportation.inference.od_parameter_layout import ODParameterLayout
 
 from tests.gravity.test_viewer_bundle import _inputs
 
 
-def _mapping_bundle_inputs(tmp_path, *, changed_network: bool = False, save=True):
-    base_result, _, _ = _inputs(tmp_path)
+def _mapping_bundle_inputs(
+    tmp_path,
+    *,
+    changed_network: bool = False,
+    save=True,
+    base_result=None,
+    fit_source_revision: str | None = None,
+    mapping_source_revision: str | None = None,
+    fit_assignment_fingerprint: str = "fit-assignment-fingerprint",
+    fit_mapping_fingerprint: str = "fit-mapping-fingerprint",
+    artifact_timetable_fingerprint: str = "artifact-timetable-fingerprint",
+    artifact_mapping_fingerprint: str = "artifact-measurement-mapping-fingerprint",
+    compact_layout_fingerprint: str = "compact-layout-fingerprint",
+):
+    if base_result is None:
+        base_result, _, _ = _inputs(tmp_path)
+    fit_source_revision = fit_source_revision or package_revision()
+    mapping_source_revision = mapping_source_revision or fit_source_revision
     layout = ODParameterLayout(
         num_od_total=3,
         od_keys=(
@@ -70,17 +89,17 @@ def _mapping_bundle_inputs(tmp_path, *, changed_network: bool = False, save=True
             CanonicalMeasurement(2, "m2", "alighting", "d2", "am"),
         ),
         source_od_layout_fingerprint=layout.fingerprint,
-        source_compact_layout_fingerprint="compact-layout-fingerprint",
+        source_compact_layout_fingerprint=compact_layout_fingerprint,
     )
     identity = AssignmentArtifactIdentity(
         canonical_index_fingerprint=canonical_index.artifact_fingerprint,
         network_fingerprint="network-other" if changed_network else "network",
-        timetable_fingerprint="assignment-fingerprint",
+        timetable_fingerprint=artifact_timetable_fingerprint,
         temporal_discretization_fingerprint="temporal-discretization",
         route_choice_fingerprint="route-choice",
         departure_choice_fingerprint="departure-choice",
         feasibility_fingerprint="feasibility",
-        measurement_mapping_fingerprint="mapping-fingerprint",
+        measurement_mapping_fingerprint=artifact_mapping_fingerprint,
         coefficient_policy_fingerprint="coefficient-policy",
         numeric_dtype="float64",
     )
@@ -101,12 +120,13 @@ def _mapping_bundle_inputs(tmp_path, *, changed_network: bool = False, save=True
     provenance.update(
         {
             "artifact_identity_fingerprint": identity.fingerprint,
-            "assignment_fingerprint": identity.timetable_fingerprint,
+            "assignment_fingerprint": fit_assignment_fingerprint,
             "binding_fingerprint": canonical_index.binding_fingerprint,
             "canonical_index_fingerprint": canonical_index.artifact_fingerprint,
-            "compact_layout_fingerprint": "compact-layout-fingerprint",
-            "mapping_fingerprint": identity.measurement_mapping_fingerprint,
+            "compact_layout_fingerprint": compact_layout_fingerprint,
+            "mapping_fingerprint": fit_mapping_fingerprint,
             "od_layout_fingerprint": layout.fingerprint,
+            "package_revision": fit_source_revision,
         }
     )
     metadata = GravityValidationMetadata(
@@ -152,7 +172,28 @@ def _mapping_bundle_inputs(tmp_path, *, changed_network: bool = False, save=True
     artifact_path = tmp_path / "linear-mapping"
     if save:
         save_temporal_block_operator(artifact_path, operator)
+        if mapping_source_revision != package_revision():
+            _rewrite_mapping_source(artifact_path, mapping_source_revision)
     return result, report, provenance, artifact_path
+
+
+def _rewrite_mapping_source(
+    artifact_path: Path, source_revision: str, *, schema_version: int | None = None
+) -> None:
+    manifest_path = artifact_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["package_revision"] = source_revision
+    if schema_version is not None:
+        manifest["schema_version"] = schema_version
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
+    marker_path = artifact_path / "COMPLETE.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    marker_path.write_text(
+        json.dumps(marker, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
 
 
 def _split_interval_query_inputs(tmp_path):
@@ -460,6 +501,177 @@ def test_local_query_service_binds_fit_bundle_and_mapping_before_query(tmp_path)
             bundle=read_gravity_viewer_bundle(bundle.path),
             fit_manifest_path=fit_path,
             mapping_artifact_path=artifact,
+        )
+
+
+def test_viewer_supports_matching_legacy_schema_revision_with_distinct_provenance(tmp_path, monkeypatch):
+    source_revision = "579a70af1e15a88d34ad8907b19740db11caff01"
+    supplied = {
+        "artifact_identity": "8b6a5675a63d7797278a74fde03f78940829ab55d61e36185f4c6d590eccfed5",
+        "fit_assignment": "44a6cf1ba0fe177cb4d218146056aa1bae33c2ce961a3e6da9a2a762d71e25bf",
+        "fit_mapping": "44a6cf1ba0fe177cb4d218146056aa1bae33c2ce961a3e6da9a2a762d71e25bf",
+        "artifact_timetable": "7a711efcbbf896254840ff2a1b7ebaeb51c985137bb619d2f8a1919dcf4aa9d0",
+        "artifact_mapping": "c26fc89b28cb34d605c429ea4f8693e6d2d2edfdedf4ab5874bc245d572d1db1",
+        "canonical_index": "70d41ba56745a20442c666f02fc4bbb493e03f9d191dc2dc73d5c04e70fbd693",
+        "binding": "e5941fc0f404c6fbbe79f7d5a7563b97e1df724becdc7cd1264fd1b0e6b39124",
+        "od_layout": "544a8d00b05806828a16a192b36e85d7b8e62d9d8bdd84e5d57488813d228945",
+        "compact_layout": "d494daf2ff89865bcf48366e00c53f88ea802ebf797ac08aa5d5fb115069b63a",
+    }
+    base_result, _, _ = _inputs(tmp_path)
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            AssignmentArtifactIdentity,
+            "fingerprint",
+            property(lambda _self: supplied["artifact_identity"]),
+        )
+        patcher.setattr(
+            CanonicalAssignmentIndex,
+            "artifact_fingerprint",
+            property(lambda _self: supplied["canonical_index"]),
+        )
+        patcher.setattr(
+            CanonicalAssignmentIndex,
+            "binding_fingerprint",
+            property(lambda _self: supplied["binding"]),
+        )
+        patcher.setattr(
+            ODParameterLayout,
+            "fingerprint",
+            property(lambda _self: supplied["od_layout"]),
+        )
+        result, report, provenance, artifact = _mapping_bundle_inputs(
+            tmp_path,
+            base_result=base_result,
+            fit_source_revision=source_revision,
+            fit_assignment_fingerprint=supplied["fit_assignment"],
+            fit_mapping_fingerprint=supplied["fit_mapping"],
+            artifact_timetable_fingerprint=supplied["artifact_timetable"],
+            artifact_mapping_fingerprint=supplied["artifact_mapping"],
+            compact_layout_fingerprint=supplied["compact_layout"],
+        )
+        compatible_reader = open_temporal_block_artifact_for_viewer(
+            artifact,
+            fit_source_package_revision=source_revision,
+        )
+        assert compatible_reader.source_package_revision == source_revision
+        assert compatible_reader.artifact_schema_version == 2
+        bundle = write_gravity_viewer_bundle(
+            output_directory=tmp_path / "legacy-source-bundle",
+            fit_result=result,
+            validation_result=report.adequacy,
+            report=report,
+            metadata={"provenance": provenance},
+            linear_mapping_artifact=artifact,
+        )
+        summary = bundle.viewer_summary["measurement_od_contributions"]
+        assert summary["assignment_fingerprint"] == supplied["fit_assignment"]
+        assert summary["mapping_fingerprint"] == supplied["fit_mapping"]
+        assert summary["artifact_timetable_fingerprint"] == supplied["artifact_timetable"]
+        assert summary["artifact_measurement_mapping_fingerprint"] == supplied["artifact_mapping"]
+        assert summary["mapping_artifact_fingerprint"] == supplied["artifact_identity"]
+        assert summary["canonical_index_fingerprint"] == supplied["canonical_index"]
+        assert summary["binding_fingerprint"] == supplied["binding"]
+        assert summary["od_layout_fingerprint"] == supplied["od_layout"]
+        assert summary["mapping_artifact_schema_version"] == 2
+        assert summary["runtime_package_revision"] == package_revision()
+        assert summary["fit_source_package_revision"] == source_revision
+        assert summary["mapping_source_package_revision"] == source_revision
+        assert bundle.manifest["runtime_package_revision"] == package_revision()
+        assert bundle.manifest["package_revision"] == source_revision
+        assert not (bundle.path / "partitions" / "measurement_od_contributions").exists()
+
+        with pytest.raises(ValueError, match="package revision is incompatible"):
+            open_temporal_block_artifact(artifact)
+
+        fit_payload = {
+            **provenance,
+            "model_fingerprint": result.model_fingerprint,
+            "result": asdict(result),
+        }
+
+        def json_default(value):
+            if isinstance(value, np.ndarray):
+                return value.tolist()
+            if isinstance(value, np.generic):
+                return value.item()
+            if isinstance(value, Path):
+                return str(value)
+            if isinstance(value, Enum):
+                return value.value
+            raise TypeError(type(value).__name__)
+
+        fit_path = tmp_path / "legacy-source-fit.json"
+        fit_path.write_text(json.dumps(fit_payload, default=json_default), encoding="utf-8")
+        service = GravityViewerQueryService(
+            bundle=read_gravity_viewer_bundle(bundle.path),
+            fit_manifest_path=fit_path,
+            mapping_artifact_path=artifact,
+        )
+        page = service.query_measurement(0, page=0, page_size=1)
+        assert page["total"] == 2
+        assert len(page["rows"]) == 1
+        assert page["rows"][0]["measurement_index"] == 0
+
+
+def test_viewer_rejects_fit_mapping_source_revision_mismatch_and_unknown_schema(tmp_path):
+    result, report, provenance, artifact = _mapping_bundle_inputs(
+        tmp_path / "revision-mismatch",
+        fit_source_revision=package_revision(),
+        mapping_source_revision="579a70af1e15a88d34ad8907b19740db11caff01",
+    )
+    with pytest.raises(ValueError, match="fit and mapping source package revisions differ"):
+        write_gravity_viewer_bundle(
+            output_directory=tmp_path / "revision-mismatch-bundle",
+            fit_result=result,
+            validation_result=report.adequacy,
+            report=report,
+            metadata={"provenance": provenance},
+            linear_mapping_artifact=artifact,
+        )
+
+    result, report, provenance, artifact = _mapping_bundle_inputs(
+        tmp_path / "unsupported-schema",
+        fit_source_revision="579a70af1e15a88d34ad8907b19740db11caff01",
+    )
+    _rewrite_mapping_source(
+        artifact,
+        "579a70af1e15a88d34ad8907b19740db11caff01",
+        schema_version=99,
+    )
+    with pytest.raises(ValueError, match="schema is incompatible"):
+        write_gravity_viewer_bundle(
+            output_directory=tmp_path / "unsupported-schema-bundle",
+            fit_result=result,
+            validation_result=report.adequacy,
+            report=report,
+            metadata={"provenance": provenance},
+            linear_mapping_artifact=artifact,
+        )
+
+
+def test_bundle_validation_verifies_mapping_block_checksums_without_expanding_contributions(tmp_path):
+    result, report, provenance, artifact = _mapping_bundle_inputs(tmp_path)
+    manifest_path = artifact / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["blocks"][0]["content_hash"] = "0" * 64
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
+    marker_path = artifact / "COMPLETE.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    marker_path.write_text(
+        json.dumps(marker, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="payload is missing or corrupt"):
+        write_gravity_viewer_bundle(
+            output_directory=tmp_path / "corrupt-block-bundle",
+            fit_result=result,
+            validation_result=report.adequacy,
+            report=report,
+            metadata={"provenance": provenance},
+            linear_mapping_artifact=artifact,
         )
 
 
