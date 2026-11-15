@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import csv
+import copy
 import hashlib
 import json
 import re
 import shutil
 import sqlite3
+import tempfile
+from collections import OrderedDict
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -42,6 +45,517 @@ _COMPONENT_COLUMNS = (
     "mean_floor_adjustment",
     "modeled_mean",
 )
+
+
+def _query_scale_inputs(
+    *,
+    artifact: TemporalBlockArtifactReader,
+    fit_result: GravityEstimationResult,
+    rho: float | None,
+) -> dict[str, object] | None:
+    """Validate the fitted scales needed by both the query and its summary."""
+    row_count = artifact.number_of_measurements
+    if row_count != fit_result.predicted_measurements.size:
+        raise ValueError("mapping measurement dimension differs from fitted predictions.")
+    if artifact.number_of_demand_cells != fit_result.free_od_demand.size:
+        raise ValueError("mapping demand dimension differs from fitted free OD demand.")
+    demand = np.asarray(fit_result.free_od_demand, dtype=np.float64)
+    modeled = np.asarray(fit_result.predicted_measurements, dtype=np.float64)
+    if not np.all(np.isfinite(demand)) or not np.all(np.isfinite(modeled)):
+        raise ValueError("fitted OD demand and modeled measurements must be finite.")
+
+    if fit_result.observation_scales is None:
+        if rho is None:
+            return None
+        observation_scale = float(rho)
+        if not np.isfinite(observation_scale) or observation_scale <= 0.0:
+            raise ValueError("rho must be finite and positive.")
+        observation_scales = np.full(row_count, observation_scale, dtype=np.float64)
+        observation_scale_source = "explicit_rho"
+    else:
+        if rho is not None:
+            raise ValueError("rho must be omitted when the fit stores observation_scales.")
+        observation_scales = np.asarray(fit_result.observation_scales, dtype=np.float64)
+        if (
+            observation_scales.shape != (row_count,)
+            or not np.all(np.isfinite(observation_scales))
+            or np.any(observation_scales <= 0.0)
+        ):
+            raise ValueError("fitted observation_scales are invalid.")
+        observation_scale_source = "fit_result.observation_scales"
+
+    journey_scale = _journey_scale(fit_result)
+    additive_vectors = tuple(
+        np.asarray(value, dtype=np.float64) for value in fit_result.additive_measurement_contributions
+    )
+    if any(value.shape != (row_count,) or not np.all(np.isfinite(value)) for value in additive_vectors):
+        raise ValueError("fitted additive measurement contributions are invalid.")
+    additive = np.sum(np.stack(additive_vectors), axis=0) if additive_vectors else np.zeros(row_count, dtype=np.float64)
+    if fit_result.latent_measurements is not None:
+        latent = np.asarray(fit_result.latent_measurements, dtype=np.float64)
+        if latent.shape != (row_count,) or not np.all(np.isfinite(latent)):
+            raise ValueError("fitted latent measurements are invalid.")
+    elif additive_vectors:
+        raise ValueError("fit is missing latent measurements required to separate fixed and additive components.")
+
+    return {
+        "demand": demand,
+        "modeled": modeled,
+        "observation_scales": observation_scales,
+        "observation_scale_source": observation_scale_source,
+        "journey_scale": journey_scale,
+        "additive": additive,
+    }
+
+
+def measurement_od_query_descriptor(
+    *,
+    artifact: TemporalBlockArtifactReader,
+    fit_result: GravityEstimationResult,
+    rho: float | None = None,
+) -> dict[str, object]:
+    """Describe an on-demand mapping source without expanding its sparse entries."""
+    scales = _query_scale_inputs(artifact=artifact, fit_result=fit_result, rho=rho)
+    base: dict[str, object] = {
+        "schema_version": _SCHEMA_VERSION,
+        "available": scales is not None,
+        "query_mode": "local_service",
+        "query_path": "/api/measurement-od-contributions",
+        "reverse_query_path": "/api/od-measurement-contributions",
+        "reverse_query_available": scales is not None,
+        "fit_fingerprint": fit_result.model_fingerprint,
+        "assignment_fingerprint": artifact.identity.timetable_fingerprint,
+        "mapping_artifact_fingerprint": artifact.identity.fingerprint,
+        "mapping_manifest_sha256": artifact.manifest_sha256,
+        "canonical_index_fingerprint": artifact.canonical_index.artifact_fingerprint,
+        "binding_fingerprint": artifact.canonical_index.binding_fingerprint,
+        "od_layout_fingerprint": artifact.canonical_index.source_od_layout_fingerprint,
+        "number_of_measurements": artifact.number_of_measurements,
+        "number_of_free_od_cells": artifact.number_of_demand_cells,
+        "number_of_physical_od_cells": artifact.canonical_index.number_of_physical_demand_cells,
+        "nonzero_pairs": artifact.nonzero_entries,
+        "query_block_scope": "canonical_measurement_interval",
+        "block_checksum_policy": "verify_each_selected_block_before_use",
+        "fixed_positive_od_attribution_available": not any(
+            cell.role == "fixed_positive" for cell in artifact.canonical_index.demand_cells
+        ),
+        "fixed_positive_od_attribution_message": None,
+    }
+    if not base["fixed_positive_od_attribution_available"]:
+        base["fixed_positive_od_attribution_message"] = (
+            "Fixed-positive OD demand is aggregated in the mapping's fixed offset; "
+            "the artifact has no per-cell coefficients for those cells."
+        )
+    if scales is None:
+        base["message"] = (
+            "The fit does not persist its measurement-scale vector; pass rho when "
+            "building the bundle to enable exact on-demand modeled-mean contributions."
+        )
+        return base
+    base.update(
+        {
+            "journey_aggregate_scale": scales["journey_scale"],
+            "observation_scale_source": scales["observation_scale_source"],
+            "explicit_rho": float(rho) if scales["observation_scale_source"] == "explicit_rho" else None,
+        }
+    )
+    return base
+
+
+class MeasurementODContributionQuery:
+    """Bounded, row-selective queries over a persisted temporal mapping."""
+
+    def __init__(
+        self,
+        *,
+        artifact: TemporalBlockArtifactReader,
+        fit_result: GravityEstimationResult,
+        rho: float | None = None,
+        max_cached_pages: int = 16,
+        max_page_size: int = 500,
+    ) -> None:
+        if max_cached_pages <= 0 or max_page_size <= 0:
+            raise ValueError("query cache and page bounds must be positive.")
+        scales = _query_scale_inputs(artifact=artifact, fit_result=fit_result, rho=rho)
+        if scales is None:
+            raise ValueError(
+                "the fit has no persisted observation scale; pass rho for exact modeled-mean contributions."
+            )
+        self.artifact = artifact
+        self.fit_result = fit_result
+        self.rho = rho
+        self.max_cached_pages = int(max_cached_pages)
+        self.max_page_size = int(max_page_size)
+        self._scales = scales
+        self._cache: OrderedDict[tuple[object, ...], dict[str, object]] = OrderedDict()
+        self._namespace = (fit_result.model_fingerprint, artifact.identity.fingerprint)
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+        index = artifact.canonical_index
+        self._full_index_by_column = np.full(artifact.number_of_demand_cells, -1, dtype=np.int64)
+        self._operator_column_by_full = np.full(index.number_of_physical_demand_cells, -1, dtype=np.int64)
+        self._departure_code_by_column = np.full(artifact.number_of_demand_cells, -1, dtype=np.int32)
+        self._departure_intervals: list[str] = []
+        departure_codes: dict[str, int] = {}
+        for cell in index.demand_cells:
+            if cell.operator_column is None:
+                continue
+            column = int(cell.operator_column)
+            if self._full_index_by_column[column] != -1:
+                raise ValueError("canonical free-OD operator column is duplicated.")
+            code = departure_codes.get(cell.departure_interval_id)
+            if code is None:
+                code = len(self._departure_intervals)
+                departure_codes[cell.departure_interval_id] = code
+                self._departure_intervals.append(cell.departure_interval_id)
+            self._full_index_by_column[column] = cell.full_index
+            self._operator_column_by_full[cell.full_index] = column
+            self._departure_code_by_column[column] = code
+        if (
+            np.any(self._full_index_by_column < 0)
+            or np.any(self._departure_code_by_column < 0)
+            or not np.array_equal(
+                self._operator_column_by_full[self._full_index_by_column],
+                np.arange(artifact.number_of_demand_cells, dtype=np.int64),
+            )
+        ):
+            raise ValueError("canonical free-OD operator columns are incomplete.")
+        self._measurement_by_index = index.measurements
+        self._cell_by_full_index = index.demand_cells
+
+    @property
+    def cache_namespace(self) -> tuple[str, str]:
+        """Fit and mapping fingerprints used to isolate recent page entries."""
+        return self._namespace
+
+    def clear_cache(self) -> None:
+        self._cache.clear()
+
+    def query(
+        self,
+        measurement_index: int,
+        *,
+        page: int = 0,
+        page_size: int = 100,
+    ) -> dict[str, object]:
+        if isinstance(measurement_index, bool) or not isinstance(measurement_index, (int, np.integer)):
+            raise TypeError("measurement_index must be an integer.")
+        measurement_index = int(measurement_index)
+        if measurement_index < 0 or measurement_index >= len(self._measurement_by_index):
+            raise IndexError("measurement_index is outside the canonical mapping.")
+        if page < 0 or page_size <= 0 or page_size > self.max_page_size:
+            raise ValueError(f"page must be non-negative and page_size must be between 1 and {self.max_page_size}.")
+        if (page + 1) * page_size > 5_000:
+            raise ValueError("requested ranked page exceeds the bounded contribution-query window.")
+        cache_key = (
+            *self._namespace,
+            "measurement",
+            measurement_index,
+            page,
+            page_size,
+        )
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            self.cache_hits += 1
+            self._cache.move_to_end(cache_key)
+            return copy.deepcopy(cached)
+
+        self.cache_misses += 1
+        measurement = self._measurement_by_index[measurement_index]
+        result = self._query_measurement_interval_row(
+            measurement_index=measurement_index,
+            measurement_interval_id=measurement.interval_id,
+            page=page,
+            page_size=page_size,
+        )
+        self._cache[cache_key] = result
+        self._cache.move_to_end(cache_key)
+        while len(self._cache) > self.max_cached_pages:
+            self._cache.popitem(last=False)
+        return copy.deepcopy(result)
+
+    def query_od(
+        self,
+        od_index: int,
+        *,
+        page: int = 0,
+        page_size: int = 100,
+    ) -> dict[str, object]:
+        """Return affected measurement rows for one physical OD-time cell."""
+        if isinstance(od_index, bool) or not isinstance(od_index, (int, np.integer)):
+            raise TypeError("od_index must be an integer.")
+        od_index = int(od_index)
+        cells = self.artifact.canonical_index.demand_cells
+        if od_index < 0 or od_index >= len(cells):
+            raise IndexError("od_index is outside the canonical mapping.")
+        if page < 0 or page_size <= 0 or page_size > self.max_page_size:
+            raise ValueError(f"page must be non-negative and page_size must be between 1 and {self.max_page_size}.")
+        if (page + 1) * page_size > 5_000:
+            raise ValueError("requested ranked page exceeds the bounded contribution-query window.")
+        cache_key = (*self._namespace, "od", od_index, page, page_size)
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            self.cache_hits += 1
+            self._cache.move_to_end(cache_key)
+            return copy.deepcopy(cached)
+        self.cache_misses += 1
+
+        cell = cells[od_index]
+        column = cell.operator_column
+        if column is None:
+            result: dict[str, object] = {
+                "schema_version": _SCHEMA_VERSION,
+                "fit_fingerprint": self._namespace[0],
+                "mapping_artifact_fingerprint": self._namespace[1],
+                "od_index": od_index,
+                "page": page,
+                "page_size": page_size,
+                "total": 0,
+                "rows": [],
+            }
+        else:
+            result = self._query_od_interval(
+                od_index=od_index,
+                operator_column=column,
+                departure_interval_id=cell.departure_interval_id,
+                page=page,
+                page_size=page_size,
+            )
+        self._cache[cache_key] = result
+        self._cache.move_to_end(cache_key)
+        while len(self._cache) > self.max_cached_pages:
+            self._cache.popitem(last=False)
+        return copy.deepcopy(result)
+
+    def _query_od_interval(
+        self,
+        *,
+        od_index: int,
+        operator_column: int,
+        departure_interval_id: str,
+        page: int,
+        page_size: int,
+    ) -> dict[str, object]:
+        offset = page * page_size
+        with tempfile.TemporaryDirectory(prefix="gravity-od-measurement-query-") as temporary:
+            connection = sqlite3.connect(Path(temporary) / "selected_od.sqlite")
+            try:
+                connection.execute("PRAGMA journal_mode=OFF")
+                connection.execute("PRAGMA synchronous=OFF")
+                connection.execute("PRAGMA temp_store=FILE")
+                connection.execute("PRAGMA cache_size=-4096")
+                connection.execute(
+                    "CREATE TABLE contributions ("
+                    "measurement_index INTEGER PRIMARY KEY, operator_coefficient REAL NOT NULL, "
+                    "linear_flow_contribution REAL NOT NULL, "
+                    "modeled_mean_contribution REAL NOT NULL) WITHOUT ROWID"
+                )
+                demand = float(np.asarray(self._scales["demand"])[operator_column])
+                observation_scales = np.asarray(self._scales["observation_scales"])
+                for block in self.artifact.iter_blocks_for_departure_interval(departure_interval_id):
+                    for start in range(0, block.nonzero_entries, _WRITE_BATCH_SIZE):
+                        stop = min(block.nonzero_entries, start + _WRITE_BATCH_SIZE)
+                        block_columns = block.column_indices[start:stop]
+                        selected = np.flatnonzero(block_columns == operator_column)
+                        if not selected.size:
+                            continue
+                        rows = np.asarray(block.row_indices[start:stop][selected], dtype=np.int64)
+                        coefficients = np.asarray(block.values[start:stop][selected], dtype=np.float64)
+                        flows = coefficients * demand
+                        means = flows * float(self._scales["journey_scale"]) * observation_scales[rows]
+                        if not np.all(np.isfinite(flows)) or not np.all(np.isfinite(means)):
+                            raise ValueError("selected OD contributions are non-finite.")
+                        connection.executemany(
+                            "INSERT INTO contributions VALUES (?, ?, ?, ?) "
+                            "ON CONFLICT(measurement_index) DO UPDATE SET "
+                            "operator_coefficient=operator_coefficient+excluded.operator_coefficient, "
+                            "linear_flow_contribution=linear_flow_contribution+excluded.linear_flow_contribution, "
+                            "modeled_mean_contribution=modeled_mean_contribution+excluded.modeled_mean_contribution",
+                            [
+                                (int(row), float(coefficient), float(flow), float(mean))
+                                for row, coefficient, flow, mean in zip(rows, coefficients, flows, means, strict=True)
+                            ],
+                        )
+                connection.commit()
+                total = int(connection.execute("SELECT COUNT(*) FROM contributions").fetchone()[0])
+                rows = connection.execute(
+                    "SELECT measurement_index, operator_coefficient, linear_flow_contribution, modeled_mean_contribution "
+                    "FROM contributions ORDER BY ABS(modeled_mean_contribution) DESC, measurement_index ASC LIMIT ? OFFSET ?",
+                    (page_size, offset),
+                ).fetchall()
+            finally:
+                connection.close()
+        return {
+            "schema_version": _SCHEMA_VERSION,
+            "fit_fingerprint": self._namespace[0],
+            "mapping_artifact_fingerprint": self._namespace[1],
+            "od_index": od_index,
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "rows": [
+                {
+                    "measurement_index": int(measurement_index),
+                    "od_index": od_index,
+                    "departure_time_bin": departure_interval_id,
+                    "operator_coefficient": float(coefficient),
+                    "linear_flow_contribution": float(flow),
+                    "modeled_mean_contribution": float(mean),
+                }
+                for measurement_index, coefficient, flow, mean in rows
+            ],
+        }
+
+    def _query_measurement_interval_row(
+        self,
+        *,
+        measurement_index: int,
+        measurement_interval_id: str,
+        page: int,
+        page_size: int,
+    ) -> dict[str, object]:
+        offset = page * page_size
+        with tempfile.TemporaryDirectory(prefix="gravity-measurement-query-") as temporary:
+            database_path = Path(temporary) / "selected_measurement.sqlite"
+            connection = sqlite3.connect(database_path)
+            try:
+                connection.execute("PRAGMA journal_mode=OFF")
+                connection.execute("PRAGMA synchronous=OFF")
+                connection.execute("PRAGMA temp_store=FILE")
+                connection.execute("PRAGMA cache_size=-4096")
+                connection.execute(
+                    "CREATE TABLE contributions ("
+                    "od_index INTEGER PRIMARY KEY, operator_coefficient REAL NOT NULL, "
+                    "linear_flow_contribution REAL NOT NULL, "
+                    "modeled_mean_contribution REAL NOT NULL) WITHOUT ROWID"
+                )
+                demand = np.asarray(self._scales["demand"])
+                observation_scale = float(np.asarray(self._scales["observation_scales"])[measurement_index])
+                for block in self.artifact.iter_blocks_for_measurement_interval(measurement_interval_id):
+                    for start in range(0, block.nonzero_entries, _WRITE_BATCH_SIZE):
+                        stop = min(block.nonzero_entries, start + _WRITE_BATCH_SIZE)
+                        block_rows = block.row_indices[start:stop]
+                        selected = np.flatnonzero(block_rows == measurement_index)
+                        if not selected.size:
+                            continue
+                        columns = np.asarray(block.column_indices[start:stop][selected], dtype=np.int64)
+                        coefficients = np.asarray(block.values[start:stop][selected], dtype=np.float64)
+                        flows = coefficients * demand[columns]
+                        means = flows * float(self._scales["journey_scale"]) * observation_scale
+                        if not np.all(np.isfinite(flows)) or not np.all(np.isfinite(means)):
+                            raise ValueError("selected measurement contributions are non-finite.")
+                        rows_to_write = [
+                            (
+                                int(self._full_index_by_column[int(column)]),
+                                float(coefficient),
+                                float(flow),
+                                float(mean),
+                            )
+                            for column, coefficient, flow, mean in zip(columns, coefficients, flows, means, strict=True)
+                        ]
+                        connection.executemany(
+                            "INSERT INTO contributions VALUES (?, ?, ?, ?) "
+                            "ON CONFLICT(od_index) DO UPDATE SET "
+                            "operator_coefficient=operator_coefficient+excluded.operator_coefficient, "
+                            "linear_flow_contribution=linear_flow_contribution+excluded.linear_flow_contribution, "
+                            "modeled_mean_contribution=modeled_mean_contribution+excluded.modeled_mean_contribution",
+                            rows_to_write,
+                        )
+                connection.commit()
+                total = int(connection.execute("SELECT COUNT(*) FROM contributions").fetchone()[0])
+                raw_od = float(
+                    connection.execute(
+                        "SELECT COALESCE(SUM(linear_flow_contribution), 0.0) FROM contributions"
+                    ).fetchone()[0]
+                )
+                components = self._components_for_row(measurement_index, raw_od)
+                rows = connection.execute(
+                    "SELECT od_index, operator_coefficient, linear_flow_contribution, modeled_mean_contribution "
+                    "FROM contributions ORDER BY ABS(modeled_mean_contribution) DESC, od_index ASC LIMIT ? OFFSET ?",
+                    (page_size, offset),
+                ).fetchall()
+            finally:
+                connection.close()
+
+        demand = np.asarray(self._scales["demand"])
+        contributors: list[dict[str, object]] = []
+        for od_index, coefficient, linear_flow, modeled_mean in rows:
+            cell = self._cell_by_full_index[int(od_index)]
+            column = cell.operator_column
+            if column is None:
+                raise ValueError("a sparse mapping entry resolved to a non-free OD cell.")
+            departure_code = int(self._departure_code_by_column[column])
+            contributors.append(
+                {
+                    "measurement_index": measurement_index,
+                    "od_index": int(od_index),
+                    "departure_time_bin": self._departure_intervals[departure_code],
+                    "operator_coefficient": float(coefficient),
+                    "linear_flow_contribution": float(linear_flow),
+                    "modeled_mean_contribution": float(modeled_mean),
+                    "origin_stop_id": cell.origin_id,
+                    "destination_stop_id": cell.destination_id,
+                    "estimated_demand": float(demand[column]),
+                }
+            )
+        return {
+            "schema_version": _SCHEMA_VERSION,
+            "fit_fingerprint": self._namespace[0],
+            "mapping_artifact_fingerprint": self._namespace[1],
+            "measurement_index": measurement_index,
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "rows": contributors,
+            "components": components,
+        }
+
+    def _components_for_row(self, measurement_index: int, raw_od: float) -> dict[str, float]:
+        result = self.fit_result
+        expected_od = result.od_measurement_contribution
+        if expected_od is not None:
+            expected = np.asarray(expected_od, dtype=np.float64)
+            if expected.shape != (self.artifact.number_of_measurements,) or not np.isclose(
+                raw_od, float(expected[measurement_index]), rtol=1e-6, atol=1e-8
+            ):
+                raise ValueError("mapping OD contribution differs from the fitted OD measurement component.")
+        additive = float(np.asarray(self._scales["additive"])[measurement_index])
+        if result.latent_measurements is None:
+            if result.additive_measurement_contributions:
+                raise ValueError(
+                    "fit is missing latent measurements required to separate fixed and additive components."
+                )
+            fixed_offset = float(self.artifact.fixed_measurement_offset[measurement_index])
+        else:
+            latent = np.asarray(result.latent_measurements, dtype=np.float64)
+            fixed_offset = float(latent[measurement_index] - float(self._scales["journey_scale"]) * (raw_od + additive))
+            if not np.isclose(
+                fixed_offset,
+                float(self.artifact.fixed_measurement_offset[measurement_index]),
+                rtol=1e-6,
+                atol=1e-8,
+            ):
+                raise ValueError("fitted fixed offset differs from the mapping artifact.")
+        scale = float(np.asarray(self._scales["observation_scales"])[measurement_index])
+        fixed_mean = scale * fixed_offset
+        additive_mean = scale * float(self._scales["journey_scale"]) * additive
+        od_mean = scale * float(self._scales["journey_scale"]) * raw_od
+        modeled = float(np.asarray(self._scales["modeled"])[measurement_index])
+        floor = modeled - fixed_mean - additive_mean - od_mean
+        tolerance = 1e-6 + 1e-6 * abs(modeled)
+        if floor < -tolerance:
+            raise ValueError("OD, fixed, and additive components exceed the saved modeled mean.")
+        floor = max(floor, 0.0)
+        if not np.isclose(fixed_mean + additive_mean + od_mean + floor, modeled, rtol=1e-6, atol=1e-8):
+            raise ValueError("measurement component totals do not reproduce fitted predictions.")
+        return {
+            "fixed_offset_contribution": fixed_mean,
+            "additive_contribution": additive_mean,
+            "od_contribution": od_mean,
+            "mean_floor_adjustment": floor,
+            "modeled_mean": modeled,
+        }
 
 
 def _sha256(path: Path) -> str:

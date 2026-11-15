@@ -242,6 +242,9 @@ from .viewer_bundle import (
     write_gravity_viewer_bundle,
     write_persisted_gravity_viewer_bundle,
 )
+from .measurement_od_contributions import (
+    MeasurementODContributionQuery,
+)
 from .viewer_route_export import (
     GravityRouteFlowExportPlan,
     export_gravity_route_flows,

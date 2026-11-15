@@ -46,7 +46,7 @@ from .specification import GravityModelSpecification
 from .validation import GravityAdequacyReport, GravityValidationMetadata
 from .measurement_od_contributions import (
     validate_dataset as _validate_measurement_od_dataset,
-    write_measurement_od_contributions_dataset,
+    measurement_od_query_descriptor,
 )
 from .measurement_location_lookup import (
     MEASUREMENT_LOCATION_COLUMNS,
@@ -2005,7 +2005,20 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
         if not isinstance(contribution_payload, Mapping):
             raise ValueError("viewer measurement OD contribution metadata is invalid.")
         if contribution_payload.get("available"):
-            _validate_measurement_od_dataset(root, contribution_payload)
+            query_mode = contribution_payload.get("query_mode")
+            if query_mode == "local_service":
+                if contribution_payload.get("query_path") != "/api/measurement-od-contributions":
+                    raise ValueError("viewer on-demand measurement query path is invalid.")
+                if contribution_payload.get("reverse_query_path") != "/api/od-measurement-contributions":
+                    raise ValueError("viewer on-demand reverse measurement query path is invalid.")
+                if contribution_payload.get("number_of_measurements") != counts.get("predicted_measurements.csv"):
+                    raise ValueError("viewer on-demand measurement count differs from predicted measurements.")
+                if contribution_payload.get("block_checksum_policy") != "verify_each_selected_block_before_use":
+                    raise ValueError("viewer on-demand block checksum policy is invalid.")
+            elif query_mode is None:
+                _validate_measurement_od_dataset(root, contribution_payload)
+            else:
+                raise ValueError("viewer measurement OD contribution query mode is unsupported.")
             for field, expected in (
                 ("fit_fingerprint", manifest.get("model_fingerprint")),
                 ("assignment_fingerprint", manifest.get("assignment_fingerprint")),
@@ -2573,6 +2586,10 @@ class GravityViewerBundle:
         """Return ranked OD contributors to one measured row, with bounded output."""
         limit = self._measurement_od_query_window(top_n=top_n, page=page, page_size=page_size)
         payload = self._measurement_od_payload()
+        if payload.get("query_mode") == "local_service":
+            raise RuntimeError(
+                "This bundle uses on-demand mapping queries; start the local gravity viewer query service."
+            )
         number_of_measurements = int(payload.get("number_of_measurements", -1))
         if measurement_index < 0 or measurement_index >= number_of_measurements:
             raise IndexError("measurement_index is outside the contribution dataset.")
@@ -2602,6 +2619,10 @@ class GravityViewerBundle:
         """Return ranked measured rows affected by one fitted OD-time cell."""
         fetch = self._measurement_od_query_window(top_n=top_n, page=page, page_size=page_size)
         payload = self._measurement_od_payload()
+        if payload.get("query_mode") == "local_service":
+            raise RuntimeError(
+                "This bundle uses on-demand mapping queries; start the local gravity viewer query service."
+            )
         od_rows = int(self.manifest.get("row_counts", {}).get("full_od.csv", -1))
         if od_index < 0 or od_index >= od_rows:
             raise IndexError("od_index is outside the viewer bundle.")
@@ -2632,6 +2653,10 @@ class GravityViewerBundle:
     def query_measurement_contribution_components(self, measurement_index: int) -> Mapping[str, object] | None:
         """Return the separate fixed, additive, floor, and total row components."""
         payload = self._measurement_od_payload()
+        if payload.get("query_mode") == "local_service":
+            raise RuntimeError(
+                "This bundle uses on-demand mapping queries; start the local gravity viewer query service."
+            )
         number_of_measurements = int(payload.get("number_of_measurements", -1))
         if measurement_index < 0 or measurement_index >= number_of_measurements:
             raise IndexError("measurement_index is outside the contribution dataset.")
@@ -3202,17 +3227,11 @@ def write_gravity_viewer_bundle(
                 metadata=metadata,
                 full_od_path=staging / "full_od.csv",
             )
-            contribution_summary = write_measurement_od_contributions_dataset(
-                destination=staging / _PARTITION_ROOT / "measurement_od_contributions",
+            contribution_summary = measurement_od_query_descriptor(
                 artifact=mapping_reader,
                 fit_result=fit_result,
                 rho=rho,
             )
-            if not contribution_summary.get("available"):
-                # Even when an exact model scale is absent, never publish an
-                # availability status before validating every source payload.
-                for _ in mapping_reader.iter_blocks():
-                    pass
             viewer_summary["measurement_od_contributions"] = contribution_summary
         _write_json(staging / _VIEWER_SUMMARY_FILE, viewer_summary)
         route_source = staging / "route_flows.csv"

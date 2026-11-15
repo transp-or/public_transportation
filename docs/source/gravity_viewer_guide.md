@@ -35,7 +35,7 @@ viewer_bundle/
   stop_summary.csv                 optional display summary
   viewer_summary.json              partition/index metadata
   partitions/od/                   one CSV per departure-time bin
-  partitions/measurement_od_contributions/  optional sparse OD-to-measurement map
+  partitions/measurement_od_contributions/  legacy precomputed contribution data
     manifest.json
     components/                      bounded measurement-row component shards
     bins/                           bounded CSV partitions by OD departure interval
@@ -173,15 +173,35 @@ nearby or similarly named stops. The small stop index is read at startup, but
 measurement rows themselves are fetched only for the clicked stop and are
 page-limited.
 
-For the selected row, the viewer shows the observation and modeled mean. If a
-compatible contribution dataset is present, OD contributors are ranked by
-absolute modeled-mean contribution, retain their signed modeled-mean and raw
-linear-flow values, and can be browsed in bounded pages. The browser streams
-the selected measurement's matching entries into its local IndexedDB cache in
-batches; it does not load the full contribution dataset into memory. Fixed
-offset, additive contribution, and mean-floor adjustment remain separate and
-are not attributed to an OD pair. OD contributions decompose the modeled mean,
-not the observed count. Observation time is not the OD departure-time bin.
+For the selected row, the viewer shows the observation and modeled mean. New
+bundles with a compatible mapping query only the selected measurement interval
+through the local query service; they do not expand the full OD-by-measurement
+matrix during bundle creation. Results are ranked by absolute modeled-mean
+contribution, preserve signed modeled-mean and raw linear-flow values, and are
+returned in bounded pages. The service caches only a bounded number of recent
+pages. Fixed offset, additive contribution, and mean-floor adjustment remain
+separate and are not attributed to an OD pair. OD contributions decompose the
+modeled mean, not the observed count. Observation time is not the OD
+departure-time bin.
+
+Start the local query service with the exact bundle, fit manifest, and mapping
+artifact used to create the bundle:
+
+```sh
+PYTHONPATH=src python -m public_transportation.inference.gravity.viewer_query_service \
+  --bundle /path/to/viewer_bundle \
+  --fit-manifest /path/to/fit/manifest.json \
+  --mapping-artifact /path/to/temporal_mapping_artifact
+```
+
+The service binds only to `127.0.0.1:8765`. Then open
+`tools/gravity_viewer/index.html`, select the bundle directory, and use
+**Measurement** map mode. The service validates the bundle/fit/mapping
+fingerprints at startup and checks each selected block payload before using
+it. It never rebuilds routing or writes a complete contribution cache. Stop it
+with Ctrl-C when finished. The bundle can also be inspected without the
+service; measured values and map lookup remain available, while contribution
+queries report that the local service is unavailable.
 
 Bundles made before the stop lookup was added remain readable. Map-based row
 selection is reported unavailable when the network snapshot or lookup is
@@ -191,9 +211,12 @@ the observed and modeled row values when the stop lookup exists.
 When a validated sparse linear-mapping artifact was supplied during bundle
 creation, the **Measured flows by OD pair** panel lets you inspect the
 contributions in either direction: the OD pairs contributing to a selected
-measurement row, or the measured rows affected by one OD-time cell. Results are
-ranked by absolute modeled contribution and the browser reads only bounded CSV
-partitions. The Python bundle API provides the same queries:
+measurement row, or the measured rows affected by one OD-time cell. New bundles
+use the local service for both directions; older bundles with precomputed
+partitions remain readable. Results are ranked by absolute modeled
+contribution. The Python bundle API provides bounded queries for legacy
+precomputed datasets, while the on-demand query API is
+`MeasurementODContributionQuery`:
 
 ```python
 bundle.query_measurement_od_contributions(measurement_index=123, top_n=50)
@@ -201,16 +224,16 @@ bundle.query_od_measurement_contributions(od_index=456, top_n=50)
 bundle.query_measurement_contribution_components(measurement_index=123)
 ```
 
-Enable the dataset by passing the supported persisted sparse mapping artifact
-as `linear_mapping_artifact` to either viewer-bundle writer. The writer
-validates fit and assignment fingerprints, canonical coordinates, and payload
-checksums, then streams stored sparse entries; it does not rerun routing. When
-the fit persists its observation-scale vector, no extra scale is needed. For a
-fit whose measurement scale is specified only by `rho`, pass that same fitted
-`rho`; otherwise the contribution panel is marked unavailable. Python queries
-keep at most 5,000 ranked rows in memory per request; `top_n` and pagination
-are bounded to that ranked window. In the browser, the selected measurement
-can be browsed page-by-page from its local indexed cache.
+Enable on-demand queries by passing the supported persisted sparse mapping
+artifact as `linear_mapping_artifact` to either viewer-bundle writer. Bundle
+creation validates fit and assignment fingerprints and canonical coordinates,
+but does not read every sparse block or create a matrix-sized SQLite/CSV
+cache. At query time, the service selects blocks for the requested measurement
+interval (or OD departure interval) and verifies each block checksum before
+use. Page size is bounded to 500 and ranked offsets to 5,000 rows. When the fit
+persists its observation-scale vector, no extra scale is needed. For a fit
+whose measurement scale is specified only by `rho`, pass that same fitted
+`rho`; otherwise the contribution panel is marked unavailable.
 
 The contribution is calculated from the saved sparse mapping and fitted OD
 demand, without rerunning routing. It decomposes measured channels only; it is

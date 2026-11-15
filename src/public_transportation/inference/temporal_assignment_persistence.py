@@ -62,6 +62,10 @@ class TemporalBlockArtifactReader:
     manifest_sha256: str
     nonzero_entries: int
     _block_items: tuple[Mapping[str, object], ...]
+    _block_items_by_measurement_interval: Mapping[str, tuple[Mapping[str, object], ...]]
+    _block_items_by_departure_interval: Mapping[str, tuple[Mapping[str, object], ...]]
+    _measurement_interval_ids: frozenset[str]
+    _departure_interval_ids: frozenset[str]
 
     @property
     def number_of_measurements(self) -> int:
@@ -75,45 +79,75 @@ class TemporalBlockArtifactReader:
         """Yield checksum-verified blocks one at a time."""
         total_nonzeros = 0
         for item in self._block_items:
-            filename = item.get("filename")
-            key_payload = item.get("key")
-            if (
-                not isinstance(filename, str)
-                or Path(filename).name != filename
-                or not isinstance(key_payload, Mapping)
-            ):
-                raise ValueError("temporal block artifact entry is invalid.")
-            try:
-                with np.load(
-                    self.directory / "blocks" / filename, allow_pickle=False
-                ) as data:
-                    rows = np.asarray(data["row_indices"])
-                    columns = np.asarray(data["column_indices"])
-                    values = np.asarray(data["values"])
-                if _block_content_hash(rows, columns, values) != item.get(
-                    "content_hash"
-                ):
-                    raise ValueError("temporal block content hash is invalid.")
-                block = TemporalSparseBlock(
-                    key=TemporalBlockKey(**key_payload),
-                    row_indices=rows,
-                    column_indices=columns,
-                    values=values,
-                    number_of_measurements=self.number_of_measurements,
-                    number_of_demand_cells=self.number_of_demand_cells,
-                )
-            except (KeyError, OSError, TypeError, ValueError) as error:
-                raise ValueError(
-                    "temporal block artifact payload is missing or corrupt."
-                ) from error
-            if block.nonzero_entries != item.get("nonzero_entries"):
-                raise ValueError("temporal block artifact nonzero count is invalid.")
+            block = self._load_block(item)
             total_nonzeros += block.nonzero_entries
             yield block
         if total_nonzeros != self.nonzero_entries:
             raise ValueError(
                 "temporal block artifact aggregate nonzero count is invalid."
             )
+
+    def iter_blocks_for_measurement_interval(
+        self, measurement_interval_id: str
+    ) -> Iterator[TemporalSparseBlock]:
+        """Yield verified blocks for one canonical measurement interval only."""
+        if not measurement_interval_id:
+            raise ValueError("measurement_interval_id must be non-empty.")
+        if measurement_interval_id not in self._measurement_interval_ids:
+            raise ValueError("measurement_interval_id is absent from the canonical index.")
+        for item in self._block_items_by_measurement_interval.get(
+            measurement_interval_id, ()
+        ):
+            yield self._load_block(item)
+
+    def iter_blocks_for_departure_interval(
+        self, departure_interval_id: str
+    ) -> Iterator[TemporalSparseBlock]:
+        """Yield verified blocks for one canonical OD departure interval only."""
+        if not departure_interval_id:
+            raise ValueError("departure_interval_id must be non-empty.")
+        if departure_interval_id not in self._departure_interval_ids:
+            raise ValueError("departure_interval_id is absent from the canonical index.")
+        for item in self._block_items_by_departure_interval.get(
+            departure_interval_id, ()
+        ):
+            yield self._load_block(item)
+
+    def _load_block(self, item: Mapping[str, object]) -> TemporalSparseBlock:
+        filename = item.get("filename")
+        key_payload = item.get("key")
+        if (
+            not isinstance(filename, str)
+            or Path(filename).name != filename
+            or not isinstance(key_payload, Mapping)
+        ):
+            raise ValueError("temporal block artifact entry is invalid.")
+        try:
+            with np.load(
+                self.directory / "blocks" / filename, allow_pickle=False
+            ) as data:
+                rows = np.asarray(data["row_indices"])
+                columns = np.asarray(data["column_indices"])
+                values = np.asarray(data["values"])
+            if _block_content_hash(rows, columns, values) != item.get(
+                "content_hash"
+            ):
+                raise ValueError("temporal block content hash is invalid.")
+            block = TemporalSparseBlock(
+                key=TemporalBlockKey(**key_payload),
+                row_indices=rows,
+                column_indices=columns,
+                values=values,
+                number_of_measurements=self.number_of_measurements,
+                number_of_demand_cells=self.number_of_demand_cells,
+            )
+        except (KeyError, OSError, TypeError, ValueError) as error:
+            raise ValueError(
+                "temporal block artifact payload is missing or corrupt."
+            ) from error
+        if block.nonzero_entries != item.get("nonzero_entries"):
+            raise ValueError("temporal block artifact nonzero count is invalid.")
+        return block
 
 
 def open_temporal_block_artifact(
@@ -191,6 +225,35 @@ def open_temporal_block_artifact(
         raise ValueError("temporal block fixed measurement offset is invalid.")
     offset = np.array(offset, copy=True)
     offset.setflags(write=False)
+    block_items_by_measurement_interval: dict[str, list[Mapping[str, object]]] = {}
+    block_items_by_departure_interval: dict[str, list[Mapping[str, object]]] = {}
+    measurement_interval_ids = frozenset(
+        measurement.interval_id for measurement in canonical_index.measurements
+    )
+    departure_interval_ids = frozenset(
+        interval.interval_id for interval in canonical_index.time_intervals
+    )
+    for item in block_items:
+        key_payload = item.get("key")
+        if not isinstance(key_payload, Mapping):
+            raise ValueError("temporal block artifact entry is invalid.")
+        measurement_interval_id = key_payload.get("measurement_interval_id")
+        departure_interval_id = key_payload.get("departure_interval_id")
+        if (
+            not isinstance(measurement_interval_id, str)
+            or not isinstance(departure_interval_id, str)
+            or measurement_interval_id not in measurement_interval_ids
+            or departure_interval_id not in departure_interval_ids
+        ):
+            raise ValueError(
+                "temporal block artifact entry references an unknown canonical interval."
+            )
+        block_items_by_measurement_interval.setdefault(
+            measurement_interval_id, []
+        ).append(item)
+        block_items_by_departure_interval.setdefault(
+            departure_interval_id, []
+        ).append(item)
     return TemporalBlockArtifactReader(
         directory=source,
         identity=identity,
@@ -199,6 +262,16 @@ def open_temporal_block_artifact(
         manifest_sha256=_file_sha256(manifest_path),
         nonzero_entries=nonzero_entries,
         _block_items=tuple(dict(item) for item in block_items),
+        _block_items_by_measurement_interval={
+            interval_id: tuple(items)
+            for interval_id, items in block_items_by_measurement_interval.items()
+        },
+        _block_items_by_departure_interval={
+            interval_id: tuple(items)
+            for interval_id, items in block_items_by_departure_interval.items()
+        },
+        _measurement_interval_ids=measurement_interval_ids,
+        _departure_interval_ids=departure_interval_ids,
     )
 
 

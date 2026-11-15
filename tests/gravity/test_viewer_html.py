@@ -66,3 +66,16 @@ def test_viewer_starts_from_manifest_and_streams_selected_partitions() -> None:
     assert "streamMatches: true" in viewer_source
     assert "measurementContributions" in viewer_source
     assert 'id="measurement-row-index"' not in source
+
+
+def test_viewer_uses_the_local_service_for_selected_measurement_pages() -> None:
+    source = VIEWER.read_text(encoding="utf-8")
+    viewer_source = VIEWER.with_name("viewer.js").read_text(encoding="utf-8")
+    assert 'id="measurement-query-service"' in source
+    assert 'value="http://127.0.0.1:8765"' in source
+    assert "queryLocalMeasurementPage" in viewer_source
+    assert "measurement_index" in viewer_source
+    assert "/api/measurement-od-contributions" in viewer_source
+    assert "Local query service fit or mapping identity differs" in viewer_source
+    assert "Querying only the selected measurement interval" in viewer_source
+    assert "summary.available && summary.query_mode === 'local_service'" in viewer_source

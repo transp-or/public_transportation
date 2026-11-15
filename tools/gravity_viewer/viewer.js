@@ -327,6 +327,54 @@
     return {rows, total: count};
   }
 
+  async function queryLocalMeasurementPage(measurementIndex, page, pageSize) {
+    const summary = viewer.summary.measurement_od_contributions || {};
+    const base = new URL($('measurement-query-service').value.trim());
+    if (base.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(base.hostname)) {
+      throw new Error('The on-demand query service must be an HTTP service on this computer.');
+    }
+    const endpoint = new URL('/api/measurement-od-contributions', base.origin);
+    endpoint.searchParams.set('measurement_index', String(measurementIndex));
+    endpoint.searchParams.set('page', String(page));
+    endpoint.searchParams.set('page_size', String(pageSize));
+    const response = await fetch(endpoint, {cache: 'no-store'});
+    let payload;
+    try { payload = await response.json(); }
+    catch (_) { throw new Error(`Local query service returned HTTP ${response.status} without a valid JSON response.`); }
+    if (!response.ok) throw new Error(payload.error || `Local query service returned HTTP ${response.status}.`);
+    if (payload.fit_fingerprint !== summary.fit_fingerprint || payload.mapping_artifact_fingerprint !== summary.mapping_artifact_fingerprint) {
+      throw new Error('Local query service fit or mapping identity differs from this viewer bundle.');
+    }
+    if (Number(payload.measurement_index) !== measurementIndex || !Array.isArray(payload.rows) || !Number.isSafeInteger(Number(payload.total))) {
+      throw new Error('Local query service returned an invalid measurement page.');
+    }
+    return payload;
+  }
+
+  async function queryLocalOdPage(odIndex, pageSize) {
+    const summary = viewer.summary.measurement_od_contributions || {};
+    const base = new URL($('measurement-query-service').value.trim());
+    if (base.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(base.hostname)) {
+      throw new Error('The on-demand query service must be an HTTP service on this computer.');
+    }
+    const endpoint = new URL('/api/od-measurement-contributions', base.origin);
+    endpoint.searchParams.set('od_index', String(odIndex));
+    endpoint.searchParams.set('page', '0');
+    endpoint.searchParams.set('page_size', String(pageSize));
+    const response = await fetch(endpoint, {cache: 'no-store'});
+    let payload;
+    try { payload = await response.json(); }
+    catch (_) { throw new Error(`Local query service returned HTTP ${response.status} without a valid JSON response.`); }
+    if (!response.ok) throw new Error(payload.error || `Local query service returned HTTP ${response.status}.`);
+    if (payload.fit_fingerprint !== summary.fit_fingerprint || payload.mapping_artifact_fingerprint !== summary.mapping_artifact_fingerprint) {
+      throw new Error('Local query service fit or mapping identity differs from this viewer bundle.');
+    }
+    if (Number(payload.od_index) !== odIndex || !Array.isArray(payload.rows) || !Number.isSafeInteger(Number(payload.total))) {
+      throw new Error('Local query service returned an invalid OD contribution page.');
+    }
+    return payload;
+  }
+
   function renderTable(rows, title = '') {
     const target = $('flow-table');
     if (!rows.length) { target.querySelector('thead').innerHTML = ''; target.querySelector('tbody').innerHTML = `<tr><td class="muted">No rows for this selection.</td></tr>`; return; }
@@ -364,10 +412,12 @@
   function populateMeasurementOdControls() {
     const summary = viewer.summary.measurement_od_contributions || {};
     const locations = viewer.summary.measurement_locations || {};
+    const onDemand = summary.available && summary.query_mode === 'local_service';
     const panel = $('measurement-od'); panel.classList.remove('hidden');
     $('measurement-od-direction').disabled = !summary.available;
     $('measurement-od-load').disabled = !summary.available;
     $('measurement-od-limit').disabled = !summary.available;
+    $('measurement-query-service-label').classList.toggle('hidden', !onDemand);
     if (!summary.available) {
       $('measurement-od-unavailable').textContent = summary.message || 'OD-by-measurement contributions are unavailable in this bundle.';
       $('measurement-od-unavailable').classList.remove('hidden');
@@ -387,6 +437,10 @@
       const message = locations.message || 'Map-based measurement selection is unavailable in this bundle.';
       $('measurement-stop-label').textContent = message;
       $('map-click-status').textContent = message;
+    }
+    if (onDemand) {
+      $('measurement-od-unavailable').textContent = 'Contributions are computed only for the selected measurement row by the local query service. Start the service documented in the viewer guide; no full OD-by-measurement expansion is stored in this bundle.';
+      $('measurement-od-unavailable').classList.remove('hidden');
     }
     updateMeasurementOdDirection();
   }
@@ -435,6 +489,12 @@
     if (!(viewer.summary.measurement_od_contributions || {}).available) {
       $('measurement-od-detail').textContent = 'OD contributions are unavailable for this bundle; the measured row values above remain available.';
       renderMeasurementOdRows([]);
+      return;
+    }
+    if ((viewer.summary.measurement_od_contributions || {}).query_mode === 'local_service') {
+      $('measurement-od-detail').textContent = 'The local query service will calculate this row’s components and ranked OD contributors.';
+      $('measurement-od-status').textContent = 'Querying the selected measurement row locally…';
+      await refreshMeasurementOd();
       return;
     }
     try {
@@ -581,21 +641,39 @@
     if (!summary.available) return;
     const direction = $('measurement-od-direction').value;
     const limit = Math.max(1, Math.min(500, Number($('measurement-od-limit').value) || 50));
-    $('measurement-od-status').textContent = direction === 'measurement' ? 'Loading this measurement’s sparse contributors into the bounded local cache…' : 'Reading indexed sparse contribution partitions…';
+    const localService = summary.available && summary.query_mode === 'local_service';
+    const onDemand = direction === 'measurement' && summary.query_mode === 'local_service';
+    $('measurement-od-status').textContent = onDemand
+      ? 'Querying only the selected measurement interval in the local mapping service…'
+      : localService ? 'Querying the selected OD cell in the local mapping service…'
+        : direction === 'measurement' ? 'Loading this measurement’s sparse contributors into the bounded local cache…' : 'Reading indexed sparse contribution partitions…';
     try {
-      let rows; let measurementIndex = null; let selectedOd = null; let total = 0;
+      let rows; let measurementIndex = null; let selectedOd = null; let total = 0; let queryResult = null;
       if (direction === 'measurement') {
         if (!viewer.selectedMeasurement) throw new Error('Select a measurement row from the map first.');
         measurementIndex = Number(viewer.selectedMeasurement.measurement_index);
-        const result = await measurementContributionPage(measurementIndex, viewer.measurementContributionPage, limit);
-        rows = result.rows; total = result.total;
+        queryResult = onDemand
+          ? await queryLocalMeasurementPage(measurementIndex, viewer.measurementContributionPage, limit)
+          : await measurementContributionPage(measurementIndex, viewer.measurementContributionPage, limit);
+        rows = queryResult.rows; total = queryResult.total;
+        if (onDemand) {
+          const components = queryResult.components || {};
+          const fixedAttribution = summary.fixed_positive_od_attribution_available === false
+            ? `<p class="muted">${esc(summary.fixed_positive_od_attribution_message || 'Fixed-positive demand is aggregated in the mapping offset and cannot be assigned to individual OD pairs.')}</p>` : '';
+          $('measurement-od-detail').innerHTML = `<dl><dt>Measurement row</dt><dd>${esc(measurementIndex)}</dd><dt>Observed count</dt><dd>${display(viewer.selectedMeasurement.observed)}</dd><dt>Modeled mean</dt><dd>${display(components.modeled_mean ?? viewer.selectedMeasurement.modeled)}</dd><dt>Fixed offset</dt><dd>${display(components.fixed_offset_contribution)}</dd><dt>Additive component</dt><dd>${display(components.additive_contribution)}</dd><dt>OD component</dt><dd>${display(components.od_contribution)}</dd><dt>Mean-floor adjustment</dt><dd>${display(components.mean_floor_adjustment)}</dd></dl>${fixedAttribution}<p class="muted">OD contributors decompose the modeled mean; they are not a decomposition of the observed count.</p>`;
+        }
       } else {
         const bin = $('measurement-bin').value; const origin = $('measurement-origin').value; const destination = $('measurement-destination').value;
         if (!bin || !origin || !destination) throw new Error('Choose a departure interval, origin, and destination.');
         const odRows = await readPartition('od', bin, {origin_stop_id: origin, destination_stop_id: destination}, 100);
         selectedOd = odRows.find((row) => row.departure_time_bin === bin);
         if (!selectedOd) { renderMeasurementOdRows([]); $('measurement-od-status').textContent = 'No fitted OD cell matches that selection.'; return; }
-        rows = await readPartition('measurement_od_contributions', bin, {od_index: String(selectedOd.od_index)}, limit, {rankBy: 'modeled_mean_contribution', rankAbs: true});
+        if (localService) {
+          queryResult = await queryLocalOdPage(Number(selectedOd.od_index), limit);
+          rows = queryResult.rows; total = queryResult.total;
+        } else {
+          rows = await readPartition('measurement_od_contributions', bin, {od_index: String(selectedOd.od_index)}, limit, {rankBy: 'modeled_mean_contribution', rankAbs: true});
+        }
       }
       rows = await labelMeasurementOdRows(rows, direction);
       renderMeasurementOdRows(rows);
@@ -605,7 +683,7 @@
         $('measurement-contribution-previous').disabled = viewer.measurementContributionPage === 0;
         $('measurement-contribution-next').disabled = (viewer.measurementContributionPage + 1) * limit >= total;
       } else {
-        $('measurement-od-detail').innerHTML = `<dl><dt>OD pair</dt><dd>${esc(selectedOd.origin_stop_id)} → ${esc(selectedOd.destination_stop_id)} (${esc(selectedOd.departure_time_bin)})</dd><dt>Estimated demand</dt><dd>${display(selectedOd.estimated_demand)}</dd><dt>Measurement rows shown</dt><dd>${esc(rows.length)} (ranked by absolute modeled contribution)</dd></dl>`;
+        $('measurement-od-detail').innerHTML = `<dl><dt>OD pair</dt><dd>${esc(selectedOd.origin_stop_id)} → ${esc(selectedOd.destination_stop_id)} (${esc(selectedOd.departure_time_bin)})</dd><dt>Estimated demand</dt><dd>${display(selectedOd.estimated_demand)}</dd><dt>Measurement rows shown</dt><dd>${esc(rows.length)}${localService ? ` of ${total}` : ''} (ranked by absolute modeled contribution)</dd></dl>`;
       }
       $('measurement-od-status').textContent = direction === 'measurement'
         ? `Loaded ${rows.length} of ${total} OD contributors. Signed modeled-mean and linear-flow contributions are preserved.`
