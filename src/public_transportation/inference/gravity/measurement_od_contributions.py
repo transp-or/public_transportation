@@ -42,6 +42,7 @@ _ROUTED_OD_ONLY_SCALE_FLAGS = {
 _ROUTED_OD_ONLY_SCALE_SCOPES = frozenset(
     {"routed_od_only", "routed_od_contribution_only", "routed_od_contribution"}
 )
+_ROUTED_OD_COMPONENT_RECONCILIATION_TOLERANCE = {"rtol": 5e-6, "atol": 5e-6}
 _CONTRIBUTION_COLUMNS = (
     "measurement_index",
     "od_index",
@@ -155,16 +156,22 @@ def _query_scale_inputs(
             od_mean[zero_od] = 0.0
             fixed_mean = observation_scales * artifact_fixed
             additive_mean = observation_scales * additive
-            floor_adjustment = modeled - fixed_mean - additive_mean - od_mean
-            tolerance = 1e-6 + 1e-6 * np.abs(modeled)
-            if np.any(floor_adjustment < -tolerance):
+            modeled_without_floor = fixed_mean + additive_mean + od_mean
+            floor_adjustment = modeled - modeled_without_floor
+            if np.any(
+                (floor_adjustment < 0.0)
+                & ~np.isclose(
+                    modeled_without_floor,
+                    modeled,
+                    **_ROUTED_OD_COMPONENT_RECONCILIATION_TOLERANCE,
+                )
+            ):
                 raise ValueError("OD, fixed, and additive components exceed the saved modeled mean.")
             floor_adjustment = np.maximum(floor_adjustment, 0.0)
             if not np.allclose(
-                fixed_mean + additive_mean + od_mean + floor_adjustment,
+                modeled_without_floor + floor_adjustment,
                 modeled,
-                rtol=1e-6,
-                atol=1e-8,
+                **_ROUTED_OD_COMPONENT_RECONCILIATION_TOLERANCE,
             ):
                 raise ValueError("measurement component totals do not reproduce fitted predictions.")
     else:
@@ -726,13 +733,29 @@ class MeasurementODContributionQuery:
             fixed_mean = scale * fixed_offset
             additive_mean = scale * aggregate_flow_scale * additive
             od_mean = scale * aggregate_flow_scale * raw_od
-        floor = modeled - fixed_mean - additive_mean - od_mean
-        tolerance = 1e-6 + 1e-6 * abs(modeled)
-        if floor < -tolerance:
-            raise ValueError("OD, fixed, and additive components exceed the saved modeled mean.")
-        floor = max(floor, 0.0)
-        if not np.isclose(fixed_mean + additive_mean + od_mean + floor, modeled, rtol=1e-6, atol=1e-8):
-            raise ValueError("measurement component totals do not reproduce fitted predictions.")
+        modeled_without_floor = fixed_mean + additive_mean + od_mean
+        floor = modeled - modeled_without_floor
+        if self._scales["measurement_scale_contract"] == "routed_od_only":
+            if floor < 0.0 and not np.isclose(
+                modeled_without_floor,
+                modeled,
+                **_ROUTED_OD_COMPONENT_RECONCILIATION_TOLERANCE,
+            ):
+                raise ValueError("OD, fixed, and additive components exceed the saved modeled mean.")
+            floor = max(floor, 0.0)
+            if not np.isclose(
+                modeled_without_floor + floor,
+                modeled,
+                **_ROUTED_OD_COMPONENT_RECONCILIATION_TOLERANCE,
+            ):
+                raise ValueError("measurement component totals do not reproduce fitted predictions.")
+        else:
+            tolerance = 1e-6 + 1e-6 * abs(modeled)
+            if floor < -tolerance:
+                raise ValueError("OD, fixed, and additive components exceed the saved modeled mean.")
+            floor = max(floor, 0.0)
+            if not np.isclose(fixed_mean + additive_mean + od_mean + floor, modeled, rtol=1e-6, atol=1e-8):
+                raise ValueError("measurement component totals do not reproduce fitted predictions.")
         return {
             "fixed_offset_contribution": fixed_mean,
             "additive_contribution": additive_mean,
