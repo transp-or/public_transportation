@@ -34,6 +34,7 @@ from public_transportation.inference.temporal_assignment_blocks import (
     TemporalSparseBlock,
 )
 from public_transportation.inference.temporal_assignment_persistence import (
+    TemporalBlockArtifactReader,
     open_temporal_block_artifact,
     open_temporal_block_artifact_for_viewer,
     save_temporal_block_operator,
@@ -649,7 +650,34 @@ def test_viewer_rejects_fit_mapping_source_revision_mismatch_and_unknown_schema(
         )
 
 
-def test_bundle_validation_verifies_mapping_block_checksums_without_expanding_contributions(tmp_path):
+def test_reader_reuses_validated_dimensions_for_each_block(tmp_path, monkeypatch):
+    _, _, provenance, artifact = _mapping_bundle_inputs(tmp_path)
+    original = CanonicalAssignmentIndex.number_of_demand_cells.fget
+    calls = 0
+
+    def counted(index):
+        nonlocal calls
+        calls += 1
+        return original(index)
+
+    monkeypatch.setattr(
+        CanonicalAssignmentIndex,
+        "number_of_demand_cells",
+        property(counted),
+    )
+    reader = open_temporal_block_artifact_for_viewer(
+        artifact,
+        fit_source_package_revision=provenance["package_revision"],
+    )
+    assert calls == 1
+
+    list(reader.iter_blocks())
+    assert calls == 1
+
+
+def test_bundle_creation_skips_sparse_payload_scan_and_queries_verify_selected_blocks(
+    tmp_path, monkeypatch
+):
     result, report, provenance, artifact = _mapping_bundle_inputs(tmp_path)
     manifest_path = artifact / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -664,8 +692,12 @@ def test_bundle_validation_verifies_mapping_block_checksums_without_expanding_co
         json.dumps(marker, sort_keys=True, indent=2) + "\n", encoding="utf-8"
     )
 
-    with pytest.raises(ValueError, match="payload is missing or corrupt"):
-        write_gravity_viewer_bundle(
+    def fail_if_scanned(_reader):
+        pytest.fail("on-demand bundle creation scanned every sparse mapping block")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(TemporalBlockArtifactReader, "iter_blocks", fail_if_scanned)
+        bundle = write_gravity_viewer_bundle(
             output_directory=tmp_path / "corrupt-block-bundle",
             fit_result=result,
             validation_result=report.adequacy,
@@ -673,6 +705,15 @@ def test_bundle_validation_verifies_mapping_block_checksums_without_expanding_co
             metadata={"provenance": provenance},
             linear_mapping_artifact=artifact,
         )
+    assert bundle.viewer_summary["measurement_od_contributions"]["available"] is True
+
+    reader = open_temporal_block_artifact_for_viewer(
+        artifact,
+        fit_source_package_revision=provenance["package_revision"],
+    )
+    interval_id = manifest["blocks"][0]["key"]["measurement_interval_id"]
+    with pytest.raises(ValueError, match="payload is missing or corrupt"):
+        list(reader.iter_blocks_for_measurement_interval(interval_id))
 
 
 def test_mapping_identity_uses_persisted_operator_provenance_when_fit_has_wrapper_id(

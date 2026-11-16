@@ -3312,6 +3312,7 @@ def write_gravity_viewer_bundle(
                 report_payload=report_payload,
                 metadata=metadata,
                 full_od_path=staging / "full_od.csv",
+                validate_block_payloads=False,
             )
             viewer_summary["mapping_source_package_revision"] = mapping_reader.source_package_revision
             contribution_summary = measurement_od_query_descriptor(

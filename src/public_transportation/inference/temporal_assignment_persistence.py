@@ -66,19 +66,13 @@ class TemporalBlockArtifactReader:
     nonzero_entries: int
     artifact_schema_version: int
     source_package_revision: str
+    number_of_measurements: int
+    number_of_demand_cells: int
     _block_items: tuple[Mapping[str, object], ...]
     _block_items_by_measurement_interval: Mapping[str, tuple[Mapping[str, object], ...]]
     _block_items_by_departure_interval: Mapping[str, tuple[Mapping[str, object], ...]]
     _measurement_interval_ids: frozenset[str]
     _departure_interval_ids: frozenset[str]
-
-    @property
-    def number_of_measurements(self) -> int:
-        return self.canonical_index.number_of_measurements
-
-    @property
-    def number_of_demand_cells(self) -> int:
-        return self.canonical_index.number_of_demand_cells
 
     def iter_blocks(self) -> Iterator[TemporalSparseBlock]:
         """Yield checksum-verified blocks one at a time."""
@@ -309,6 +303,8 @@ def _open_temporal_block_artifact(
         nonzero_entries=nonzero_entries,
         artifact_schema_version=int(manifest["schema_version"]),
         source_package_revision=str(source_package_revision),
+        number_of_measurements=number_of_measurements,
+        number_of_demand_cells=number_of_demand_cells,
         _block_items=tuple(dict(item) for item in block_items),
         _block_items_by_measurement_interval={
             interval_id: tuple(items)
