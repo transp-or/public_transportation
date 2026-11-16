@@ -235,6 +235,15 @@ persists its observation-scale vector, no extra scale is needed. For a fit
 whose measurement scale is specified only by `rho`, pass that same fitted
 `rho`; otherwise the contribution panel is marked unavailable.
 
+An externally defined scale can also declare a generic `routed_od_only` scope
+with consistent component flags. In that case the query recovers the effective
+OD component from saved latent measurements and allocates it across mapped OD
+flows proportionally; additive terms and fixed offsets receive only the saved
+outer observation scale. Reverse queries use the same row-specific factors and
+are marked unavailable if the fit does not save the raw OD measurement
+component. Other missing, contradictory, or unsupported scope declarations
+are rejected rather than guessed.
+
 The contribution is calculated from the saved sparse mapping and fitted OD
 demand, without rerunning routing. It decomposes measured channels only; it is
 not a flow on every route section unless those sections are rows of that

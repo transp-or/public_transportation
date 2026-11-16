@@ -79,3 +79,5 @@ def test_viewer_uses_the_local_service_for_selected_measurement_pages() -> None:
     assert "Local query service fit or mapping identity differs" in viewer_source
     assert "Querying only the selected measurement interval" in viewer_source
     assert "summary.available && summary.query_mode === 'local_service'" in viewer_source
+    assert "summary.reverse_query_available === false" in viewer_source
+    assert "Reverse OD-to-measurement contributions are unavailable" in viewer_source

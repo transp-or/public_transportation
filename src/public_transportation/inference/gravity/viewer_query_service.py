@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -145,11 +146,34 @@ class GravityViewerQueryService:
             raise ValueError("on-demand query cache identity differs from the viewer bundle.")
 
     def query_measurement(self, measurement_index: int, *, page: int, page_size: int) -> dict[str, object]:
-        return self.query.query(
+        payload = self.query.query(
             measurement_index,
             page=page,
             page_size=page_size,
         )
+        selected = self.bundle.read_table(
+            "predicted_measurements.csv",
+            columns=("row_index", "observed", "modeled"),
+            filters={"row_index": measurement_index},
+            chunksize=1,
+        )
+        if len(selected) != 1:
+            raise ValueError("selected measurement row is missing or duplicated in the viewer bundle.")
+        observed = float(selected.iloc[0]["observed"])
+        modeled_mean = float(selected.iloc[0]["modeled"])
+        if not math.isfinite(observed) or not math.isfinite(modeled_mean):
+            raise ValueError("selected measurement observation or modeled mean is non-finite.")
+        components = payload.get("components")
+        if isinstance(components, dict) and not math.isclose(
+            float(components.get("modeled_mean", float("nan"))),
+            modeled_mean,
+            rel_tol=1e-6,
+            abs_tol=1e-8,
+        ):
+            raise ValueError("query decomposition modeled mean differs from the saved viewer prediction.")
+        payload["observed"] = observed
+        payload["modeled_mean"] = modeled_mean
+        return payload
 
     def query_od(self, od_index: int, *, page: int, page_size: int) -> dict[str, object]:
         return self.query.query_od(od_index, page=page, page_size=page_size)

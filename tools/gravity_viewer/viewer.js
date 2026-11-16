@@ -642,6 +642,12 @@
     const direction = $('measurement-od-direction').value;
     const limit = Math.max(1, Math.min(500, Number($('measurement-od-limit').value) || 50));
     const localService = summary.available && summary.query_mode === 'local_service';
+    if (localService && direction === 'od' && summary.reverse_query_available === false) {
+      $('measurement-od-status').textContent = summary.reverse_query_message || 'Reverse OD-to-measurement contributions are unavailable for this fit.';
+      $('measurement-od-detail').textContent = summary.reverse_query_message || 'Reverse OD-to-measurement contributions are unavailable for this fit.';
+      renderMeasurementOdRows([]);
+      return;
+    }
     const onDemand = direction === 'measurement' && summary.query_mode === 'local_service';
     $('measurement-od-status').textContent = onDemand
       ? 'Querying only the selected measurement interval in the local mapping service…'

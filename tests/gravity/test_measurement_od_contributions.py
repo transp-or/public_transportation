@@ -26,6 +26,9 @@ from public_transportation.inference.gravity import (
     write_gravity_detailed_report,
     write_gravity_viewer_bundle,
 )
+from public_transportation.inference.gravity.viewer_bundle import (
+    _validate_linear_mapping_for_bundle,
+)
 from public_transportation.inference.gravity.viewer_query_service import (
     GravityViewerQueryService,
 )
@@ -437,6 +440,155 @@ def test_query_scale_contracts_create_descriptors_and_close_modeled_rows(
     assert components["modeled_mean"] == pytest.approx(expected_modeled)
 
 
+def _routed_od_only_payload(**overrides):
+    return {
+        "type": "opaque_external_scale",
+        "scale_scope": "routed_od_only",
+        "scales_routed_od_contribution": True,
+        "scales_assignment_and_boundary_flow_contributions": False,
+        "scales_additive_boundary_flow_contributions": False,
+        "scales_fixed_operator_offsets": False,
+        **overrides,
+    }
+
+
+def _routed_od_only_result(tmp_path, *, overrides=None):
+    result, report, provenance, artifact = _mapping_bundle_inputs(
+        tmp_path,
+        result_overrides={
+            "measurement_model": _routed_od_only_payload(),
+            "latent_measurements": np.asarray((7.0, 7.25, 0.0)),
+            "predicted_measurements": np.asarray((15.0, 3.625, 1e-8)),
+        },
+    )
+    if overrides:
+        result = replace(result, **overrides)
+    return result, report, provenance, artifact
+
+
+def test_routed_od_only_contract_decomposes_forward_and_reverse_queries(tmp_path, monkeypatch):
+    result, _, provenance, artifact = _routed_od_only_result(tmp_path)
+
+    def fail_deserialize(*_args, **_kwargs):
+        pytest.fail("opaque scale payload was passed to a built-in model deserializer")
+
+    monkeypatch.setattr(GravityJourneyLatentClassModel, "from_dict", fail_deserialize)
+    monkeypatch.setattr(GravityObservationModel, "from_dict", fail_deserialize)
+    descriptor = measurement_od_query_descriptor(
+        artifact=open_temporal_block_artifact(artifact),
+        fit_result=result,
+        fit_provenance=provenance,
+        runtime_package_revision=package_revision(),
+    )
+    assert descriptor["measurement_scale_contract"] == "routed_od_only"
+    assert descriptor["scale_component_scope"] == "routed_od_only"
+    assert descriptor["aggregate_flow_scale"] is None
+    assert descriptor["reverse_query_available"] is True
+
+    query = MeasurementODContributionQuery(
+        artifact=open_temporal_block_artifact(artifact),
+        fit_result=result,
+    )
+    page = query.query(0, page=0, page_size=10)
+    assert [row["linear_flow_contribution"] for row in page["rows"]] == pytest.approx((2.0, 1.0))
+    assert [row["modeled_mean_contribution"] for row in page["rows"]] == pytest.approx((8.0, 4.0))
+    assert page["components"] == {
+        "fixed_offset_contribution": pytest.approx(1.0),
+        "additive_contribution": pytest.approx(1.0),
+        "od_contribution": pytest.approx(12.0),
+        "mean_floor_adjustment": pytest.approx(1.0),
+        "modeled_mean": pytest.approx(15.0),
+    }
+    assert page["modeled_mean"] == pytest.approx(15.0)
+    assert sum(row["modeled_mean_contribution"] for row in page["rows"]) + sum(
+        page["components"][name]
+        for name in (
+            "fixed_offset_contribution",
+            "additive_contribution",
+            "mean_floor_adjustment",
+        )
+    ) == pytest.approx(15.0)
+
+    mismatched_fit_component = replace(
+        result,
+        od_measurement_contribution=np.asarray((3.01, 2.0, 0.0)),
+    )
+    mismatched_query = MeasurementODContributionQuery(
+        artifact=open_temporal_block_artifact(artifact),
+        fit_result=mismatched_fit_component,
+    )
+    with pytest.raises(ValueError, match="mapping OD contribution differs"):
+        mismatched_query.query(0, page=0, page_size=10)
+
+    affected = query.query_od(0, page=0, page_size=10)
+    assert [row["measurement_index"] for row in affected["rows"]] == [0, 1]
+    assert [row["modeled_mean_contribution"] for row in affected["rows"]] == pytest.approx((4.0, 2.0))
+    zero_row = query.query(2, page=0, page_size=10)
+    assert zero_row["rows"] == []
+    assert zero_row["components"]["mean_floor_adjustment"] == pytest.approx(1e-8)
+
+
+def test_routed_od_only_scope_is_fail_closed_for_invalid_metadata_and_zero_flow(tmp_path):
+    result, _, provenance, artifact = _routed_od_only_result(tmp_path)
+    for payload in (
+        _routed_od_only_payload(scales_fixed_operator_offsets=True),
+        _routed_od_only_payload(scale_scope="unsupported_scope"),
+        {
+            "type": "opaque_external_scale",
+            "scale_scope": "routed_od_only",
+            "scales_routed_od_contribution": True,
+        },
+        {
+            "type": "opaque_external_scale",
+            "scales_routed_od_contribution": True,
+            "scales_assignment_and_boundary_flow_contributions": False,
+            "scales_additive_boundary_flow_contributions": False,
+            "scales_fixed_operator_offsets": False,
+        },
+    ):
+        with pytest.raises(ValueError, match="scale|scope|component flags"):
+            measurement_od_query_descriptor(
+                artifact=open_temporal_block_artifact(artifact),
+                fit_result=replace(result, measurement_model=payload),
+                fit_provenance=provenance,
+                runtime_package_revision=package_revision(),
+            )
+
+    inconsistent = replace(
+        result,
+        latent_measurements=np.asarray((7.0, 7.25, 0.1)),
+    )
+    with pytest.raises(ValueError, match="zero raw OD contribution"):
+        measurement_od_query_descriptor(
+            artifact=open_temporal_block_artifact(artifact),
+            fit_result=inconsistent,
+            fit_provenance=provenance,
+            runtime_package_revision=package_revision(),
+        )
+
+
+def test_routed_od_only_reverse_query_is_unavailable_without_saved_raw_od_component(tmp_path):
+    result, _, provenance, artifact = _routed_od_only_result(
+        tmp_path,
+        overrides={"od_measurement_contribution": None},
+    )
+    descriptor = measurement_od_query_descriptor(
+        artifact=open_temporal_block_artifact(artifact),
+        fit_result=result,
+        fit_provenance=provenance,
+        runtime_package_revision=package_revision(),
+    )
+    assert descriptor["reverse_query_available"] is False
+    assert "persisted raw OD measurement component" in descriptor["reverse_query_message"]
+    query = MeasurementODContributionQuery(
+        artifact=open_temporal_block_artifact(artifact),
+        fit_result=result,
+    )
+    assert query.query(0)["components"]["od_contribution"] == pytest.approx(12.0)
+    with pytest.raises(ValueError, match="reverse OD-to-measurement contributions are unavailable"):
+        query.query_od(0)
+
+
 def test_unknown_and_incomplete_measurement_scale_contracts_fail_clearly(tmp_path):
     result, _, provenance, artifact = _mapping_bundle_inputs(tmp_path)
     with pytest.raises(ValueError, match="unsupported fitted measurement-scale contract"):
@@ -578,7 +730,7 @@ def test_on_demand_query_verifies_only_selected_interval_payloads(tmp_path):
 
 
 def test_bundle_mapping_uses_query_descriptor_without_full_matrix_writer(tmp_path, monkeypatch):
-    result, report, provenance, artifact = _mapping_bundle_inputs(tmp_path)
+    result, report, provenance, artifact = _routed_od_only_result(tmp_path)
 
     def fail_if_called(**_kwargs):
         pytest.fail("bundle creation attempted to materialize the complete contribution matrix")
@@ -595,10 +747,21 @@ def test_bundle_mapping_uses_query_descriptor_without_full_matrix_writer(tmp_pat
         metadata={"provenance": provenance},
         linear_mapping_artifact=artifact,
     )
+    _validate_linear_mapping_for_bundle(
+        artifact=open_temporal_block_artifact(artifact),
+        fit_result=result,
+        report_payload=json.loads(report.files["report.json"].read_text(encoding="utf-8")),
+        metadata={"provenance": provenance},
+        full_od_path=bundle.path / "full_od.csv",
+        validate_block_payloads=True,
+    )
     summary = bundle.viewer_summary["measurement_od_contributions"]
     assert summary["query_mode"] == "local_service"
     assert summary["query_path"] == "/api/measurement-od-contributions"
     assert summary["mapping_artifact_fingerprint"] == provenance["artifact_identity_fingerprint"]
+    assert summary["measurement_scale_contract"] == "routed_od_only"
+    assert summary["scale_component_scope"] == "routed_od_only"
+    assert summary["reverse_query_available"] is True
     assert not (bundle.path / "partitions" / "measurement_od_contributions").exists()
     assert not list(bundle.path.rglob("contributions.sqlite"))
 
@@ -642,6 +805,8 @@ def test_local_query_service_binds_fit_bundle_and_mapping_before_query(tmp_path)
     assert response["mapping_artifact_fingerprint"] == provenance["artifact_identity_fingerprint"]
     assert response["rows"][0]["od_index"] == 1
     assert response["components"]["modeled_mean"] == pytest.approx(8.0)
+    assert response["observed"] == pytest.approx(3.0)
+    assert response["modeled_mean"] == pytest.approx(8.0)
 
     fit_payload["artifact_identity_fingerprint"] = "stale-fit-artifact"
     fit_path.write_text(json.dumps(fit_payload, default=json_default), encoding="utf-8")
@@ -651,6 +816,47 @@ def test_local_query_service_binds_fit_bundle_and_mapping_before_query(tmp_path)
             fit_manifest_path=fit_path,
             mapping_artifact_path=artifact,
         )
+
+
+def test_routed_od_only_bundle_query_service_returns_observed_and_saved_modeled_mean(tmp_path):
+    result, report, provenance, artifact = _routed_od_only_result(tmp_path)
+    bundle = write_gravity_viewer_bundle(
+        output_directory=tmp_path / "routed-service-bundle",
+        fit_result=result,
+        validation_result=report.adequacy,
+        report=report,
+        metadata={"provenance": provenance},
+        linear_mapping_artifact=artifact,
+    )
+    fit_payload = {
+        **provenance,
+        "model_fingerprint": result.model_fingerprint,
+        "result": asdict(result),
+    }
+
+    def json_default(value):
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, Enum):
+            return value.value
+        raise TypeError(type(value).__name__)
+
+    fit_path = tmp_path / "routed-fit-manifest.json"
+    fit_path.write_text(json.dumps(fit_payload, default=json_default), encoding="utf-8")
+    service = GravityViewerQueryService(
+        bundle=read_gravity_viewer_bundle(bundle.path),
+        fit_manifest_path=fit_path,
+        mapping_artifact_path=artifact,
+    )
+    response = service.query_measurement(0, page=0, page_size=1)
+    assert response["observed"] == pytest.approx(3.0)
+    assert response["modeled_mean"] == pytest.approx(15.0)
+    assert response["components"]["modeled_mean"] == pytest.approx(15.0)
+    assert response["rows"][0]["modeled_mean_contribution"] == pytest.approx(8.0)
 
 
 def test_viewer_supports_matching_legacy_schema_revision_with_distinct_provenance(tmp_path, monkeypatch):

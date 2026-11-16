@@ -1483,15 +1483,27 @@ def _validate_linear_mapping_for_bundle(
                 if additive_vectors
                 else np.zeros_like(raw_od)
             )
-            aggregate_flow_scale, _ = _measurement_scale_contract(fit_result)
-            fixed_offset = latent - aggregate_flow_scale * (raw_od + additive)
-            if not np.allclose(
-                fixed_offset,
-                np.asarray(artifact.fixed_measurement_offset, dtype=np.float64),
-                rtol=1e-6,
-                atol=1e-8,
-            ):
-                raise ValueError("fitted fixed offset differs from the mapping artifact.")
+            aggregate_flow_scale, scale_contract = _measurement_scale_contract(fit_result)
+            artifact_fixed = np.asarray(artifact.fixed_measurement_offset, dtype=np.float64)
+            if artifact_fixed.shape != raw_od.shape or not np.all(np.isfinite(artifact_fixed)):
+                raise ValueError("mapping fixed measurement offset is invalid.")
+            if scale_contract == "routed_od_only":
+                effective_od_latent = latent - additive - artifact_fixed
+                if np.any((raw_od == 0.0) & ~np.isclose(effective_od_latent, 0.0, rtol=1e-6, atol=1e-8)):
+                    raise ValueError(
+                        "routed-OD-only fitted component is nonzero for a measurement with zero raw OD contribution."
+                    )
+            else:
+                if aggregate_flow_scale is None:
+                    raise ValueError("supported measurement-scale contract is missing its aggregate flow scale.")
+                fixed_offset = latent - aggregate_flow_scale * (raw_od + additive)
+                if not np.allclose(
+                    fixed_offset,
+                    artifact_fixed,
+                    rtol=1e-6,
+                    atol=1e-8,
+                ):
+                    raise ValueError("fitted fixed offset differs from the mapping artifact.")
         elif additive_vectors:
             raise ValueError("fit is missing latent measurements required to validate fixed offsets.")
 

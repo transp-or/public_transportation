@@ -33,6 +33,15 @@ _SCHEMA_VERSION = 1
 _WRITE_BATCH_SIZE = 32_768
 _MAX_PARTITION_ROWS = 100_000
 _COMPONENT_PARTITION_ROWS = 500
+_ROUTED_OD_ONLY_SCALE_FLAGS = {
+    "scales_routed_od_contribution": True,
+    "scales_assignment_and_boundary_flow_contributions": False,
+    "scales_additive_boundary_flow_contributions": False,
+    "scales_fixed_operator_offsets": False,
+}
+_ROUTED_OD_ONLY_SCALE_SCOPES = frozenset(
+    {"routed_od_only", "routed_od_contribution_only", "routed_od_contribution"}
+)
 _CONTRIBUTION_COLUMNS = (
     "measurement_index",
     "od_index",
@@ -58,20 +67,20 @@ def _query_scale_inputs(
 ) -> dict[str, object] | None:
     """Validate the fitted scales needed by both the query and its summary."""
     row_count = artifact.number_of_measurements
-    if row_count != fit_result.predicted_measurements.size:
+    modeled = np.asarray(fit_result.predicted_measurements, dtype=np.float64)
+    if modeled.shape != (row_count,):
         raise ValueError("mapping measurement dimension differs from fitted predictions.")
     if artifact.number_of_demand_cells != fit_result.free_od_demand.size:
         raise ValueError("mapping demand dimension differs from fitted free OD demand.")
     demand = np.asarray(fit_result.free_od_demand, dtype=np.float64)
-    modeled = np.asarray(fit_result.predicted_measurements, dtype=np.float64)
     if not np.all(np.isfinite(demand)) or not np.all(np.isfinite(modeled)):
         raise ValueError("fitted OD demand and modeled measurements must be finite.")
 
     aggregate_flow_scale, scale_contract = _measurement_scale_contract(fit_result)
     if fit_result.observation_scales is None:
-        if scale_contract == "rowwise_observation_scale":
+        if scale_contract in {"rowwise_observation_scale", "routed_od_only"}:
             raise ValueError(
-                "row-wise measurement-scale results require persisted observation_scales."
+                f"{scale_contract} results require persisted observation_scales."
             )
         if rho is None:
             return None
@@ -98,43 +107,94 @@ def _query_scale_inputs(
     if any(value.shape != (row_count,) or not np.all(np.isfinite(value)) for value in additive_vectors):
         raise ValueError("fitted additive measurement contributions are invalid.")
     additive = np.sum(np.stack(additive_vectors), axis=0) if additive_vectors else np.zeros(row_count, dtype=np.float64)
+    if not np.all(np.isfinite(additive)):
+        raise ValueError("summed fitted additive measurement contributions are non-finite.")
     saved_od = None
     if fit_result.od_measurement_contribution is not None:
         saved_od = np.asarray(fit_result.od_measurement_contribution, dtype=np.float64)
         if saved_od.shape != (row_count,) or not np.all(np.isfinite(saved_od)):
             raise ValueError("fitted OD measurement contributions are invalid.")
+    latent = None
     if fit_result.latent_measurements is not None:
         latent = np.asarray(fit_result.latent_measurements, dtype=np.float64)
         if latent.shape != (row_count,) or not np.all(np.isfinite(latent)):
             raise ValueError("fitted latent measurements are invalid.")
-    elif additive_vectors:
+    elif additive_vectors or scale_contract == "routed_od_only":
         raise ValueError("fit is missing latent measurements required to separate fixed and additive components.")
 
-    if saved_od is not None:
-        artifact_fixed = np.asarray(artifact.fixed_measurement_offset, dtype=np.float64)
-        if artifact_fixed.shape != (row_count,) or not np.all(np.isfinite(artifact_fixed)):
-            raise ValueError("mapping fixed measurement offset is invalid.")
-        if fit_result.latent_measurements is None:
-            fixed_offset = artifact_fixed
-        else:
-            fixed_offset = latent - aggregate_flow_scale * (saved_od + additive)
-            if not np.allclose(fixed_offset, artifact_fixed, rtol=1e-6, atol=1e-8):
-                raise ValueError("fitted fixed offset differs from the mapping artifact.")
-        fixed_mean = observation_scales * fixed_offset
-        additive_mean = observation_scales * aggregate_flow_scale * additive
-        od_mean = observation_scales * aggregate_flow_scale * saved_od
-        floor_adjustment = modeled - fixed_mean - additive_mean - od_mean
-        tolerance = 1e-6 + 1e-6 * np.abs(modeled)
-        if np.any(floor_adjustment < -tolerance):
-            raise ValueError("OD, fixed, and additive components exceed the saved modeled mean.")
-        floor_adjustment = np.maximum(floor_adjustment, 0.0)
-        if not np.allclose(
-            fixed_mean + additive_mean + od_mean + floor_adjustment,
-            modeled,
-            rtol=1e-6,
-            atol=1e-8,
-        ):
-            raise ValueError("measurement component totals do not reproduce fitted predictions.")
+    artifact_fixed = np.asarray(artifact.fixed_measurement_offset, dtype=np.float64)
+    if artifact_fixed.shape != (row_count,) or not np.all(np.isfinite(artifact_fixed)):
+        raise ValueError("mapping fixed measurement offset is invalid.")
+
+    od_mean_multipliers: np.ndarray | None
+    if scale_contract == "routed_od_only":
+        if aggregate_flow_scale is not None:
+            raise ValueError("routed-OD-only scale contract must not declare a scalar aggregate flow scale.")
+        assert latent is not None
+        effective_od_latent = latent - additive - artifact_fixed
+        if not np.all(np.isfinite(effective_od_latent)):
+            raise ValueError("routed-OD-only fitted latent component is non-finite.")
+        od_mean_multipliers = None
+        if saved_od is not None:
+            zero_od = saved_od == 0.0
+            q_tolerance = 1e-6 + 1e-6 * np.abs(latent)
+            if np.any(zero_od & (np.abs(effective_od_latent) > q_tolerance)):
+                raise ValueError(
+                    "routed-OD-only fitted component is nonzero for a measurement with zero raw OD contribution."
+                )
+            od_mean_multipliers = np.zeros(row_count, dtype=np.float64)
+            nonzero_od = ~zero_od
+            od_mean_multipliers[nonzero_od] = (
+                observation_scales[nonzero_od]
+                * effective_od_latent[nonzero_od]
+                / saved_od[nonzero_od]
+            )
+            if not np.all(np.isfinite(od_mean_multipliers)):
+                raise ValueError("routed-OD-only modeled contribution scale is non-finite.")
+            od_mean = observation_scales * effective_od_latent
+            od_mean[zero_od] = 0.0
+            fixed_mean = observation_scales * artifact_fixed
+            additive_mean = observation_scales * additive
+            floor_adjustment = modeled - fixed_mean - additive_mean - od_mean
+            tolerance = 1e-6 + 1e-6 * np.abs(modeled)
+            if np.any(floor_adjustment < -tolerance):
+                raise ValueError("OD, fixed, and additive components exceed the saved modeled mean.")
+            floor_adjustment = np.maximum(floor_adjustment, 0.0)
+            if not np.allclose(
+                fixed_mean + additive_mean + od_mean + floor_adjustment,
+                modeled,
+                rtol=1e-6,
+                atol=1e-8,
+            ):
+                raise ValueError("measurement component totals do not reproduce fitted predictions.")
+    else:
+        if aggregate_flow_scale is None:
+            raise ValueError("supported measurement-scale contract is missing its aggregate flow scale.")
+        od_mean_multipliers = observation_scales * aggregate_flow_scale
+        if not np.all(np.isfinite(od_mean_multipliers)):
+            raise ValueError("fitted modeled contribution scale is non-finite.")
+        if saved_od is not None:
+            if latent is None:
+                fixed_offset = artifact_fixed
+            else:
+                fixed_offset = latent - aggregate_flow_scale * (saved_od + additive)
+                if not np.allclose(fixed_offset, artifact_fixed, rtol=1e-6, atol=1e-8):
+                    raise ValueError("fitted fixed offset differs from the mapping artifact.")
+            fixed_mean = observation_scales * fixed_offset
+            additive_mean = observation_scales * aggregate_flow_scale * additive
+            od_mean = observation_scales * aggregate_flow_scale * saved_od
+            floor_adjustment = modeled - fixed_mean - additive_mean - od_mean
+            tolerance = 1e-6 + 1e-6 * np.abs(modeled)
+            if np.any(floor_adjustment < -tolerance):
+                raise ValueError("OD, fixed, and additive components exceed the saved modeled mean.")
+            floor_adjustment = np.maximum(floor_adjustment, 0.0)
+            if not np.allclose(
+                fixed_mean + additive_mean + od_mean + floor_adjustment,
+                modeled,
+                rtol=1e-6,
+                atol=1e-8,
+            ):
+                raise ValueError("measurement component totals do not reproduce fitted predictions.")
 
     return {
         "demand": demand,
@@ -143,6 +203,10 @@ def _query_scale_inputs(
         "observation_scale_source": observation_scale_source,
         "aggregate_flow_scale": aggregate_flow_scale,
         "measurement_scale_contract": scale_contract,
+        "scale_component_scope": (
+            "routed_od_only" if scale_contract == "routed_od_only" else "all_latent_components"
+        ),
+        "od_mean_multipliers": od_mean_multipliers,
         "additive": additive,
     }
 
@@ -164,7 +228,7 @@ def measurement_od_query_descriptor(
         "query_mode": "local_service",
         "query_path": "/api/measurement-od-contributions",
         "reverse_query_path": "/api/od-measurement-contributions",
-        "reverse_query_available": scales is not None,
+        "reverse_query_available": scales is not None and scales.get("od_mean_multipliers") is not None,
         "fit_fingerprint": fit_result.model_fingerprint,
         "assignment_fingerprint": fit_provenance.get("assignment_fingerprint"),
         "mapping_fingerprint": fit_provenance.get("mapping_fingerprint"),
@@ -205,13 +269,32 @@ def measurement_od_query_descriptor(
         {
             "aggregate_flow_scale": scales["aggregate_flow_scale"],
             "measurement_scale_contract": scales["measurement_scale_contract"],
+            "scale_component_scope": scales["scale_component_scope"],
             "observation_scale_source": scales["observation_scale_source"],
             "explicit_rho": float(rho) if scales["observation_scale_source"] == "explicit_rho" else None,
         }
     )
-    if scales["measurement_scale_contract"] != "rowwise_observation_scale":
+    if scales["measurement_scale_contract"] not in {"rowwise_observation_scale", "routed_od_only"}:
         # Retain this legacy field where its old semantics remain accurate.
         base["journey_aggregate_scale"] = scales["aggregate_flow_scale"]
+    if scales["measurement_scale_contract"] == "routed_od_only":
+        base["scale_component_semantics"] = {
+            "routed_od": "recovered_from_saved_latent_measurement_and_allocated_proportionally_to_raw_od_flow",
+            "additive": "multiplied_only_by_outer_observation_scale",
+            "fixed_operator_offset": "multiplied_only_by_outer_observation_scale",
+            "mean_floor": "residual_to_saved_modeled_mean",
+        }
+        if not base["reverse_query_available"]:
+            base["reverse_query_message"] = (
+                "Reverse OD-to-measurement contributions require the persisted raw OD measurement component."
+            )
+    else:
+        base["scale_component_semantics"] = {
+            "routed_od": "multiplied_by_aggregate_flow_scale_and_observation_scale",
+            "additive": "multiplied_by_aggregate_flow_scale_and_observation_scale",
+            "fixed_operator_offset": "multiplied_by_aggregate_flow_scale_and_observation_scale",
+            "mean_floor": "residual_to_saved_modeled_mean",
+        }
     return base
 
 
@@ -390,6 +473,12 @@ class MeasurementODContributionQuery:
         page: int,
         page_size: int,
     ) -> dict[str, object]:
+        od_mean_multipliers = self._scales.get("od_mean_multipliers")
+        if od_mean_multipliers is None:
+            raise ValueError(
+                "reverse OD-to-measurement contributions are unavailable because the fit does not persist its raw OD measurement component."
+            )
+        od_mean_multipliers = np.asarray(od_mean_multipliers, dtype=np.float64)
         offset = page * page_size
         with tempfile.TemporaryDirectory(prefix="gravity-od-measurement-query-") as temporary:
             connection = sqlite3.connect(Path(temporary) / "selected_od.sqlite")
@@ -405,7 +494,6 @@ class MeasurementODContributionQuery:
                     "modeled_mean_contribution REAL NOT NULL) WITHOUT ROWID"
                 )
                 demand = float(np.asarray(self._scales["demand"])[operator_column])
-                observation_scales = np.asarray(self._scales["observation_scales"])
                 for block in self.artifact.iter_blocks_for_departure_interval(departure_interval_id):
                     for start in range(0, block.nonzero_entries, _WRITE_BATCH_SIZE):
                         stop = min(block.nonzero_entries, start + _WRITE_BATCH_SIZE)
@@ -416,7 +504,7 @@ class MeasurementODContributionQuery:
                         rows = np.asarray(block.row_indices[start:stop][selected], dtype=np.int64)
                         coefficients = np.asarray(block.values[start:stop][selected], dtype=np.float64)
                         flows = coefficients * demand
-                        means = flows * float(self._scales["aggregate_flow_scale"]) * observation_scales[rows]
+                        means = flows * od_mean_multipliers[rows]
                         if not np.all(np.isfinite(flows)) or not np.all(np.isfinite(means)):
                             raise ValueError("selected OD contributions are non-finite.")
                         connection.executemany(
@@ -447,6 +535,8 @@ class MeasurementODContributionQuery:
             "page": page,
             "page_size": page_size,
             "total": total,
+            "measurement_scale_contract": self._scales["measurement_scale_contract"],
+            "scale_component_scope": self._scales["scale_component_scope"],
             "rows": [
                 {
                     "measurement_index": int(measurement_index),
@@ -484,7 +574,11 @@ class MeasurementODContributionQuery:
                     "modeled_mean_contribution REAL NOT NULL) WITHOUT ROWID"
                 )
                 demand = np.asarray(self._scales["demand"])
-                observation_scale = float(np.asarray(self._scales["observation_scales"])[measurement_index])
+                od_mean_multipliers = self._scales.get("od_mean_multipliers")
+                if od_mean_multipliers is None:
+                    initial_mean = 0.0
+                else:
+                    initial_mean = float(np.asarray(od_mean_multipliers)[measurement_index])
                 for block in self.artifact.iter_blocks_for_measurement_interval(measurement_interval_id):
                     for start in range(0, block.nonzero_entries, _WRITE_BATCH_SIZE):
                         stop = min(block.nonzero_entries, start + _WRITE_BATCH_SIZE)
@@ -495,7 +589,7 @@ class MeasurementODContributionQuery:
                         columns = np.asarray(block.column_indices[start:stop][selected], dtype=np.int64)
                         coefficients = np.asarray(block.values[start:stop][selected], dtype=np.float64)
                         flows = coefficients * demand[columns]
-                        means = flows * float(self._scales["aggregate_flow_scale"]) * observation_scale
+                        means = flows * initial_mean
                         if not np.all(np.isfinite(flows)) or not np.all(np.isfinite(means)):
                             raise ValueError("selected measurement contributions are non-finite.")
                         rows_to_write = [
@@ -523,6 +617,16 @@ class MeasurementODContributionQuery:
                     ).fetchone()[0]
                 )
                 components = self._components_for_row(measurement_index, raw_od)
+                if self._scales["measurement_scale_contract"] == "routed_od_only":
+                    if raw_od == 0.0:
+                        od_mean_multiplier = 0.0
+                    else:
+                        od_mean_multiplier = float(components["od_contribution"]) / raw_od
+                    connection.execute(
+                        "UPDATE contributions SET modeled_mean_contribution = linear_flow_contribution * ?",
+                        (od_mean_multiplier,),
+                    )
+                    connection.commit()
                 rows = connection.execute(
                     "SELECT od_index, operator_coefficient, linear_flow_contribution, modeled_mean_contribution "
                     "FROM contributions ORDER BY ABS(modeled_mean_contribution) DESC, od_index ASC LIMIT ? OFFSET ?",
@@ -560,6 +664,9 @@ class MeasurementODContributionQuery:
             "page": page,
             "page_size": page_size,
             "total": total,
+            "measurement_scale_contract": self._scales["measurement_scale_contract"],
+            "scale_component_scope": self._scales["scale_component_scope"],
+            "modeled_mean": components["modeled_mean"],
             "rows": contributors,
             "components": components,
         }
@@ -574,14 +681,37 @@ class MeasurementODContributionQuery:
             ):
                 raise ValueError("mapping OD contribution differs from the fitted OD measurement component.")
         additive = float(np.asarray(self._scales["additive"])[measurement_index])
-        if result.latent_measurements is None:
+        scale = float(np.asarray(self._scales["observation_scales"])[measurement_index])
+        modeled = float(np.asarray(self._scales["modeled"])[measurement_index])
+        if self._scales["measurement_scale_contract"] == "routed_od_only":
+            if result.latent_measurements is None:
+                raise ValueError("routed-OD-only decomposition requires persisted latent measurements.")
+            latent = np.asarray(result.latent_measurements, dtype=np.float64)
+            fixed_offset = float(np.asarray(self.artifact.fixed_measurement_offset)[measurement_index])
+            effective_od_latent = float(latent[measurement_index]) - additive - fixed_offset
+            if raw_od == 0.0:
+                if not np.isclose(effective_od_latent, 0.0, rtol=1e-6, atol=1e-8):
+                    raise ValueError(
+                        "routed-OD-only fitted component is nonzero for a measurement with zero raw OD contribution."
+                    )
+                od_mean = 0.0
+            else:
+                od_mean = scale * effective_od_latent
+            fixed_mean = scale * fixed_offset
+            additive_mean = scale * additive
+        elif result.latent_measurements is None:
             if result.additive_measurement_contributions:
                 raise ValueError(
                     "fit is missing latent measurements required to separate fixed and additive components."
                 )
             fixed_offset = float(self.artifact.fixed_measurement_offset[measurement_index])
+            aggregate_flow_scale = float(self._scales["aggregate_flow_scale"])
+            fixed_mean = scale * fixed_offset
+            additive_mean = scale * aggregate_flow_scale * additive
+            od_mean = scale * aggregate_flow_scale * raw_od
         else:
             latent = np.asarray(result.latent_measurements, dtype=np.float64)
+            aggregate_flow_scale = float(self._scales["aggregate_flow_scale"])
             fixed_offset = float(
                 latent[measurement_index]
                 - float(self._scales["aggregate_flow_scale"]) * (raw_od + additive)
@@ -593,12 +723,9 @@ class MeasurementODContributionQuery:
                 atol=1e-8,
             ):
                 raise ValueError("fitted fixed offset differs from the mapping artifact.")
-        scale = float(np.asarray(self._scales["observation_scales"])[measurement_index])
-        fixed_mean = scale * fixed_offset
-        aggregate_flow_scale = float(self._scales["aggregate_flow_scale"])
-        additive_mean = scale * aggregate_flow_scale * additive
-        od_mean = scale * aggregate_flow_scale * raw_od
-        modeled = float(np.asarray(self._scales["modeled"])[measurement_index])
+            fixed_mean = scale * fixed_offset
+            additive_mean = scale * aggregate_flow_scale * additive
+            od_mean = scale * aggregate_flow_scale * raw_od
         floor = modeled - fixed_mean - additive_mean - od_mean
         tolerance = 1e-6 + 1e-6 * abs(modeled)
         if floor < -tolerance:
@@ -631,13 +758,55 @@ def _slug(value: str) -> str:
 
 def _measurement_scale_contract(
     result: GravityEstimationResult,
-) -> tuple[float, str]:
-    """Resolve the fitted factor applied before row-wise observation scales."""
+) -> tuple[float | None, str]:
+    """Resolve a supported generic scale contract without interpreting opaque models."""
     payload = result.measurement_model
     if payload is None:
         return 1.0, "unit_flow_scale"
     if not isinstance(payload, Mapping):
         raise ValueError("fitted measurement-scale contract must be an object.")
+
+    declared_scope_fields = tuple(
+        field
+        for field in ("scale_scope", "scale_application_scope", "scope")
+        if field in payload
+    )
+    routed_flags_present = any(
+        field in payload for field in _ROUTED_OD_ONLY_SCALE_FLAGS
+    )
+    if declared_scope_fields or routed_flags_present:
+        if not declared_scope_fields:
+            raise ValueError(
+                "routed-OD measurement-scale contract is missing its declared scale scope."
+            )
+        declared_scopes = tuple(payload[field] for field in declared_scope_fields)
+        if any(scope != declared_scopes[0] for scope in declared_scopes[1:]):
+            raise ValueError("fitted measurement-scale scope declarations contradict each other.")
+        scope = declared_scopes[0]
+        if not isinstance(scope, str) or scope not in _ROUTED_OD_ONLY_SCALE_SCOPES:
+            raise ValueError(f"unsupported fitted measurement-scale scope: {scope!r}.")
+        missing_flags = tuple(
+            field for field in _ROUTED_OD_ONLY_SCALE_FLAGS if field not in payload
+        )
+        if missing_flags:
+            raise ValueError(
+                "routed-OD measurement-scale contract is incomplete; missing component flags: "
+                + ", ".join(sorted(missing_flags))
+                + "."
+            )
+        contradictory = tuple(
+            field
+            for field, expected in _ROUTED_OD_ONLY_SCALE_FLAGS.items()
+            if not isinstance(payload[field], bool) or payload[field] is not expected
+        )
+        if contradictory:
+            raise ValueError(
+                "routed-OD measurement-scale scope contradicts its component flags: "
+                + ", ".join(sorted(contradictory))
+                + "."
+            )
+        return None, "routed_od_only"
+
     if payload.get("schema_version", 1) != 1:
         raise ValueError("fitted measurement-scale contract schema is unsupported.")
 
@@ -768,6 +937,10 @@ def write_measurement_od_contributions_dataset(
     if not np.all(np.isfinite(demand)) or not np.all(np.isfinite(modeled)):
         raise ValueError("fitted OD demand and modeled measurements must be finite.")
     aggregate_flow_scale, scale_contract = _measurement_scale_contract(fit_result)
+    if aggregate_flow_scale is None:
+        raise ValueError(
+            "routed-OD-only scale semantics require bounded on-demand queries and cannot be written as a materialized contribution dataset."
+        )
 
     if fit_result.observation_scales is None:
         if scale_contract == "rowwise_observation_scale":
