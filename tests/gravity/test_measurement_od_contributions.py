@@ -528,6 +528,60 @@ def test_routed_od_only_contract_decomposes_forward_and_reverse_queries(tmp_path
     assert zero_row["components"]["mean_floor_adjustment"] == pytest.approx(1e-8)
 
 
+def test_routed_od_only_serialization_sized_negative_floor_is_clamped_and_reconciled(tmp_path):
+    result, _, provenance, artifact = _routed_od_only_result(
+        tmp_path,
+        overrides={"predicted_measurements": np.asarray((14.0 - 2e-5, 3.625, 1e-8))},
+    )
+    descriptor = measurement_od_query_descriptor(
+        artifact=open_temporal_block_artifact(artifact),
+        fit_result=result,
+        fit_provenance=provenance,
+        runtime_package_revision=package_revision(),
+    )
+    assert descriptor["available"] is True
+
+    query = MeasurementODContributionQuery(
+        artifact=open_temporal_block_artifact(artifact),
+        fit_result=result,
+    )
+    page = query.query(0, page=0, page_size=10)
+    assert page["components"]["mean_floor_adjustment"] == 0.0
+    component_sum = (
+        sum(row["modeled_mean_contribution"] for row in page["rows"])
+        + page["components"]["fixed_offset_contribution"]
+        + page["components"]["additive_contribution"]
+        + page["components"]["mean_floor_adjustment"]
+    )
+    assert component_sum == pytest.approx(14.0)
+    assert page["modeled_mean"] == pytest.approx(14.0 - 2e-5)
+
+
+def test_routed_od_only_rejects_negative_floor_discrepancy_beyond_shared_tolerance(tmp_path):
+    result, _, provenance, artifact = _routed_od_only_result(
+        tmp_path,
+        overrides={"predicted_measurements": np.asarray((14.0 - 2e-4, 3.625, 1e-8))},
+    )
+    with pytest.raises(ValueError, match="components exceed the saved modeled mean"):
+        measurement_od_query_descriptor(
+            artifact=open_temporal_block_artifact(artifact),
+            fit_result=result,
+            fit_provenance=provenance,
+            runtime_package_revision=package_revision(),
+        )
+
+    valid_result, _, _, valid_artifact = _routed_od_only_result(tmp_path / "row-query")
+    query = MeasurementODContributionQuery(
+        artifact=open_temporal_block_artifact(valid_artifact),
+        fit_result=valid_result,
+    )
+    changed_predictions = np.array(query._scales["modeled"], copy=True)
+    changed_predictions[0] = 14.0 - 2e-4
+    query._scales["modeled"] = changed_predictions
+    with pytest.raises(ValueError, match="components exceed the saved modeled mean"):
+        query.query(0, page=0, page_size=10)
+
+
 def test_routed_od_only_scope_is_fail_closed_for_invalid_metadata_and_zero_flow(tmp_path):
     result, _, provenance, artifact = _routed_od_only_result(tmp_path)
     for payload in (
