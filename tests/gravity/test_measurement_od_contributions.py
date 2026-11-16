@@ -18,6 +18,8 @@ from public_transportation.inference.assignment_contract import (
 )
 from public_transportation.inference.gravity import (
     GRAVITY_REPORT_PROVENANCE_FIELDS,
+    GravityJourneyLatentClassModel,
+    GravityObservationModel,
     MeasurementODContributionQuery,
     GravityValidationMetadata,
     read_gravity_viewer_bundle,
@@ -41,6 +43,9 @@ from public_transportation.inference.temporal_assignment_persistence import (
 )
 from public_transportation.inference.hierarchical_artifacts import package_revision
 from public_transportation.inference.od_parameter_layout import ODParameterLayout
+from public_transportation.inference.gravity.measurement_od_contributions import (
+    measurement_od_query_descriptor,
+)
 
 from tests.gravity.test_viewer_bundle import _inputs
 
@@ -58,6 +63,7 @@ def _mapping_bundle_inputs(
     artifact_timetable_fingerprint: str = "artifact-timetable-fingerprint",
     artifact_mapping_fingerprint: str = "artifact-measurement-mapping-fingerprint",
     compact_layout_fingerprint: str = "compact-layout-fingerprint",
+    result_overrides: dict[str, object] | None = None,
 ):
     if base_result is None:
         base_result, _, _ = _inputs(tmp_path)
@@ -115,6 +121,8 @@ def _mapping_bundle_inputs(
         additive_measurement_contributions=(np.asarray((0.5, 0.25, 0.0)),),
         observation_scales=np.asarray((2.0, 0.5, 3.0)),
     )
+    if result_overrides:
+        result = replace(result, **result_overrides)
     provenance = {
         field: f"{field}-value" for field in GRAVITY_REPORT_PROVENANCE_FIELDS
     }
@@ -302,21 +310,23 @@ def test_sparse_mapping_decomposes_measurements_by_od_and_closes_components(tmp_
         metadata={"provenance": provenance},
         linear_mapping_artifact=artifact,
     )
-
     assert bundle.measurement_od_contributions_available
     summary = bundle.viewer_summary["measurement_od_contributions"]
     assert summary["query_mode"] == "local_service"
-    assert (
-        bundle.viewer_summary["measurement_od_contributions"]["observation_scale_source"]
-        == "fit_result.observation_scales"
+    assert summary["observation_scale_source"] == "fit_result.observation_scales"
+    assert summary["fixed_positive_od_attribution_available"] is False
+    query = MeasurementODContributionQuery(
+        artifact=open_temporal_block_artifact(artifact), fit_result=result
     )
-    assert bundle.viewer_summary["measurement_od_contributions"]["fixed_positive_od_attribution_available"] is False
-    query = MeasurementODContributionQuery(artifact=open_temporal_block_artifact(artifact), fit_result=result)
     page = query.query(0, page=0, page_size=10)
     contributors = page["rows"]
     assert [row["od_index"] for row in contributors] == [1, 0]
-    assert [row["linear_flow_contribution"] for row in contributors] == pytest.approx((2.0, 1.0))
-    assert [row["modeled_mean_contribution"] for row in contributors] == pytest.approx((4.0, 2.0))
+    assert [row["linear_flow_contribution"] for row in contributors] == pytest.approx(
+        (2.0, 1.0)
+    )
+    assert [row["modeled_mean_contribution"] for row in contributors] == pytest.approx(
+        (4.0, 2.0)
+    )
     assert [row["origin_stop_id"] for row in contributors] == ["o1", "o1"]
     components = page["components"]
     assert components["fixed_offset_contribution"] == pytest.approx(1.0)
@@ -338,6 +348,144 @@ def test_sparse_mapping_decomposes_measurements_by_od_and_closes_components(tmp_
 
     reopened = read_gravity_viewer_bundle(bundle.path)
     assert reopened.measurement_od_contributions_available
+
+
+@pytest.mark.parametrize(
+    ("scale_contract", "result_overrides", "expected_scale", "expected_means", "expected_modeled"),
+    [
+        (
+            "journey_latent_class",
+            {
+                "measurement_model": GravityJourneyLatentClassModel(
+                    class_probabilities=(0.5, 0.5),
+                    class_effects=(1.0, 1.4),
+                ).to_dict(),
+                "latent_measurements": np.asarray((4.7, 5.7, 0.0)),
+                "predicted_measurements": np.asarray((9.4, 2.85, 1e-8)),
+            },
+            1.2,
+            (4.8, 2.4),
+            9.4,
+        ),
+        (
+            "rowwise_observation_scale",
+            {
+                "measurement_model": GravityObservationModel(
+                    measurement_types=("boarding", "boarding", "alighting"),
+                    boarding_scale=2.0,
+                    alighting_scale=0.5,
+                ).to_dict(),
+                "observation_scales": np.asarray((2.0, 2.0, 0.5)),
+                "predicted_measurements": np.asarray((8.0, 10.5, 1e-8)),
+            },
+            1.0,
+            (4.0, 2.0),
+            8.0,
+        ),
+    ],
+)
+def test_query_scale_contracts_create_descriptors_and_close_modeled_rows(
+    tmp_path,
+    scale_contract,
+    result_overrides,
+    expected_scale,
+    expected_means,
+    expected_modeled,
+):
+    result, report, provenance, artifact = _mapping_bundle_inputs(
+        tmp_path,
+        result_overrides=result_overrides,
+    )
+    bundle = write_gravity_viewer_bundle(
+        output_directory=tmp_path / f"{scale_contract}-bundle",
+        fit_result=result,
+        validation_result=report.adequacy,
+        report=report,
+        metadata={"provenance": provenance},
+        linear_mapping_artifact=artifact,
+    )
+    descriptor = bundle.viewer_summary["measurement_od_contributions"]
+    assert descriptor["available"] is True
+    assert descriptor["measurement_scale_contract"] == scale_contract
+    assert descriptor["aggregate_flow_scale"] == pytest.approx(expected_scale)
+    if scale_contract == "rowwise_observation_scale":
+        assert "journey_aggregate_scale" not in descriptor
+    else:
+        assert descriptor["journey_aggregate_scale"] == pytest.approx(expected_scale)
+
+    reader = open_temporal_block_artifact_for_viewer(
+        artifact,
+        fit_source_package_revision=provenance["package_revision"],
+    )
+    query = MeasurementODContributionQuery(artifact=reader, fit_result=result)
+    page = query.query(0, page=0, page_size=10)
+    components = page["components"]
+    assert [row["modeled_mean_contribution"] for row in page["rows"]] == pytest.approx(
+        expected_means
+    )
+    assert components["fixed_offset_contribution"] == pytest.approx(1.0)
+    assert components["additive_contribution"] == pytest.approx(
+        1.2 if scale_contract == "journey_latent_class" else 1.0
+    )
+    assert components["mean_floor_adjustment"] == pytest.approx(0.0)
+    assert (
+        sum(row["modeled_mean_contribution"] for row in page["rows"])
+        + components["fixed_offset_contribution"]
+        + components["additive_contribution"]
+        + components["mean_floor_adjustment"]
+    ) == pytest.approx(expected_modeled)
+    assert components["modeled_mean"] == pytest.approx(expected_modeled)
+
+
+def test_unknown_and_incomplete_measurement_scale_contracts_fail_clearly(tmp_path):
+    result, _, provenance, artifact = _mapping_bundle_inputs(tmp_path)
+    with pytest.raises(ValueError, match="unsupported fitted measurement-scale contract"):
+        measurement_od_query_descriptor(
+            artifact=open_temporal_block_artifact(artifact),
+            fit_result=replace(result, measurement_model={"type": "unsupported_scale"}),
+            fit_provenance=provenance,
+            runtime_package_revision=package_revision(),
+        )
+
+    with pytest.raises(ValueError, match="missing its scale specification"):
+        measurement_od_query_descriptor(
+            artifact=open_temporal_block_artifact(artifact),
+            fit_result=replace(
+                result,
+                measurement_model={"type": "rowwise_measurement_scale"},
+            ),
+            fit_provenance=provenance,
+            runtime_package_revision=package_revision(),
+        )
+
+    rowwise = GravityObservationModel(
+        measurement_types=("boarding", "boarding", "alighting"),
+        boarding_scale=2.0,
+        alighting_scale=0.5,
+    ).to_dict()
+    with pytest.raises(ValueError, match="require persisted observation_scales"):
+        measurement_od_query_descriptor(
+            artifact=open_temporal_block_artifact(artifact),
+            fit_result=replace(
+                result,
+                measurement_model=rowwise,
+                observation_scales=None,
+            ),
+            fit_provenance=provenance,
+            runtime_package_revision=package_revision(),
+            rho=1.0,
+        )
+
+    with pytest.raises(ValueError, match="components exceed the saved modeled mean"):
+        measurement_od_query_descriptor(
+            artifact=open_temporal_block_artifact(artifact),
+            fit_result=replace(
+                result,
+                predicted_measurements=np.asarray((7.9, 2.625, 1e-8)),
+            ),
+            fit_provenance=provenance,
+            runtime_package_revision=package_revision(),
+        )
 
 
 def test_on_demand_query_selects_measurement_intervals_aggregates_duplicates_and_pages(

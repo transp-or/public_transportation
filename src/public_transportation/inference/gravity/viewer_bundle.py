@@ -46,7 +46,7 @@ from .reporting import (
 from .specification import GravityModelSpecification
 from .validation import GravityAdequacyReport, GravityValidationMetadata
 from .measurement_od_contributions import (
-    _journey_scale,
+    _measurement_scale_contract,
     validate_dataset as _validate_measurement_od_dataset,
     measurement_od_query_descriptor,
 )
@@ -1483,7 +1483,8 @@ def _validate_linear_mapping_for_bundle(
                 if additive_vectors
                 else np.zeros_like(raw_od)
             )
-            fixed_offset = latent - _journey_scale(fit_result) * (raw_od + additive)
+            aggregate_flow_scale, _ = _measurement_scale_contract(fit_result)
+            fixed_offset = latent - aggregate_flow_scale * (raw_od + additive)
             if not np.allclose(
                 fixed_offset,
                 np.asarray(artifact.fixed_measurement_offset, dtype=np.float64),
