@@ -20,11 +20,6 @@ def test_viewer_exposes_stop_and_od_pair_interaction_controls() -> None:
         "stop_summary.csv",
         "chooseOdStop",
         "selectOd",
-        'id="route-sections"',
-        'id="section-lines"',
-        'id="section-bin"',
-        'id="section-id"',
-        'id="section-page-next"',
         'id="measurement-od"',
         'id="measurement-od-direction"',
         'id="map-measurement-mode"',
@@ -54,8 +49,8 @@ def test_viewer_starts_from_manifest_and_streams_selected_partitions() -> None:
     assert "validatePartition" in viewer_source
     assert "flow-kind" in source
     assert "route-assignment flow" in viewer_source
-    assert "query_section_od" in viewer_source or "route_sections" in viewer_source
-    assert "section_loads" in viewer_source
+    assert 'id="route-sections"' not in source
+    assert "section_loads" not in viewer_source
     assert "measurement_od_contributions" in viewer_source
     assert "refreshMeasurementOd" in viewer_source
     assert "rankBy" in viewer_source
@@ -77,7 +72,9 @@ def test_viewer_uses_the_local_service_for_selected_measurement_pages() -> None:
     assert "measurement_index" in viewer_source
     assert "/api/measurement-od-contributions" in viewer_source
     assert "Local query service fit or mapping identity differs" in viewer_source
-    assert "Querying only the selected measurement interval" in viewer_source
+    assert "Still processing; the selected mapping data can take a few minutes to scan." in viewer_source
+    assert 'id="measurement-od-status" class="status" role="status"' in source
+    assert "status.classList.add('is-loading')" in viewer_source
     assert "summary.available && summary.query_mode === 'local_service'" in viewer_source
     assert "summary.reverse_query_available === false" in viewer_source
     assert "Reverse OD-to-measurement contributions are unavailable" in viewer_source

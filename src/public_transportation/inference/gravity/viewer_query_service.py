@@ -1,11 +1,12 @@
-"""Loopback-only HTTP API for on-demand gravity viewer measurement queries."""
+"""Single-process local gravity viewer and on-demand measurement query server."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import math
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from typing import Any
@@ -144,19 +145,24 @@ class GravityViewerQueryService:
             str(summary.get("mapping_artifact_fingerprint")),
         ):
             raise ValueError("on-demand query cache identity differs from the viewer bundle.")
+        # Keep the expensive sparse-mapping queries serial. The threaded HTTP
+        # server can still serve the viewer assets and health endpoint while a
+        # contribution query is running.
+        self._query_lock = threading.Lock()
 
     def query_measurement(self, measurement_index: int, *, page: int, page_size: int) -> dict[str, object]:
-        payload = self.query.query(
-            measurement_index,
-            page=page,
-            page_size=page_size,
-        )
-        selected = self.bundle.read_table(
-            "predicted_measurements.csv",
-            columns=("row_index", "observed", "modeled"),
-            filters={"row_index": measurement_index},
-            chunksize=1,
-        )
+        with self._query_lock:
+            payload = self.query.query(
+                measurement_index,
+                page=page,
+                page_size=page_size,
+            )
+            selected = self.bundle.read_table(
+                "predicted_measurements.csv",
+                columns=("row_index", "observed", "modeled"),
+                filters={"row_index": measurement_index},
+                chunksize=1,
+            )
         if len(selected) != 1:
             raise ValueError("selected measurement row is missing or duplicated in the viewer bundle.")
         observed = float(selected.iloc[0]["observed"])
@@ -176,12 +182,25 @@ class GravityViewerQueryService:
         return payload
 
     def query_od(self, od_index: int, *, page: int, page_size: int) -> dict[str, object]:
-        return self.query.query_od(od_index, page=page, page_size=page_size)
+        with self._query_lock:
+            return self.query.query_od(od_index, page=page, page_size=page_size)
 
 
-def _handler_for(service: GravityViewerQueryService) -> type[BaseHTTPRequestHandler]:
-    class Handler(BaseHTTPRequestHandler):
-        server_version = "GravityViewerQuery/1"
+def _handler_for(
+    service: GravityViewerQueryService,
+    viewer_directory: Path,
+) -> type[SimpleHTTPRequestHandler]:
+    class Handler(SimpleHTTPRequestHandler):
+        server_version = "GravityViewer/1"
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, directory=str(viewer_directory), **kwargs)
+
+        def end_headers(self) -> None:
+            if not urlparse(self.path).path.startswith("/api/"):
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Content-Type-Options", "nosniff")
+            super().end_headers()
 
         def _json(self, status: int, payload: dict[str, object]) -> None:
             body = json.dumps(payload, allow_nan=False, separators=(",", ":")).encode("utf-8")
@@ -210,6 +229,9 @@ def _handler_for(service: GravityViewerQueryService) -> type[BaseHTTPRequestHand
 
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
+            if not parsed.path.startswith("/api/"):
+                super().do_GET()
+                return
             if parsed.path == "/api/status":
                 self._json(
                     200,
@@ -242,7 +264,7 @@ def _handler_for(service: GravityViewerQueryService) -> type[BaseHTTPRequestHand
             self._json(200, payload)
 
         def log_message(self, format: str, *args: Any) -> None:
-            # Keep local service output to one concise request line per query.
+            # Keep local server output to one concise request line per request.
             super().log_message(format, *args)
 
     return Handler
@@ -271,9 +293,24 @@ def _is_loopback_origin(origin: str) -> bool:
     }
 
 
+def _default_viewer_directory() -> Path:
+    """Find the static viewer assets in a public_transportation checkout."""
+    repository_root = Path(__file__).resolve().parents[4]
+    return repository_root / "tools" / "gravity_viewer"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Serve bounded on-demand OD contributions for a local gravity viewer bundle."
+        description=(
+            "Serve the local gravity viewer and its bounded on-demand OD query API "
+            "from one loopback-only process."
+        )
+    )
+    parser.add_argument(
+        "--viewer-directory",
+        type=Path,
+        default=None,
+        help="static viewer asset directory (defaults to tools/gravity_viewer in this checkout)",
     )
     parser.add_argument("--bundle", required=True, type=Path, help="viewer bundle directory")
     parser.add_argument("--fit-manifest", required=True, type=Path, help="persisted fit manifest")
@@ -293,6 +330,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535.")
+    viewer_directory = (
+        args.viewer_directory.expanduser().resolve()
+        if args.viewer_directory is not None
+        else _default_viewer_directory()
+    )
+    if not viewer_directory.is_dir() or not (viewer_directory / "index.html").is_file():
+        parser.error(
+            f"viewer assets were not found in {viewer_directory}; "
+            "pass --viewer-directory pointing to tools/gravity_viewer."
+        )
     bundle = read_gravity_viewer_bundle(args.bundle)
     service = GravityViewerQueryService(
         bundle=bundle,
@@ -300,9 +347,12 @@ def main(argv: list[str] | None = None) -> int:
         mapping_artifact_path=args.mapping_artifact,
         rho=args.rho,
     )
-    server = HTTPServer(("127.0.0.1", args.port), _handler_for(service))
-    print(f"Gravity viewer query API listening at http://127.0.0.1:{args.port}")
-    print("Open tools/gravity_viewer/index.html, select the bundle folder, and use Measurement mode.")
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", args.port),
+        _handler_for(service, viewer_directory),
+    )
+    print(f"Gravity viewer and query API listening at http://127.0.0.1:{args.port}/")
+    print("Select the bundle folder in the viewer and use Measurement mode.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

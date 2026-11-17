@@ -99,11 +99,11 @@
   const viewer = {
     files: [], fileMap: new Map(), manifest: null, summary: {}, model: {}, report: {},
     map: null, stops: [], stopsById: new Map(), markerLayer: null, selectedOd: null,
-    cacheDb: null, cacheIdentity: '', odRows: [], routeRows: [], sectionPage: 0, sectionPageSize: 500,
+    cacheDb: null, cacheIdentity: '', odRows: [], routeRows: [],
     mapClickMode: 'od', measurementLocationManifest: null, selectedMeasurementStop: '',
     selectedMeasurement: null, measurementRows: [], measurementRowPage: 0, measurementRowsPerPage: 50,
-    measurementContributionPage: 0, measurementContributions: new Map(),
-    sectionFeatures: [], sectionLayer: null, selectedSection: null,
+    measurementContributionPage: 0, measurementContributions: new Map(), measurementQueryId: 0,
+    measurementQueryTimer: null,
   };
 
   const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[char]));
@@ -493,7 +493,6 @@
     }
     if ((viewer.summary.measurement_od_contributions || {}).query_mode === 'local_service') {
       $('measurement-od-detail').textContent = 'The local query service will calculate this row’s components and ranked OD contributors.';
-      $('measurement-od-status').textContent = 'Querying the selected measurement row locally…';
       await refreshMeasurementOd();
       return;
     }
@@ -509,6 +508,7 @@
   }
 
   async function selectMeasurementStop(stopId) {
+    stopMeasurementOdQuery('Select a measured row to inspect its OD decomposition.');
     viewer.selectedMeasurementStop = stopId;
     viewer.selectedMeasurement = null;
     viewer.measurementRowPage = 0;
@@ -516,7 +516,6 @@
     $('measurement-row-select').innerHTML = '';
     $('measurement-row-select').disabled = true;
     $('measurement-row-detail').textContent = 'Loading measurements for this stop…';
-    $('measurement-od-status').textContent = 'Select a measured row to inspect its OD decomposition.';
     $('measurement-contribution-page').textContent = '';
     $('measurement-od-detail').textContent = 'No measurement selected.';
     renderMeasurementOdRows([]);
@@ -636,6 +635,26 @@
     target.querySelector('tbody').innerHTML = rows.slice(0, 500).map((row) => `<tr>${headers.map((header) => `<td>${esc(row[header])}</td>`).join('')}</tr>`).join('');
   }
 
+  function formatElapsed(seconds) {
+    const minutes = Math.floor(seconds / 60);
+    const remainder = seconds % 60;
+    return minutes ? `${minutes}m ${String(remainder).padStart(2, '0')}s` : `${remainder}s`;
+  }
+
+  function stopMeasurementOdQuery(message) {
+    viewer.measurementQueryId += 1;
+    if (viewer.measurementQueryTimer) clearInterval(viewer.measurementQueryTimer);
+    viewer.measurementQueryTimer = null;
+    const status = $('measurement-od-status');
+    status.classList.remove('is-loading');
+    status.classList.remove('bad', 'ok');
+    status.setAttribute('aria-busy', 'false');
+    const button = $('measurement-od-load');
+    button.disabled = false;
+    button.textContent = 'Load contributions';
+    if (message) status.textContent = message;
+  }
+
   async function refreshMeasurementOd() {
     const summary = viewer.summary.measurement_od_contributions || {};
     if (!summary.available) return;
@@ -643,21 +662,42 @@
     const limit = Math.max(1, Math.min(500, Number($('measurement-od-limit').value) || 50));
     const localService = summary.available && summary.query_mode === 'local_service';
     if (localService && direction === 'od' && summary.reverse_query_available === false) {
+      stopMeasurementOdQuery();
       $('measurement-od-status').textContent = summary.reverse_query_message || 'Reverse OD-to-measurement contributions are unavailable for this fit.';
+      $('measurement-od-status').classList.add('bad');
       $('measurement-od-detail').textContent = summary.reverse_query_message || 'Reverse OD-to-measurement contributions are unavailable for this fit.';
       renderMeasurementOdRows([]);
       return;
     }
     const onDemand = direction === 'measurement' && summary.query_mode === 'local_service';
-    $('measurement-od-status').textContent = onDemand
-      ? 'Querying only the selected measurement interval in the local mapping service…'
-      : localService ? 'Querying the selected OD cell in the local mapping service…'
-        : direction === 'measurement' ? 'Loading this measurement’s sparse contributors into the bounded local cache…' : 'Reading indexed sparse contribution partitions…';
+    const requestId = ++viewer.measurementQueryId;
+    if (viewer.measurementQueryTimer) clearInterval(viewer.measurementQueryTimer);
+    const status = $('measurement-od-status');
+    const button = $('measurement-od-load');
+    const startedAt = Date.now();
+    const measurementIndex = direction === 'measurement' ? Number(viewer.selectedMeasurement?.measurement_index) : null;
+    const operation = onDemand
+      ? `Calculating OD contributions for measurement row ${measurementIndex} from the local mapping`
+      : localService ? 'Querying the selected OD cell in the local mapping service'
+        : direction === 'measurement' ? 'Loading this measurement’s sparse contributors into the local cache' : 'Reading indexed sparse contribution partitions';
+    const updateLoadingStatus = () => {
+      const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+      const progressHint = elapsed >= 15
+        ? 'Still processing; the selected mapping data can take a few minutes to scan. No percentage estimate is available.'
+        : 'Please wait while the selected mapping data is processed.';
+      status.textContent = `${operation}… Elapsed ${formatElapsed(elapsed)}. ${progressHint}`;
+    };
+    status.classList.remove('bad', 'ok');
+    status.classList.add('is-loading');
+    status.setAttribute('aria-busy', 'true');
+    button.disabled = true;
+    button.textContent = 'Calculating…';
+    updateLoadingStatus();
+    viewer.measurementQueryTimer = setInterval(updateLoadingStatus, 10000);
     try {
-      let rows; let measurementIndex = null; let selectedOd = null; let total = 0; let queryResult = null;
+      let rows; let selectedOd = null; let total = 0; let queryResult = null;
       if (direction === 'measurement') {
         if (!viewer.selectedMeasurement) throw new Error('Select a measurement row from the map first.');
-        measurementIndex = Number(viewer.selectedMeasurement.measurement_index);
         queryResult = onDemand
           ? await queryLocalMeasurementPage(measurementIndex, viewer.measurementContributionPage, limit)
           : await measurementContributionPage(measurementIndex, viewer.measurementContributionPage, limit);
@@ -681,7 +721,9 @@
           rows = await readPartition('measurement_od_contributions', bin, {od_index: String(selectedOd.od_index)}, limit, {rankBy: 'modeled_mean_contribution', rankAbs: true});
         }
       }
+      if (requestId !== viewer.measurementQueryId) return;
       rows = await labelMeasurementOdRows(rows, direction);
+      if (requestId !== viewer.measurementQueryId) return;
       renderMeasurementOdRows(rows);
       if (direction === 'measurement') {
         const pageCount = Math.max(1, Math.ceil(total / limit));
@@ -692,113 +734,25 @@
         $('measurement-od-detail').innerHTML = `<dl><dt>OD pair</dt><dd>${esc(selectedOd.origin_stop_id)} → ${esc(selectedOd.destination_stop_id)} (${esc(selectedOd.departure_time_bin)})</dd><dt>Estimated demand</dt><dd>${display(selectedOd.estimated_demand)}</dd><dt>Measurement rows shown</dt><dd>${esc(rows.length)}${localService ? ` of ${total}` : ''} (ranked by absolute modeled contribution)</dd></dl>`;
       }
       $('measurement-od-status').textContent = direction === 'measurement'
-        ? `Loaded ${rows.length} of ${total} OD contributors. Signed modeled-mean and linear-flow contributions are preserved.`
-        : `Loaded ${rows.length} bounded contribution rows.`;
-    } catch (error) { $('measurement-od-status').textContent = `Could not load OD contributions: ${error.message}`; }
-  }
-
-  function sectionSummary() { return viewer.summary.route_sections || {}; }
-  function selectedSectionLines() {
-    return [...($('section-lines')?.selectedOptions || [])].map((option) => option.value).filter(Boolean);
-  }
-  function populateSectionControls() {
-    const summary = sectionSummary(); const panel = $('route-sections');
-    if (!panel) return;
-    panel.classList.remove('hidden');
-    if (!summary.available) {
-      $('section-unavailable').textContent = summary.message || 'Route-section data unavailable. This bundle still supports OD destination exploration.';
-      $('section-unavailable').classList.remove('hidden');
-      [...panel.querySelectorAll('button, select, input')].forEach((element) => { if (element.id !== 'section-clear-cache') element.disabled = true; });
-      return;
-    }
-    const route = viewer.summary.route_flows || {};
-    const lineSelect = $('section-lines');
-    const sectionLines = route.lines?.length ? route.lines : (summary.lines || []);
-    lineSelect.innerHTML = sectionLines.map((line) => `<option value="${esc(line)}" selected>${esc(line)}</option>`).join('');
-    options($('section-pattern'), route.patterns || [], 'All patterns'); options($('section-direction'), route.directions || [], 'All directions');
-    if (summary.dataset_path) {
-      $('section-pattern').disabled = true; $('section-direction').disabled = true;
-    }
-    const bins = canonicalBins((viewer.summary.od || {}).bins || []); const slider = $('section-bin');
-    slider.max = Math.max(0, bins.length - 1); slider.value = 0; slider.dataset.bins = JSON.stringify(bins); updateSectionBinLabel();
-    const catalogFile = findFile(summary.catalog_path); if (catalogFile) catalogFile.text().then((source) => { const rows = parseSmallCsv(source); $('section-id').innerHTML = '<option value="">Choose a directed section</option>' + rows.map((row) => `<option value="${esc(row.section_id)}">${esc(row.line_id)} / ${esc(row.from_stop_id)} → ${esc(row.to_stop_id)}</option>`).join(''); }).catch(() => {});
-    refreshSectionLineChips();
-  }
-  function sectionBins() { try { return JSON.parse($('section-bin').dataset.bins || '[]'); } catch (_) { return []; } }
-  function updateSectionBinLabel() { const bins = sectionBins(); const value = bins[Number($('section-bin')?.value || 0)] || '—'; $('section-bin-label').textContent = value; }
-  function refreshSectionLineChips() { $('section-line-chips').innerHTML = selectedSectionLines().map((line) => `<span class="chip">${esc(line)}</span>`).join('') || '<span class="muted small">No line filter</span>'; applySectionLineFilter(); }
-  function applySectionLineFilter() {
-    if (!viewer.sectionLayer) return;
-    const selected = new Set(selectedSectionLines());
-    viewer.sectionLayer.eachLayer((layer) => { const line = layer.feature?.properties?.line_id; const visible = selected.has(line); if (visible) layer.addTo(viewer.sectionLayer); else viewer.sectionLayer.removeLayer(layer); });
-    // Re-add hidden layers only when the filter changes, without rebuilding geometry.
-    viewer.sectionFeatures.forEach((feature) => { if (!visibleSectionFeature(feature, selected)) return; if (!viewer.sectionLayer.hasLayer(feature._layer)) feature._layer.addTo(viewer.sectionLayer); });
-  }
-  function visibleSectionFeature(feature, selected) { return selected.has(feature.properties?.line_id); }
-  async function readSectionPartition(groupName, bin, filters = {}, limit = 500, offset = 0) {
-    const group = sectionSummary()[groupName] || {}; const descriptor = (group.partitions || []).find((item) => String(item.key) === String(bin));
-    if (!descriptor) return {rows: [], cached: false};
-    const path = descriptor.path || descriptor.file; const file = findFile(path); await validatePartition(file, descriptor);
-    const identity = `${viewer.cacheIdentity}|route_sections|${groupName}|${path}|${descriptor.sha256 || file.size}|${bin}|${offset}|${limit}|${JSON.stringify(filters)}|v${CACHE_VERSION}`;
-    const cached = await cacheGet(identity);
-    if (cached && Array.isArray(cached.rows)) return {rows: cached.rows, total: cached.total ?? cached.rows.length, cached: true};
-    let total = 0;
-    const rows = await new Promise((resolve, reject) => {
-      const worker = new Worker(workerUrl); const collected = [];
-      worker.onmessage = (event) => { if (event.data.type === 'rows') collected.push(...event.data.rows); else { total = event.data.total ?? collected.length; worker.terminate(); resolve(collected); } };
-      worker.onerror = (event) => { worker.terminate(); reject(new Error(event.message || 'CSV worker failed.')); };
-      worker.postMessage({file, filters, offset, limit, scanAll: true, chunkSize: 1024 * 1024});
-    });
-    await cachePut({key: identity, identity, partition: path, rows, total}); return {rows, total, cached: false};
-  }
-  async function inspectSection(feature) {
-    const summary = sectionSummary(); if (!summary.available) return;
-    const bins = sectionBins(); const bin = bins[Number($('section-bin').value || 0)]; const properties = feature.properties || feature || {};
-    const filters = {section_id: properties.section_id}; const lines = selectedSectionLines(); if (lines.length === 1) filters.line_id = lines[0];
-    if (!summary.dataset_path && $('section-pattern').value) filters.pattern_id = $('section-pattern').value;
-    if (!summary.dataset_path && $('section-direction').value) filters.direction = $('section-direction').value;
-    $('section-status').textContent = `Loading section ${properties.section_id} for ${bin}…`;
-    try {
-      const load = summary.dataset_path ? {rows: [], total: 0} : await readSectionPartition('section_loads', bin, filters, 1000);
-      const contributors = await readSectionPartition('contributors', bin, filters, viewer.sectionPageSize, viewer.sectionPage * viewer.sectionPageSize);
-      viewer.selectedSection = properties; const loadRow = load.rows[0] || {}; const distinct = loadRow.distinct_od_count || new Set(contributors.rows.map((row) => `${row.origin_stop_id}|${row.destination_stop_id}`)).size;
-      const serviceMarginal = (summary.flow_semantics || []).includes('service_marginal');
-      const meaning = serviceMarginal
-        ? 'Expected OD use of this scheduled section from cached fixed-routing probabilities; this is not an enumerated route alternative or an exact transfer-count distribution.'
-        : 'Saved path contribution per traversed section; transfer journeys may contribute on multiple legs.';
-      $('section-detail').innerHTML = `<dl><dt>Section</dt><dd>${esc(properties.line_id)} / ${esc(properties.pattern_id || '')}: ${esc(properties.from_stop_id || '')} → ${esc(properties.to_stop_id || '')}</dd><dt>Interval</dt><dd>${esc(bin)} (OD departure interval)</dd><dt>Assigned section flow</dt><dd>${display(loadRow.assigned_flow || contributors.rows.reduce((sum, row) => sum + (num(row.assigned_demand ?? row.assigned_contribution) || 0), 0))}</dd><dt>Distinct ODs</dt><dd>${esc(distinct)}</dd><dt>Meaning</dt><dd>${meaning}</dd></dl>`;
-      renderSectionTable(contributors.rows); $('section-page-label').textContent = `Page ${viewer.sectionPage + 1} of ${Math.max(1, Math.ceil(contributors.total / viewer.sectionPageSize))} (${contributors.total} matching ODs/contributions)`; $('section-status').textContent = `${contributors.cached ? 'Cache hit' : 'Read selected partition'}: selected interval/section only.`;
-    } catch (error) { $('section-status').textContent = `Could not load section: ${error.message}`; }
-  }
-  function chooseSection(feature) { viewer.sectionPage = 0; inspectSection(feature); }
-  function sectionClick(feature) {
-    const properties = feature.properties || {}; const candidates = viewer.sectionFeatures.filter((item) => {
-      const other = item.properties || {};
-      return other.from_stop_id === properties.from_stop_id && other.to_stop_id === properties.to_stop_id;
-    });
-    if (candidates.length > 1) {
-      $('section-detail').innerHTML = `<p>Multiple directed patterns overlap this stop pair. Choose one:</p>${candidates.map((item, index) => `<button type="button" data-section-choice="${index}">${esc(item.properties?.line_id)} / ${esc(item.properties?.pattern_id)} / ${esc(item.properties?.direction || '—')}</button>`).join(' ')}`;
-      candidates.forEach((item, index) => $('section-detail').querySelector(`[data-section-choice="${index}"]`)?.addEventListener('click', () => chooseSection(item)));
-      return;
-    }
-    chooseSection(feature);
-  }
-  async function loadSectionSummary() {
-    if (!sectionSummary().available) return;
-    const bins = sectionBins(); const bin = bins[Number($('section-bin').value || 0)];
-    try {
-      if (sectionSummary().dataset_path) {
-        $('section-status').textContent = `Compact section dataset ready for ${bin}. Contributors remain unopened until a section is selected.`;
-        return;
+        ? `Loaded ${rows.length} of ${total} OD contributors in ${formatElapsed(Math.floor((Date.now() - startedAt) / 1000))}. Signed modeled-mean and linear-flow contributions are preserved.`
+        : `Loaded ${rows.length} bounded contribution rows in ${formatElapsed(Math.floor((Date.now() - startedAt) / 1000))}.`;
+      status.classList.add('ok');
+    } catch (error) {
+      if (requestId === viewer.measurementQueryId) {
+        const elapsed = formatElapsed(Math.floor((Date.now() - startedAt) / 1000));
+        status.textContent = `Could not load OD contributions after ${elapsed}: ${error.message}`;
+        status.classList.add('bad');
       }
-      const summary = await readSectionPartition('section_loads', bin, {}, 100000);
-      $('section-status').textContent = `${summary.cached ? 'Cache hit' : 'Read selected interval'}: ${summary.total} directed section loads for ${bin}. Contributors remain unopened until a section is selected.`;
-    } catch (error) { $('section-status').textContent = `Could not load section summary: ${error.message}`; }
-  }
-  function renderSectionTable(rows) {
-    const target = $('section-table'); if (!rows.length) { target.querySelector('thead').innerHTML = ''; target.querySelector('tbody').innerHTML = '<tr><td class="muted">No matching OD contributors.</td></tr>'; return; }
-    const headers = Object.keys(rows[0]); target.querySelector('thead').innerHTML = `<tr>${headers.map((header) => `<th>${esc(header)}</th>`).join('')}</tr>`;
-    target.querySelector('tbody').innerHTML = rows.slice(0, 500).map((row) => `<tr>${headers.map((header) => `<td>${esc(row[header])}</td>`).join('')}</tr>`).join('');
+    } finally {
+      if (requestId === viewer.measurementQueryId) {
+        if (viewer.measurementQueryTimer) clearInterval(viewer.measurementQueryTimer);
+        viewer.measurementQueryTimer = null;
+        status.classList.remove('is-loading');
+        status.setAttribute('aria-busy', 'false');
+        button.disabled = false;
+        button.textContent = 'Load contributions';
+      }
+    }
   }
 
   async function refreshFlows() {
@@ -880,14 +834,17 @@
   async function renderLineGeometry() {
     const geometry = viewer.summary.line_geometry || viewer.summary.route_sections || {};
     if (!geometry.available || !geometry.geometry_path || !viewer.map || !window.L) return;
-    const file = findFile(geometry.geometry_path); if (!file) return;
+    const file = findFile(geometry.geometry_path);
+    if (!file) return;
     try {
-      const geojson = JSON.parse(await file.text()); viewer.sectionLayer = L.layerGroup().addTo(viewer.map);
-      viewer.sectionFeatures = (geojson.features || []).map((feature) => {
-        const selected = L.geoJSON(feature, {style: {color: '#6a4fb3', weight: 4, opacity: .75}}); const layer = selected.getLayers()[0];
-        feature._layer = layer; layer.feature = feature; layer.on('click', () => sectionClick(feature)); layer.bindTooltip(`${feature.properties?.line_id || ''}: ${feature.properties?.from_stop_id || ''} → ${feature.properties?.to_stop_id || ''}`); layer.addTo(viewer.sectionLayer); return feature;
-      });
-    } catch (error) { setFlowStatus(`Line geometry unavailable: ${error.message}`, ''); }
+      const geojson = JSON.parse(await file.text());
+      L.geoJSON(geojson, {
+        style: {color: '#6a4fb3', weight: 4, opacity: .75},
+        interactive: false,
+      }).addTo(viewer.map);
+    } catch (error) {
+      setFlowStatus(`Line geometry unavailable: ${error.message}`, '');
+    }
   }
 
   async function validateStartup(manifest) {
@@ -915,7 +872,7 @@
       const counts = viewer.manifest.row_counts || {}; $('metrics').innerHTML = [metric('Bundle type', viewer.manifest.bundle_type), metric('Schema', viewer.manifest.schema_version), metric('OD rows', counts['full_od.csv'] ?? 'unknown'), metric('Measurements', counts['predicted_measurements.csv'] ?? 'unknown'), metric('OD partitions', viewer.summary.od?.partitions?.length ?? 'legacy'), metric('Route flows', viewer.summary.route_flows?.available ? 'available' : 'absent'), metric('OD contribution map', viewer.summary.measurement_od_contributions?.available ? 'available' : 'absent'), metric('Identifiability', viewer.manifest.identifiability?.available ? 'available' : 'not available'), metric('Network files', Object.keys(viewer.manifest.files || {}).filter((key) => key.startsWith('network/')).length)].join('');
       const modelLikelihood = viewer.model.likelihood || viewer.model.specification?.likelihood?.family; $('model').innerHTML = renderKeyValue({fingerprint: viewer.manifest.model_fingerprint, likelihood: modelLikelihood}); $('provenance').innerHTML = renderKeyValue(viewer.manifest.provenance || viewer.manifest.fit_provenance); const adequacy = viewer.report.adequacy || {}; $('diagnostic-metrics').innerHTML = [metric('Observed total', adequacy.observed_total), metric('Modeled total', adequacy.modeled_total), metric('MAE', adequacy.mae), metric('RMSE', adequacy.rmse), metric('Report fingerprint', viewer.report.report_fingerprint, 'fingerprint')].join('');
       $('table-content').innerHTML = '<p class="muted">Large tables are available through the partitioned explorer. No complete CSV is parsed at startup.</p>';
-      const executive = findFile('executive_summary.md'); $('executive').innerHTML = executive ? `<pre>${esc(await executive.text())}</pre>` : '<p>No executive summary supplied.</p>'; populateFlowSelectors(); populateMeasurementOdControls(); populateSectionControls(); await renderNetwork(); if (viewer.summary.route_sections?.available) await loadSectionSummary(); else await refreshFlows();
+      const executive = findFile('executive_summary.md'); $('executive').innerHTML = executive ? `<pre>${esc(await executive.text())}</pre>` : '<p>No executive summary supplied.</p>'; populateFlowSelectors(); populateMeasurementOdControls(); await renderNetwork(); await refreshFlows();
       if (!viewer.summary.od) { $('interactive-notice').textContent = 'This is a legacy bundle without partition metadata. The validated tables remain available; route-flow and lazy time-slot exploration require a refreshed export.'; $('interactive-notice').classList.remove('hidden'); }
       if (problems.length) setStatus(`Bundle loaded with startup validation warnings:\n- ${problems.join('\n- ')}`, 'bad'); else setStatus('Bundle manifest and summary loaded. Partition checksums are verified when selected.', 'ok');
     } catch (error) { $('summary').classList.add('hidden'); $('diagnostics').classList.add('hidden'); $('flows').classList.add('hidden'); setStatus(`Could not load bundle: ${error.message}`, 'bad'); }
@@ -934,7 +891,4 @@
   $('measurement-contribution-next')?.addEventListener('click', () => { viewer.measurementContributionPage += 1; refreshMeasurementOd(); });
   $('measurement-od-limit')?.addEventListener('change', () => { viewer.measurementContributionPage = 0; if (viewer.selectedMeasurement) refreshMeasurementOd(); });
   ['measurement-bin', 'measurement-origin', 'measurement-destination'].forEach((id) => $(id)?.addEventListener('change', () => { if ($('measurement-od-direction').value === 'od') refreshMeasurementOd(); }));
-  $('section-lines')?.addEventListener('change', refreshSectionLineChips); $('section-all-lines')?.addEventListener('click', () => { [...$('section-lines').options].forEach((option) => { option.selected = true; }); refreshSectionLineChips(); }); $('section-clear-lines')?.addEventListener('click', () => { [...$('section-lines').options].forEach((option) => { option.selected = false; }); refreshSectionLineChips(); });
-  $('section-pattern')?.addEventListener('change', () => viewer.selectedSection && inspectSection(viewer.selectedSection)); $('section-direction')?.addEventListener('change', () => viewer.selectedSection && inspectSection(viewer.selectedSection)); $('section-bin')?.addEventListener('input', updateSectionBinLabel); $('section-bin')?.addEventListener('change', () => { updateSectionBinLabel(); viewer.sectionPage = 0; loadSectionSummary(); if (viewer.selectedSection) inspectSection(viewer.selectedSection); }); $('section-previous')?.addEventListener('click', () => { const slider = $('section-bin'); slider.value = Math.max(0, Number(slider.value) - 1); slider.dispatchEvent(new Event('change')); }); $('section-next')?.addEventListener('click', () => { const slider = $('section-bin'); slider.value = Math.min(Number(slider.max), Number(slider.value) + 1); slider.dispatchEvent(new Event('change')); }); $('section-page-previous')?.addEventListener('click', () => { viewer.sectionPage = Math.max(0, viewer.sectionPage - 1); if (viewer.selectedSection) inspectSection(viewer.selectedSection); }); $('section-page-next')?.addEventListener('click', () => { viewer.sectionPage += 1; if (viewer.selectedSection) inspectSection(viewer.selectedSection); }); $('section-clear-cache')?.addEventListener('click', clearCache);
-  $('section-inspect')?.addEventListener('click', () => { const id = $('section-id').value; const feature = viewer.sectionFeatures.find((item) => item.properties?.section_id === id); if (feature) chooseSection(feature); else if (id) inspectSection({section_id: id}); });
 })();

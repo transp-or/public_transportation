@@ -1370,14 +1370,10 @@ The report summary is rendered as Markdown. The map uses the bundled stop and
 stop-time files and OpenStreetMap tiles; it requires internet access for the
 background tiles. It does not run Python or recompute the model.
 
-Start it from the repository root with any local static server:
-
-```bash
-uv run --no-project python -m http.server 8765 --directory tools/gravity_viewer
-```
-
-Open <http://localhost:8765>, choose the case's
-`results/viewer_bundle/` directory, and confirm that the page reports
-“Bundle loaded and all manifest checks passed.” The viewer uses the browser's
-directory picker, so the bundle remains in its original location and is never
-copied or changed. Stop the local server after the inspection.
+For on-demand measurement OD queries, start the combined local viewer and
+query service described in [`gravity_viewer_guide.md`](gravity_viewer_guide.md).
+It serves the page and query API from one process at
+<http://127.0.0.1:8765/>. Do not start a separate static server alongside it.
+The viewer uses the browser's directory picker, so the bundle remains in its
+original location and is never copied or changed. Stop the combined server
+after the inspection.

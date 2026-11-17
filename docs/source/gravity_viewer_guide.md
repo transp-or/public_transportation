@@ -43,10 +43,6 @@ viewer_bundle/
     manifest.json
     stops/                          checksummed bounded per-stop pages
   partitions/route_flows/          optional sparse post-fit route flows
-  partitions/route_sections/       optional OD-to-directed-section contributors
-  partitions/section_loads/        optional section-load summaries by OD interval
-  line_geometry/sections.csv       optional directed section catalog
-  line_geometry/lines.geojson      optional compact line geometry
   network/                          optional network snapshot
     stops.csv
     lines.csv
@@ -74,28 +70,23 @@ The viewer source is in the public repository at:
 tools/gravity_viewer/index.html
 ```
 
-There is no build step and no JavaScript package installation. From the public
-repository root, the simplest option is to open the file in the default
-browser:
+There is no build step and no JavaScript package installation. For on-demand
+measurement OD queries, one Python process serves both the viewer files and
+the query API. From the public repository root, run:
 
 ```bash
-cd /path/to/public_transportation
-open tools/gravity_viewer/index.html
+PYTHONPATH=src uv run --frozen python -m public_transportation.inference.gravity.viewer_query_service \
+  --bundle /path/to/viewer_bundle \
+  --fit-manifest /path/to/fit/manifest.json \
+  --mapping-artifact /path/to/temporal_mapping_artifact
 ```
 
-If the browser blocks local-file resources, or if the page does not behave as
-expected when opened directly, serve the static directory locally instead:
-
-```bash
-cd /path/to/public_transportation
-uv run --no-project python -m http.server 8765 --directory tools/gravity_viewer
-```
-
-Then open <http://127.0.0.1:8765/> (or
-<http://localhost:8765/>) in the browser. The server only serves the viewer
-files; the bundle is selected separately through the browser's folder picker.
-Leave this terminal running while the page is open and press `Ctrl-C` when the
-inspection is finished.
+Then open <http://127.0.0.1:8765/> in the browser and select the same bundle
+directory in the folder picker. The server validates the fit and mapping
+identity before serving the page, and binds only to loopback. Keep this single
+process running while using the viewer; press `Ctrl-C` when finished. The
+viewer can still be opened directly as a static file for bundle inspection,
+but on-demand contribution queries require the combined local server.
 
 The viewer uses Leaflet and OpenStreetMap tiles for the optional map. Internet
 access is therefore needed for the map background, but the bundle tables and
@@ -184,24 +175,14 @@ separate and are not attributed to an OD pair. OD contributions decompose the
 modeled mean, not the observed count. Observation time is not the OD
 departure-time bin.
 
-Start the local query service with the exact bundle, fit manifest, and mapping
-artifact used to create the bundle:
-
-```sh
-PYTHONPATH=src python -m public_transportation.inference.gravity.viewer_query_service \
-  --bundle /path/to/viewer_bundle \
-  --fit-manifest /path/to/fit/manifest.json \
-  --mapping-artifact /path/to/temporal_mapping_artifact
-```
-
-The service binds only to `127.0.0.1:8765`. Then open
-`tools/gravity_viewer/index.html`, select the bundle directory, and use
-**Measurement** map mode. The service validates the bundle/fit/mapping
-fingerprints at startup and checks each selected block payload before using
-it. It never rebuilds routing or writes a complete contribution cache. Stop it
-with Ctrl-C when finished. The bundle can also be inspected without the
-service; measured values and map lookup remain available, while contribution
-queries report that the local service is unavailable.
+The combined local server above validates the bundle, fit, and mapping
+fingerprints at startup. It checks each selected block payload before use and
+never rebuilds routing or writes a complete contribution cache. Open the
+served page, select the bundle directory, and use **Measurement** map mode.
+While a query is running, the page shows a spinner and elapsed time; no
+percentage is shown because the query API does not report one. The bundle can
+also be inspected without the service; measured values and map lookup remain
+available, while contribution queries require the local server.
 
 Bundles made before the stop lookup was added remain readable. Map-based row
 selection is reported unavailable when the network snapshot or lookup is
@@ -214,8 +195,11 @@ contributions in either direction: the OD pairs contributing to a selected
 measurement row, or the measured rows affected by one OD-time cell. New bundles
 use the local service for both directions; older bundles with precomputed
 partitions remain readable. Results are ranked by absolute modeled
-contribution. The Python bundle API provides bounded queries for legacy
-precomputed datasets, while the on-demand query API is
+contribution. While a query runs, the viewer shows an animated indicator and
+elapsed time. The service does not report a percentage, so the viewer does not
+present a guessed completion estimate. Keep the viewer tab and local query
+service open until the result or an error appears. The Python bundle API
+provides bounded queries for legacy precomputed datasets, while the on-demand query API is
 `MeasurementODContributionQuery`:
 
 ```python
@@ -254,37 +238,10 @@ shown separately and is not divided among OD pairs. Bundles without a
 compatible mapping or the exact measurement scale report this feature as
 unavailable rather than estimating missing contributions.
 
-## Directed line sections
-
-Bundles produced with an explicit post-fit route export may also contain a
-`route_sections` entry in `viewer_summary.json`. The catalog contains one
-directed section for each consecutive stop pair in each unique line pattern.
-When no validated source shape is available, the geometry is labelled
-`stop_to_stop_approximation`; it is a display connector and must not be read as
-road-following vehicle geometry. Branches and directions retain separate
-pattern and section identities.
-
-The section explorer first loads only the small line geometry and the selected
-OD departure-time interval's section-load summary. Clicking a section then
-loads only that interval's contributor partition. Each contributor preserves
-the OD, stable route-path and leg identity, path share, assigned contribution,
-line/pattern/trip, and realized transfer count. Assigned section flow is the
-sum of the saved path contributions once per traversed section. It is passenger
-section usage (a transfer journey can contribute on more than one line), not a
-count of unique passengers. The interval is the OD departure interval, not the
-clock interval at which a vehicle passes the selected section.
-
-The Python API mirrors the viewer:
-
-```python
-bundle.query_section_load("s-…", departure_time_bin="t3")
-bundle.query_section_od("s-…", departure_time_bin="t3", page=0, page_size=100)
-```
-
-`query_section_od` streams the selected interval and section only, and pages
-the returned rows without truncating the underlying contributor data. Older
-schema-1 bundles explicitly report section data as unavailable and continue to
-support the destination/OD view.
+Older bundles may still contain route-section contributor data. The static
+viewer ignores those partitions; packaged route geometry, when present, is
+drawn only as map context. OD decomposition is available for selected measured
+rows through the measurement query described above.
 
 When the optional display files and a network snapshot are present, the
 **Network map** panel provides two modes:
@@ -384,37 +341,6 @@ export_gravity_route_flows(
 The resulting CSV can be supplied as `route_flow_rows` to the bundle writer;
 the writer partitions it by departure-time bin and records checksums and row
 counts in the manifest.
-
-## Compact OD-to-section product
-
-Bundles may include a compact section-usage dataset when a case-specific
-producer has already materialized section-level rows. The viewer reads this
-dataset directly for bounded section/OD/service queries:
-
-```python
-from public_transportation.inference.gravity import iter_section_usage_rows
-
-rows = iter_section_usage_rows(
-    "section_usage", departure_time_bin="t3", section_id="s-…"
-)
-```
-
-Each row is exactly
-`(departure_time_bin, section_id, origin_stop_id, destination_stop_id,
-line_id, trip_id, assigned_contribution)`. Duplicate contributions are summed
-without changing `service_marginal` semantics or assignment identities. The
-dataset is partitioned by departure interval and carries a completed manifest.
-Parquet/Zstandard is supported when the optional `pyarrow` dependency is
-installed; checksummed CSV shards remain directly queryable by the viewer.
-
-The bundle writer accepts the resulting directory through
-`section_usage_dataset=...`, so section queries stream only
-the selected departure partition and bounded batches.
-
-When trip-level detail is not needed, `write_line_usage_dataset(...)` produces
-the exact line aggregate from the same compact rows (with an intentionally
-blank `trip_id`); it is a separate manifest/product and never replaces the
-trip-level dataset silently.
 
 ## Short checklist
 
