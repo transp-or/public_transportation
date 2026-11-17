@@ -88,6 +88,11 @@ process running while using the viewer; press `Ctrl-C` when finished. The
 viewer can still be opened directly as a static file for bundle inspection,
 but on-demand contribution queries require the combined local server.
 
+Departure-time selectors display the canonical interval boundaries from the
+validated temporal mapping, using the bundle's local schedule time zone. The
+interval IDs remain internal query keys; the displayed end boundary is
+exclusive.
+
 The viewer uses Leaflet and OpenStreetMap tiles for the optional map. Internet
 access is therefore needed for the map background, but the bundle tables and
 diagnostic panels remain useful if the map library or tile service is

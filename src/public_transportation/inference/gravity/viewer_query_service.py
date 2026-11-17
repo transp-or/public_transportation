@@ -79,6 +79,8 @@ class GravityViewerQueryService:
             mapping_artifact_path,
             fit_source_package_revision=fit_source_revision,
         )
+        self.artifact = artifact
+        self.time_zone = bundle_manifest.get("time_zone")
         if summary.get("mapping_manifest_sha256") != artifact.manifest_sha256:
             raise ValueError("mapping manifest checksum differs from the selected viewer bundle.")
         for field, actual in (
@@ -237,6 +239,24 @@ def _handler_for(
                     200,
                     {
                         "service": "gravity_viewer_measurement_queries",
+                        "fit_fingerprint": service.query.cache_namespace[0],
+                        "mapping_artifact_fingerprint": service.query.cache_namespace[1],
+                    },
+                )
+                return
+            if parsed.path == "/api/departure-intervals":
+                self._json(
+                    200,
+                    {
+                        "intervals": [
+                            {
+                                "interval_id": interval.interval_id,
+                                "start_seconds": interval.start_seconds,
+                                "end_seconds": interval.end_seconds,
+                            }
+                            for interval in service.artifact.canonical_index.time_intervals
+                        ],
+                        "time_zone": service.time_zone,
                         "fit_fingerprint": service.query.cache_namespace[0],
                         "mapping_artifact_fingerprint": service.query.cache_namespace[1],
                     },

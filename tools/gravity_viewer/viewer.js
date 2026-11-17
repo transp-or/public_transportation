@@ -103,7 +103,8 @@
     mapClickMode: 'od', measurementLocationManifest: null, selectedMeasurementStop: '',
     selectedMeasurement: null, measurementRows: [], measurementRowPage: 0, measurementRowsPerPage: 50,
     measurementContributionPage: 0, measurementContributions: new Map(), measurementQueryId: 0,
-    measurementQueryTimer: null,
+    measurementQueryTimer: null, departureIntervals: new Map(), departureTimeZone: '',
+    departureIntervalMetadataError: '',
   };
 
   const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[char]));
@@ -385,6 +386,79 @@
     drawFlowMap(rows, title);
   }
   function options(select, values, placeholder = 'All') { select.innerHTML = `<option value="">${esc(placeholder)}</option>${[...new Set(values.filter(Boolean))].sort().map((value) => `<option value="${esc(value)}">${esc(value)}</option>`).join('')}`; }
+  function clockTime(seconds) {
+    const value = Number(seconds);
+    if (!Number.isSafeInteger(value) || value < 0) return null;
+    const hours = Math.floor(value / 3600);
+    const minutes = Math.floor((value % 3600) / 60);
+    const remainder = value % 60;
+    return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}${remainder ? `:${String(remainder).padStart(2, '0')}` : ''}`;
+  }
+  function departureIntervalLabel(intervalId) {
+    const interval = viewer.departureIntervals.get(String(intervalId));
+    if (!interval) return `${intervalId} (time range unavailable)`;
+    const start = clockTime(interval.start_seconds); const end = clockTime(interval.end_seconds);
+    return start && end ? `${start}–${end}` : `${intervalId} (invalid time range)`;
+  }
+  function intervalOptions(select, values, placeholder) {
+    const intervals = canonicalBins(values);
+    select.replaceChildren(new Option(placeholder, ''));
+    intervals.forEach((intervalId) => {
+      const option = new Option(departureIntervalLabel(intervalId), intervalId);
+      option.title = String(intervalId);
+      select.add(option);
+    });
+  }
+  async function loadDepartureIntervalMetadata() {
+    viewer.departureIntervals = new Map();
+    viewer.departureTimeZone = String(viewer.manifest?.time_zone || '');
+    viewer.departureIntervalMetadataError = '';
+    const bundled = viewer.summary.od?.departure_intervals;
+    if (Array.isArray(bundled)) {
+      bundled.forEach((interval) => {
+        if (interval && typeof interval.interval_id === 'string') viewer.departureIntervals.set(interval.interval_id, interval);
+      });
+    }
+    const requestedBins = [...new Set(viewer.summary.od?.bins || [])].map(String);
+    if (requestedBins.length && requestedBins.every((intervalId) => viewer.departureIntervals.has(intervalId))) return;
+    const querySummary = viewer.summary.measurement_od_contributions || {};
+    if (!querySummary.available || querySummary.query_mode !== 'local_service') return;
+    try {
+      const base = new URL($('measurement-query-service').value.trim());
+      if (base.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(base.hostname)) {
+        throw new Error('The local query service URL must use loopback HTTP.');
+      }
+      const response = await fetch(new URL('/api/departure-intervals', base.origin), {cache: 'no-store'});
+      let payload;
+      try { payload = await response.json(); }
+      catch (_) { throw new Error(`Local query service returned HTTP ${response.status} without valid interval metadata.`); }
+      if (!response.ok) throw new Error(payload.error || `Local query service returned HTTP ${response.status}.`);
+      if (payload.fit_fingerprint !== querySummary.fit_fingerprint || payload.mapping_artifact_fingerprint !== querySummary.mapping_artifact_fingerprint || !Array.isArray(payload.intervals)) {
+        throw new Error('Local interval metadata belongs to a different fit or mapping artifact.');
+      }
+      payload.intervals.forEach((interval) => {
+        if (interval && typeof interval.interval_id === 'string') viewer.departureIntervals.set(interval.interval_id, interval);
+      });
+      if (payload.time_zone) viewer.departureTimeZone = String(payload.time_zone);
+    } catch (error) {
+      viewer.departureIntervalMetadataError = error.message;
+    }
+  }
+  function updateIntervalTimeNotes() {
+    const values = [...new Set([
+      ...(viewer.summary.od?.bins || []),
+      ...(viewer.summary.route_flows?.bins || []),
+    ])];
+    const hasAllRanges = values.every((intervalId) => viewer.departureIntervals.has(String(intervalId)));
+    const timeZone = viewer.departureTimeZone ? ` (${viewer.departureTimeZone})` : '';
+    const note = hasAllRanges
+      ? `Local schedule time${timeZone}; interval end is exclusive.`
+      : `Some interval ranges are unavailable; internal slot IDs are shown. ${viewer.departureIntervalMetadataError || 'Use the combined local query service to load exact times.'}`;
+    ['flow-bin-time-note', 'measurement-bin-time-note'].forEach((id) => {
+      const target = $(id);
+      if (target) target.textContent = note;
+    });
+  }
   function canonicalBins(values) {
     return [...new Set(values || [])].sort((a, b) => {
       const ai = Number(String(a).match(/\d+/)?.[0]); const bi = Number(String(b).match(/\d+/)?.[0]);
@@ -394,7 +468,7 @@
   }
   function populateFlowSelectors() {
     const od = viewer.summary.od || {}; const route = viewer.summary.route_flows || {};
-    options($('flow-bin'), canonicalBins(od.bins || []), 'Select time slot');
+    intervalOptions($('flow-bin'), od.bins || [], 'Select departure interval');
     options($('flow-origin'), od.origins || [], 'All origins'); options($('flow-destination'), od.destinations || [], 'All destinations');
     options($('flow-line'), route.lines || [], 'All lines'); options($('flow-trip'), route.trips || [], 'All trips');
     options($('flow-transfers'), route.transfer_counts || ['0', '1', '2', '3'], 'All transfers');
@@ -425,7 +499,7 @@
       $('measurement-od-unavailable').classList.add('hidden');
     }
     const bins = canonicalBins((viewer.summary.od || {}).bins || []);
-    options($('measurement-bin'), bins, 'Select departure interval');
+    intervalOptions($('measurement-bin'), bins, 'Select departure interval');
     options($('measurement-origin'), (viewer.summary.od || {}).origins || [], 'Select origin');
     options($('measurement-destination'), (viewer.summary.od || {}).destinations || [], 'Select destination');
     if (bins.length) $('measurement-bin').value = bins[0];
@@ -867,12 +941,13 @@
         };
       }
       if (!viewer.summary.measurement_od_contributions) viewer.summary.measurement_od_contributions = {available: false, message: 'This bundle predates OD-by-measurement contributions.'};
+      await loadDepartureIntervalMetadata();
       viewer.cacheIdentity = `${viewer.manifest.model_fingerprint || ''}|${viewer.manifest.specification_fingerprint || ''}|${viewer.manifest.report_fingerprint || ''}|${JSON.stringify(viewer.manifest.provenance || {})}`;
       $('summary').classList.remove('hidden'); $('diagnostics').classList.remove('hidden'); $('tables').classList.remove('hidden'); $('flows').classList.remove('hidden');
       const counts = viewer.manifest.row_counts || {}; $('metrics').innerHTML = [metric('Bundle type', viewer.manifest.bundle_type), metric('Schema', viewer.manifest.schema_version), metric('OD rows', counts['full_od.csv'] ?? 'unknown'), metric('Measurements', counts['predicted_measurements.csv'] ?? 'unknown'), metric('OD partitions', viewer.summary.od?.partitions?.length ?? 'legacy'), metric('Route flows', viewer.summary.route_flows?.available ? 'available' : 'absent'), metric('OD contribution map', viewer.summary.measurement_od_contributions?.available ? 'available' : 'absent'), metric('Identifiability', viewer.manifest.identifiability?.available ? 'available' : 'not available'), metric('Network files', Object.keys(viewer.manifest.files || {}).filter((key) => key.startsWith('network/')).length)].join('');
       const modelLikelihood = viewer.model.likelihood || viewer.model.specification?.likelihood?.family; $('model').innerHTML = renderKeyValue({fingerprint: viewer.manifest.model_fingerprint, likelihood: modelLikelihood}); $('provenance').innerHTML = renderKeyValue(viewer.manifest.provenance || viewer.manifest.fit_provenance); const adequacy = viewer.report.adequacy || {}; $('diagnostic-metrics').innerHTML = [metric('Observed total', adequacy.observed_total), metric('Modeled total', adequacy.modeled_total), metric('MAE', adequacy.mae), metric('RMSE', adequacy.rmse), metric('Report fingerprint', viewer.report.report_fingerprint, 'fingerprint')].join('');
       $('table-content').innerHTML = '<p class="muted">Large tables are available through the partitioned explorer. No complete CSV is parsed at startup.</p>';
-      const executive = findFile('executive_summary.md'); $('executive').innerHTML = executive ? `<pre>${esc(await executive.text())}</pre>` : '<p>No executive summary supplied.</p>'; populateFlowSelectors(); populateMeasurementOdControls(); await renderNetwork(); await refreshFlows();
+      const executive = findFile('executive_summary.md'); $('executive').innerHTML = executive ? `<pre>${esc(await executive.text())}</pre>` : '<p>No executive summary supplied.</p>'; populateFlowSelectors(); populateMeasurementOdControls(); updateIntervalTimeNotes(); await renderNetwork(); await refreshFlows();
       if (!viewer.summary.od) { $('interactive-notice').textContent = 'This is a legacy bundle without partition metadata. The validated tables remain available; route-flow and lazy time-slot exploration require a refreshed export.'; $('interactive-notice').classList.remove('hidden'); }
       if (problems.length) setStatus(`Bundle loaded with startup validation warnings:\n- ${problems.join('\n- ')}`, 'bad'); else setStatus('Bundle manifest and summary loaded. Partition checksums are verified when selected.', 'ok');
     } catch (error) { $('summary').classList.add('hidden'); $('diagnostics').classList.add('hidden'); $('flows').classList.add('hidden'); setStatus(`Could not load bundle: ${error.message}`, 'bad'); }
