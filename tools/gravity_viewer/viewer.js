@@ -655,8 +655,12 @@
 
   function updateMeasurementOdDirection() {
     const byMeasurement = $('measurement-od-direction').value === 'measurement';
-    $('measurement-row-picker').classList.toggle('hidden', !byMeasurement);
-    ['measurement-bin-label', 'measurement-origin-label', 'measurement-destination-label'].forEach((id) => $(id).classList.toggle('hidden', byMeasurement));
+    $('measurement-mode-measurement').classList.toggle('hidden', !byMeasurement);
+    $('measurement-mode-od').classList.toggle('hidden', byMeasurement);
+    $('measurement-od').dataset.queryMode = byMeasurement ? 'measurement' : 'od';
+    $('measurement-od-load').textContent = byMeasurement
+      ? 'Load OD contributors'
+      : 'Load affected measurements';
     $('measurement-contribution-previous').disabled = byMeasurement ? !viewer.selectedMeasurement : true;
     $('measurement-contribution-next').disabled = byMeasurement ? !viewer.selectedMeasurement : true;
   }
@@ -946,7 +950,9 @@
     status.setAttribute('aria-busy', 'false');
     const button = $('measurement-od-load');
     button.disabled = false;
-    button.textContent = 'Load contributions';
+    button.textContent = $('measurement-od-direction').value === 'measurement'
+      ? 'Load OD contributors'
+      : 'Load affected measurements';
     $('measurement-query-progress-wrap').classList.add('hidden');
     if (message) status.textContent = message;
   }
@@ -1131,7 +1137,9 @@
         status.classList.remove('is-loading');
         status.setAttribute('aria-busy', 'false');
         button.disabled = false;
-        button.textContent = 'Load contributions';
+        button.textContent = direction === 'measurement'
+          ? 'Load OD contributors'
+          : 'Load affected measurements';
       }
     }
   }
