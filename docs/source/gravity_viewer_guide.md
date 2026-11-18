@@ -88,6 +88,16 @@ process running while using the viewer; press `Ctrl-C` when finished. The
 viewer can still be opened directly as a static file for bundle inspection,
 but on-demand contribution queries require the combined local server.
 
+During startup, the terminal names each loading and validation stage and prints
+an elapsed-time heartbeat every 10 seconds while a stage is still running. It
+also shows throttled progress bars for bundle checksum and CSV-row scans, the
+temporal mapping manifest checksum, and decoding canonical mapping records.
+Network cross-reference checks and measurement-location index validation also
+show row-level progress bars. Repeated full-OD network scans are consolidated
+into a single pass.
+Manifest JSON parsing and index invariant/fingerprint checks still use elapsed
+heartbeats because those operations do not expose reliable incremental totals.
+
 Departure-time selectors display the canonical interval boundaries from the
 validated temporal mapping, using the bundle's local schedule time zone. The
 interval IDs remain internal query keys; the displayed end boundary is
@@ -143,18 +153,13 @@ The explorer distinguishes estimated OD demand from post-fit assignment data:
 - choose a departure-time slot, origin, and destination for origin-first or
   destination-first OD exploration;
 - select **Route-assignment flow** and filter by line, trip, origin,
-  destination, or realized transfer count when `partitions/route_flows/` is
-  present;
+  or destination when `partitions/route_flows/` is present;
 - service totals are expected assigned demand or passenger-leg usage as stated
-  by the bundle, not automatically unique passengers;
-- the transfer selector uses realized route-assignment transfers only. A
-  minimum-feasible-transfer feature used during demand estimation is never
-  substituted for an observed route-choice outcome.
+  by the bundle, not automatically unique passengers.
 
 Existing bundles without `viewer_summary.json` or route-flow partitions remain
-readable. They expose the validated legacy tables and clearly report that
-lazy time-slot and route-level exploration is unavailable until a refreshed
-export is produced.
+readable. The OD demand view remains available when its table is present;
+route-flow controls appear only when route-flow partitions are included.
 
 ## Measured rows by OD pair
 

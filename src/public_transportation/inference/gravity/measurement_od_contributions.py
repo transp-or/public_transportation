@@ -11,7 +11,7 @@ import shutil
 import sqlite3
 import tempfile
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -58,6 +58,15 @@ _COMPONENT_COLUMNS = (
     "mean_floor_adjustment",
     "modeled_mean",
 )
+
+
+class MeasurementODQueryCancelled(RuntimeError):
+    """Raised when a viewer query is superseded by a newer selection."""
+
+
+def _raise_if_cancelled(cancel_check: Callable[[], bool] | None) -> None:
+    if cancel_check is not None and cancel_check():
+        raise MeasurementODQueryCancelled("Query cancelled because the selection changed.")
 
 
 def _query_scale_inputs(
@@ -381,7 +390,10 @@ class MeasurementODContributionQuery:
         *,
         page: int = 0,
         page_size: int = 100,
+        progress_callback: Callable[[str, int, int, str], None] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> dict[str, object]:
+        _raise_if_cancelled(cancel_check)
         if isinstance(measurement_index, bool) or not isinstance(measurement_index, (int, np.integer)):
             raise TypeError("measurement_index must be an integer.")
         measurement_index = int(measurement_index)
@@ -400,8 +412,11 @@ class MeasurementODContributionQuery:
         )
         cached = self._cache.get(cache_key)
         if cached is not None:
+            _raise_if_cancelled(cancel_check)
             self.cache_hits += 1
             self._cache.move_to_end(cache_key)
+            if progress_callback is not None:
+                progress_callback("complete", 1, 1, "Using cached contribution results")
             return copy.deepcopy(cached)
 
         self.cache_misses += 1
@@ -411,7 +426,10 @@ class MeasurementODContributionQuery:
             measurement_interval_id=measurement.interval_id,
             page=page,
             page_size=page_size,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
         )
+        _raise_if_cancelled(cancel_check)
         self._cache[cache_key] = result
         self._cache.move_to_end(cache_key)
         while len(self._cache) > self.max_cached_pages:
@@ -424,8 +442,10 @@ class MeasurementODContributionQuery:
         *,
         page: int = 0,
         page_size: int = 100,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> dict[str, object]:
         """Return affected measurement rows for one physical OD-time cell."""
+        _raise_if_cancelled(cancel_check)
         if isinstance(od_index, bool) or not isinstance(od_index, (int, np.integer)):
             raise TypeError("od_index must be an integer.")
         od_index = int(od_index)
@@ -439,6 +459,7 @@ class MeasurementODContributionQuery:
         cache_key = (*self._namespace, "od", od_index, page, page_size)
         cached = self._cache.get(cache_key)
         if cached is not None:
+            _raise_if_cancelled(cancel_check)
             self.cache_hits += 1
             self._cache.move_to_end(cache_key)
             return copy.deepcopy(cached)
@@ -464,7 +485,9 @@ class MeasurementODContributionQuery:
                 departure_interval_id=cell.departure_interval_id,
                 page=page,
                 page_size=page_size,
+                cancel_check=cancel_check,
             )
+        _raise_if_cancelled(cancel_check)
         self._cache[cache_key] = result
         self._cache.move_to_end(cache_key)
         while len(self._cache) > self.max_cached_pages:
@@ -479,6 +502,7 @@ class MeasurementODContributionQuery:
         departure_interval_id: str,
         page: int,
         page_size: int,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> dict[str, object]:
         od_mean_multipliers = self._scales.get("od_mean_multipliers")
         if od_mean_multipliers is None:
@@ -490,6 +514,10 @@ class MeasurementODContributionQuery:
         with tempfile.TemporaryDirectory(prefix="gravity-od-measurement-query-") as temporary:
             connection = sqlite3.connect(Path(temporary) / "selected_od.sqlite")
             try:
+                connection.set_progress_handler(
+                    lambda: int(cancel_check is not None and cancel_check()),
+                    10_000,
+                )
                 connection.execute("PRAGMA journal_mode=OFF")
                 connection.execute("PRAGMA synchronous=OFF")
                 connection.execute("PRAGMA temp_store=FILE")
@@ -502,7 +530,9 @@ class MeasurementODContributionQuery:
                 )
                 demand = float(np.asarray(self._scales["demand"])[operator_column])
                 for block in self.artifact.iter_blocks_for_departure_interval(departure_interval_id):
+                    _raise_if_cancelled(cancel_check)
                     for start in range(0, block.nonzero_entries, _WRITE_BATCH_SIZE):
+                        _raise_if_cancelled(cancel_check)
                         stop = min(block.nonzero_entries, start + _WRITE_BATCH_SIZE)
                         block_columns = block.column_indices[start:stop]
                         selected = np.flatnonzero(block_columns == operator_column)
@@ -526,12 +556,14 @@ class MeasurementODContributionQuery:
                             ],
                         )
                 connection.commit()
+                _raise_if_cancelled(cancel_check)
                 total = int(connection.execute("SELECT COUNT(*) FROM contributions").fetchone()[0])
                 rows = connection.execute(
                     "SELECT measurement_index, operator_coefficient, linear_flow_contribution, modeled_mean_contribution "
-                    "FROM contributions ORDER BY ABS(modeled_mean_contribution) DESC, measurement_index ASC LIMIT ? OFFSET ?",
+                    "FROM contributions ORDER BY modeled_mean_contribution DESC, measurement_index ASC LIMIT ? OFFSET ?",
                     (page_size, offset),
                 ).fetchall()
+                _raise_if_cancelled(cancel_check)
             finally:
                 connection.close()
         return {
@@ -564,12 +596,18 @@ class MeasurementODContributionQuery:
         measurement_interval_id: str,
         page: int,
         page_size: int,
+        progress_callback: Callable[[str, int, int, str], None] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> dict[str, object]:
         offset = page * page_size
         with tempfile.TemporaryDirectory(prefix="gravity-measurement-query-") as temporary:
             database_path = Path(temporary) / "selected_measurement.sqlite"
             connection = sqlite3.connect(database_path)
             try:
+                connection.set_progress_handler(
+                    lambda: int(cancel_check is not None and cancel_check()),
+                    10_000,
+                )
                 connection.execute("PRAGMA journal_mode=OFF")
                 connection.execute("PRAGMA synchronous=OFF")
                 connection.execute("PRAGMA temp_store=FILE")
@@ -586,12 +624,33 @@ class MeasurementODContributionQuery:
                     initial_mean = 0.0
                 else:
                     initial_mean = float(np.asarray(od_mean_multipliers)[measurement_index])
+                total_nonzero_entries = self.artifact.measurement_interval_nonzero_entries(
+                    measurement_interval_id
+                )
+                completed_nonzero_entries = 0
+                if progress_callback is not None:
+                    progress_callback(
+                        "mapping_scan",
+                        0,
+                        total_nonzero_entries,
+                        "Scanning sparse mapping entries",
+                    )
                 for block in self.artifact.iter_blocks_for_measurement_interval(measurement_interval_id):
+                    _raise_if_cancelled(cancel_check)
                     for start in range(0, block.nonzero_entries, _WRITE_BATCH_SIZE):
+                        _raise_if_cancelled(cancel_check)
                         stop = min(block.nonzero_entries, start + _WRITE_BATCH_SIZE)
                         block_rows = block.row_indices[start:stop]
                         selected = np.flatnonzero(block_rows == measurement_index)
                         if not selected.size:
+                            completed_nonzero_entries += stop - start
+                            if progress_callback is not None:
+                                progress_callback(
+                                    "mapping_scan",
+                                    completed_nonzero_entries,
+                                    total_nonzero_entries,
+                                    "Scanning sparse mapping entries",
+                                )
                             continue
                         columns = np.asarray(block.column_indices[start:stop][selected], dtype=np.int64)
                         coefficients = np.asarray(block.values[start:stop][selected], dtype=np.float64)
@@ -616,7 +675,23 @@ class MeasurementODContributionQuery:
                             "modeled_mean_contribution=modeled_mean_contribution+excluded.modeled_mean_contribution",
                             rows_to_write,
                         )
+                        completed_nonzero_entries += stop - start
+                        if progress_callback is not None:
+                            progress_callback(
+                                "mapping_scan",
+                                completed_nonzero_entries,
+                                total_nonzero_entries,
+                                "Scanning sparse mapping entries",
+                            )
+                if progress_callback is not None:
+                    progress_callback(
+                        "finalizing",
+                        0,
+                        0,
+                        "Combining OD contributions and ranking contributors",
+                    )
                 connection.commit()
+                _raise_if_cancelled(cancel_check)
                 total = int(connection.execute("SELECT COUNT(*) FROM contributions").fetchone()[0])
                 raw_od = float(
                     connection.execute(
@@ -636,15 +711,24 @@ class MeasurementODContributionQuery:
                     connection.commit()
                 rows = connection.execute(
                     "SELECT od_index, operator_coefficient, linear_flow_contribution, modeled_mean_contribution "
-                    "FROM contributions ORDER BY ABS(modeled_mean_contribution) DESC, od_index ASC LIMIT ? OFFSET ?",
+                    "FROM contributions ORDER BY modeled_mean_contribution DESC, od_index ASC LIMIT ? OFFSET ?",
                     (page_size, offset),
                 ).fetchall()
+                _raise_if_cancelled(cancel_check)
+                if progress_callback is not None:
+                    progress_callback(
+                        "complete",
+                        1,
+                        1,
+                        "Contribution ranking complete",
+                    )
             finally:
                 connection.close()
 
         demand = np.asarray(self._scales["demand"])
         contributors: list[dict[str, object]] = []
         for od_index, coefficient, linear_flow, modeled_mean in rows:
+            _raise_if_cancelled(cancel_check)
             cell = self._cell_by_full_index[int(od_index)]
             column = cell.operator_column
             if column is None:

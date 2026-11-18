@@ -15,7 +15,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import nullcontext
 from pathlib import Path
 from time import perf_counter
-from typing import Literal
+from typing import Callable, Literal, TypeVar
 
 import numpy as np
 
@@ -52,6 +52,8 @@ PREFLIGHT_ADOPTION_SCHEMA_VERSION = 1
 _SUPPORTED_VIEWER_TEMPORAL_BLOCK_COMPATIBILITY = frozenset(
     {("579a70af1e15a88d34ad8907b19740db11caff01", TEMPORAL_BLOCK_ARTIFACT_SCHEMA_VERSION)}
 )
+_ViewerProgressCallback = Callable[[str, int, int, str], None]
+_CanonicalRecord = TypeVar("_CanonicalRecord")
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +100,19 @@ class TemporalBlockArtifactReader:
             measurement_interval_id, ()
         ):
             yield self._load_block(item)
+
+    def measurement_interval_nonzero_entries(self, measurement_interval_id: str) -> int:
+        """Return the manifest-backed work size for one measurement interval."""
+        if not measurement_interval_id:
+            raise ValueError("measurement_interval_id must be non-empty.")
+        if measurement_interval_id not in self._measurement_interval_ids:
+            raise ValueError("measurement_interval_id is absent from the canonical index.")
+        return sum(
+            int(item["nonzero_entries"])
+            for item in self._block_items_by_measurement_interval.get(
+                measurement_interval_id, ()
+            )
+        )
 
     def iter_blocks_for_departure_interval(
         self, departure_interval_id: str
@@ -164,6 +179,7 @@ def open_temporal_block_artifact_for_viewer(
     directory: str | Path,
     *,
     fit_source_package_revision: str,
+    progress_callback: _ViewerProgressCallback | None = None,
 ) -> TemporalBlockArtifactReader:
     """Open a mapping for the viewer under an explicit fit/source compatibility contract."""
     fit_revision = str(fit_source_package_revision).strip()
@@ -173,6 +189,7 @@ def open_temporal_block_artifact_for_viewer(
         directory,
         fit_source_package_revision=fit_revision,
         viewer_compatibility=True,
+        progress_callback=progress_callback,
     )
 
 
@@ -181,6 +198,7 @@ def _open_temporal_block_artifact(
     *,
     fit_source_package_revision: str | None,
     viewer_compatibility: bool,
+    progress_callback: _ViewerProgressCallback | None = None,
 ) -> TemporalBlockArtifactReader:
     """Validate an artifact header and return a bounded-memory block reader.
 
@@ -220,7 +238,10 @@ def _open_temporal_block_artifact(
             raise ValueError("temporal block artifact output size is invalid.")
     try:
         identity = AssignmentArtifactIdentity(**manifest["identity"])
-        canonical_index = _decode_canonical_index(manifest["canonical_index"])
+        canonical_index = _decode_canonical_index(
+            manifest["canonical_index"],
+            progress_callback=progress_callback,
+        )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("temporal block artifact identity is invalid.") from error
     if manifest.get("identity_fingerprint") != identity.fingerprint:
@@ -229,7 +250,27 @@ def _open_temporal_block_artifact(
         raise AssignmentCompatibilityError(
             "temporal block artifact identity and canonical index differ."
         )
-    _validate_completion_marker(source, manifest)
+    if progress_callback is not None:
+        progress_callback(
+            "Checking temporal mapping manifest checksum",
+            0,
+            0,
+            manifest_path.name,
+        )
+    manifest_sha256 = _file_sha256(
+        manifest_path,
+        progress_callback=(
+            lambda completed, total: progress_callback(
+                "Checking temporal mapping manifest checksum",
+                completed,
+                total,
+                manifest_path.name,
+            )
+            if progress_callback is not None
+            else None
+        ),
+    )
+    _validate_completion_marker(source, manifest, manifest_sha256=manifest_sha256)
     number_of_measurements = canonical_index.number_of_measurements
     number_of_demand_cells = canonical_index.number_of_demand_cells
     if (
@@ -299,7 +340,7 @@ def _open_temporal_block_artifact(
         identity=identity,
         canonical_index=canonical_index,
         fixed_measurement_offset=offset,
-        manifest_sha256=_file_sha256(manifest_path),
+        manifest_sha256=manifest_sha256,
         nonzero_entries=nonzero_entries,
         artifact_schema_version=int(manifest["schema_version"]),
         source_package_revision=str(source_package_revision),
@@ -347,11 +388,21 @@ def _array_content_hash(value: np.ndarray) -> str:
     return digest.hexdigest()
 
 
-def _file_sha256(path: str | Path) -> str:
+def _file_sha256(
+    path: str | Path,
+    *,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> str:
     digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
+    source = Path(path)
+    total = source.stat().st_size
+    completed = 0
+    with source.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
+            completed += len(chunk)
+            if progress_callback is not None:
+                progress_callback(completed, total)
     return digest.hexdigest()
 
 
@@ -392,7 +443,12 @@ def _publish_completion_marker(directory: str | Path) -> None:
     )
 
 
-def _validate_completion_marker(root: Path, manifest: Mapping[str, object]) -> None:
+def _validate_completion_marker(
+    root: Path,
+    manifest: Mapping[str, object],
+    *,
+    manifest_sha256: str | None = None,
+) -> None:
     marker_path = root / "COMPLETE.json"
     if not marker_path.is_file():
         raise ValueError("completion_marker_missing")
@@ -402,7 +458,8 @@ def _validate_completion_marker(root: Path, manifest: Mapping[str, object]) -> N
     )
     if (
         marker.get("identity_fingerprint") != expected_identity
-        or marker.get("manifest_sha256") != _file_sha256(root / "manifest.json")
+        or marker.get("manifest_sha256")
+        != (manifest_sha256 or _file_sha256(root / "manifest.json"))
     ):
         raise ValueError("completion_marker_invalid")
 
@@ -457,20 +514,66 @@ def _canonical_index_payload(index: CanonicalAssignmentIndex) -> dict[str, objec
     }
 
 
-def _decode_canonical_index(payload: object) -> CanonicalAssignmentIndex:
+def _decode_canonical_index(
+    payload: object,
+    *,
+    progress_callback: _ViewerProgressCallback | None = None,
+) -> CanonicalAssignmentIndex:
     if not isinstance(payload, dict):
         raise ValueError("canonical index payload must be an object.")
+
+    def decode_records(
+        records: object,
+        constructor: Callable[[Mapping[str, object]], _CanonicalRecord],
+        label: str,
+    ) -> tuple[_CanonicalRecord, ...]:
+        if not isinstance(records, list):
+            raise ValueError(f"canonical index {label} must be a list.")
+        total = len(records)
+        if progress_callback is not None:
+            progress_callback(f"Decoding canonical index {label}", 0, total, "")
+
+        def generate() -> Iterator[_CanonicalRecord]:
+            for index, item in enumerate(records, start=1):
+                if not isinstance(item, Mapping):
+                    raise ValueError(f"canonical index {label} entry is invalid.")
+                yield constructor(item)
+                if progress_callback is not None and (
+                    index == total or index % 50_000 == 0
+                ):
+                    progress_callback(
+                        f"Decoding canonical index {label}", index, total, ""
+                    )
+
+        return tuple(generate())
+
     try:
+        time_intervals = decode_records(
+            payload["time_intervals"],
+            lambda item: CanonicalTimeInterval(**item),
+            "time intervals",
+        )
+        demand_cells = decode_records(
+            payload["demand_cells"],
+            lambda item: CanonicalODTimeCell(**item),
+            "OD cells",
+        )
+        measurements = decode_records(
+            payload["measurements"],
+            lambda item: CanonicalMeasurement(**item),
+            "measurements",
+        )
+        if progress_callback is not None:
+            progress_callback(
+                "Validating canonical assignment index",
+                0,
+                0,
+                "checking uniqueness, ordering, bindings, and fingerprints",
+            )
         index = CanonicalAssignmentIndex(
-            time_intervals=tuple(
-                CanonicalTimeInterval(**item) for item in payload["time_intervals"]
-            ),
-            demand_cells=tuple(
-                CanonicalODTimeCell(**item) for item in payload["demand_cells"]
-            ),
-            measurements=tuple(
-                CanonicalMeasurement(**item) for item in payload["measurements"]
-            ),
+            time_intervals=time_intervals,
+            demand_cells=demand_cells,
+            measurements=measurements,
             source_od_layout_fingerprint=payload.get("source_od_layout_fingerprint"),
             source_compact_layout_fingerprint=payload.get(
                 "source_compact_layout_fingerprint"

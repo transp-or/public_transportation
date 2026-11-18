@@ -8,7 +8,7 @@
 (() => {
   'use strict';
 
-  const CACHE_VERSION = 3;
+  const CACHE_VERSION = 4;
   const REQUIRED = ['bundle_manifest.json', 'model_specification.json', 'report.json'];
   const $ = (id) => document.getElementById(id);
   const status = $('status');
@@ -100,10 +100,14 @@
     files: [], fileMap: new Map(), manifest: null, summary: {}, model: {}, report: {},
     map: null, stops: [], stopsById: new Map(), markerLayer: null, selectedOd: null,
     cacheDb: null, cacheIdentity: '', odRows: [], routeRows: [],
+    flowRows: [], flowBufferedRows: [], flowMatchedCount: 0, flowLoadedLimit: 0, flowPage: 0,
+    flowSortColumn: '', flowSortDirection: 'desc', flowTitle: '',
     mapClickMode: 'od', measurementLocationManifest: null, selectedMeasurementStop: '',
     selectedMeasurement: null, measurementRows: [], measurementRowPage: 0, measurementRowsPerPage: 50,
-    measurementContributionPage: 0, measurementContributions: new Map(), measurementQueryId: 0,
-    measurementQueryTimer: null, departureIntervals: new Map(), departureTimeZone: '',
+    measurementContributionPage: 0, measurementContributions: new Map(), measurementOdRows: [],
+    measurementOdSortColumn: 'modeled_mean_contribution', measurementOdSortDirection: 'desc', measurementQueryId: 0,
+    measurementQueryTimer: null, measurementQueryController: null, measurementQueryRequestId: '',
+    measurementStopSelectionId: 0, departureIntervals: new Map(), departureTimeZone: '',
     departureIntervalMetadataError: '',
   };
 
@@ -169,41 +173,50 @@
     }
   }
   async function readPartition(kind, bin, filters = {}, limit = 5000, options = {}) {
+    const returnDetails = options.returnDetails === true;
+    const workerOptions = {...options}; delete workerOptions.returnDetails;
     const group = viewer.summary[kind];
-    if (!group?.available) return [];
+    if (!group?.available) return returnDetails ? {rows: [], total: 0} : [];
     const matching = (group.partitions || []).filter((item) => item.key === bin);
     const descriptors = bin === 'all'
       ? (group.partitions || [])
       : (kind === 'measurement_od_contributions' ? matching : matching.slice(0, 1));
-    const output = [];
+    const output = []; let total = 0;
     const rankOutput = () => {
       output.sort((a, b) => {
-        const left = Math.abs(Number(a[options.rankBy]) || 0);
-        const right = Math.abs(Number(b[options.rankBy]) || 0);
+        const leftValue = Number(a[workerOptions.rankBy]); const rightValue = Number(b[workerOptions.rankBy]);
+        const left = workerOptions.rankAbs ? Math.abs(leftValue) : leftValue;
+        const right = workerOptions.rankAbs ? Math.abs(rightValue) : rightValue;
         return right - left;
       });
       if (output.length > limit) output.length = limit;
     };
     for (const item of descriptors) {
       const path = item.path || item.file; const file = findFile(path); await validatePartition(file, item);
-      const identity = `${viewer.cacheIdentity}|${kind}|${path}|${item.sha256 || file.size}|${JSON.stringify(filters)}|${JSON.stringify(options)}|${limit}|v${CACHE_VERSION}`;
+      const identity = `${viewer.cacheIdentity}|${kind}|${path}|${item.sha256 || file.size}|${JSON.stringify(filters)}|${JSON.stringify(workerOptions)}|${limit}|v${CACHE_VERSION}`;
       const cacheKey = identity;
       const cached = await cacheGet(cacheKey);
       if (cached && Array.isArray(cached.rows)) {
         output.push(...cached.rows);
-        if (options.rankBy) rankOutput();
+        total += Number(cached.total) || cached.rows.length;
+        if (workerOptions.rankBy) rankOutput();
         continue;
       }
-      const rows = await new Promise((resolve, reject) => {
+      const result = await new Promise((resolve, reject) => {
         const worker = new Worker(workerUrl); const collected = [];
-        worker.onmessage = (event) => { if (event.data.type === 'rows') collected.push(...event.data.rows); else { worker.terminate(); resolve(collected); } };
+        let matched = 0;
+        worker.onmessage = (event) => {
+          if (event.data.type === 'rows') collected.push(...event.data.rows);
+          else { matched = Number(event.data.total) || 0; worker.terminate(); resolve({rows: collected, total: matched}); }
+        };
         worker.onerror = (event) => { worker.terminate(); reject(new Error(event.message || 'CSV worker failed.')); };
-        worker.postMessage({file, filters, limit: Math.max(limit, 1), chunkSize: 1024 * 1024, ...options});
+        worker.postMessage({file, filters, limit: Math.max(limit, 1), chunkSize: 1024 * 1024, ...workerOptions});
       });
-      await cachePut({key: cacheKey, identity, partition: path, rows}); output.push(...rows);
-      if (options.rankBy) rankOutput();
+      await cachePut({key: cacheKey, identity, partition: path, rows: result.rows, total: result.total});
+      output.push(...result.rows); total += result.total;
+      if (workerOptions.rankBy) rankOutput();
     }
-    return output.slice(0, limit);
+    return returnDetails ? {rows: output.slice(0, limit), total} : output.slice(0, limit);
   }
 
   async function readDescriptorPage(descriptor, filters, offset, limit, cacheScope) {
@@ -262,8 +275,11 @@
     return {rows, total};
   }
 
+  function measurementContributionCacheIdentity() {
+    return `${viewer.cacheIdentity}|measurement-contributions|modeled-mean-desc-v2`;
+  }
   function measurementContributionMarker(measurementIndex) {
-    return `${viewer.cacheIdentity}|measurement-contributions|${measurementIndex}|v${CACHE_VERSION}`;
+    return `${measurementContributionCacheIdentity()}|${measurementIndex}|v${CACHE_VERSION}`;
   }
 
   async function writeMeasurementContributionBatch(measurementIndex, rows) {
@@ -272,7 +288,7 @@
     rows.forEach((row) => {
       const value = Number(row.modeled_mean_contribution); const odIndex = Number(row.od_index);
       if (!Number.isFinite(value) || !Number.isSafeInteger(odIndex)) throw new Error('Contribution partition contains an invalid value or OD index.');
-      store.put({...row, identity: viewer.cacheIdentity, measurement_index: Number(measurementIndex), od_index: odIndex, rank: -Math.abs(value)});
+      store.put({...row, identity: measurementContributionCacheIdentity(), measurement_index: Number(measurementIndex), od_index: odIndex, rank: -value});
     });
     await new Promise((resolve, reject) => { tx.oncomplete = resolve; tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error); });
   }
@@ -309,11 +325,12 @@
   async function measurementContributionPage(measurementIndex, page, pageSize) {
     const rowCount = await cacheMeasurementContributions(measurementIndex);
     const db = await openCache(); const tx = db.transaction('measurementContributions', 'readonly'); const store = tx.objectStore('measurementContributions');
-    const count = await idbRequest(store.index('byMeasurement').count(IDBKeyRange.only([viewer.cacheIdentity, Number(measurementIndex)])));
+    const identity = measurementContributionCacheIdentity();
+    const count = await idbRequest(store.index('byMeasurement').count(IDBKeyRange.only([identity, Number(measurementIndex)])));
     if (count !== rowCount) throw new Error('Cached contribution index row count is inconsistent. Clear the viewer cache and retry.');
     const start = page * pageSize; const rows = [];
     if (start >= count) return {rows, total: count};
-    const range = IDBKeyRange.bound([viewer.cacheIdentity, Number(measurementIndex), -Number.MAX_VALUE, 0], [viewer.cacheIdentity, Number(measurementIndex), 0, Number.MAX_SAFE_INTEGER]);
+    const range = IDBKeyRange.bound([identity, Number(measurementIndex), -Number.MAX_VALUE, 0], [identity, Number(measurementIndex), Number.MAX_VALUE, Number.MAX_SAFE_INTEGER]);
     await new Promise((resolve, reject) => {
       let skipped = 0; const request = store.index('byRank').openCursor(range);
       request.onerror = () => reject(request.error);
@@ -328,7 +345,7 @@
     return {rows, total: count};
   }
 
-  async function queryLocalMeasurementPage(measurementIndex, page, pageSize) {
+  async function queryLocalMeasurementPage(measurementIndex, page, pageSize, requestId, signal) {
     const summary = viewer.summary.measurement_od_contributions || {};
     const base = new URL($('measurement-query-service').value.trim());
     if (base.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(base.hostname)) {
@@ -338,7 +355,8 @@
     endpoint.searchParams.set('measurement_index', String(measurementIndex));
     endpoint.searchParams.set('page', String(page));
     endpoint.searchParams.set('page_size', String(pageSize));
-    const response = await fetch(endpoint, {cache: 'no-store'});
+    endpoint.searchParams.set('request_id', requestId);
+    const response = await fetch(endpoint, {cache: 'no-store', signal});
     let payload;
     try { payload = await response.json(); }
     catch (_) { throw new Error(`Local query service returned HTTP ${response.status} without a valid JSON response.`); }
@@ -352,7 +370,27 @@
     return payload;
   }
 
-  async function queryLocalOdPage(odIndex, pageSize) {
+  async function queryLocalMeasurementProgress(measurementIndex, requestId, signal) {
+    const summary = viewer.summary.measurement_od_contributions || {};
+    const base = new URL($('measurement-query-service').value.trim());
+    if (base.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(base.hostname)) {
+      throw new Error('The on-demand query service must be an HTTP service on this computer.');
+    }
+    const endpoint = new URL('/api/measurement-query-progress', base.origin);
+    endpoint.searchParams.set('measurement_index', String(measurementIndex));
+    endpoint.searchParams.set('request_id', requestId);
+    const response = await fetch(endpoint, {cache: 'no-store', signal});
+    let payload;
+    try { payload = await response.json(); }
+    catch (_) { throw new Error(`Local query service returned HTTP ${response.status} without valid progress data.`); }
+    if (!response.ok) throw new Error(payload.error || `Local query service returned HTTP ${response.status}.`);
+    if (Number(payload.measurement_index) !== measurementIndex || payload.request_id !== requestId || payload.fit_fingerprint !== summary.fit_fingerprint || payload.mapping_artifact_fingerprint !== summary.mapping_artifact_fingerprint) {
+      throw new Error('Local query progress belongs to a different measurement, fit, or mapping artifact.');
+    }
+    return payload;
+  }
+
+  async function queryLocalOdPage(odIndex, pageSize, requestId, signal) {
     const summary = viewer.summary.measurement_od_contributions || {};
     const base = new URL($('measurement-query-service').value.trim());
     if (base.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(base.hostname)) {
@@ -362,7 +400,8 @@
     endpoint.searchParams.set('od_index', String(odIndex));
     endpoint.searchParams.set('page', '0');
     endpoint.searchParams.set('page_size', String(pageSize));
-    const response = await fetch(endpoint, {cache: 'no-store'});
+    endpoint.searchParams.set('request_id', requestId);
+    const response = await fetch(endpoint, {cache: 'no-store', signal});
     let payload;
     try { payload = await response.json(); }
     catch (_) { throw new Error(`Local query service returned HTTP ${response.status} without a valid JSON response.`); }
@@ -376,14 +415,83 @@
     return payload;
   }
 
-  function renderTable(rows, title = '') {
+  function cancelLocalQuery(requestId) {
+    const summary = viewer.summary.measurement_od_contributions || {};
+    if (!requestId || summary.query_mode !== 'local_service') return;
+    try {
+      const base = new URL($('measurement-query-service').value.trim());
+      if (base.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(base.hostname)) return;
+      const endpoint = new URL('/api/cancel-query', base.origin);
+      endpoint.searchParams.set('request_id', requestId);
+      void fetch(endpoint, {method: 'POST', cache: 'no-store', keepalive: true}).catch(() => {});
+    } catch (_) {
+      // The query service may have been stopped while the viewer was open.
+    }
+  }
+
+  function hasInformativeValue(value) {
+    if (value === null || value === undefined) return false;
+    if (typeof value === 'number') return Number.isFinite(value);
+    const normalized = String(value).trim().toLowerCase();
+    return normalized !== '' && normalized !== 'nan' && normalized !== 'null';
+  }
+  function flowColumnLabel(column) {
+    return ({
+      estimated_to_prior_ratio: 'Estimated / baseline ratio',
+      inference_score: 'Free/fixed indicator (1=estimated, 0=fixed)',
+    })[column] || column;
+  }
+  function compareFlowValues(left, right, column) {
+    const leftValue = left[column]; const rightValue = right[column];
+    const leftText = String(leftValue ?? '').trim(); const rightText = String(rightValue ?? '').trim();
+    if (!leftText && rightText) return 1;
+    if (leftText && !rightText) return -1;
+    if (column === 'departure_time_bin') {
+      const leftInterval = viewer.departureIntervals.get(leftText); const rightInterval = viewer.departureIntervals.get(rightText);
+      if (leftInterval && rightInterval) return Number(leftInterval.start_seconds) - Number(rightInterval.start_seconds);
+    }
+    const leftNumber = leftText === '' ? null : Number(leftText); const rightNumber = rightText === '' ? null : Number(rightText);
+    if (leftNumber !== null && rightNumber !== null && Number.isFinite(leftNumber) && Number.isFinite(rightNumber)) return leftNumber - rightNumber;
+    return leftText.localeCompare(rightText, undefined, {numeric: true, sensitivity: 'base'});
+  }
+  function sortFlowRows() {
+    if (!viewer.flowSortColumn) return;
+    const direction = viewer.flowSortDirection === 'asc' ? 1 : -1;
+    viewer.flowRows.sort((left, right) => direction * compareFlowValues(left, right, viewer.flowSortColumn));
+  }
+  function updateFlowLoadControls() {
+    const loaded = viewer.flowRows.length; const total = viewer.flowMatchedCount;
+    $('flow-more').disabled = loaded === 0 || loaded >= total;
+    $('flow-all').disabled = loaded === 0 || loaded >= total;
+  }
+  function renderTable(rows, title = '', total = rows.length) {
     const target = $('flow-table');
-    if (!rows.length) { target.querySelector('thead').innerHTML = ''; target.querySelector('tbody').innerHTML = `<tr><td class="muted">No rows for this selection.</td></tr>`; return; }
-    const headers = Object.keys(rows[0]);
-    target.querySelector('thead').innerHTML = `<tr>${headers.map((header) => `<th>${esc(header)}</th>`).join('')}</tr>`;
-    target.querySelector('tbody').innerHTML = rows.slice(0, 500).map((row) => `<tr>${headers.map((header) => `<td>${esc(row[header])}</td>`).join('')}</tr>`).join('');
-    $('flow-detail').innerHTML = `<dl><dt>View</dt><dd>${esc(title)}</dd><dt>Rows shown</dt><dd>${display(rows.length)}</dd><dt>Display bound</dt><dd>500 rows; file parsing is streamed in a worker.</dd></dl>`;
-    drawFlowMap(rows, title);
+    if (!rows.length) {
+      target.querySelector('thead').innerHTML = ''; target.querySelector('tbody').innerHTML = '<tr><td class="muted">No rows for this selection.</td></tr>';
+      $('flow-pagination').classList.add('hidden'); $('flow-page-label').textContent = ''; updateFlowLoadControls(); return;
+    }
+    const headers = Object.keys(rows[0]).filter((header) => header !== 'prior_demand' && rows.some((row) => hasInformativeValue(row[header])));
+    if (!headers.length) { target.querySelector('thead').innerHTML = ''; target.querySelector('tbody').innerHTML = '<tr><td class="muted">No populated fields in these rows.</td></tr>'; return; }
+    target.querySelector('thead').innerHTML = `<tr>${headers.map((header) => {
+      const active = viewer.flowSortColumn === header; const direction = active ? viewer.flowSortDirection : '';
+      const marker = direction === 'asc' ? ' ▲' : direction === 'desc' ? ' ▼' : '';
+      return `<th aria-sort="${direction === 'asc' ? 'ascending' : direction === 'desc' ? 'descending' : 'none'}"><button type="button" class="flow-sort" data-flow-sort="${esc(header)}">${esc(flowColumnLabel(header))}${marker}</button></th>`;
+    }).join('')}</tr>`;
+    const pageSize = 50; const pageCount = Math.max(1, Math.ceil(rows.length / pageSize));
+    viewer.flowPage = Math.min(viewer.flowPage, pageCount - 1);
+    const start = viewer.flowPage * pageSize; const pageRows = rows.slice(start, start + pageSize);
+    target.querySelector('tbody').innerHTML = pageRows.map((row) => `<tr>${headers.map((header) => `<td>${esc(header === 'departure_time_bin' && hasInformativeValue(row[header]) ? departureIntervalLabel(row[header]) : row[header])}</td>`).join('')}</tr>`).join('');
+    $('flow-detail').innerHTML = `<dl><dt>View</dt><dd>${esc(title)}</dd><dt>Rows loaded</dt><dd>${display(rows.length)} of ${display(total)} matching rows</dd><dt>Table page</dt><dd>${display(start + 1)}–${display(Math.min(start + pageSize, rows.length))} of ${display(rows.length)} loaded</dd><dt>Sort</dt><dd>${viewer.flowSortColumn ? `${esc(flowColumnLabel(viewer.flowSortColumn))} (${viewer.flowSortDirection}); sorted rows currently loaded` : 'Select a column heading to sort loaded rows'}</dd></dl>`;
+    $('flow-pagination').classList.toggle('hidden', rows.length <= pageSize);
+    $('flow-page-label').textContent = `Page ${viewer.flowPage + 1} of ${pageCount}`;
+    $('flow-page-previous').disabled = viewer.flowPage === 0;
+    $('flow-page-next').disabled = viewer.flowPage + 1 >= pageCount;
+    target.querySelectorAll('button[data-flow-sort]').forEach((button) => button.addEventListener('click', () => {
+      const column = button.dataset.flowSort;
+      viewer.flowSortDirection = viewer.flowSortColumn === column && viewer.flowSortDirection === 'asc' ? 'desc' : 'asc';
+      viewer.flowSortColumn = column; viewer.flowPage = 0; sortFlowRows(); renderTable(viewer.flowRows, viewer.flowTitle, viewer.flowMatchedCount);
+    }));
+    drawFlowMap(pageRows, title); updateFlowLoadControls();
   }
   function options(select, values, placeholder = 'All') { select.innerHTML = `<option value="">${esc(placeholder)}</option>${[...new Set(values.filter(Boolean))].sort().map((value) => `<option value="${esc(value)}">${esc(value)}</option>`).join('')}`; }
   function clockTime(seconds) {
@@ -399,6 +507,16 @@
     if (!interval) return `${intervalId} (time range unavailable)`;
     const start = clockTime(interval.start_seconds); const end = clockTime(interval.end_seconds);
     return start && end ? `${start}–${end}` : `${intervalId} (invalid time range)`;
+  }
+  function measurementPeriodLabel(intervalId) {
+    const interval = viewer.departureIntervals.get(String(intervalId ?? ''));
+    if (!interval) return 'Time range unavailable';
+    const start = clockTime(interval.start_seconds); const end = clockTime(interval.end_seconds);
+    return start && end ? `${start}–${end}` : 'Time range unavailable';
+  }
+  function measurementTimeLabel(value) {
+    const interval = viewer.departureIntervals.get(String(value ?? ''));
+    return interval ? measurementPeriodLabel(value) : String(value ?? '');
   }
   function intervalOptions(select, values, placeholder) {
     const intervals = canonicalBins(values);
@@ -419,8 +537,9 @@
         if (interval && typeof interval.interval_id === 'string') viewer.departureIntervals.set(interval.interval_id, interval);
       });
     }
-    const requestedBins = [...new Set(viewer.summary.od?.bins || [])].map(String);
-    if (requestedBins.length && requestedBins.every((intervalId) => viewer.departureIntervals.has(intervalId))) return;
+    const requestedBins = [...new Set([...(viewer.summary.od?.bins || []), ...(viewer.summary.route_flows?.bins || [])])].map(String);
+    const measurementLocationsAvailable = viewer.summary.measurement_locations?.available === true;
+    if (requestedBins.length && requestedBins.every((intervalId) => viewer.departureIntervals.has(intervalId)) && !measurementLocationsAvailable) return;
     const querySummary = viewer.summary.measurement_od_contributions || {};
     if (!querySummary.available || querySummary.query_mode !== 'local_service') return;
     try {
@@ -466,21 +585,36 @@
       return String(a).localeCompare(String(b));
     });
   }
+  function defaultDepartureInterval(values) {
+    const intervals = canonicalBins(values).map(String);
+    // Bundle producers can set this generic preference without baking a case's
+    // timetable into the reusable viewer. Invalid or absent preferences fall back
+    // to the first interval available in the bundle.
+    const preferred = String(viewer.summary.od?.default_departure_interval_id || '');
+    return intervals.includes(preferred) ? preferred : intervals[0] || '';
+  }
   function populateFlowSelectors() {
     const od = viewer.summary.od || {}; const route = viewer.summary.route_flows || {};
     intervalOptions($('flow-bin'), od.bins || [], 'Select departure interval');
     options($('flow-origin'), od.origins || [], 'All origins'); options($('flow-destination'), od.destinations || [], 'All destinations');
     options($('flow-line'), route.lines || [], 'All lines'); options($('flow-trip'), route.trips || [], 'All trips');
-    options($('flow-transfers'), route.transfer_counts || ['0', '1', '2', '3'], 'All transfers');
-    if ((od.bins || []).length) $('flow-bin').value = od.bins[0];
-    const definition = route.transfer_count_definition || 'No realized route-assignment transfer count is present.';
+    const routeOption = $('flow-kind').querySelector('option[value="route"]');
+    routeOption.hidden = !route.available; routeOption.disabled = !route.available;
+    if (!route.available) $('flow-kind').value = 'od';
+    $('flow-bin').value = defaultDepartureInterval(od.bins || []);
     const semantics = route.flow_semantics || [];
     const serviceMarginal = semantics.includes('service_marginal');
     $('flow-semantics').textContent = route.available
       ? (serviceMarginal
-        ? 'Expected OD use of a scheduled section is a service marginal: each value is the fitted OD demand times its cached probability of using that ride link. It is not an enumerated passenger path or an exact transfer-count distribution.'
-        : `Estimated OD demand is separate from route-assignment flow. ${definition}. A service total is expected assigned demand or passenger-leg usage, not unique passengers when a journey uses multiple legs.`)
-      : `${definition} Existing bundles without route-flow partitions support the OD destination view only.`;
+        ? 'Expected OD use of a scheduled section is a service marginal: each value is fitted OD demand times its cached probability of using that ride link. These are link-use marginals, not enumerated passenger paths.'
+        : 'Estimated OD demand and route-assignment flow are separate values. Route-assignment totals may count passenger legs, so they do not necessarily represent unique passengers.')
+      : 'Estimated OD demand is shown by departure interval, origin, and destination.';
+    updateFlowFilterVisibility();
+  }
+
+  function updateFlowFilterVisibility() {
+    const routeMode = viewer.summary.route_flows?.available && $('flow-kind').value === 'route';
+    ['flow-line-label', 'flow-trip-label'].forEach((id) => $(id).classList.toggle('hidden', !routeMode));
   }
 
   function populateMeasurementOdControls() {
@@ -502,7 +636,7 @@
     intervalOptions($('measurement-bin'), bins, 'Select departure interval');
     options($('measurement-origin'), (viewer.summary.od || {}).origins || [], 'Select origin');
     options($('measurement-destination'), (viewer.summary.od || {}).destinations || [], 'Select destination');
-    if (bins.length) $('measurement-bin').value = bins[0];
+    $('measurement-bin').value = defaultDepartureInterval(bins);
     $('measurement-row-select').disabled = !locations.available;
     $('measurement-row-previous').disabled = !locations.available;
     $('measurement-row-next').disabled = !locations.available;
@@ -532,8 +666,8 @@
     $('map-od-mode').classList.toggle('active', mode === 'od');
     $('map-measurement-mode').classList.toggle('active', mode === 'measurement');
     $('map-click-status').textContent = mode === 'measurement'
-      ? 'Click a stop to inspect its measured rows.'
-      : 'Click stops to choose an OD origin or destination.';
+      ? 'Hover to see the stop ID and name. Click a stop to inspect measurement rows matched to that exact stop ID.'
+      : 'Hover to see the stop ID and name. The first click sets Origin; each later click sets or replaces Destination. OD matching uses the exact stop ID.';
     if (mode === 'measurement') {
       const unmatched = viewer.measurementLocationManifest?.unmatched_stop_ids || [];
       if (unmatched.length) $('map-click-status').textContent += ` ${unmatched.length} measurement stop ID(s) have no exact network stop match; examples: ${unmatched.slice(0, 5).join(', ')}.`;
@@ -556,18 +690,23 @@
   }
 
   async function renderSelectedMeasurementRow(row) {
+    cancelActiveMeasurementOdRequest();
     viewer.selectedMeasurement = row;
     viewer.measurementContributionPage = 0;
+    viewer.measurementOdSortColumn = 'modeled_mean_contribution';
+    viewer.measurementOdSortDirection = 'desc';
     $('measurement-row-select').value = String(row.measurement_index);
-    $('measurement-row-detail').innerHTML = `<dl><dt>Measurement row</dt><dd>${esc(row.measurement_index)}</dd><dt>Measurement type</dt><dd>${esc(row.measurement_type || '—')}</dd><dt>Line</dt><dd>${esc(row.line || '—')}</dd><dt>Direction</dt><dd>${esc(row.direction || '—')}</dd><dt>Stop</dt><dd>${esc(row.stop || '—')}</dd><dt>Observation time</dt><dd>${esc(row.observation_time || '—')}</dd><dt>Observation period</dt><dd>${esc(row.time_period || '—')}</dd><dt>Observed count</dt><dd>${display(row.observed)}</dd><dt>Modeled mean</dt><dd>${display(row.modeled)}</dd></dl>`;
+    $('measurement-row-detail').innerHTML = `<dl><dt>Measurement row</dt><dd>${esc(row.measurement_index)}</dd><dt>Measurement type</dt><dd>${esc(row.measurement_type || '—')}</dd><dt>Line</dt><dd>${esc(row.line || '—')}</dd><dt>Direction</dt><dd>${esc(row.direction || '—')}</dd><dt>Stop</dt><dd>${esc(row.stop || '—')}</dd><dt>Observation time</dt><dd>${esc(measurementTimeLabel(row.observation_time) || '—')}</dd><dt>Observation period</dt><dd>${esc(row.time_period ? measurementPeriodLabel(row.time_period) : '—')}</dd><dt>Observed count</dt><dd>${display(row.observed)}</dd><dt>Modeled mean</dt><dd>${display(row.modeled)}</dd></dl>`;
     if (!(viewer.summary.measurement_od_contributions || {}).available) {
       $('measurement-od-detail').textContent = 'OD contributions are unavailable for this bundle; the measured row values above remain available.';
       renderMeasurementOdRows([]);
       return;
     }
     if ((viewer.summary.measurement_od_contributions || {}).query_mode === 'local_service') {
-      $('measurement-od-detail').textContent = 'The local query service will calculate this row’s components and ranked OD contributors.';
-      await refreshMeasurementOd();
+      $('measurement-od-detail').textContent = $('measurement-od-direction').value === 'measurement'
+        ? 'The local query service will calculate this row’s components and ranked OD contributors.'
+        : 'Refreshing the reverse OD-to-measurement query for the current selection.';
+      await refreshMeasurementOdForCurrentSelection();
       return;
     }
     try {
@@ -575,7 +714,7 @@
       const fixedAttribution = (viewer.summary.measurement_od_contributions || {}).fixed_positive_od_attribution_available === false
         ? `<p class="muted">${esc(viewer.summary.measurement_od_contributions.fixed_positive_od_attribution_message || 'Fixed-positive demand is aggregated in the mapping offset and cannot be assigned to individual OD pairs.')}</p>` : '';
       $('measurement-od-detail').innerHTML = `<dl><dt>Measurement row</dt><dd>${esc(row.measurement_index)}</dd><dt>Observed count</dt><dd>${display(row.observed)}</dd><dt>Modeled mean</dt><dd>${display(components.modeled_mean ?? row.modeled)}</dd><dt>Fixed offset</dt><dd>${display(components.fixed_offset_contribution)}</dd><dt>Additive component</dt><dd>${display(components.additive_contribution)}</dd><dt>Mean-floor adjustment</dt><dd>${display(components.mean_floor_adjustment)}</dd></dl>${fixedAttribution}<p class="muted">OD contributors decompose the modeled mean; they are not a decomposition of the observed count.</p>`;
-      await refreshMeasurementOd();
+      await refreshMeasurementOdForCurrentSelection();
     } catch (error) {
       $('measurement-od-detail').textContent = `Measurement components unavailable: ${error.message}`;
     }
@@ -583,6 +722,7 @@
 
   async function selectMeasurementStop(stopId) {
     stopMeasurementOdQuery('Select a measured row to inspect its OD decomposition.');
+    const selectionId = ++viewer.measurementStopSelectionId;
     viewer.selectedMeasurementStop = stopId;
     viewer.selectedMeasurement = null;
     viewer.measurementRowPage = 0;
@@ -595,6 +735,7 @@
     renderMeasurementOdRows([]);
     try {
       const {rows, total} = await measurementsAtStop(stopId, 0, viewer.measurementRowsPerPage);
+      if (selectionId !== viewer.measurementStopSelectionId) return;
       if (!total) {
         viewer.measurementRows = [];
         $('measurement-row-detail').textContent = 'No measurements at this location.';
@@ -607,7 +748,7 @@
       viewer.measurementRows = rows;
       $('measurement-row-select').disabled = false;
       $('measurement-row-select').innerHTML = rows.map((row) => {
-        const details = [row.measurement_type, row.line, row.direction, row.observation_time ? `observed ${row.observation_time}` : '', row.time_period ? `period ${row.time_period}` : '', row.stop].filter(Boolean).join(' · ');
+        const details = [row.measurement_type, row.line, row.direction, row.observation_time ? `observed ${measurementTimeLabel(row.observation_time)}` : '', row.time_period ? `period ${measurementPeriodLabel(row.time_period)}` : '', row.stop].filter(Boolean).join(' · ');
         return `<option value="${esc(row.measurement_index)}">${esc(row.measurement_index)} — ${esc(details)}</option>`;
       }).join('');
       $('measurement-row-page').textContent = `Rows ${viewer.measurementRowPage * viewer.measurementRowsPerPage + 1}–${viewer.measurementRowPage * viewer.measurementRowsPerPage + rows.length} of ${total}`;
@@ -616,6 +757,7 @@
       await renderSelectedMeasurementRow(rows[0]);
       $('measurement-od').scrollIntoView({behavior: 'smooth', block: 'start'});
     } catch (error) {
+      if (selectionId !== viewer.measurementStopSelectionId) return;
       $('measurement-row-detail').textContent = `Could not read measurements for this stop: ${error.message}`;
       $('map-click-status').textContent = `Measurement lookup failed for ${stopId}: ${error.message}`;
     }
@@ -623,19 +765,25 @@
 
   async function changeMeasurementRowPage(delta) {
     if (!viewer.selectedMeasurementStop) return;
+    stopMeasurementOdQuery('Loading measurements for the selected stop…');
+    const selectionId = ++viewer.measurementStopSelectionId;
     viewer.measurementRowPage = Math.max(0, viewer.measurementRowPage + delta);
     try {
       const {rows, total} = await measurementsAtStop(viewer.selectedMeasurementStop, viewer.measurementRowPage, viewer.measurementRowsPerPage);
+      if (selectionId !== viewer.measurementStopSelectionId) return;
       viewer.measurementRows = rows;
       $('measurement-row-select').innerHTML = rows.map((row) => {
-        const details = [row.measurement_type, row.line, row.direction, row.observation_time ? `observed ${row.observation_time}` : '', row.time_period ? `period ${row.time_period}` : '', row.stop].filter(Boolean).join(' · ');
+        const details = [row.measurement_type, row.line, row.direction, row.observation_time ? `observed ${measurementTimeLabel(row.observation_time)}` : '', row.time_period ? `period ${measurementPeriodLabel(row.time_period)}` : '', row.stop].filter(Boolean).join(' · ');
         return `<option value="${esc(row.measurement_index)}">${esc(row.measurement_index)} — ${esc(details)}</option>`;
       }).join('');
       $('measurement-row-page').textContent = `Rows ${viewer.measurementRowPage * viewer.measurementRowsPerPage + 1}–${viewer.measurementRowPage * viewer.measurementRowsPerPage + rows.length} of ${total}`;
       $('measurement-row-previous').disabled = viewer.measurementRowPage === 0;
       $('measurement-row-next').disabled = (viewer.measurementRowPage + 1) * viewer.measurementRowsPerPage >= total;
       if (rows.length) await renderSelectedMeasurementRow(rows[0]);
-    } catch (error) { $('measurement-row-detail').textContent = `Could not read this measurement page: ${error.message}`; }
+    } catch (error) {
+      if (selectionId !== viewer.measurementStopSelectionId) return;
+      $('measurement-row-detail').textContent = `Could not read this measurement page: ${error.message}`;
+    }
   }
 
   async function readCsvFile(name, filters = {}, limit = 5000) {
@@ -701,12 +849,75 @@
     });
   }
 
+  function measurementOdColumnLabel(column) {
+    return ({
+      od_index: 'OD index',
+      origin_stop_id: 'Origin',
+      destination_stop_id: 'Destination',
+      departure_time_bin: 'Departure interval',
+      estimated_demand: 'Estimated demand',
+      modeled_mean_contribution: 'Modeled flow contribution',
+      linear_flow_contribution: 'Linear flow contribution',
+      operator_coefficient: 'Mapping coefficient',
+      measurement_index: 'Measurement row',
+      measurement_type: 'Measurement type',
+      observation_time: 'Observation time',
+      time_period: 'Observation interval',
+      observed: 'Observed count',
+      modeled: 'Modeled count',
+    })[column] || column.replace(/_/g, ' ');
+  }
+
+  function compareMeasurementOdValues(left, right, column) {
+    const leftText = String(left[column] ?? '').trim();
+    const rightText = String(right[column] ?? '').trim();
+    if (!leftText && rightText) return 1;
+    if (leftText && !rightText) return -1;
+    if (column === 'departure_time_bin') {
+      const leftInterval = viewer.departureIntervals.get(leftText);
+      const rightInterval = viewer.departureIntervals.get(rightText);
+      if (leftInterval && rightInterval) {
+        return Number(leftInterval.start_seconds) - Number(rightInterval.start_seconds);
+      }
+    }
+    const leftNumber = leftText === '' ? null : Number(leftText);
+    const rightNumber = rightText === '' ? null : Number(rightText);
+    if (leftNumber !== null && rightNumber !== null && Number.isFinite(leftNumber) && Number.isFinite(rightNumber)) {
+      return leftNumber - rightNumber;
+    }
+    return leftText.localeCompare(rightText, undefined, {numeric: true, sensitivity: 'base'});
+  }
+
   function renderMeasurementOdRows(rows) {
     const target = $('measurement-od-table');
-    if (!rows.length) { target.querySelector('thead').innerHTML = ''; target.querySelector('tbody').innerHTML = '<tr><td class="muted">No OD contribution entries match this selection.</td></tr>'; return; }
-    const headers = Object.keys(rows[0]);
-    target.querySelector('thead').innerHTML = `<tr>${headers.map((header) => `<th>${esc(header)}</th>`).join('')}</tr>`;
-    target.querySelector('tbody').innerHTML = rows.slice(0, 500).map((row) => `<tr>${headers.map((header) => `<td>${esc(row[header])}</td>`).join('')}</tr>`).join('');
+    if (!rows.length) {
+      viewer.measurementOdRows = [];
+      target.querySelector('thead').innerHTML = '';
+      target.querySelector('tbody').innerHTML = '<tr><td class="muted">No OD contribution entries match this selection.</td></tr>';
+      return;
+    }
+    if (rows !== viewer.measurementOdRows) viewer.measurementOdRows = rows.slice();
+    const direction = viewer.measurementOdSortDirection === 'asc' ? 1 : -1;
+    const sortedRows = viewer.measurementOdRows.slice().sort((left, right) => direction * compareMeasurementOdValues(left, right, viewer.measurementOdSortColumn));
+    const headers = Object.keys(sortedRows[0]);
+    target.querySelector('thead').innerHTML = `<tr>${headers.map((header) => {
+      const active = viewer.measurementOdSortColumn === header;
+      const sortDirection = active ? viewer.measurementOdSortDirection : '';
+      const marker = sortDirection === 'asc' ? ' ▲' : sortDirection === 'desc' ? ' ▼' : '';
+      return `<th aria-sort="${sortDirection === 'asc' ? 'ascending' : sortDirection === 'desc' ? 'descending' : 'none'}"><button type="button" class="flow-sort" data-measurement-od-sort="${esc(header)}">${esc(measurementOdColumnLabel(header))}${marker}</button></th>`;
+    }).join('')}</tr>`;
+    target.querySelector('tbody').innerHTML = sortedRows.map((row) => `<tr>${headers.map((header) => {
+      const value = header === 'departure_time_bin' && hasInformativeValue(row[header])
+        ? departureIntervalLabel(row[header])
+        : row[header];
+      return `<td>${esc(value)}</td>`;
+    }).join('')}</tr>`).join('');
+    target.querySelectorAll('button[data-measurement-od-sort]').forEach((button) => button.addEventListener('click', () => {
+      const column = button.dataset.measurementOdSort;
+      viewer.measurementOdSortDirection = viewer.measurementOdSortColumn === column && viewer.measurementOdSortDirection === 'asc' ? 'desc' : 'asc';
+      viewer.measurementOdSortColumn = column;
+      renderMeasurementOdRows(viewer.measurementOdRows);
+    }));
   }
 
   function formatElapsed(seconds) {
@@ -715,7 +926,17 @@
     return minutes ? `${minutes}m ${String(remainder).padStart(2, '0')}s` : `${remainder}s`;
   }
 
+  function cancelActiveMeasurementOdRequest() {
+    const requestId = viewer.measurementQueryRequestId;
+    const controller = viewer.measurementQueryController;
+    viewer.measurementQueryRequestId = '';
+    viewer.measurementQueryController = null;
+    if (controller) controller.abort();
+    if (requestId) cancelLocalQuery(requestId);
+  }
+
   function stopMeasurementOdQuery(message) {
+    cancelActiveMeasurementOdRequest();
     viewer.measurementQueryId += 1;
     if (viewer.measurementQueryTimer) clearInterval(viewer.measurementQueryTimer);
     viewer.measurementQueryTimer = null;
@@ -726,7 +947,29 @@
     const button = $('measurement-od-load');
     button.disabled = false;
     button.textContent = 'Load contributions';
+    $('measurement-query-progress-wrap').classList.add('hidden');
     if (message) status.textContent = message;
+  }
+
+  async function refreshMeasurementOdForCurrentSelection() {
+    const direction = $('measurement-od-direction').value;
+    if (direction === 'measurement' && !viewer.selectedMeasurement) {
+      stopMeasurementOdQuery('Select a measured row to inspect its OD decomposition.');
+      renderMeasurementOdRows([]);
+      return;
+    }
+    if (direction === 'od') {
+      const bin = $('measurement-bin').value;
+      const origin = $('measurement-origin').value;
+      const destination = $('measurement-destination').value;
+      if (!bin || !origin || !destination) {
+        stopMeasurementOdQuery('Choose a departure interval, origin, and destination.');
+        $('measurement-od-detail').textContent = 'Choose a departure interval, origin, and destination to query this OD cell.';
+        renderMeasurementOdRows([]);
+        return;
+      }
+    }
+    await refreshMeasurementOd();
   }
 
   async function refreshMeasurementOd() {
@@ -744,7 +987,14 @@
       return;
     }
     const onDemand = direction === 'measurement' && summary.query_mode === 'local_service';
+    cancelActiveMeasurementOdRequest();
     const requestId = ++viewer.measurementQueryId;
+    const requestToken = globalThis.crypto?.randomUUID
+      ? globalThis.crypto.randomUUID()
+      : `${Date.now()}-${requestId}-${Math.random().toString(36).slice(2)}`;
+    const controller = new AbortController();
+    viewer.measurementQueryRequestId = requestToken;
+    viewer.measurementQueryController = controller;
     if (viewer.measurementQueryTimer) clearInterval(viewer.measurementQueryTimer);
     const status = $('measurement-od-status');
     const button = $('measurement-od-load');
@@ -754,12 +1004,59 @@
       ? `Calculating OD contributions for measurement row ${measurementIndex} from the local mapping`
       : localService ? 'Querying the selected OD cell in the local mapping service'
         : direction === 'measurement' ? 'Loading this measurement’s sparse contributors into the local cache' : 'Reading indexed sparse contribution partitions';
+    const progressWrap = $('measurement-query-progress-wrap');
+    const progressBar = $('measurement-query-progress-bar');
+    const progressLabel = $('measurement-query-progress-label');
+    progressWrap.classList.toggle('hidden', !onDemand);
+    progressBar.removeAttribute('value');
+    progressLabel.textContent = onDemand ? 'Starting local query…' : '';
+    renderMeasurementOdRows([]);
+    $('measurement-contribution-page').textContent = '';
     const updateLoadingStatus = () => {
       const elapsed = Math.floor((Date.now() - startedAt) / 1000);
-      const progressHint = elapsed >= 15
-        ? 'Still processing; the selected mapping data can take a few minutes to scan. No percentage estimate is available.'
-        : 'Please wait while the selected mapping data is processed.';
+      const progressHint = onDemand
+        ? 'Live mapping progress is shown below.'
+        : elapsed >= 15
+          ? 'Still processing the selected contribution data.'
+          : 'Please wait while the selected contribution data is processed.';
       status.textContent = `${operation}… Elapsed ${formatElapsed(elapsed)}. ${progressHint}`;
+    };
+    let progressPollInFlight = false;
+    const pollQueryProgress = async () => {
+      if (!onDemand || progressPollInFlight || requestId !== viewer.measurementQueryId) return;
+      progressPollInFlight = true;
+      try {
+        const progress = await queryLocalMeasurementProgress(measurementIndex, requestToken, controller.signal);
+        if (requestId !== viewer.measurementQueryId) return;
+        if (progress.status === 'running' && progress.phase === 'mapping_scan' && Number(progress.total) > 0) {
+          const total = Number(progress.total); const completed = Math.min(total, Math.max(0, Number(progress.completed) || 0));
+          progressBar.max = total; progressBar.value = completed;
+          const percent = Math.floor((completed / total) * 100);
+          progressLabel.textContent = `Scanning sparse mapping entries: ${percent}% · ${formatCount(completed)} of ${formatCount(total)} entries.`;
+        } else if (progress.status === 'complete') {
+          progressBar.max = 1; progressBar.value = 1;
+          progressLabel.textContent = progress.message || 'OD contributions are ready.';
+        } else {
+          progressBar.removeAttribute('value');
+          const phaseLabels = {
+            starting: 'Starting the query…',
+            mapping_scan: progress.message || 'Scanning sparse mapping entries…',
+            finalizing: 'Combining OD contributions and ranking contributors…',
+            validating: 'Checking results against the saved measurement prediction…',
+            waiting: progress.message || 'Waiting for the local query…',
+            cancelled: 'Query cancelled because the selection changed.',
+            failed: `Query failed: ${progress.message || 'unknown error'}`,
+          };
+          progressLabel.textContent = phaseLabels[progress.phase] || progress.message || 'Processing the measurement query…';
+        }
+      } catch (_) {
+        if (requestId === viewer.measurementQueryId) {
+          progressBar.removeAttribute('value');
+          progressLabel.textContent = 'Live progress is temporarily unavailable; the elapsed timer continues.';
+        }
+      } finally {
+        progressPollInFlight = false;
+      }
     };
     status.classList.remove('bad', 'ok');
     status.classList.add('is-loading');
@@ -767,13 +1064,14 @@
     button.disabled = true;
     button.textContent = 'Calculating…';
     updateLoadingStatus();
-    viewer.measurementQueryTimer = setInterval(updateLoadingStatus, 10000);
+    void pollQueryProgress();
+    viewer.measurementQueryTimer = setInterval(() => { updateLoadingStatus(); void pollQueryProgress(); }, 2000);
     try {
       let rows; let selectedOd = null; let total = 0; let queryResult = null;
       if (direction === 'measurement') {
         if (!viewer.selectedMeasurement) throw new Error('Select a measurement row from the map first.');
         queryResult = onDemand
-          ? await queryLocalMeasurementPage(measurementIndex, viewer.measurementContributionPage, limit)
+          ? await queryLocalMeasurementPage(measurementIndex, viewer.measurementContributionPage, limit, requestToken, controller.signal)
           : await measurementContributionPage(measurementIndex, viewer.measurementContributionPage, limit);
         rows = queryResult.rows; total = queryResult.total;
         if (onDemand) {
@@ -789,10 +1087,10 @@
         selectedOd = odRows.find((row) => row.departure_time_bin === bin);
         if (!selectedOd) { renderMeasurementOdRows([]); $('measurement-od-status').textContent = 'No fitted OD cell matches that selection.'; return; }
         if (localService) {
-          queryResult = await queryLocalOdPage(Number(selectedOd.od_index), limit);
+          queryResult = await queryLocalOdPage(Number(selectedOd.od_index), limit, requestToken, controller.signal);
           rows = queryResult.rows; total = queryResult.total;
         } else {
-          rows = await readPartition('measurement_od_contributions', bin, {od_index: String(selectedOd.od_index)}, limit, {rankBy: 'modeled_mean_contribution', rankAbs: true});
+          rows = await readPartition('measurement_od_contributions', bin, {od_index: String(selectedOd.od_index)}, limit, {rankBy: 'modeled_mean_contribution', rankAbs: false});
         }
       }
       if (requestId !== viewer.measurementQueryId) return;
@@ -801,26 +1099,35 @@
       renderMeasurementOdRows(rows);
       if (direction === 'measurement') {
         const pageCount = Math.max(1, Math.ceil(total / limit));
-        $('measurement-contribution-page').textContent = `Page ${viewer.measurementContributionPage + 1} of ${pageCount} · ${total} OD contributors, ranked by absolute modeled-mean contribution`;
+        $('measurement-contribution-page').textContent = `Page ${viewer.measurementContributionPage + 1} of ${pageCount} · ${total} OD contributors. Pages start with the largest modeled-mean contributions; column sorting applies to this page.`;
         $('measurement-contribution-previous').disabled = viewer.measurementContributionPage === 0;
         $('measurement-contribution-next').disabled = (viewer.measurementContributionPage + 1) * limit >= total;
       } else {
-        $('measurement-od-detail').innerHTML = `<dl><dt>OD pair</dt><dd>${esc(selectedOd.origin_stop_id)} → ${esc(selectedOd.destination_stop_id)} (${esc(selectedOd.departure_time_bin)})</dd><dt>Estimated demand</dt><dd>${display(selectedOd.estimated_demand)}</dd><dt>Measurement rows shown</dt><dd>${esc(rows.length)}${localService ? ` of ${total}` : ''} (ranked by absolute modeled contribution)</dd></dl>`;
+        $('measurement-od-detail').innerHTML = `<dl><dt>OD pair</dt><dd>${esc(selectedOd.origin_stop_id)} → ${esc(selectedOd.destination_stop_id)} (${esc(selectedOd.departure_time_bin)})</dd><dt>Estimated demand</dt><dd>${display(selectedOd.estimated_demand)}</dd><dt>Measurement rows shown</dt><dd>${esc(rows.length)}${localService ? ` of ${total}` : ''} (ranked by modeled-mean contribution)</dd></dl>`;
       }
       $('measurement-od-status').textContent = direction === 'measurement'
         ? `Loaded ${rows.length} of ${total} OD contributors in ${formatElapsed(Math.floor((Date.now() - startedAt) / 1000))}. Signed modeled-mean and linear-flow contributions are preserved.`
         : `Loaded ${rows.length} bounded contribution rows in ${formatElapsed(Math.floor((Date.now() - startedAt) / 1000))}.`;
       status.classList.add('ok');
+      if (onDemand) {
+        progressBar.max = 1; progressBar.value = 1;
+        progressLabel.textContent = 'OD contributors loaded.';
+      }
     } catch (error) {
       if (requestId === viewer.measurementQueryId) {
         const elapsed = formatElapsed(Math.floor((Date.now() - startedAt) / 1000));
         status.textContent = `Could not load OD contributions after ${elapsed}: ${error.message}`;
         status.classList.add('bad');
+        if (onDemand) { progressBar.removeAttribute('value'); progressLabel.textContent = `Query failed: ${error.message}`; }
       }
     } finally {
       if (requestId === viewer.measurementQueryId) {
         if (viewer.measurementQueryTimer) clearInterval(viewer.measurementQueryTimer);
         viewer.measurementQueryTimer = null;
+        if (viewer.measurementQueryRequestId === requestToken) {
+          viewer.measurementQueryRequestId = '';
+          viewer.measurementQueryController = null;
+        }
         status.classList.remove('is-loading');
         status.setAttribute('aria-busy', 'false');
         button.disabled = false;
@@ -829,21 +1136,49 @@
     }
   }
 
-  async function refreshFlows() {
-    const bin = $('flow-bin').value || 'all'; const limit = Math.max(1, Math.min(500, Number($('flow-limit').value) || 50));
+  async function refreshFlows(limit = 50, preserveSort = false, bufferLimit = Math.max(500, limit)) {
+    const bin = $('flow-bin').value || 'all';
     const kind = $('flow-kind')?.value || 'od'; const filters = {};
     if (kind === 'od') { if ($('flow-origin').value) filters.origin_stop_id = $('flow-origin').value; if ($('flow-destination').value) filters.destination_stop_id = $('flow-destination').value; }
-    else { if ($('flow-line').value) filters.line_id = $('flow-line').value; if ($('flow-trip').value) filters.trip_id = $('flow-trip').value; if ($('flow-origin').value) filters.origin_stop_id = $('flow-origin').value; if ($('flow-destination').value) filters.destination_stop_id = $('flow-destination').value; if ($('flow-transfers').value) filters.transfer_count = $('flow-transfers').value; }
-    setFlowStatus(`Loading ${kind === 'od' ? 'estimated OD demand' : 'route-assignment flows'} for ${bin}…`);
+    else { if ($('flow-line').value) filters.line_id = $('flow-line').value; if ($('flow-trip').value) filters.trip_id = $('flow-trip').value; if ($('flow-origin').value) filters.origin_stop_id = $('flow-origin').value; if ($('flow-destination').value) filters.destination_stop_id = $('flow-destination').value; }
+    const rankBy = kind === 'od' ? 'estimated_demand' : 'assigned_demand';
+    if (!preserveSort || !viewer.flowSortColumn) { viewer.flowSortColumn = rankBy; viewer.flowSortDirection = 'desc'; }
+    $('flow-more').disabled = true; $('flow-all').disabled = true;
+    setFlowStatus(`Scanning ${kind === 'od' ? 'estimated OD demand' : 'route-assignment flows'} for ${bin}; preparing rows ranked by ${kind === 'od' ? 'estimated demand' : 'assigned demand'}…`, 'is-loading');
     try {
-      const rows = await readPartition(kind === 'od' ? 'od' : 'route_flows', bin, filters, limit * 4);
-      if (kind === 'od') {
-        rows.sort((a, b) => (num(b.estimated_demand) || 0) - (num(a.estimated_demand) || 0));
-      } else rows.sort((a, b) => (num(b.assigned_demand) || 0) - (num(a.assigned_demand) || 0));
-      viewer.odRows = kind === 'od' ? rows.slice(0, limit) : []; viewer.routeRows = kind === 'route' ? rows.slice(0, limit) : [];
-      renderTable(rows.slice(0, limit), kind === 'od' ? 'Estimated OD demand' : 'Route-assignment flow');
-      setFlowStatus(`Loaded ${Math.min(rows.length, limit)} bounded rows from ${bin === 'all' ? 'the selected partitions' : 'one time partition'}.`, 'ok');
+      const result = await readPartition(kind === 'od' ? 'od' : 'route_flows', bin, filters, bufferLimit, {rankBy, rankAbs: false, returnDetails: true});
+      viewer.flowBufferedRows = result.rows; viewer.flowRows = result.rows.slice(0, limit);
+      viewer.flowMatchedCount = result.total; viewer.flowLoadedLimit = viewer.flowRows.length; viewer.flowPage = 0;
+      viewer.flowTitle = kind === 'od' ? 'Estimated OD demand' : 'Route-assignment flow';
+      viewer.odRows = kind === 'od' ? result.rows : []; viewer.routeRows = kind === 'route' ? result.rows : [];
+      sortFlowRows(); renderTable(viewer.flowRows, viewer.flowTitle, result.total);
+      setFlowStatus(`Prepared ${display(result.rows.length)} ranked rows; showing ${display(viewer.flowRows.length)} of ${display(result.total)} matches. Use Load 50 more or Load all matching rows to continue.`, 'ok');
     } catch (error) { setFlowStatus(`Could not load partition: ${error.message}`, 'bad'); }
+  }
+
+  async function loadMoreFlows(loadAll = false) {
+    if (!viewer.flowRows.length) return;
+    if (loadAll) {
+      if (viewer.flowBufferedRows.length < viewer.flowMatchedCount) {
+        if (viewer.flowMatchedCount > 5000 && !window.confirm(`Load all ${display(viewer.flowMatchedCount)} matching rows into browser memory? Large results can make the viewer slow or cause the browser tab to run out of memory. Continue?`)) return;
+        await refreshFlows(viewer.flowMatchedCount, true, viewer.flowMatchedCount);
+        return;
+      }
+      viewer.flowRows = viewer.flowBufferedRows.slice(0, viewer.flowMatchedCount);
+    } else {
+      const nextLimit = Math.min(viewer.flowRows.length + 50, viewer.flowMatchedCount);
+      if (nextLimit <= viewer.flowRows.length) { updateFlowLoadControls(); return; }
+      if (nextLimit <= viewer.flowBufferedRows.length) {
+        viewer.flowRows = viewer.flowBufferedRows.slice(0, nextLimit);
+      } else {
+        const nextBufferLimit = Math.min(viewer.flowMatchedCount, Math.max(nextLimit, viewer.flowBufferedRows.length + 500));
+        await refreshFlows(nextLimit, true, nextBufferLimit);
+        return;
+      }
+    }
+    viewer.flowLoadedLimit = viewer.flowRows.length; viewer.flowPage = 0;
+    sortFlowRows(); renderTable(viewer.flowRows, viewer.flowTitle, viewer.flowMatchedCount);
+    setFlowStatus(`Loaded ${display(viewer.flowRows.length)} of ${display(viewer.flowMatchedCount)} matching rows.`, 'ok');
   }
   // Kept as named actions for integrations and the legacy map controls.
   function selectOd(row) { viewer.selectedOd = row; }
@@ -898,7 +1233,7 @@
       const hasMeasurements = Object.prototype.hasOwnProperty.call(indexedStops, stop.stop_id);
       const rowCount = hasMeasurements ? Number(indexedStops[stop.stop_id].row_count) || 0 : 0;
       const marker = L.circleMarker([lat, lon], {radius: hasMeasurements ? 6 : 4, color: hasMeasurements ? '#087f8c' : '#235aa6', fillColor: hasMeasurements ? '#40c4cf' : '#235aa6', fillOpacity: .75});
-      marker.bindTooltip(`${esc(stop.stop_id)}: ${esc(stop.name || '')}${hasMeasurements ? ` · ${rowCount} measurement row(s)` : ''}`)
+      marker.bindTooltip(`Stop ID: ${esc(stop.stop_id)}${stop.name ? ` · ${esc(stop.name)}` : ''}${hasMeasurements ? ` · ${rowCount} measurement row(s)` : ''}`)
         .on('click', () => viewer.mapClickMode === 'measurement' ? selectMeasurementStop(stop.stop_id) : chooseOdStop(stop.stop_id))
         .addTo(viewer.markerLayer);
     });
@@ -945,18 +1280,124 @@
       viewer.cacheIdentity = `${viewer.manifest.model_fingerprint || ''}|${viewer.manifest.specification_fingerprint || ''}|${viewer.manifest.report_fingerprint || ''}|${JSON.stringify(viewer.manifest.provenance || {})}`;
       $('summary').classList.remove('hidden'); $('diagnostics').classList.remove('hidden'); $('tables').classList.remove('hidden'); $('flows').classList.remove('hidden');
       const counts = viewer.manifest.row_counts || {}; $('metrics').innerHTML = [metric('Bundle type', viewer.manifest.bundle_type), metric('Schema', viewer.manifest.schema_version), metric('OD rows', counts['full_od.csv'] ?? 'unknown'), metric('Measurements', counts['predicted_measurements.csv'] ?? 'unknown'), metric('OD partitions', viewer.summary.od?.partitions?.length ?? 'legacy'), metric('Route flows', viewer.summary.route_flows?.available ? 'available' : 'absent'), metric('OD contribution map', viewer.summary.measurement_od_contributions?.available ? 'available' : 'absent'), metric('Identifiability', viewer.manifest.identifiability?.available ? 'available' : 'not available'), metric('Network files', Object.keys(viewer.manifest.files || {}).filter((key) => key.startsWith('network/')).length)].join('');
-      const modelLikelihood = viewer.model.likelihood || viewer.model.specification?.likelihood?.family; $('model').innerHTML = renderKeyValue({fingerprint: viewer.manifest.model_fingerprint, likelihood: modelLikelihood}); $('provenance').innerHTML = renderKeyValue(viewer.manifest.provenance || viewer.manifest.fit_provenance); const adequacy = viewer.report.adequacy || {}; $('diagnostic-metrics').innerHTML = [metric('Observed total', adequacy.observed_total), metric('Modeled total', adequacy.modeled_total), metric('MAE', adequacy.mae), metric('RMSE', adequacy.rmse), metric('Report fingerprint', viewer.report.report_fingerprint, 'fingerprint')].join('');
+      $('model').innerHTML = renderModelSpecification(); $('provenance').innerHTML = renderRunDetails(); $('bundle-files').innerHTML = renderBundleFiles(); $('bundle-path-note').textContent = 'Included-file paths are relative to the selected bundle. Original source paths appear only if recorded in bundle metadata; browser security hides the laptop’s absolute folder path.'; const adequacy = viewer.report.adequacy || {}; $('diagnostic-metrics').innerHTML = [metric('Observed total', adequacy.observed_total), metric('Modeled total', adequacy.modeled_total), metric('MAE', adequacy.mae), metric('RMSE', adequacy.rmse), metric('Report fingerprint', viewer.report.report_fingerprint, 'fingerprint')].join('');
       $('table-content').innerHTML = '<p class="muted">Large tables are available through the partitioned explorer. No complete CSV is parsed at startup.</p>';
-      const executive = findFile('executive_summary.md'); $('executive').innerHTML = executive ? `<pre>${esc(await executive.text())}</pre>` : '<p>No executive summary supplied.</p>'; populateFlowSelectors(); populateMeasurementOdControls(); updateIntervalTimeNotes(); await renderNetwork(); await refreshFlows();
+      const executive = findFile('executive_summary.md'); $('executive').innerHTML = executive ? renderMarkdown(await executive.text()) : '<p>No executive summary supplied.</p>'; populateFlowSelectors(); populateMeasurementOdControls(); updateIntervalTimeNotes(); await renderNetwork(); await refreshFlows();
       if (!viewer.summary.od) { $('interactive-notice').textContent = 'This is a legacy bundle without partition metadata. The validated tables remain available; route-flow and lazy time-slot exploration require a refreshed export.'; $('interactive-notice').classList.remove('hidden'); }
       if (problems.length) setStatus(`Bundle loaded with startup validation warnings:\n- ${problems.join('\n- ')}`, 'bad'); else setStatus('Bundle manifest and summary loaded. Partition checksums are verified when selected.', 'ok');
     } catch (error) { $('summary').classList.add('hidden'); $('diagnostics').classList.add('hidden'); $('flows').classList.add('hidden'); setStatus(`Could not load bundle: ${error.message}`, 'bad'); }
   }
   function metric(label, value, extra = '') { return `<div class="metric"><label>${esc(label)}</label><strong class="${extra}">${esc(value)}</strong></div>`; }
-  function renderKeyValue(value) { if (!value || typeof value !== 'object') return `<p>${esc(value)}</p>`; return `<div class="fingerprint">${Object.entries(value).map(([key, item]) => `<div><b>${esc(key)}:</b> ${esc(typeof item === 'object' ? JSON.stringify(item) : item)}</div>`).join('')}</div>`; }
-  $('folder').addEventListener('change', (event) => load([...event.target.files])); $('flow-refresh').addEventListener('click', refreshFlows); $('flow-clear-cache').addEventListener('click', clearCache); ['flow-bin', 'flow-origin', 'flow-destination', 'flow-line', 'flow-trip', 'flow-transfers', 'flow-kind'].forEach((id) => { if ($(id)) $(id).addEventListener('change', refreshFlows); });
+  function humanize(value) { return String(value ?? '').replace(/^model(\d+)[_-]/i, 'Model $1: ').replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim().replace(/\b[a-z]/g, (letter) => letter.toUpperCase()); }
+  function displayValue(value) { if (value === null || value === undefined || value === '') return 'Not recorded'; if (typeof value === 'boolean') return value ? 'Yes' : 'No'; return String(value); }
+  function formatCount(value) { const number = Number(value); return Number.isFinite(number) ? new Intl.NumberFormat().format(number) : 'Not recorded'; }
+  function formatBytes(value) { const bytes = Number(value); if (!Number.isFinite(bytes) || bytes < 0) return 'size unavailable'; if (bytes < 1024) return `${formatCount(bytes)} B`; const units = ['KB', 'MB', 'GB', 'TB']; let amount = bytes / 1024; let unit = units[0]; for (let index = 0; amount >= 1024 && index < units.length - 1; index += 1) { amount /= 1024; unit = units[index + 1]; } return `${new Intl.NumberFormat(undefined, {maximumFractionDigits: 1}).format(amount)} ${unit}`; }
+  function formatDate(value) { if (!value) return 'Not recorded'; const date = new Date(value); return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString(undefined, {dateStyle: 'medium', timeStyle: 'short'}); }
+  function renderDefinitionList(entries) { const rows = entries.filter(([, value]) => value !== undefined && value !== null && value !== '').map(([label, value]) => `<dt>${esc(label)}</dt><dd>${esc(displayValue(value))}</dd>`); return rows.length ? `<dl class="summary-list">${rows.join('')}</dl>` : '<p>No readable details were recorded.</p>'; }
+  function readableEffects(specification) {
+    const entries = [...(Array.isArray(specification.components) ? specification.components.map((item) => ({...item, kind: 'Component'})) : []), ...(Array.isArray(specification.terms) ? specification.terms.map((item) => ({...item, kind: 'Term'})) : [])];
+    if (!entries.length && specification.legacy && typeof specification.legacy === 'object') for (const [key, value] of Object.entries(specification.legacy)) if (key.endsWith('_scope') && value && value !== 'none') entries.push({name: key.replace(/_scope$/, ''), scope: value, kind: 'Effect'});
+    if (!entries.length) return '<p>The detailed structure is in <code>model_specification.json</code>.</p>';
+    return `<ul class="effect-list">${entries.map((item) => { const details = [item.target ? humanize(item.target) : '', item.scope ? `${humanize(item.scope)} effect` : '', item.source ? `source: ${humanize(item.source)}` : '', item.grouping ? `grouped by ${humanize(item.grouping)}` : '', item.parameterization ? `${humanize(item.parameterization)} parameterization` : '', item.deviation?.scope ? `${humanize(item.deviation.scope)} deviations` : ''].filter(Boolean).join(' · '); return `<li><strong>${esc(humanize(item.name || item.kind))}</strong><span class="muted small">${esc(details || item.kind)}</span></li>`; }).join('')}</ul>`;
+  }
+  function renderModelSpecification() {
+    const specification = viewer.model.specification && typeof viewer.model.specification === 'object' ? viewer.model.specification : viewer.model;
+    const likelihoodValue = specification.likelihood ?? viewer.model.likelihood;
+    const likelihood = likelihoodValue && typeof likelihoodValue === 'object' ? likelihoodValue.family || likelihoodValue.name : likelihoodValue;
+    const entries = [['Model', humanize(specification.model_name || specification.preset || 'Gravity model')], ['Preset', specification.preset ? humanize(specification.preset) : null], ['Likelihood', likelihood ? humanize(likelihood) : null], ['Production input', specification.production_source ? humanize(specification.production_source) : null], ['Destination-attractiveness input', specification.destination_attractiveness_source ? humanize(specification.destination_attractiveness_source) : null]];
+    const time = specification.time && typeof specification.time === 'object' ? Object.entries(specification.time).filter(([, value]) => ['string', 'number', 'boolean'].includes(typeof value) && value !== '').map(([key, value]) => [humanize(key), humanize(value)]) : [];
+    return `${renderDefinitionList([...entries, ...time])}<h4>Included model effects</h4>${readableEffects(specification)}<p class="small muted">Full specification: <code>${esc(viewer.manifest.model_specification?.path || 'model_specification.json')}</code>.</p>`;
+  }
+  function selectedBundleName() { const manifestPath = [...viewer.fileMap.keys()].find((path) => path === 'bundle_manifest.json' || path.endsWith('/bundle_manifest.json')); const parent = manifestPath ? manifestPath.slice(0, -'bundle_manifest.json'.length).replace(/\/$/, '') : ''; return parent ? parent.split('/').pop() : 'Selected viewer bundle'; }
+  function collectTechnicalIdentifiers() {
+    const identifiers = new Map();
+    const visit = (value, prefix = '') => { if (!value || typeof value !== 'object') return; for (const [key, item] of Object.entries(value)) { const label = prefix ? `${prefix}.${key}` : key; if (item && typeof item === 'object') visit(item, label); else if (/(fingerprint|sha256|checksum|revision|commit)/i.test(key) && item !== null && item !== undefined && item !== '') identifiers.set(label, String(item)); } };
+    visit(viewer.manifest.provenance || {}); visit(viewer.manifest.fit_provenance || {}); visit(viewer.manifest.validation_provenance || {}); visit(viewer.manifest.report_provenance || {}); visit(viewer.manifest.route_flow_provenance || {}); visit(viewer.manifest.route_section_provenance || {}); visit(viewer.report.provenance || {});
+    for (const [key, value] of Object.entries(viewer.manifest)) if (/(fingerprint|sha256|checksum|revision|commit)/i.test(key) && value !== null && value !== undefined && typeof value !== 'object') identifiers.set(key, String(value));
+    if (viewer.model.specification_fingerprint) identifiers.set('model_specification_fingerprint', String(viewer.model.specification_fingerprint));
+    return [...identifiers.entries()].sort(([left], [right]) => left.localeCompare(right));
+  }
+  function renderRunDetails() {
+    const fit = viewer.manifest.fit_provenance || {}; const metadata = viewer.manifest.metadata && typeof viewer.manifest.metadata === 'object' ? viewer.manifest.metadata : {};
+    const entries = [['Selected bundle', selectedBundleName()], ['Bundle created', formatDate(viewer.manifest.created_at_utc)], ['Fit outcome', fit.status ? humanize(fit.status) : null], ['Optimizer', fit.optimizer ? humanize(fit.optimizer) : null], ['Fit acceptance', fit.acceptance], ['Time zone', viewer.manifest.time_zone], ...Object.entries(metadata).filter(([key, value]) => !/(fingerprint|sha256|checksum|revision)$/i.test(key) && ['string', 'number', 'boolean'].includes(typeof value) && value !== '').map(([key, value]) => [humanize(key), value])];
+    const technical = collectTechnicalIdentifiers(); const details = technical.length ? `<details class="technical-details"><summary>Technical fingerprints and version identifiers (${formatCount(technical.length)})</summary><div class="fingerprint">${technical.map(([key, value]) => `<div><b>${esc(humanize(key))}:</b> ${esc(value)}</div>`).join('')}</div></details>` : '';
+    return `${renderDefinitionList(entries)}${details}`;
+  }
+  function bundleFileDescription(path) {
+    const base = fileName(path); const descriptions = {'bundle_manifest.json': 'Bundle index, run details, and file checksums', 'viewer_summary.json': 'Index of time partitions and on-demand datasets', 'model_specification.json': 'Model inputs, likelihood, and modeled effects', 'report.json': 'Fit diagnostics and aggregate performance measures', 'executive_summary.md': 'Human-readable report summary', 'full_od.csv': 'Estimated demand by origin, destination, and departure interval', 'predicted_measurements.csv': 'Observed counts and model-predicted counts', 'residuals.csv': 'Measurement-level observed-minus-modeled differences', 'grouped_residuals.csv': 'Residual diagnostics aggregated by group', 'parameters.csv': 'Estimated model parameters', 'identifiability.csv': 'Parameter identifiability classifications', 'od_map.csv': 'Map-ready OD demand summaries', 'stop_summary.csv': 'Observed and modeled values summarized by stop', 'measurement_location_manifest.json': 'Index linking map stops to measurement rows', 'report.html': 'Formatted detailed report'};
+    if (path.startsWith('network/')) return 'Network snapshot used for map display'; if (path.startsWith('partitions/od/')) return 'Estimated OD demand for one time partition'; if (path.startsWith('partitions/route_flows/')) return 'Assigned route flow for one time partition'; if (path.startsWith('partitions/measurement_od_contributions/')) return 'OD contributions to measured rows'; if (path.startsWith('partitions/measurement_locations/')) return 'Map-stop measurement lookup data'; if (path.startsWith('partitions/route_sections/')) return 'Route section geometry and lookup data'; if (path.startsWith('partitions/section_loads/')) return 'Passenger load summaries by route section'; if (path.startsWith('identifiability/')) return 'Parameter identifiability report data'; return descriptions[base] || 'Supporting data included in the viewer bundle';
+  }
+  function bundleFileCategory(path) {
+    if (path === 'bundle_manifest.json' || !path.includes('/')) return ['Summary and report files', 'Summary, model, and report']; if (path.startsWith('network/')) return ['Network snapshot', 'Stops, lines, trips, and stop times'];
+    if (path.startsWith('partitions/')) { const section = path.split('/')[1] || 'other'; const names = {od: 'Estimated OD demand', route_flows: 'Route-assignment flows', measurement_od_contributions: 'OD contributions to measurements', measurement_locations: 'Measurement lookup by stop', route_sections: 'Route section data', section_loads: 'Section load data'}; return [`${names[section] || humanize(section)} partitions`, 'Partitioned data']; }
+    if (path.startsWith('identifiability/')) return ['Identifiability diagnostics', 'Parameter diagnostic data']; return [`${humanize(path.split('/')[0])} files`, 'Supporting files'];
+  }
+  function renderBundleFiles() {
+    const records = {...(viewer.manifest.files || {})}; if (!records['bundle_manifest.json']) records['bundle_manifest.json'] = {size_bytes: findFile('bundle_manifest.json')?.size}; const groups = new Map();
+    for (const [path, record] of Object.entries(records)) { const [title, subtitle] = bundleFileCategory(path); if (!groups.has(title)) groups.set(title, {subtitle, files: []}); groups.get(title).files.push([path, record || {}]); }
+    return [...groups.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([title, group]) => {
+      group.files.sort(([a], [b]) => a.localeCompare(b)); const totalBytes = group.files.reduce((sum, [, record]) => sum + (Number(record.size_bytes ?? record.size) || 0), 0); const totalRows = group.files.reduce((sum, [, record]) => sum + (Number(record.row_count) || 0), 0); const shown = group.files.slice(0, 250);
+      const rows = shown.map(([path, record]) => `<li><code>${esc(path)}</code><span class="small muted">${esc(bundleFileDescription(path))}</span><small>${esc(formatBytes(record.size_bytes ?? record.size))}${record.row_count === undefined ? '' : ` · ${esc(formatCount(record.row_count))} rows`}</small></li>`).join(''); const remainder = group.files.length > shown.length ? `<p class="file-limit-note small muted">Showing ${formatCount(shown.length)} of ${formatCount(group.files.length)} files. The complete file index is in <code>bundle_manifest.json</code>.</p>` : ''; const rowNote = totalRows ? ` · ${formatCount(totalRows)} rows total` : '';
+      return `<details><summary>${esc(title)} — ${formatCount(group.files.length)} files · ${esc(formatBytes(totalBytes))}${rowNote}</summary><p class="small muted">${esc(group.subtitle)}</p><ul class="bundle-file-list">${rows}</ul>${remainder}</details>`;
+    }).join('') || '<p class="muted">No file inventory was recorded.</p>';
+  }
+  function markdownTableCells(line) { return line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((cell) => cell.trim().replace(/\\\|/g, '|')); }
+  function isMarkdownTableStart(lines, index) {
+    if (index + 1 >= lines.length || !lines[index].includes('|')) return false;
+    const header = markdownTableCells(lines[index]); const separators = markdownTableCells(lines[index + 1]);
+    return separators.length === header.length && separators.every((cell) => /^:?-{3,}:?$/.test(cell));
+  }
+  function inlineMarkdown(source) {
+    let value = esc(source);
+    value = value.replace(/`([^`]+)`/g, '<code>$1</code>');
+    value = value.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>').replace(/\*([^*]+)\*/g, '<em>$1</em>');
+    return value.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+  }
+  function renderMarkdown(source) {
+    const lines = String(source ?? '').replace(/\r\n?/g, '\n').split('\n').map((line) => line.replace(/^\\(?=#{1,6}\s|\|)/, '').replace(/\\$/, ''));
+    const blocks = []; let index = 0;
+    while (index < lines.length) {
+      if (!lines[index].trim()) { index += 1; continue; }
+      if (/^\s*```/.test(lines[index])) {
+        const code = []; index += 1;
+        while (index < lines.length && !/^\s*```/.test(lines[index])) code.push(lines[index++]);
+        if (index < lines.length) index += 1;
+        blocks.push(`<pre><code>${esc(code.join('\n'))}</code></pre>`); continue;
+      }
+      if (isMarkdownTableStart(lines, index)) {
+        const header = markdownTableCells(lines[index]); const separators = markdownTableCells(lines[index + 1]);
+        const alignment = separators.map((cell) => cell.startsWith(':') ? (cell.endsWith(':') ? 'center' : 'left') : (cell.endsWith(':') ? 'right' : 'left'));
+        const rows = []; index += 2;
+        while (index < lines.length && lines[index].trim() && lines[index].includes('|')) rows.push(markdownTableCells(lines[index++]));
+        const headerHtml = `<thead><tr>${header.map((cell, column) => `<th style="text-align:${alignment[column]}">${inlineMarkdown(cell)}</th>`).join('')}</tr></thead>`;
+        const bodyHtml = `<tbody>${rows.map((row) => `<tr>${header.map((_, column) => `<td style="text-align:${alignment[column]}">${inlineMarkdown(row[column] ?? '')}</td>`).join('')}</tr>`).join('')}</tbody>`;
+        blocks.push(`<div class="table-wrap markdown-table"><table>${headerHtml}${bodyHtml}</table></div>`); continue;
+      }
+      const heading = lines[index].match(/^\s{0,3}(#{1,6})\s+(.+)$/);
+      if (heading) { const level = Math.min(heading[1].length, 4); blocks.push(`<h${level}>${inlineMarkdown(heading[2].replace(/\s+#+\s*$/, ''))}</h${level}>`); index += 1; continue; }
+      if (/^\s*[-*+]\s+/.test(lines[index])) {
+        const items = []; while (index < lines.length && /^\s*[-*+]\s+/.test(lines[index])) items.push(`<li>${inlineMarkdown(lines[index++].replace(/^\s*[-*+]\s+/, ''))}</li>`);
+        blocks.push(`<ul>${items.join('')}</ul>`); continue;
+      }
+      if (/^\s*\d+\.\s+/.test(lines[index])) {
+        const items = []; while (index < lines.length && /^\s*\d+\.\s+/.test(lines[index])) items.push(`<li>${inlineMarkdown(lines[index++].replace(/^\s*\d+\.\s+/, ''))}</li>`);
+        blocks.push(`<ol>${items.join('')}</ol>`); continue;
+      }
+      const paragraph = []; while (index < lines.length && lines[index].trim() && !/^\s*```/.test(lines[index]) && !/^\s{0,3}#{1,6}\s+/.test(lines[index]) && !isMarkdownTableStart(lines, index)) paragraph.push(inlineMarkdown(lines[index++]));
+      blocks.push(`<p>${paragraph.join('<br>')}</p>`);
+    }
+    return blocks.join('\n');
+  }
+  $('folder').addEventListener('change', (event) => load([...event.target.files])); $('flow-refresh').addEventListener('click', () => refreshFlows()); $('flow-more').addEventListener('click', () => loadMoreFlows()); $('flow-all').addEventListener('click', () => loadMoreFlows(true)); $('flow-page-previous').addEventListener('click', () => { viewer.flowPage = Math.max(0, viewer.flowPage - 1); renderTable(viewer.flowRows, viewer.flowTitle, viewer.flowMatchedCount); }); $('flow-page-next').addEventListener('click', () => { viewer.flowPage += 1; renderTable(viewer.flowRows, viewer.flowTitle, viewer.flowMatchedCount); }); $('flow-clear-cache').addEventListener('click', clearCache); ['flow-bin', 'flow-origin', 'flow-destination', 'flow-line', 'flow-trip'].forEach((id) => { if ($(id)) $(id).addEventListener('change', () => refreshFlows()); }); $('flow-kind').addEventListener('change', () => { updateFlowFilterVisibility(); refreshFlows(); });
   $('map-od-mode')?.addEventListener('click', () => setMapClickMode('od')); $('map-measurement-mode')?.addEventListener('click', () => setMapClickMode('measurement'));
-  $('measurement-od-direction')?.addEventListener('change', updateMeasurementOdDirection); $('measurement-od-load')?.addEventListener('click', refreshMeasurementOd);
+  $('measurement-od-direction')?.addEventListener('change', () => {
+    updateMeasurementOdDirection();
+    viewer.measurementContributionPage = 0;
+    viewer.measurementOdSortColumn = 'modeled_mean_contribution';
+    viewer.measurementOdSortDirection = 'desc';
+    void refreshMeasurementOdForCurrentSelection();
+  });
+  $('measurement-od-load')?.addEventListener('click', refreshMeasurementOd);
   $('measurement-row-select')?.addEventListener('change', () => {
     const row = viewer.measurementRows.find((item) => String(item.measurement_index) === $('measurement-row-select').value);
     if (row) renderSelectedMeasurementRow(row);
@@ -964,6 +1405,11 @@
   $('measurement-row-previous')?.addEventListener('click', () => changeMeasurementRowPage(-1)); $('measurement-row-next')?.addEventListener('click', () => changeMeasurementRowPage(1));
   $('measurement-contribution-previous')?.addEventListener('click', () => { viewer.measurementContributionPage = Math.max(0, viewer.measurementContributionPage - 1); refreshMeasurementOd(); });
   $('measurement-contribution-next')?.addEventListener('click', () => { viewer.measurementContributionPage += 1; refreshMeasurementOd(); });
-  $('measurement-od-limit')?.addEventListener('change', () => { viewer.measurementContributionPage = 0; if (viewer.selectedMeasurement) refreshMeasurementOd(); });
-  ['measurement-bin', 'measurement-origin', 'measurement-destination'].forEach((id) => $(id)?.addEventListener('change', () => { if ($('measurement-od-direction').value === 'od') refreshMeasurementOd(); }));
+  $('measurement-od-limit')?.addEventListener('change', () => {
+    viewer.measurementContributionPage = 0;
+    void refreshMeasurementOdForCurrentSelection();
+  });
+  ['measurement-bin', 'measurement-origin', 'measurement-destination'].forEach((id) => $(id)?.addEventListener('change', () => {
+    if ($('measurement-od-direction').value === 'od') void refreshMeasurementOdForCurrentSelection();
+  }));
 })();

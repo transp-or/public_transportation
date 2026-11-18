@@ -19,6 +19,9 @@
     .status { margin-top: 12px; padding: 10px 12px; border-radius: 8px; background: #eef2f8; color: #42516a; white-space: pre-wrap; }
     .status.is-loading { display: flex; align-items: center; gap: 10px; }
     .status.is-loading::before { content: ''; flex: 0 0 14px; width: 14px; height: 14px; border: 2px solid #a9b7ca; border-right-color: #235aa6; border-radius: 50%; animation: status-spin .8s linear infinite; }
+    .query-progress { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(220px, 2fr); align-items: center; gap: 10px; margin: 10px 0; }
+    .query-progress progress { width: 100%; height: 14px; accent-color: #235aa6; }
+    @media (max-width: 600px) { .query-progress { grid-template-columns: 1fr; } }
     @keyframes status-spin { to { transform: rotate(360deg); } }
     @media (prefers-reduced-motion: reduce) { .status.is-loading::before { animation-duration: 2s; } }
     .status.ok { background: #e9f8ef; color: #17663a; }
@@ -34,11 +37,30 @@
     table { width: 100%; border-collapse: collapse; font-size: 12px; white-space: nowrap; }
     th, td { padding: 8px 10px; border-bottom: 1px solid #edf0f5; text-align: left; }
     th { position: sticky; top: 0; color: #4b5b75; background: #f5f7fb; }
+    .flow-sort { border: 0; padding: 0; background: transparent; color: inherit; font: inherit; font-weight: 700; text-align: left; cursor: pointer; }
+    .flow-sort:focus-visible { outline: 2px solid #235aa6; outline-offset: 2px; }
     .muted { color: #69758a; }
     .fingerprint { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; word-break: break-all; }
+    .summary-list { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 7px 14px; margin: 0; font-size: 14px; }
+    .summary-list dt { color: #69758a; }
+    .summary-list dd { margin: 0; overflow-wrap: anywhere; color: #27354d; }
+    .effect-list, .bundle-file-list { margin: 8px 0 0; padding: 0; list-style: none; }
+    .effect-list li { padding: 7px 0; border-top: 1px solid #edf0f5; }
+    .effect-list li strong { color: #27354d; }
+    .effect-list li span { display: block; margin-top: 2px; }
+    .technical-details, .bundle-files details { margin-top: 10px; padding: 10px 12px; border: 1px solid #e1e6ef; border-radius: 8px; background: #fafcff; }
+    .technical-details summary, .bundle-files summary { cursor: pointer; color: #34445f; font-weight: 600; }
+    .technical-details .fingerprint { margin-top: 10px; }
+    .bundle-files details { margin-top: 8px; }
+    .bundle-file-list { margin-top: 8px; }
+    .bundle-file-list li { display: grid; grid-template-columns: minmax(180px, 1.2fr) minmax(180px, 1.5fr) minmax(110px, .7fr); gap: 8px 14px; padding: 7px 0; border-top: 1px solid #edf0f5; align-items: baseline; }
+    .bundle-file-list code { overflow-wrap: anywhere; color: #27354d; }
+    .bundle-file-list small { color: #69758a; text-align: right; }
+    .bundle-files .file-limit-note { margin: 8px 0 0; }
     #map { height: 620px; border-radius: 10px; background: #e9eef5; }
     .toolbar { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; margin-bottom: 14px; }
     .toolbar label { display: grid; gap: 4px; color: #4b5b75; font-size: 12px; }
+    #map-click-status { flex-basis: 100%; }
     .toolbar input, .toolbar select, .toolbar button { min-height: 34px; box-sizing: border-box; border: 1px solid #cbd5e5; border-radius: 6px; background: white; color: #172033; padding: 6px 9px; }
     .toolbar button { cursor: pointer; font-weight: 600; }
     .toolbar button.active { color: white; border-color: #235aa6; background: #235aa6; }
@@ -63,10 +85,14 @@
     .markdown h3 { font-size: 16px; }
     .markdown p { margin: 8px 0; line-height: 1.5; }
     .markdown ul, .markdown ol { margin: 8px 0; padding-left: 24px; }
+    .markdown-table { margin: 10px 0; }
+    .markdown-table table { font-size: 14px; white-space: normal; }
+    .markdown-table th, .markdown-table td { vertical-align: top; }
     .markdown code { padding: 2px 4px; border-radius: 4px; background: #eef2f8; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9em; }
     .markdown pre { overflow: auto; padding: 12px; border-radius: 8px; background: #172033; color: #f5f7fb; }
     .markdown pre code { padding: 0; background: transparent; color: inherit; }
     .hidden { display: none; }
+    @media (max-width: 700px) { .bundle-file-list li { grid-template-columns: 1fr; gap: 3px; } .bundle-file-list small { text-align: left; } }
     @media (max-width: 600px) { main { width: min(100% - 24px, 1400px); } .panel { padding: 14px; } }
   </style>
 </head>
@@ -90,8 +116,11 @@
       <div id="metrics" class="grid"></div>
       <div class="two">
         <div><h3>Model specification</h3><div id="model" class="muted"></div></div>
-        <div><h3>Provenance</h3><div id="provenance" class="muted"></div></div>
+        <div><h3>Run details</h3><div id="provenance" class="muted"></div></div>
       </div>
+      <h3>Files in this bundle</h3>
+      <p id="bundle-path-note" class="muted small"></p>
+      <div id="bundle-files" class="bundle-files"></div>
     </section>
 
     <section id="diagnostics" class="panel hidden">
@@ -103,14 +132,14 @@
 
     <section id="network-map" class="panel hidden">
       <h2>Network map</h2>
-      <p class="muted">Bundled stops and approximate route paths over an OpenStreetMap background. Teal stops have measurement rows.</p>
+      <p class="muted">Markers come from <code>network/stops.csv</code>. Hover to see the stop ID and name; the viewer matches that exact stop ID to the OD data’s <code>origin_stop_id</code> and <code>destination_stop_id</code>. Teal stops have measurement rows.</p>
       <div id="interactive-notice" class="notice hidden"></div>
       <div id="measurement-unmatched-notice" class="notice hidden"></div>
       <div id="map-click-toolbar" class="toolbar">
         <span class="muted">Map click mode</span>
         <button id="map-od-mode" type="button" class="active">OD selection</button>
         <button id="map-measurement-mode" type="button">Measurement</button>
-        <span id="map-click-status" class="muted">Click a stop to select an OD origin or destination.</span>
+        <span id="map-click-status" class="muted">Hover to see a stop’s ID and name. The first click sets Origin; each later click sets or replaces Destination. OD matching uses the exact stop ID.</span>
       </div>
       <div id="map-toolbar" class="toolbar hidden">
         <button id="stops-mode" type="button" class="active">Stops</button>
@@ -172,30 +201,34 @@
         <label>Destination
           <select id="flow-destination"></select>
         </label>
-        <label>Line
+        <label id="flow-line-label">Line
           <select id="flow-line"></select>
         </label>
-        <label>Trip
+        <label id="flow-trip-label">Trip
           <select id="flow-trip"></select>
         </label>
-        <label>Transfers
-          <select id="flow-transfers"><option value="">All</option></select>
-        </label>
-        <label>Top rows
-          <input id="flow-limit" type="number" min="1" max="500" value="50">
-        </label>
+        <button id="flow-more" type="button" disabled>Load 50 more</button>
+        <button id="flow-all" type="button" disabled>Load all matching rows</button>
         <button id="flow-refresh" type="button">Load selected partition</button>
         <button id="flow-clear-cache" type="button">Clear viewer cache</button>
       </div>
+      <p class="muted small">Load 50 more to extend the ranked rows in 50-row steps, or load all matching rows. The table shows 50 rows per page. Click a column heading to sort the rows currently loaded.</p>
+      <p class="muted small">Inference score is a binary fixed/free marker: 1 means the OD cell was estimated; 0 means it was fixed by the demand input or structural-zero policy. It is not a confidence or probability score.</p>
       <div id="flow-status" class="status">No partition selected.</div>
       <div id="flow-detail" class="detail"></div>
       <div class="table-wrap"><table id="flow-table"><thead></thead><tbody></tbody></table></div>
+      <div id="flow-pagination" class="toolbar hidden">
+        <button id="flow-page-previous" type="button" disabled>Previous 50 rows</button>
+        <span id="flow-page-label" class="muted"></span>
+        <button id="flow-page-next" type="button" disabled>Next 50 rows</button>
+      </div>
     </section>
 
     <section id="measurement-od" class="panel hidden">
       <h2>Measured flows by OD pair</h2>
       <p id="measurement-od-unavailable" class="notice hidden"></p>
       <p class="muted">Select a stop in Measurement map mode, then choose one of its measured rows. The decomposition is of that row’s modeled mean, not its observed count. Observation time and OD departure interval are different time concepts.</p>
+      <p class="muted small">OD contributors are loaded in descending modeled-mean contribution, so the largest positive contributors appear first. Click a column heading to sort the rows on the current page; page navigation follows the contribution ranking.</p>
       <div id="measurement-row-picker" class="toolbar">
         <span id="measurement-stop-label" class="muted">No measured stop selected.</span>
         <label>Measurement row
@@ -234,6 +267,10 @@
         <span id="measurement-contribution-page" class="muted"></span>
       </div>
       <div id="measurement-od-status" class="status" role="status" aria-live="polite" aria-atomic="true" aria-busy="false">No contribution query selected.</div>
+      <div id="measurement-query-progress-wrap" class="query-progress hidden" aria-live="polite">
+        <progress id="measurement-query-progress-bar" max="1" aria-label="OD contribution query progress"></progress>
+        <span id="measurement-query-progress-label" class="muted small"></span>
+      </div>
       <div id="measurement-od-detail" class="detail"></div>
       <div class="table-wrap"><table id="measurement-od-table"><thead></thead><tbody></tbody></table></div>
     </section>

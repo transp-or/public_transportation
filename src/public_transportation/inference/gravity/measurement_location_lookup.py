@@ -7,7 +7,7 @@ import hashlib
 import json
 import sqlite3
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +16,7 @@ import numpy as np
 _SCHEMA_VERSION = 1
 _PARTITION_ROWS = 500
 _INSERT_BATCH = 10_000
+_ProgressCallback = Callable[[str, int, int, str], None]
 MEASUREMENT_LOCATION_COLUMNS = (
     "measurement_index",
     "measurement_type",
@@ -29,11 +30,20 @@ MEASUREMENT_LOCATION_COLUMNS = (
 )
 
 
-def _sha256(path: Path) -> str:
+def _sha256(
+    path: Path,
+    *,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> str:
     digest = hashlib.sha256()
+    total = path.stat().st_size
+    completed = 0
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
+            completed += len(block)
+            if progress_callback is not None:
+                progress_callback(completed, total)
     return digest.hexdigest()
 
 
@@ -41,13 +51,30 @@ def _slug(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
 
 
-def read_measurement_location_manifest(root: str | Path, payload: Mapping[str, object]) -> Mapping[str, object]:
+def read_measurement_location_manifest(
+    root: str | Path,
+    payload: Mapping[str, object],
+    *,
+    progress_callback: _ProgressCallback | None = None,
+) -> Mapping[str, object]:
     """Read the small lookup index after checking its bundle-bound checksum."""
     relative = Path(str(payload.get("manifest_path", "")))
     if relative.is_absolute() or ".." in relative.parts or not relative.parts or not relative.as_posix().startswith("partitions/measurement_locations/"):
         raise ValueError("measurement location lookup manifest path is unsafe.")
     path = Path(root) / relative
-    if not path.is_file() or _sha256(path) != payload.get("manifest_sha256"):
+    if not path.is_file() or _sha256(
+        path,
+        progress_callback=(
+            lambda completed, total: progress_callback(
+                "Checking measurement-location manifest checksum",
+                completed,
+                total,
+                path.name,
+            )
+            if progress_callback is not None
+            else None
+        ),
+    ) != payload.get("manifest_sha256"):
         raise ValueError("measurement location lookup manifest checksum mismatch.")
     try:
         manifest = json.loads(path.read_text(encoding="utf-8"))
@@ -220,11 +247,21 @@ def write_measurement_location_lookup(
     }
 
 
-def validate_measurement_location_lookup(root: str | Path, payload: Mapping[str, object]) -> Mapping[str, object]:
+def validate_measurement_location_lookup(
+    root: str | Path,
+    payload: Mapping[str, object],
+    *,
+    progress_callback: _ProgressCallback | None = None,
+    network_stop_row_count: int | None = None,
+) -> Mapping[str, object]:
     """Validate the compact stop index and checksums of all bounded partitions."""
     if payload.get("available") is not True or payload.get("schema_version") != _SCHEMA_VERSION:
         raise ValueError("measurement location lookup metadata is invalid.")
-    manifest = read_measurement_location_manifest(root, payload)
+    manifest = read_measurement_location_manifest(
+        root,
+        payload,
+        progress_callback=progress_callback,
+    )
     if manifest.get("schema_version") != _SCHEMA_VERSION or manifest.get("dataset_type") != "gravity_measurement_location_lookup":
         raise ValueError("measurement location lookup schema is incompatible.")
     if tuple(manifest.get("columns", ())) != MEASUREMENT_LOCATION_COLUMNS or manifest.get("partition_rows_limit") != _PARTITION_ROWS:
@@ -242,12 +279,29 @@ def validate_measurement_location_lookup(root: str | Path, payload: Mapping[str,
         raise ValueError("measurement location lookup stops index is invalid.")
     expected_columns = tuple(MEASUREMENT_LOCATION_COLUMNS)
     total_rows = 0
+    completed_rows = 0
+    validated_total_rows = 0
+    total_partition_bytes = 0
+    descriptors_by_stop: list[tuple[str, Mapping[str, object], list[object]]] = []
     for stop, entry in stops.items():
         if not isinstance(stop, str) or stop == "" or not isinstance(entry, Mapping):
             raise ValueError("measurement location lookup stop entry is invalid.")
         descriptors = entry.get("partitions")
         if not isinstance(descriptors, list):
             raise ValueError("measurement location lookup partitions are invalid.")
+        descriptors_by_stop.append((stop, entry, descriptors))
+        for descriptor in descriptors:
+            if isinstance(descriptor, Mapping):
+                size = descriptor.get("size_bytes")
+                rows = descriptor.get("row_count")
+                if isinstance(size, int) and not isinstance(size, bool) and size >= 0:
+                    total_partition_bytes += size
+                if isinstance(rows, int) and not isinstance(rows, bool) and rows >= 0:
+                    total_rows += rows
+    completed_partition_bytes = 0
+    for stop, entry, descriptors in descriptors_by_stop:
+        if not isinstance(stop, str) or stop == "" or not isinstance(entry, Mapping):
+            raise ValueError("measurement location lookup stop entry is invalid.")
         stop_count = 0
         previous_index = -1
         for chunk_index, descriptor in enumerate(descriptors):
@@ -263,8 +317,27 @@ def validate_measurement_location_lookup(root: str | Path, payload: Mapping[str,
             ):
                 raise ValueError("measurement location lookup partition path is unsafe.")
             path = Path(root) / relative
-            if not path.is_file() or path.stat().st_size != descriptor.get("size_bytes") or _sha256(path) != descriptor.get("sha256"):
+            actual_size = path.stat().st_size if path.is_file() else None
+            actual_sha256 = (
+                _sha256(
+                    path,
+                    progress_callback=(
+                        lambda completed, total, base=completed_partition_bytes: progress_callback(
+                            "Checking measurement-location partition checksums",
+                            base + completed,
+                            total_partition_bytes,
+                            path.name,
+                        )
+                        if progress_callback is not None
+                        else None
+                    ),
+                )
+                if path.is_file()
+                else None
+            )
+            if actual_size != descriptor.get("size_bytes") or actual_sha256 != descriptor.get("sha256"):
                 raise ValueError("measurement location lookup partition checksum mismatch.")
+            completed_partition_bytes += int(actual_size or 0)
             with path.open(newline="", encoding="utf-8") as stream:
                 reader = csv.DictReader(stream)
                 if tuple(reader.fieldnames or ()) != expected_columns:
@@ -286,25 +359,48 @@ def validate_measurement_location_lookup(root: str | Path, payload: Mapping[str,
                         raise ValueError("measurement location lookup row is inconsistent.")
                     previous_index = index
                     count += 1
+                    completed_rows += 1
+                    if progress_callback is not None and (
+                        count % 100 == 0 or count == descriptor.get("row_count")
+                    ):
+                        progress_callback(
+                            "Validating measurement-location rows",
+                            completed_rows,
+                            total_rows,
+                            path.name,
+                        )
             if count != descriptor.get("row_count") or count <= 0 or count > _PARTITION_ROWS:
                 raise ValueError("measurement location lookup row count is invalid.")
             stop_count += count
         if stop_count != entry.get("row_count"):
             raise ValueError("measurement location lookup stop row count mismatch.")
-        total_rows += stop_count
+        validated_total_rows += stop_count
     unmatched = manifest.get("unmatched_stop_ids")
     if not isinstance(unmatched, list) or any(not isinstance(value, str) for value in unmatched) or unmatched != sorted(set(unmatched)):
         raise ValueError("measurement location lookup unmatched stop IDs are invalid.")
     if (
-        total_rows != manifest.get("indexed_measurements")
-        or total_rows + int(manifest.get("missing_stop_rows", -1)) != manifest.get("number_of_measurements")
+        validated_total_rows != manifest.get("indexed_measurements")
+        or validated_total_rows + int(manifest.get("missing_stop_rows", -1)) != manifest.get("number_of_measurements")
         or len(stops) != manifest.get("number_of_stops")
         or len(unmatched) != payload.get("unmatched_stop_count")
     ):
         raise ValueError("measurement location lookup aggregate counts are invalid.")
     if (Path(root) / "network" / "stops.csv").is_file():
         with (Path(root) / "network" / "stops.csv").open(newline="", encoding="utf-8") as stream:
-            network_ids = {row["stop_id"] for row in csv.DictReader(stream)}
+            reader = csv.DictReader(stream)
+            network_ids: set[str] = set()
+            for row_number, row in enumerate(reader, start=1):
+                network_ids.add(row["stop_id"])
+                if progress_callback is not None and (
+                    row_number % 10_000 == 0
+                    or row_number == network_stop_row_count
+                ):
+                    progress_callback(
+                        "Checking measurement-location network stop rows",
+                        row_number,
+                        network_stop_row_count or 0,
+                        "stops.csv",
+                    )
         if sorted(set(stops) - network_ids) != manifest.get("unmatched_stop_ids"):
             raise ValueError("measurement location lookup unmatched stop IDs are invalid.")
     return manifest

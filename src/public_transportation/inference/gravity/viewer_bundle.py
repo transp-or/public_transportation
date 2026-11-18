@@ -15,7 +15,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -73,6 +73,7 @@ _SECTION_LOAD_PARTITION_ROOT = "partitions/section_loads"
 _MEASUREMENT_OD_QUERY_LIMIT = 5_000
 _MEASUREMENT_LOCATION_PAGE_LIMIT = 500
 _IDENTIFIABILITY_MESSAGE = "OD identifiability diagnostics were not available; inference_score remains only a structural fixed/free indicator."
+_ViewerProgressCallback = Callable[[str, int, int, str], None]
 _TABLE_FILES = (
     "full_od.csv",
     "predicted_measurements.csv",
@@ -261,11 +262,21 @@ def _write_json(path: Path, payload: Mapping[str, object]) -> None:
     temporary.replace(path)
 
 
-def _sha256(path: Path) -> str:
+def _sha256(
+    path: Path,
+    *,
+    progress_callback: _ViewerProgressCallback | None = None,
+    progress_stage: str = "Checking bundle checksums",
+) -> str:
     digest = hashlib.sha256()
+    total = path.stat().st_size
+    completed = 0
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
+            completed += len(block)
+            if progress_callback is not None:
+                progress_callback(progress_stage, completed, total, path.name)
     return digest.hexdigest()
 
 
@@ -277,13 +288,29 @@ def _read_csv(path: Path) -> tuple[list[str], list[dict[str, str]]]:
         return list(reader.fieldnames), list(reader)
 
 
-def _iter_csv_rows(path: Path) -> Iterator[dict[str, str]]:
+def _iter_csv_rows(
+    path: Path,
+    *,
+    progress_callback: _ViewerProgressCallback | None = None,
+    progress_stage: str = "Reading CSV rows",
+    progress_total_rows: int | None = None,
+) -> Iterator[dict[str, str]]:
     """Yield CSV rows without retaining the complete table in memory."""
     with path.open(newline="", encoding="utf-8") as stream:
         reader = csv.DictReader(stream)
         if reader.fieldnames is None:
             raise ValueError(f"CSV file {path} has no header.")
-        yield from reader
+        for row_number, row in enumerate(reader, start=1):
+            yield row
+            if progress_callback is not None and (
+                row_number % 10_000 == 0 or row_number == progress_total_rows
+            ):
+                progress_callback(
+                    progress_stage,
+                    row_number,
+                    progress_total_rows or 0,
+                    path.name,
+                )
 
 
 def _csv_fieldnames(path: Path) -> list[str]:
@@ -295,10 +322,25 @@ def _csv_fieldnames(path: Path) -> list[str]:
             raise ValueError(f"CSV file {path} has no header.") from error
 
 
-def _csv_row_count(path: Path) -> int:
+def _csv_row_count(
+    path: Path,
+    *,
+    progress_callback: _ViewerProgressCallback | None = None,
+    progress_stage: str = "Checking bundle CSV row counts",
+) -> int:
     """Count data rows while streaming through a CSV file."""
-    with path.open(newline="", encoding="utf-8") as stream:
-        return max(0, sum(1 for _ in stream) - 1)
+    total = path.stat().st_size
+    completed = 0
+    row_count = 0
+    with path.open("rb") as stream:
+        for line_number, _ in enumerate(stream, start=1):
+            row_count += 1
+            if progress_callback is not None and line_number % 10_000 == 0:
+                completed = stream.tell()
+                progress_callback(progress_stage, completed, total, path.name)
+    if progress_callback is not None:
+        progress_callback(progress_stage, total, total, path.name)
+    return max(0, row_count - 1)
 
 
 def _partition_slug(value: object) -> str:
@@ -1420,6 +1462,7 @@ def _validate_linear_mapping_for_bundle(
     metadata: Mapping[str, object],
     full_od_path: Path,
     validate_block_payloads: bool = True,
+    progress_callback: _ViewerProgressCallback | None = None,
 ) -> None:
     """Bind sparse mapping coordinates and identity to this exact fitted result."""
     provenance = _source_provenance(report_payload, fit_result, metadata)
@@ -1508,7 +1551,12 @@ def _validate_linear_mapping_for_bundle(
             raise ValueError("fit is missing latent measurements required to validate fixed offsets.")
 
     seen = np.zeros(index.number_of_physical_demand_cells, dtype=bool)
-    for row in _iter_csv_rows(full_od_path):
+    for row in _iter_csv_rows(
+        full_od_path,
+        progress_callback=progress_callback,
+        progress_stage="Checking canonical OD alignment rows",
+        progress_total_rows=len(index.demand_cells),
+    ):
         try:
             full_index = int(row["od_index"])
             estimated = float(row["estimated_demand"])
@@ -1536,7 +1584,12 @@ def _validate_linear_mapping_for_bundle(
         raise ValueError("full_od.csv does not cover the canonical OD mapping index.")
 
     expected_row = 0
-    for row in _iter_csv_rows(full_od_path.parent / "predicted_measurements.csv"):
+    for row in _iter_csv_rows(
+        full_od_path.parent / "predicted_measurements.csv",
+        progress_callback=progress_callback,
+        progress_stage="Checking canonical measurement alignment rows",
+        progress_total_rows=len(index.measurements),
+    ):
         try:
             row_index = int(row["row_index"])
         except (KeyError, TypeError, ValueError) as error:
@@ -1547,8 +1600,10 @@ def _validate_linear_mapping_for_bundle(
     if expected_row != len(index.measurements):
         raise ValueError("predicted_measurements.csv does not cover canonical measurement rows.")
 
-    if tuple(cell.operator_column for cell in index.demand_cells if cell.operator_column is not None) != tuple(range(fit_result.free_od_demand.size)):
-        raise ValueError("canonical free-OD columns are not aligned to fitted demand.")
+    # CanonicalAssignmentIndex validates that free operator columns are
+    # contiguous and ordered; the dimension check above binds that count to
+    # fit_result.free_od_demand. Rebuilding two multi-million-entry tuples
+    # here would repeat those checks while increasing startup memory use.
 
 
 def _validation_provenance(validation_result: object) -> dict[str, object]:
@@ -1687,6 +1742,8 @@ def _validate_table_inputs(
 def _validate_network(
     staging: Path,
     table_counts: Mapping[str, int],
+    *,
+    progress_callback: _ViewerProgressCallback | None = None,
 ) -> dict[str, int]:
     network_dir = staging / "network"
     if not network_dir.exists():
@@ -1698,7 +1755,14 @@ def _validate_network(
     if "stops.csv" not in files:
         raise ValueError("network snapshot must include stops.csv.")
     stop_fields = _csv_fieldnames(network_dir / "stops.csv")
-    stops = list(_iter_csv_rows(network_dir / "stops.csv"))
+    stops = list(
+        _iter_csv_rows(
+            network_dir / "stops.csv",
+            progress_callback=progress_callback,
+            progress_stage="Checking network stop rows",
+            progress_total_rows=table_counts.get("network/stops.csv"),
+        )
+    )
     _require_columns(network_dir / "stops.csv", stop_fields, ("stop_id", "name", "lat", "lon"))
     stop_ids = [str(row["stop_id"]) for row in stops]
     if len(set(stop_ids)) != len(stop_ids):
@@ -1709,9 +1773,17 @@ def _validate_network(
         raise ValueError("network/stops.csv contains invalid latitude/longitude values.")
     stop_set = set(stop_ids)
 
-    report_stops = _nonempty_values(_iter_csv_rows(staging / "full_od.csv"), "origin_stop_id") | _nonempty_values(
-        _iter_csv_rows(staging / "full_od.csv"), "destination_stop_id"
-    )
+    report_stops: set[str] = set()
+    for row in _iter_csv_rows(
+        staging / "full_od.csv",
+        progress_callback=progress_callback,
+        progress_stage="Checking network OD-reference rows",
+        progress_total_rows=table_counts.get("full_od.csv"),
+    ):
+        for field in ("origin_stop_id", "destination_stop_id"):
+            value = str(row.get(field, ""))
+            if value:
+                report_stops.add(value)
     missing_stops = sorted(report_stops - stop_set)
     if missing_stops:
         raise ValueError("report references stop IDs absent from network/stops.csv: " + ", ".join(missing_stops[:10]))
@@ -1723,12 +1795,30 @@ def _validate_network(
         line_column = _first_column(fields, ("line_id", "route_id", "line", "id"))
         if line_column is None:
             raise ValueError("network/lines.csv must contain line_id or route_id.")
-        line_ids = _nonempty_values(_iter_csv_rows(network_dir / "lines.csv"), line_column)
-        line_count = _csv_row_count(network_dir / "lines.csv")
+        line_ids: set[str] = set()
+        line_count = 0
+        for row in _iter_csv_rows(
+            network_dir / "lines.csv",
+            progress_callback=progress_callback,
+            progress_stage="Checking network line rows",
+            progress_total_rows=table_counts.get("network/lines.csv"),
+        ):
+            line_count += 1
+            value = str(row.get(line_column, ""))
+            if value:
+                line_ids.add(value)
         if len(line_ids) != line_count:
             raise ValueError("network/lines.csv contains duplicate or empty line identifiers.")
         counts["network/lines.csv"] = line_count
-        measurement_lines = _nonempty_values(_iter_csv_rows(staging / "predicted_measurements.csv"), "line")
+        measurement_lines = _nonempty_values(
+            _iter_csv_rows(
+                staging / "predicted_measurements.csv",
+                progress_callback=progress_callback,
+                progress_stage="Checking measurement line-reference rows",
+                progress_total_rows=table_counts.get("predicted_measurements.csv"),
+            ),
+            "line",
+        )
         missing_lines = sorted(measurement_lines - line_ids)
         if missing_lines:
             raise ValueError("predicted measurements reference line IDs absent from network/lines.csv: " + ", ".join(missing_lines[:10]))
@@ -1738,16 +1828,33 @@ def _validate_network(
         trip_column = _first_column(fields, ("trip_id", "trip", "id"))
         if trip_column is None:
             raise ValueError("network/trips.csv must contain trip_id.")
-        trip_ids = _nonempty_values(_iter_csv_rows(network_dir / "trips.csv"), trip_column)
-        trip_count = _csv_row_count(network_dir / "trips.csv")
+        line_column = (
+            _first_column(fields, ("line_id", "route_id", "line"))
+            if line_ids
+            else None
+        )
+        trip_ids: set[str] = set()
+        trip_line_ids: set[str] = set()
+        trip_count = 0
+        for row in _iter_csv_rows(
+            network_dir / "trips.csv",
+            progress_callback=progress_callback,
+            progress_stage="Checking network trip rows",
+            progress_total_rows=table_counts.get("network/trips.csv"),
+        ):
+            trip_count += 1
+            trip_value = str(row.get(trip_column, ""))
+            if trip_value:
+                trip_ids.add(trip_value)
+            if line_column is not None:
+                line_value = str(row.get(line_column, ""))
+                if line_value:
+                    trip_line_ids.add(line_value)
         if len(trip_ids) != trip_count:
             raise ValueError("network/trips.csv contains duplicate or empty trip identifiers.")
-        if line_ids:
-            line_column = _first_column(fields, ("line_id", "route_id", "line"))
-            if line_column is not None:
-                missing = sorted(_nonempty_values(_iter_csv_rows(network_dir / "trips.csv"), line_column) - line_ids)
-                if missing:
-                    raise ValueError("network/trips.csv references line IDs absent from lines.csv: " + ", ".join(missing[:10]))
+        missing = sorted(trip_line_ids - line_ids)
+        if missing:
+            raise ValueError("network/trips.csv references line IDs absent from lines.csv: " + ", ".join(missing[:10]))
         counts["network/trips.csv"] = trip_count
     if "stop_times.csv" in files:
         fields = _csv_fieldnames(network_dir / "stop_times.csv")
@@ -1755,18 +1862,40 @@ def _validate_network(
         stop_column = _first_column(fields, ("stop_id", "stop"))
         if trip_column is None or stop_column is None:
             raise ValueError("network/stop_times.csv must contain trip_id and stop_id.")
+        stop_time_trip_ids: set[str] = set()
+        stop_time_stop_ids: set[str] = set()
+        stop_time_count = 0
+        for row in _iter_csv_rows(
+            network_dir / "stop_times.csv",
+            progress_callback=progress_callback,
+            progress_stage="Checking network stop-time rows",
+            progress_total_rows=table_counts.get("network/stop_times.csv"),
+        ):
+            stop_time_count += 1
+            trip_value = str(row.get(trip_column, ""))
+            stop_value = str(row.get(stop_column, ""))
+            if trip_value:
+                stop_time_trip_ids.add(trip_value)
+            if stop_value:
+                stop_time_stop_ids.add(stop_value)
         if trip_ids:
-            missing = sorted(_nonempty_values(_iter_csv_rows(network_dir / "stop_times.csv"), trip_column) - trip_ids)
+            missing = sorted(stop_time_trip_ids - trip_ids)
             if missing:
                 raise ValueError("network/stop_times.csv references unknown trip IDs: " + ", ".join(missing[:10]))
-        missing = sorted(_nonempty_values(_iter_csv_rows(network_dir / "stop_times.csv"), stop_column) - stop_set)
+        missing = sorted(stop_time_stop_ids - stop_set)
         if missing:
             raise ValueError("network/stop_times.csv references unknown stop IDs: " + ", ".join(missing[:10]))
-        counts["network/stop_times.csv"] = _csv_row_count(network_dir / "stop_times.csv")
+        counts["network/stop_times.csv"] = stop_time_count
     return counts
 
 
-def _validate_route_flow_network(root: Path, summary: Mapping[str, object]) -> None:
+def _validate_route_flow_network(
+    root: Path,
+    summary: Mapping[str, object],
+    *,
+    row_counts: Mapping[str, int] | None = None,
+    progress_callback: _ViewerProgressCallback | None = None,
+) -> None:
     """Validate sparse route references against the optional network snapshot."""
     network_dir = root / "network"
     route_summary = summary.get("route_flows", {})
@@ -1776,22 +1905,72 @@ def _validate_route_flow_network(root: Path, summary: Mapping[str, object]) -> N
     trip_ids: set[str] = set()
     stop_ids: set[str] = set()
     if (network_dir / "stops.csv").is_file():
-        stop_ids = _nonempty_values(_iter_csv_rows(network_dir / "stops.csv"), "stop_id")
+        stop_ids = _nonempty_values(
+            _iter_csv_rows(
+                network_dir / "stops.csv",
+                progress_callback=progress_callback,
+                progress_stage="Checking route-flow network stop rows",
+                progress_total_rows=(row_counts or {}).get("network/stops.csv"),
+            ),
+            "stop_id",
+        )
     if (network_dir / "lines.csv").is_file():
         fields = _csv_fieldnames(network_dir / "lines.csv")
         line_column = _first_column(fields, ("line_id", "route_id", "line", "id"))
         if line_column is not None:
-            line_ids = _nonempty_values(_iter_csv_rows(network_dir / "lines.csv"), line_column)
+            line_ids = _nonempty_values(
+                _iter_csv_rows(
+                    network_dir / "lines.csv",
+                    progress_callback=progress_callback,
+                    progress_stage="Checking route-flow network line rows",
+                    progress_total_rows=(row_counts or {}).get("network/lines.csv"),
+                ),
+                line_column,
+            )
     if (network_dir / "trips.csv").is_file():
         fields = _csv_fieldnames(network_dir / "trips.csv")
         trip_column = _first_column(fields, ("trip_id", "trip", "id"))
         if trip_column is not None:
-            trip_ids = _nonempty_values(_iter_csv_rows(network_dir / "trips.csv"), trip_column)
-    for descriptor in route_summary.get("partitions", ()):
+            trip_ids = _nonempty_values(
+                _iter_csv_rows(
+                    network_dir / "trips.csv",
+                    progress_callback=progress_callback,
+                    progress_stage="Checking route-flow network trip rows",
+                    progress_total_rows=(row_counts or {}).get("network/trips.csv"),
+                ),
+                trip_column,
+            )
+    partitions = route_summary.get("partitions", ())
+    total_rows = sum(
+        int(item.get("row_count", 0))
+        for item in partitions
+        if isinstance(item, Mapping)
+        and isinstance(item.get("row_count"), int)
+        and not isinstance(item.get("row_count"), bool)
+    )
+    completed_rows = 0
+    for descriptor in partitions:
         if not isinstance(descriptor, Mapping):
             continue
         path = root / str(descriptor.get("path") or descriptor.get("file"))
-        for row in _iter_csv_rows(path):
+        expected_rows = descriptor.get("row_count")
+        for row in _iter_csv_rows(
+            path,
+            progress_callback=(
+                lambda _stage, done, _total, _detail, base=completed_rows: progress_callback(
+                    "Checking route-flow reference rows",
+                    base + done,
+                    total_rows,
+                    path.name,
+                )
+                if progress_callback is not None
+                else None
+            ),
+            progress_stage="Checking route-flow reference rows",
+            progress_total_rows=(
+                expected_rows if isinstance(expected_rows, int) else None
+            ),
+        ):
             for field, known, label in (
                 ("origin_stop_id", stop_ids, "origin"),
                 ("destination_stop_id", stop_ids, "destination"),
@@ -1803,6 +1982,7 @@ def _validate_route_flow_network(root: Path, summary: Mapping[str, object]) -> N
                 value = str(row.get(field, ""))
                 if value and known and value not in known:
                     raise ValueError(f"route-flow {label} ID {value!r} is absent from the network snapshot.")
+            completed_rows += 1
 
 
 def _file_records(root: Path) -> dict[str, dict[str, object]]:
@@ -1822,7 +2002,12 @@ def _file_records(root: Path) -> dict[str, dict[str, object]]:
     return records
 
 
-def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> None:
+def _validate_bundle_directory(
+    root: Path,
+    manifest: Mapping[str, object],
+    *,
+    progress_callback: _ViewerProgressCallback | None = None,
+) -> None:
     if manifest.get("schema_version") != GRAVITY_VIEWER_BUNDLE_SCHEMA_VERSION:
         raise ValueError("unsupported gravity viewer bundle schema version.")
     if manifest.get("bundle_type") != GRAVITY_VIEWER_BUNDLE_TYPE:
@@ -1834,6 +2019,16 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
     for name in required:
         if name not in files:
             raise ValueError(f"bundle manifest is missing required file {name!r}.")
+    checksum_total = sum(
+        size
+        for record in files.values()
+        if isinstance(record, Mapping)
+        and isinstance((size := record.get("size_bytes")), int)
+        and not isinstance(size, bool)
+        and size >= 0
+    )
+    checksum_completed = 0
+    csv_records: list[tuple[str, Mapping[str, object], Path]] = []
     for name, record in files.items():
         if not isinstance(name, str) or not isinstance(record, Mapping):
             raise ValueError("bundle manifest file records are invalid.")
@@ -1847,14 +2042,45 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
         if expected_size != path.stat().st_size:
             raise ValueError(f"bundle file size mismatch for {name!r}: manifest={expected_size!r}, actual={path.stat().st_size!r}.")
         expected_digest = record.get("sha256")
-        actual_digest = _sha256(path)
+        actual_digest = _sha256(
+            path,
+            progress_callback=(
+                lambda _stage, done, _total, detail, base=checksum_completed: progress_callback(
+                    "Checking bundle checksums",
+                    base + done,
+                    checksum_total,
+                    detail,
+                )
+                if progress_callback is not None
+                else None
+            ),
+        )
         if expected_digest != actual_digest:
             raise ValueError(f"bundle file checksum mismatch for {name!r}: manifest={expected_digest!r}, actual={actual_digest!r}.")
         if "row_count" in record and path.suffix.lower() == ".csv":
-            with path.open(newline="", encoding="utf-8") as stream:
-                actual_rows = max(0, sum(1 for _ in stream) - 1)
-            if record.get("row_count") != actual_rows:
-                raise ValueError(f"bundle file row count mismatch for {name!r}: manifest={record.get('row_count')!r}, actual={actual_rows!r}.")
+            csv_records.append((name, record, path))
+        checksum_completed += int(expected_size)
+    csv_total = sum(path.stat().st_size for _, _, path in csv_records)
+    csv_completed = 0
+    validated_row_counts: dict[str, int] = {}
+    for name, record, path in csv_records:
+        actual_rows = _csv_row_count(
+            path,
+            progress_callback=(
+                lambda _stage, done, _total, detail, base=csv_completed: progress_callback(
+                    "Checking bundle CSV row counts",
+                    base + done,
+                    csv_total,
+                    detail,
+                )
+                if progress_callback is not None
+                else None
+            ),
+        )
+        if record.get("row_count") != actual_rows:
+            raise ValueError(f"bundle file row count mismatch for {name!r}: manifest={record.get('row_count')!r}, actual={actual_rows!r}.")
+        validated_row_counts[name] = actual_rows
+        csv_completed += path.stat().st_size
     report_payload = json.loads((root / "report.json").read_text(encoding="utf-8"))
     if not isinstance(report_payload, Mapping):
         raise ValueError("bundle report.json must contain an object.")
@@ -1946,7 +2172,12 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
         raise ValueError("bundle row_counts are missing or invalid.")
     for name in _TABLE_FILES:
         fields = _csv_fieldnames(root / name)
-        actual_rows = _csv_row_count(root / name)
+        actual_rows = validated_row_counts.get(name)
+        if actual_rows is None:
+            actual_rows = _csv_row_count(
+                root / name,
+                progress_callback=progress_callback,
+            )
         expected = counts.get(name)
         if expected != actual_rows:
             raise ValueError(f"bundle row count mismatch for {name!r}: manifest={expected!r}, actual={actual_rows!r}.")
@@ -1965,7 +2196,12 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
         if not (root / name).is_file():
             continue
         fields = _csv_fieldnames(root / name)
-        actual_rows = _csv_row_count(root / name)
+        actual_rows = validated_row_counts.get(name)
+        if actual_rows is None:
+            actual_rows = _csv_row_count(
+                root / name,
+                progress_callback=progress_callback,
+            )
         expected = counts.get(name)
         if expected != actual_rows:
             raise ValueError(f"bundle row count mismatch for {name!r}: manifest={expected!r}, actual={actual_rows!r}.")
@@ -2001,7 +2237,12 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
                 if not path.is_file():
                     raise ValueError(f"viewer summary partition is missing: {relative}")
                 _require_columns(path, _csv_fieldnames(path), expected_columns)
-                count = _csv_row_count(path)
+                count = validated_row_counts.get(str(relative))
+                if count is None:
+                    count = _csv_row_count(
+                        path,
+                        progress_callback=progress_callback,
+                    )
                 if descriptor.get("row_count") != count:
                     raise ValueError(f"viewer summary row count mismatch for {relative!s}.")
                 total += count
@@ -2060,7 +2301,12 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
                                     supplied = str(row.get("assignment_fingerprint", ""))
                                     if supplied and supplied != str(expected_assignment):
                                         raise ValueError("viewer route-section assignment fingerprint mismatch.")
-        _validate_route_flow_network(root, summary_payload)
+        _validate_route_flow_network(
+            root,
+            summary_payload,
+            row_counts=counts,
+            progress_callback=progress_callback,
+        )
         contribution_payload = summary_payload.get("measurement_od_contributions", {})
         if not isinstance(contribution_payload, Mapping):
             raise ValueError("viewer measurement OD contribution metadata is invalid.")
@@ -2131,7 +2377,12 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
             raise ValueError("unavailable measurement OD contributions require an explanatory message.")
         location_payload = summary_payload.get("measurement_locations")
         if isinstance(location_payload, Mapping) and location_payload.get("available"):
-            location_manifest = validate_measurement_location_lookup(root, location_payload)
+            location_manifest = validate_measurement_location_lookup(
+                root,
+                location_payload,
+                progress_callback=progress_callback,
+                network_stop_row_count=counts.get("network/stops.csv"),
+            )
             if location_manifest.get("number_of_measurements") != counts.get("predicted_measurements.csv"):
                 raise ValueError("measurement location lookup row count differs from predicted measurements.")
             source_identity = location_payload.get("source_identity", {})
@@ -2161,7 +2412,11 @@ def _validate_bundle_directory(root: Path, manifest: Mapping[str, object]) -> No
         diagnostic = read_gravity_od_identifiability(ident_dir)
         if diagnostic.provenance.get("model_fingerprint") != provenance.get("model_fingerprint"):
             raise ValueError("bundle identifiability/model provenance mismatch.")
-    network_counts = _validate_network(root, counts)
+    network_counts = _validate_network(
+        root,
+        counts,
+        progress_callback=progress_callback,
+    )
     for name, count in network_counts.items():
         if counts.get(name) != count:
             raise ValueError(f"bundle row count mismatch for {name!r}: manifest={counts.get(name)!r}, actual={count!r}.")
@@ -2202,9 +2457,17 @@ class GravityViewerBundle:
     path: Path
     manifest: Mapping[str, object]
 
-    def validate(self) -> None:
+    def validate(
+        self,
+        *,
+        progress_callback: _ViewerProgressCallback | None = None,
+    ) -> None:
         """Revalidate checksums, joins, provenance, and row counts."""
-        _validate_bundle_directory(self.path, self.manifest)
+        _validate_bundle_directory(
+            self.path,
+            self.manifest,
+            progress_callback=progress_callback,
+        )
 
     @property
     def model_specification(self) -> Mapping[str, object]:
@@ -3162,12 +3425,15 @@ def write_gravity_viewer_bundle(
     section_usage_dataset: str | Path | None = None,
     linear_mapping_artifact: str | Path | None = None,
     rho: float | None = None,
+    default_departure_interval_id: str | None = None,
 ) -> GravityViewerBundle:
     """Export validated fit/report data for an independent graphical viewer.
 
     ``linear_mapping_artifact`` optionally enables sparse OD-to-measurement
     decomposition. ``rho`` is needed only when the fit does not persist its
-    exact observation-scale vector.
+    exact observation-scale vector. ``default_departure_interval_id`` sets an
+    optional display preference for the viewer's interval selectors; it must
+    identify an interval present in the exported OD data.
     """
     if not isinstance(fit_result, GravityEstimationResult):
         raise TypeError("fit_result must be a GravityEstimationResult.")
@@ -3298,6 +3564,16 @@ def write_gravity_viewer_bundle(
             staging,
             section_usage_dataset=section_usage_dataset,
         )
+        if default_departure_interval_id is not None:
+            preferred_interval = str(default_departure_interval_id).strip()
+            if not preferred_interval:
+                raise ValueError("default_departure_interval_id must not be empty.")
+            available_intervals = viewer_summary["od"].get("bins", [])
+            if preferred_interval not in available_intervals:
+                raise ValueError(
+                    "default_departure_interval_id must match an interval in the exported OD data."
+                )
+            viewer_summary["od"]["default_departure_interval_id"] = preferred_interval
         viewer_summary["measurement_locations"] = measurement_location_summary
         fit_source_provenance = _source_provenance(report_payload, fit_result, metadata)
         viewer_summary["runtime_package_revision"] = package_revision()
@@ -3488,6 +3764,7 @@ def write_persisted_gravity_viewer_bundle(
     section_usage_dataset: str | Path | None = None,
     linear_mapping_artifact: str | Path | None = None,
     rho: float | None = None,
+    default_departure_interval_id: str | None = None,
 ) -> GravityViewerBundle:
     """Export a viewer bundle directly from persisted fit/validation artifacts.
 
@@ -3549,13 +3826,18 @@ def write_persisted_gravity_viewer_bundle(
             section_usage_dataset=section_usage_dataset,
             linear_mapping_artifact=linear_mapping_artifact,
             rho=rho,
+            default_departure_interval_id=default_departure_interval_id,
         )
     finally:
         if temporary_report is not None:
             shutil.rmtree(temporary_report, ignore_errors=True)
 
 
-def read_gravity_viewer_bundle(path: str | Path) -> GravityViewerBundle:
+def read_gravity_viewer_bundle(
+    path: str | Path,
+    *,
+    progress_callback: _ViewerProgressCallback | None = None,
+) -> GravityViewerBundle:
     """Read and validate a self-contained gravity viewer bundle."""
     root = Path(path).expanduser().resolve()
     manifest_path = root / "bundle_manifest.json"
@@ -3565,7 +3847,7 @@ def read_gravity_viewer_bundle(path: str | Path) -> GravityViewerBundle:
     if not isinstance(payload, Mapping):
         raise ValueError("gravity viewer bundle manifest must contain an object.")
     bundle = GravityViewerBundle(root, dict(payload))
-    bundle.validate()
+    bundle.validate(progress_callback=progress_callback)
     return bundle
 
 
