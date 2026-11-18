@@ -39,6 +39,11 @@
     th { position: sticky; top: 0; color: #4b5b75; background: #f5f7fb; }
     .flow-sort { border: 0; padding: 0; background: transparent; color: inherit; font: inherit; font-weight: 700; text-align: left; cursor: pointer; }
     .flow-sort:focus-visible { outline: 2px solid #235aa6; outline-offset: 2px; }
+    .measurement-mode-card { margin: 12px 0; padding: 14px 16px; border: 1px solid; border-radius: 10px; }
+    .measurement-mode-card h3 { margin: 0 0 6px; font-size: 16px; }
+    .measurement-mode-card p { margin: 0 0 10px; }
+    .measurement-mode-card.mode-measurement { border-color: #b9d1ee; background: #eff6ff; }
+    .measurement-mode-card.mode-od { border-color: #e7c995; background: #fff7e8; }
     .muted { color: #69758a; }
     .fingerprint { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; word-break: break-all; }
     .summary-list { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 7px 14px; margin: 0; font-size: 14px; }
@@ -227,39 +232,49 @@
     <section id="measurement-od" class="panel hidden">
       <h2>Measured flows by OD pair</h2>
       <p id="measurement-od-unavailable" class="notice hidden"></p>
-      <p class="muted">Select a stop in Measurement map mode, then choose one of its measured rows. The decomposition is of that row’s modeled mean, not its observed count. Observation time and OD departure interval are different time concepts.</p>
-      <p class="muted small">OD contributors are loaded in descending modeled-mean contribution, so the largest positive contributors appear first. Click a column heading to sort the rows on the current page; page navigation follows the contribution ranking.</p>
-      <div id="measurement-row-picker" class="toolbar">
-        <span id="measurement-stop-label" class="muted">No measured stop selected.</span>
-        <label>Measurement row
-          <select id="measurement-row-select" disabled></select>
-        </label>
-        <button id="measurement-row-previous" type="button" disabled>Previous rows</button>
-        <button id="measurement-row-next" type="button" disabled>Next rows</button>
-        <span id="measurement-row-page" class="muted"></span>
-      </div>
-      <div id="measurement-row-detail" class="detail">Choose Measurement mode and click a stop.</div>
       <div class="toolbar">
-        <label>Query direction
-          <select id="measurement-od-direction"><option value="measurement">OD contributors to a measurement</option><option value="od">Measurements affected by an OD pair</option></select>
+        <label>What do you want to look up?
+          <select id="measurement-od-direction"><option value="measurement">Measured row → contributing OD pairs</option><option value="od">OD pair → affected measured rows</option></select>
         </label>
         <label id="measurement-query-service-label" class="hidden">Local query service
           <input id="measurement-query-service" type="url" value="http://127.0.0.1:8765" spellcheck="false">
         </label>
-        <label id="measurement-bin-label" class="hidden">OD departure interval
-          <select id="measurement-bin"></select>
-        </label>
-        <span id="measurement-bin-time-note" class="muted small"></span>
-        <label id="measurement-origin-label" class="hidden">Origin
-          <select id="measurement-origin"></select>
-        </label>
-        <label id="measurement-destination-label" class="hidden">Destination
-          <select id="measurement-destination"></select>
-        </label>
         <label>Rows per page
           <input id="measurement-od-limit" type="number" min="1" max="500" value="50">
         </label>
-        <button id="measurement-od-load" type="button">Load contributions</button>
+        <button id="measurement-od-load" type="button">Load OD contributors</button>
+      </div>
+      <div id="measurement-mode-measurement" class="measurement-mode-card mode-measurement">
+        <h3>Measured row → contributing OD pairs</h3>
+        <p class="muted">Choose a measured stop on the map, then select the measured row. This shows the OD pairs contributing to its modeled mean; the OD departure interval is not selected here.</p>
+        <p class="muted small">Contributors start in descending modeled-mean contribution order. Click a column heading to sort the current page; page navigation follows that contribution ranking.</p>
+        <div id="measurement-row-picker" class="toolbar">
+          <span id="measurement-stop-label" class="muted">No measured stop selected.</span>
+          <label>Measurement row
+            <select id="measurement-row-select" disabled></select>
+          </label>
+          <button id="measurement-row-previous" type="button" disabled>Previous rows</button>
+          <button id="measurement-row-next" type="button" disabled>Next rows</button>
+          <span id="measurement-row-page" class="muted"></span>
+        </div>
+        <div id="measurement-row-detail" class="detail">Choose Measurement mode and click a stop.</div>
+      </div>
+      <div id="measurement-mode-od" class="measurement-mode-card mode-od hidden">
+        <h3>OD pair → affected measured rows</h3>
+        <p class="muted">Choose the OD pair’s departure interval, origin, and destination. The interval describes when the OD departs, not when a measurement was observed.</p>
+        <p class="muted small">Affected measurements start in descending modeled-mean contribution order. Click a column heading to sort the current page; page navigation follows that ranking.</p>
+        <div class="toolbar">
+          <label>OD departure interval
+            <select id="measurement-bin"></select>
+          </label>
+          <span id="measurement-bin-time-note" class="muted small"></span>
+          <label>Origin
+            <select id="measurement-origin"></select>
+          </label>
+          <label>Destination
+            <select id="measurement-destination"></select>
+          </label>
+        </div>
       </div>
       <div class="toolbar">
         <button id="measurement-contribution-previous" type="button" disabled>Previous contributors</button>
