@@ -32,6 +32,16 @@ matching rows** to display all rows matching the selection. Click a column
 heading to sort the rows currently loaded; rows not yet loaded are not included
 in that sorting.
 
+## Choose endpoints from the network map
+
+Go to **Network map** and choose **OD selection**. Click a stop to open its
+popup, then choose **Set as origin** or **Set as destination**. Clicking a stop
+alone does not change either endpoint, and choosing one endpoint leaves the
+other unchanged. The map status shows both selections; the selected origin and
+destination have distinct marker outlines. Use the **Origin** and
+**Destination** selectors in **Demand explorer** to replace or clear either
+selection.
+
 ## Find measurements at a stop
 
 Go to **Network map**, choose **Measurement** mode, then click a stop with

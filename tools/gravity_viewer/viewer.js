@@ -98,7 +98,7 @@
 
   const viewer = {
     files: [], fileMap: new Map(), manifest: null, summary: {}, model: {}, report: {},
-    map: null, stops: [], stopsById: new Map(), markerLayer: null, selectedOd: null,
+    map: null, stops: [], stopsById: new Map(), stopMarkers: new Map(), markerLayer: null, selectedOd: null,
     cacheDb: null, cacheIdentity: '', odRows: [],
     flowRows: [], flowBufferedRows: [], flowMatchedCount: 0, flowLoadedLimit: 0, flowPage: 0,
     flowSortColumn: '', flowSortDirection: 'desc', flowTitle: '',
@@ -647,17 +647,126 @@
 
   function setMapClickMode(mode) {
     viewer.mapClickMode = mode;
+    if (mode === 'measurement') viewer.map?.closePopup();
     $('map-od-mode').classList.toggle('active', mode === 'od');
     $('map-measurement-mode').classList.toggle('active', mode === 'measurement');
-    $('map-click-status').textContent = mode === 'measurement'
-      ? 'Hover to see the stop ID and name. Click a stop to inspect measurement rows matched to that exact stop ID.'
-      : 'Hover to see the stop ID and name. The first click sets Origin; each later click sets or replaces Destination. OD matching uses the exact stop ID.';
+    if (mode === 'measurement') {
+      $('map-click-status').textContent = 'Hover to see the stop ID and name. Click a stop to inspect measurement rows matched to that exact stop ID.';
+    } else {
+      updateOdMapSelectionStatus('Click a stop to choose an endpoint.');
+    }
     if (mode === 'measurement') {
       const unmatched = viewer.measurementLocationManifest?.unmatched_stop_ids || [];
       if (unmatched.length) $('map-click-status').textContent += ` ${unmatched.length} measurement stop ID(s) have no exact network stop match; examples: ${unmatched.slice(0, 5).join(', ')}.`;
       const missingIds = Number(viewer.measurementLocationManifest?.missing_stop_rows) || 0;
       if (missingIds) $('map-click-status').textContent += ` ${missingIds} measurement row(s) have no stop ID.`;
     }
+  }
+
+  function formatSelectedStop(stopId) {
+    if (!stopId) return 'not set';
+    const stop = viewer.stopsById.get(String(stopId));
+    const name = String(stop?.name || '').trim();
+    return name ? `${name} (${stopId})` : String(stopId);
+  }
+
+  function updateOdMapSelectionStatus(message = 'OD selection') {
+    if (viewer.mapClickMode !== 'od') return;
+    const origin = formatSelectedStop($('flow-origin').value);
+    const destination = formatSelectedStop($('flow-destination').value);
+    $('map-click-status').textContent = `${message} Current endpoints — Origin: ${origin}; Destination: ${destination}.`;
+  }
+
+  function stopMarkerStyle(stopId, hasMeasurements) {
+    const originSelected = String($('flow-origin').value || '') === String(stopId);
+    const destinationSelected = String($('flow-destination').value || '') === String(stopId);
+    const selected = originSelected || destinationSelected;
+    const color = originSelected && destinationSelected
+      ? '#6b21a8'
+      : originSelected ? '#166534' : destinationSelected ? '#c2410c'
+        : hasMeasurements ? '#087f8c' : '#235aa6';
+    return {
+      radius: selected ? 9 : hasMeasurements ? 6 : 4,
+      color,
+      weight: selected ? 4 : 1.5,
+      fillColor: hasMeasurements ? '#40c4cf' : '#235aa6',
+      fillOpacity: selected ? 0.9 : 0.75,
+    };
+  }
+
+  function updateOdEndpointMarkers() {
+    for (const [stopId, entry] of viewer.stopMarkers) {
+      entry.marker.setStyle(stopMarkerStyle(stopId, entry.hasMeasurements));
+    }
+  }
+
+  function assignOdEndpoint(endpoint, stopId) {
+    const selectorId = endpoint === 'origin' ? 'flow-origin' : 'flow-destination';
+    const selector = $(selectorId);
+    const available = [...selector.options].some((option) => option.value === String(stopId));
+    if (!available) {
+      updateOdMapSelectionStatus(
+        `Cannot set ${endpoint === 'origin' ? 'Origin' : 'Destination'} to stop ${stopId}: this stop is not an available ${endpoint} in the bundle.`,
+      );
+      return false;
+    }
+    selector.value = String(stopId);
+    viewer.selectedOd = null;
+    updateOdEndpointMarkers();
+    updateOdMapSelectionStatus(`${endpoint === 'origin' ? 'Origin' : 'Destination'} set to ${formatSelectedStop(stopId)}.`);
+    const origin = $('flow-origin').value;
+    const destination = $('flow-destination').value;
+    const departureBin = $('flow-bin').value || 'all';
+    void refreshFlows().then((result) => {
+      if (
+        result?.total === 0
+        && viewer.mapClickMode === 'od'
+        && $('flow-origin').value === origin
+        && $('flow-destination').value === destination
+        && ($('flow-bin').value || 'all') === departureBin
+        && origin
+        && destination
+      ) {
+        updateOdMapSelectionStatus(
+          `No OD rows match ${formatSelectedStop(origin)} → ${formatSelectedStop(destination)} in departure interval ${departureIntervalLabel(departureBin)}. The pair may be excluded by the OD universe; no other endpoint was changed.`,
+        );
+      }
+    });
+    return true;
+  }
+
+  function makeOdEndpointPopup(stop) {
+    const content = document.createElement('div');
+    content.className = 'od-endpoint-popup';
+    const heading = document.createElement('strong');
+    heading.textContent = stop.name ? String(stop.name) : 'Unnamed stop';
+    const identifier = document.createElement('span');
+    identifier.textContent = `Stop ID: ${stop.stop_id}`;
+    const actions = document.createElement('div');
+    actions.className = 'od-endpoint-popup-actions';
+    actions.setAttribute('role', 'group');
+    actions.setAttribute('aria-label', `Choose an endpoint for stop ${stop.stop_id}`);
+    for (const [endpoint, label] of [['origin', 'Set as origin'], ['destination', 'Set as destination']]) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = label;
+      button.setAttribute(
+        'aria-label',
+        `${label}: ${stop.name ? `${stop.name}, ` : ''}stop ID ${stop.stop_id}`,
+      );
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (assignOdEndpoint(endpoint, stop.stop_id)) viewer.map.closePopup();
+      });
+      actions.append(button);
+    }
+    content.append(heading, identifier, actions);
+    if (window.L?.DomEvent) {
+      L.DomEvent.disableClickPropagation(content);
+      L.DomEvent.disableScrollPropagation(content);
+    }
+    return content;
   }
 
   async function measurementComponents(measurementIndex) {
@@ -1141,7 +1250,8 @@
       viewer.odRows = result.rows;
       sortFlowRows(); renderTable(viewer.flowRows, viewer.flowTitle, result.total);
       setFlowStatus(`Prepared ${display(result.rows.length)} ranked rows; showing ${display(viewer.flowRows.length)} of ${display(result.total)} matches. Use Load 50 more or Load all matching rows to continue.`, 'ok');
-    } catch (error) { setFlowStatus(`Could not load partition: ${error.message}`, 'bad'); }
+      return result;
+    } catch (error) { setFlowStatus(`Could not load partition: ${error.message}`, 'bad'); return null; }
   }
 
   async function loadMoreFlows(loadAll = false) {
@@ -1168,9 +1278,8 @@
     sortFlowRows(); renderTable(viewer.flowRows, viewer.flowTitle, viewer.flowMatchedCount);
     setFlowStatus(`Loaded ${display(viewer.flowRows.length)} of ${display(viewer.flowMatchedCount)} matching rows.`, 'ok');
   }
-  // Kept as named actions for integrations and the legacy map controls.
+  // Kept as a named action for integrations that select a result row.
   function selectOd(row) { viewer.selectedOd = row; }
-  function chooseOdStop(id) { if (!$('flow-origin').value) $('flow-origin').value = id; else $('flow-destination').value = id; refreshFlows(); }
 
   function drawFlowMap(rows, title) {
     if (!viewer.map || !window.L) return;
@@ -1188,6 +1297,7 @@
 
   async function waitForLeaflet() { for (let i = 0; i < 100 && !window.L; i += 1) await new Promise((resolve) => setTimeout(resolve, 50)); if (!window.L) throw new Error('Map library could not be loaded.'); }
   async function renderNetwork() {
+    viewer.stopMarkers = new Map();
     const stopsFile = findFile('network/stops.csv') || findFile('stops.csv'); if (!stopsFile) return;
     try {
       const locationManifest = await measurementLocationIndex();
@@ -1220,11 +1330,25 @@
       const lat = num(stop.lat); const lon = num(stop.lon); if (lat === null || lon === null) return;
       const hasMeasurements = Object.prototype.hasOwnProperty.call(indexedStops, stop.stop_id);
       const rowCount = hasMeasurements ? Number(indexedStops[stop.stop_id].row_count) || 0 : 0;
-      const marker = L.circleMarker([lat, lon], {radius: hasMeasurements ? 6 : 4, color: hasMeasurements ? '#087f8c' : '#235aa6', fillColor: hasMeasurements ? '#40c4cf' : '#235aa6', fillOpacity: .75});
+      const marker = L.circleMarker([lat, lon], stopMarkerStyle(stop.stop_id, hasMeasurements));
       marker.bindTooltip(`Stop ID: ${esc(stop.stop_id)}${stop.name ? ` · ${esc(stop.name)}` : ''}${hasMeasurements ? ` · ${rowCount} measurement row(s)` : ''}`)
-        .on('click', () => viewer.mapClickMode === 'measurement' ? selectMeasurementStop(stop.stop_id) : chooseOdStop(stop.stop_id))
+        .on('click', (event) => {
+          if (viewer.mapClickMode === 'measurement') {
+            void selectMeasurementStop(stop.stop_id);
+            return;
+          }
+          if (event.originalEvent) L.DomEvent.stopPropagation(event.originalEvent);
+          updateOdMapSelectionStatus(`Choose an endpoint for ${formatSelectedStop(stop.stop_id)}.`);
+          L.popup()
+            .setLatLng(marker.getLatLng())
+            .setContent(makeOdEndpointPopup(stop))
+            .openOn(viewer.map);
+        })
         .addTo(viewer.markerLayer);
+      viewer.stopMarkers.set(stop.stop_id, {marker, hasMeasurements});
     });
+    updateOdEndpointMarkers();
+    updateOdMapSelectionStatus('Click a stop to choose an endpoint.');
     await renderLineGeometry();
   }
 
@@ -1378,7 +1502,7 @@
     }
     return blocks.join('\n');
   }
-  $('folder').addEventListener('change', (event) => load([...event.target.files])); $('flow-refresh').addEventListener('click', () => refreshFlows()); $('flow-more').addEventListener('click', () => loadMoreFlows()); $('flow-all').addEventListener('click', () => loadMoreFlows(true)); $('flow-page-previous').addEventListener('click', () => { viewer.flowPage = Math.max(0, viewer.flowPage - 1); renderTable(viewer.flowRows, viewer.flowTitle, viewer.flowMatchedCount); }); $('flow-page-next').addEventListener('click', () => { viewer.flowPage += 1; renderTable(viewer.flowRows, viewer.flowTitle, viewer.flowMatchedCount); }); $('flow-clear-cache').addEventListener('click', clearCache); ['flow-bin', 'flow-origin', 'flow-destination'].forEach((id) => $(id).addEventListener('change', () => refreshFlows()));
+  $('folder').addEventListener('change', (event) => load([...event.target.files])); $('flow-refresh').addEventListener('click', () => refreshFlows()); $('flow-more').addEventListener('click', () => loadMoreFlows()); $('flow-all').addEventListener('click', () => loadMoreFlows(true)); $('flow-page-previous').addEventListener('click', () => { viewer.flowPage = Math.max(0, viewer.flowPage - 1); renderTable(viewer.flowRows, viewer.flowTitle, viewer.flowMatchedCount); }); $('flow-page-next').addEventListener('click', () => { viewer.flowPage += 1; renderTable(viewer.flowRows, viewer.flowTitle, viewer.flowMatchedCount); }); $('flow-clear-cache').addEventListener('click', clearCache); ['flow-bin', 'flow-origin', 'flow-destination'].forEach((id) => $(id).addEventListener('change', (event) => { if (event.currentTarget.id !== 'flow-bin') { viewer.selectedOd = null; updateOdEndpointMarkers(); updateOdMapSelectionStatus(); } void refreshFlows(); }));
   $('map-od-mode')?.addEventListener('click', () => setMapClickMode('od')); $('map-measurement-mode')?.addEventListener('click', () => setMapClickMode('measurement'));
   $('measurement-od-direction')?.addEventListener('change', () => {
     updateMeasurementOdDirection();

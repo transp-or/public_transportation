@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
+import subprocess
+import sys
 
 
 VIEWER = Path(__file__).resolve().parents[2] / "tools" / "gravity_viewer" / "index.html"
@@ -18,7 +21,6 @@ def test_viewer_exposes_stop_and_od_pair_interaction_controls() -> None:
         'id="reset-selection"',
         "od_map.csv",
         "stop_summary.csv",
-        "chooseOdStop",
         "selectOd",
         'id="measurement-od"',
         'id="measurement-od-direction"',
@@ -68,6 +70,70 @@ def test_viewer_starts_from_manifest_and_streams_selected_partitions() -> None:
     assert "streamMatches: true" in viewer_source
     assert "measurementContributions" in viewer_source
     assert 'id="measurement-row-index"' not in source
+
+
+def test_network_map_od_selection_requires_an_explicit_endpoint_action() -> None:
+    source = VIEWER.read_text(encoding="utf-8")
+    viewer_source = VIEWER.with_name("viewer.js").read_text(encoding="utf-8")
+    popup_start = viewer_source.index("  function makeOdEndpointPopup(stop) {")
+    popup_end = viewer_source.index("\n  function ", popup_start + 1)
+    popup = viewer_source[popup_start:popup_end]
+    assign_start = viewer_source.index("  function assignOdEndpoint(endpoint, stopId) {")
+    assign_end = viewer_source.index("\n  function ", assign_start + 1)
+    assign = viewer_source[assign_start:assign_end]
+    network_start = viewer_source.index("  async function renderNetwork() {")
+    network_end = viewer_source.index("\n  async function renderLineGeometry", network_start)
+    network = viewer_source[network_start:network_end]
+    mode_start = viewer_source.index("  function setMapClickMode(mode) {")
+    mode_end = viewer_source.index("\n  function formatSelectedStop", mode_start)
+    mode_switch = viewer_source[mode_start:mode_end]
+
+    assert "Set as origin" in popup
+    assert "Set as destination" in popup
+    assert "aria-label" in popup and "stop ID ${stop.stop_id}" in popup
+    assert "role', 'group'" in popup and "Choose an endpoint for stop ${stop.stop_id}" in popup
+    assert "event.stopPropagation()" in popup
+    assert "L.DomEvent.disableClickPropagation(content)" in popup
+    assert "assignOdEndpoint(endpoint, stop.stop_id)" in popup
+    assert "selector.value = String(stopId)" in assign
+    assert not re.search(r"\$\('flow-origin'\)\.value\s*=(?!=)", assign)
+    assert not re.search(r"\$\('flow-destination'\)\.value\s*=(?!=)", assign)
+    assert "this stop is not an available" in assign
+    assert "may be excluded by the OD universe" in assign
+
+    click_handler = network.split(".on('click', (event) => {", 1)[1].split("\n        })", 1)[0]
+    assert "if (viewer.mapClickMode === 'measurement')" in click_handler
+    assert "void selectMeasurementStop(stop.stop_id);" in click_handler
+    assert "return;" in click_handler
+    assert click_handler.index("selectMeasurementStop(stop.stop_id)") < click_handler.index("stopPropagation")
+    assert "makeOdEndpointPopup(stop)" in click_handler
+    assert "assignOdEndpoint(" not in click_handler
+    assert "chooseOdStop" not in viewer_source
+    assert "if (mode === 'measurement') viewer.map?.closePopup();" in mode_switch
+
+    assert "Current endpoints — Origin: ${origin}; Destination: ${destination}." in viewer_source
+    assert "originSelected ? '#166534'" in viewer_source
+    assert "destinationSelected ? '#c2410c'" in viewer_source
+    assert "originSelected && destinationSelected" in viewer_source
+    assert 'role="status" aria-live="polite"' in source
+    assert "neither endpoint changes until you choose an action" in source
+
+
+def test_viewer_guide_documents_explicit_od_endpoint_actions() -> None:
+    source = VIEWER.read_text(encoding="utf-8")
+    guide = source.split('<details class="panel quick-guide">', 1)[1].split("</details>", 1)[0]
+    docs = VIEWER.parents[2] / "docs" / "source" / "gravity_viewer_guide.md"
+    documentation = docs.read_text(encoding="utf-8")
+
+    for content in (guide, documentation):
+        assert "OD selection" in content
+        assert "click a stop" in content.lower()
+        assert "Set as origin" in content
+        assert "Set as destination" in content
+        assert "only the chosen endpoint changes" in content or "leaves the" in content
+    assert "Measurement" in guide
+    assert 'go to <a href="#network-map">Network map</a>, choose <strong>Measurement</strong> mode' in guide
+    assert "Measurement** mode" in documentation
 
 
 def test_viewer_uses_the_local_service_for_selected_measurement_pages() -> None:
@@ -120,6 +186,14 @@ def test_quick_guide_is_collapsible_linked_and_matches_visible_controls() -> Non
     assert "query service" not in guide.lower()
     assert "terminal" not in guide.lower()
     assert "server" not in guide.lower()
-    assert "By Michel Bierlaire · Implemented 8 September 2026" in source
+    assert 'class="title-credit"' in source
     assert source.index("<h1>Gravity Viewer Bundle</h1>") < source.index("By Michel Bierlaire")
     assert source.index("By Michel Bierlaire") < source.index("<main>")
+    check = subprocess.run(
+        [sys.executable, str(VIEWER.with_name("build.py")), "--check"],
+        cwd=VIEWER.parents[2],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert check.returncode == 0, check.stdout + check.stderr
