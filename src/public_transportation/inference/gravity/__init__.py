@@ -131,21 +131,6 @@ from .boundary_artifact import (
     load_gravity_boundary_artifact,
     write_gravity_boundary_artifact,
 )
-from .section_usage import (
-    SECTION_USAGE_ALGORITHM_VERSION,
-    SECTION_USAGE_COLUMNS,
-    SECTION_USAGE_FORMAT_VERSION,
-    SECTION_USAGE_KEY_COLUMNS,
-    SECTION_USAGE_SCHEMA_VERSION,
-    SectionUsageCheckpointError,
-    SectionUsageStorageBudgetExceeded,
-    aggregate_line_usage_rows,
-    aggregate_section_usage_rows,
-    iter_section_usage_rows,
-    read_section_usage_manifest,
-    write_section_usage_dataset,
-    write_line_usage_dataset,
-)
 from .operator import (
     GravityLinearMeasurementOperator,
     GravityMeasurementOperator,
@@ -236,7 +221,6 @@ from .viewer_bundle import (
     GRAVITY_VIEWER_CACHE_FORMAT_VERSION,
     GRAVITY_VIEWER_BUNDLE_SCHEMA_VERSION,
     GRAVITY_VIEWER_BUNDLE_TYPE,
-    GRAVITY_VIEWER_ROUTE_SECTION_SCHEMA_VERSION,
     GravityViewerBundle,
     read_gravity_viewer_bundle,
     write_gravity_viewer_bundle,
@@ -244,11 +228,6 @@ from .viewer_bundle import (
 )
 from .measurement_od_contributions import (
     MeasurementODContributionQuery,
-)
-from .viewer_route_export import (
-    GravityRouteFlowExportPlan,
-    export_gravity_route_flows,
-    plan_gravity_route_flow_export,
 )
 from .identifiability import (
     GravityIdentifiabilityConfig,

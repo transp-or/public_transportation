@@ -1,371 +1,90 @@
-# Gravity-result viewer: launch and file selection
+# Gravity viewer: quick user guide
 
-This guide explains how to open the read-only browser viewer included with the
-public package and how to select a result bundle. The viewer is a small,
-standalone browser application; it does not run routing, rebuild an operator,
-evaluate an objective, or modify any input or result file.
+This guide covers common tasks in the read-only browser viewer for completed
+gravity result bundles. The viewer also includes a collapsible **Quick guide**
+panel near the page title.
 
-The viewer is useful for inspecting a completed
-`gravity_viewer_bundle_v1`. It is not a replacement for the case-study driver
-or for the validation and fit reports.
+## Before you start
 
-## What is needed
+Choose a completed viewer-bundle directory. It contains a `bundle_manifest.json`
+file at its top level. The bundle can be copied to the computer where you will
+open the viewer.
 
-Obtain a completed viewer-bundle directory produced by
-`write_gravity_viewer_bundle` or `write_persisted_gravity_viewer_bundle`.
-The bundle can be copied from the case-study results root to the computer on
-which the browser will run. A cluster scratch path is not directly visible to a
-browser running on a laptop, so copy or archive the bundle first when needed.
+## Open the viewer
 
-At its root, a complete bundle normally looks like this:
+Open `tools/gravity_viewer/index.html` in a browser. Click
+**Select a viewer-bundle directory** and choose the folder containing
+`bundle_manifest.json`. The loaded overview is shown under **Bundle summary**.
 
-```text
-viewer_bundle/
-  bundle_manifest.json
-  model_specification.json
-  report.json
-  executive_summary.md             optional
-  report.md                        optional
-  full_od.csv
-  predicted_measurements.csv
-  residuals.csv
-  grouped_residuals.csv            optional
-  parameters.csv                   optional
-  od_map.csv                       optional display summary
-  stop_summary.csv                 optional display summary
-  viewer_summary.json              partition/index metadata
-  partitions/od/                   one CSV per departure-time bin
-  partitions/measurement_od_contributions/  legacy precomputed contribution data
-    manifest.json
-    components/                      bounded measurement-row component shards
-    bins/                           bounded CSV partitions by OD departure interval
-  partitions/measurement_locations/ optional per-stop measured-row lookup
-    manifest.json
-    stops/                          checksummed bounded per-stop pages
-  partitions/route_flows/          optional sparse post-fit route flows
-  network/                          optional network snapshot
-    stops.csv
-    lines.csv
-    trips.csv
-    stop_times.csv
-```
+The viewer is read-only. If it reports missing files or a checksum problem,
+select the bundle’s root folder again and verify that the complete bundle was
+copied.
 
-The manifest and the six core files are required by the viewer:
-`bundle_manifest.json`, `model_specification.json`, `report.json`,
-`full_od.csv`, `predicted_measurements.csv`, and `residuals.csv`. Optional
-display files enable richer interaction but are not required for ordinary
-table inspection. In particular, `od_map.csv` enables the **OD pairs** mode
-and `stop_summary.csv` enables the **Stops** mode. Older valid bundles without
-these files remain readable, with the corresponding interaction disabled.
+## Explore estimated OD demand
 
-Keep private bundles outside Git and do not upload them to a public issue or
-repository. The bundle contains results and provenance, not the routing
-engine itself, so the original case directory is not needed for viewing.
+Go to **Demand explorer**. Select a **Departure time interval**, and optionally
+an **Origin** and **Destination**, then click **Load selected partition**. A
+partition is the saved slice of demand for that selection; the viewer finds it
+for you, so there is no need to locate or open a partition file.
 
-## Launch the viewer on macOS
+Use **Load 50 more** to extend the results in 50-row increments, or **Load all
+matching rows** to display all rows matching the selection. Click a column
+heading to sort the rows currently loaded; rows not yet loaded are not included
+in that sorting.
 
-The viewer source is in the public repository at:
+## Find measurements at a stop
 
-```text
-tools/gravity_viewer/index.html
-```
+Go to **Network map**, choose **Measurement** mode, then click a stop with
+measurements. If several rows are available, choose one with the **Measurement
+row** selector or browse with **Previous rows** and **Next rows**. The selected
+row shows its **Observed count** and **Modeled mean**.
 
-There is no build step and no JavaScript package installation. For on-demand
-measurement OD queries, one Python process serves both the viewer files and
-the query API. From the public repository root, run:
+Map-based measurement lookup depends on stop and measurement lookup data being
+included in the bundle. Stops without matching rows show a clear message.
 
-```bash
-PYTHONPATH=src uv run --frozen python -m public_transportation.inference.gravity.viewer_query_service \
-  --bundle /path/to/viewer_bundle \
-  --fit-manifest /path/to/fit/manifest.json \
-  --mapping-artifact /path/to/temporal_mapping_artifact
-```
+## See the OD contributors to a measured row
 
-Then open <http://127.0.0.1:8765/> in the browser and select the same bundle
-directory in the folder picker. The server validates the fit and mapping
-identity before serving the page, and binds only to loopback. Keep this single
-process running while using the viewer; press `Ctrl-C` when finished. The
-viewer can still be opened directly as a static file for bundle inspection,
-but on-demand contribution queries require the combined local server.
+When contribution data are available in the bundle, go to **Measured flows by OD
+pair**. Under **What do you want to look up?**, choose **Measured row →
+contributing OD pairs**, select the measured row, and click **Load OD
+contributors**.
 
-During startup, the terminal names each loading and validation stage and prints
-an elapsed-time heartbeat every 10 seconds while a stage is still running. It
-also shows throttled progress bars for bundle checksum and CSV-row scans, the
-temporal mapping manifest checksum, and decoding canonical mapping records.
-Network cross-reference checks and measurement-location index validation also
-show row-level progress bars. Repeated full-OD network scans are consolidated
-into a single pass.
-Manifest JSON parsing and index invariant/fingerprint checks still use elapsed
-heartbeats because those operations do not expose reliable incremental totals.
+Use **Rows per page**, **Previous contributors**, and **Next contributors** to
+browse. Contributors are ranked by the magnitude of their modeled-mean
+contribution and decompose the **Modeled mean**, not the observed count; fixed,
+additive, and floor components shown separately are not assigned to individual
+OD pairs. Column sorting applies to the displayed page.
 
-Departure-time selectors display the canonical interval boundaries from the
-validated temporal mapping, using the bundle's local schedule time zone. The
-interval IDs remain internal query keys; the displayed end boundary is
-exclusive.
+## Find measurements affected by an OD pair
 
-The viewer uses Leaflet and OpenStreetMap tiles for the optional map. Internet
-access is therefore needed for the map background, but the bundle tables and
-diagnostic panels remain useful if the map library or tile service is
-unavailable.
+In **Measured flows by OD pair**, choose **OD pair → affected measured rows**
+under **What do you want to look up?** Select the **OD departure interval**,
+**Origin**, and **Destination**, then click **Load affected measurements**.
+The OD departure interval is when the trip leaves; it is distinct from a
+measurement’s observation time. Availability depends on the bundle contents.
 
-## Select the result files
+## While a contribution query is running
 
-1. In the viewer, click **Select a viewer-bundle directory**.
-2. Choose the bundle directory itself, for example `viewer_bundle/` or
-   `results/viewer_bundle/`.
-3. Do not select an individual CSV file, the `network/` subdirectory, or an
-   unrelated parent directory containing several runs. The selected directory
-   should be the one containing `bundle_manifest.json`.
-4. Confirm the selection in the system folder picker. The browser may display
-   only the folder name; it will read the files below that folder recursively.
+Follow the status and progress area while the viewer processes the query. Wait
+for the results, or change your selection to request a different query.
 
-After selection, the page reads the manifest, model specification, report, and
-small partition summary first. It does not parse `full_od.csv`,
-`predicted_measurements.csv`, or `residuals.csv` at startup. Selecting a time
-slot streams only that partition through a Web Worker, verifies its size and
-checksum, and stores the bounded result in IndexedDB. A successful load is
-confirmed by the green message:
+## Network map
 
-```text
-Bundle manifest and summary loaded. Partition checksums are verified when selected.
-```
-
-The viewer never writes back to the selected directory. If the message reports
-missing files, size mismatches, or checksum mismatches, select the exact bundle
-root again and verify that the copy completed. Do not mix files from different
-runs to make the warning disappear.
-
-## Inspect the result
-
-The summary panel shows the bundle schema, row counts, model-specification
-fingerprint, likelihood, provenance, and available diagnostics. The model
-specification is read from `model_specification.json`; it is the authoritative
-description of the fitted model in the bundle.
-
-The data preview and **Demand and route-assignment explorer** display bounded
-samples. They never load a second copy of the full case results into browser
-memory. Use **Clear viewer cache** after replacing a bundle or when browser
-storage is under pressure; cache entries are keyed by the bundle fingerprints,
-partition checksum, and cache-format version.
-
-The explorer distinguishes estimated OD demand from post-fit assignment data:
-
-- choose a departure-time slot, origin, and destination for origin-first or
-  destination-first OD exploration;
-- select **Route-assignment flow** and filter by line, trip, origin,
-  or destination when `partitions/route_flows/` is present;
-- service totals are expected assigned demand or passenger-leg usage as stated
-  by the bundle, not automatically unique passengers.
-
-Existing bundles without `viewer_summary.json` or route-flow partitions remain
-readable. The OD demand view remains available when its table is present;
-route-flow controls appear only when route-flow partitions are included.
-
-## Measured rows by OD pair
-
-When the bundle includes a network stop snapshot, the map has an explicit
-**Measurement** click mode alongside its default **OD selection** mode. Stops
-with measurement rows are highlighted. Click one to load only that stop's
-checksummed lookup page; choose among the listed measurement type, line,
-direction, observation time/period, and stop. Stops with no rows say
-“No measurements at this location.” The viewer matches stop identifiers
-exactly; unmatched measurement IDs are reported rather than silently mapped to
-nearby or similarly named stops. The small stop index is read at startup, but
-measurement rows themselves are fetched only for the clicked stop and are
-page-limited.
-
-For the selected row, the viewer shows the observation and modeled mean. New
-bundles with a compatible mapping query only the selected measurement interval
-through the local query service; they do not expand the full OD-by-measurement
-matrix during bundle creation. Results are ranked by absolute modeled-mean
-contribution, preserve signed modeled-mean and raw linear-flow values, and are
-returned in bounded pages. The service caches only a bounded number of recent
-pages. Fixed offset, additive contribution, and mean-floor adjustment remain
-separate and are not attributed to an OD pair. OD contributions decompose the
-modeled mean, not the observed count. Observation time is not the OD
-departure-time bin.
-
-The combined local server above validates the bundle, fit, and mapping
-fingerprints at startup. It checks each selected block payload before use and
-never rebuilds routing or writes a complete contribution cache. Open the
-served page, select the bundle directory, and use **Measurement** map mode.
-While a query is running, the page shows a spinner and elapsed time; no
-percentage is shown because the query API does not report one. The bundle can
-also be inspected without the service; measured values and map lookup remain
-available, while contribution queries require the local server.
-
-Bundles made before the stop lookup was added remain readable. Map-based row
-selection is reported unavailable when the network snapshot or lookup is
-missing; an unavailable contribution dataset does not prevent inspection of
-the observed and modeled row values when the stop lookup exists.
-
-When a validated sparse linear-mapping artifact was supplied during bundle
-creation, the **Measured flows by OD pair** panel lets you inspect the
-contributions in either direction: the OD pairs contributing to a selected
-measurement row, or the measured rows affected by one OD-time cell. New bundles
-use the local service for both directions; older bundles with precomputed
-partitions remain readable. Results are ranked by absolute modeled
-contribution. While a query runs, the viewer shows an animated indicator and
-elapsed time. The service does not report a percentage, so the viewer does not
-present a guessed completion estimate. Keep the viewer tab and local query
-service open until the result or an error appears. The Python bundle API
-provides bounded queries for legacy precomputed datasets, while the on-demand query API is
-`MeasurementODContributionQuery`:
-
-```python
-bundle.query_measurement_od_contributions(measurement_index=123, top_n=50)
-bundle.query_od_measurement_contributions(od_index=456, top_n=50)
-bundle.query_measurement_contribution_components(measurement_index=123)
-```
-
-Enable on-demand queries by passing the supported persisted sparse mapping
-artifact as `linear_mapping_artifact` to either viewer-bundle writer. Bundle
-creation validates fit and assignment fingerprints and canonical coordinates,
-but does not read every sparse block or create a matrix-sized SQLite/CSV
-cache. At query time, the service selects blocks for the requested measurement
-interval (or OD departure interval) and verifies each block checksum before
-use. Page size is bounded to 500 and ranked offsets to 5,000 rows. When the fit
-persists its observation-scale vector, no extra scale is needed. For a fit
-whose measurement scale is specified only by `rho`, pass that same fitted
-`rho`; otherwise the contribution panel is marked unavailable.
-
-An externally defined scale can also declare a generic `routed_od_only` scope
-with consistent component flags. In that case the query recovers the effective
-OD component from saved latent measurements and allocates it across mapped OD
-flows proportionally; additive terms and fixed offsets receive only the saved
-outer observation scale. Reverse queries use the same row-specific factors and
-are marked unavailable if the fit does not save the raw OD measurement
-component. Other missing, contradictory, or unsupported scope declarations
-are rejected rather than guessed.
-
-The contribution is calculated from the saved sparse mapping and fitted OD
-demand, without rerunning routing. It decomposes measured channels only; it is
-not a flow on every route section unless those sections are rows of that
-mapping. The row-component query keeps fixed offsets, additive terms, and a
-mean-floor adjustment separate from OD contributions. If the mapping contains
-fixed-positive OD demand only as an aggregate fixed offset, that component is
-shown separately and is not divided among OD pairs. Bundles without a
-compatible mapping or the exact measurement scale report this feature as
-unavailable rather than estimating missing contributions.
-
-Older bundles may still contain route-section contributor data. The static
-viewer ignores those partitions; packaged route geometry, when present, is
-drawn only as map context. OD decomposition is available for selected measured
-rows through the measurement query described above.
-
-When the optional display files and a network snapshot are present, the
-**Network map** panel provides two modes:
-
-- **Stops**: search by stop name or ID, choose the marker size and colour
-  metric, and click a stop to inspect observed, modelled, residual, incoming,
-  and outgoing totals plus the largest available OD pairs.
-- **OD pairs**: choose an origin, destination, and departure-time bin; filter
-  by minimum demand or residual; select a bounded number of pairs; and click a
-  row or line for its details.
-
-OD lines are a display aid, not a newly computed assignment. Their colour uses
-the report convention (blue for positive observed-minus-modelled residual,
-red for negative residual, and grey near zero), and the viewer draws only the
-selected or filtered top-N rows.
+When the bundle includes the relevant network and display data, the map also
+offers **Stops** and **OD pairs** views. Static transit-line geometry, when
+present, is map context and does not represent passenger assignment flows.
 
 ## Troubleshooting
 
-**“Missing `bundle_manifest.json`.”** The wrong folder was selected. Reopen the
-picker and choose the directory whose top level contains the manifest.
+**The bundle cannot be opened.** Choose the directory whose top level contains
+`bundle_manifest.json`, not an individual CSV or a parent directory containing
+several bundles.
 
-**Checksum or size mismatch.** The bundle may be incomplete or may have been
-changed during copying. Re-copy the complete bundle from its durable results
-location and select the new copy. Do not edit the CSV or manifest manually.
+**Measurement selection is unavailable.** Map-based lookup depends on network
+stop and measurement lookup data in the bundle.
 
-**“Interactive summaries unavailable.”** The bundle is valid but does not
-contain the optional display summaries or partition index. Use the ordinary
-tables, or regenerate a viewer bundle. This does not change the fitted model.
+**OD contributions are unavailable.** The measured-row and reverse OD queries
+depend on compatible contribution data being included in the bundle.
 
-**“Route flows unavailable.”** The fit and destination demand are present, but
-no post-fit route export was supplied. The viewer does not invent route paths
-from OD demand. Run the separate export step below only after checking the
-saved routing cache and its expected cost.
-
-**Blank map or a Leaflet error.** Check internet access and reload the page.
-Without the map tiles, the validated tables remain usable. Without a bundled
-`network/` snapshot, the viewer cannot draw stop markers or route context.
-
-**The folder picker is unavailable or the page cannot read a local directory.**
-Use the local HTTP-server command above and select the bundle from the page.
-Browser security settings may also require granting the page permission to
-read the selected folder.
-
-**The bundle is very large.** Select only the bundle directory. Startup reads
-only small metadata, and active memory is bounded by the selected partition and
-display sample. Safari should be tested with a complete large bundle; a
-reload indicates that the chosen partition or network snapshot is still too
-large and should be split further rather than loading the legacy CSV.
-
-## Optional post-fit route-flow export
-
-The core gravity fit supplies estimated destination demand, not OD-to-line/trip
-paths. If persisted assignment artifacts expose the correct fixed-routing
-operator, prepare a CSV with the canonical fields below and pass it as
-`route_flow_rows` to `write_gravity_viewer_bundle` (or
-`write_persisted_gravity_viewer_bundle`):
-
-```text
-origin_stop_id,destination_stop_id,departure_time_bin,line_id,trip_id,
-boarding_stop_id,alighting_stop_id,route_leg_index,route_leg_count,
-route_legs,assigned_demand,path_share,transfer_count,flow_semantics,
-route_path_id,pattern_id,direction,assignment_fingerprint
-```
-
-`flow_semantics` is `path_probability` when complete path shares are available,
-`service_marginal` for link/trip marginals, or `passenger_leg_usage` for
-leg-level usage. Before any expensive computation, inspect the saved routing
-cache identity and report whether it can provide these rows, the expected
-runtime/storage, and the checkpoint plan. If the cache cannot recover route
-contributions, use the separate post-fit export with the saved fit and routing
-implementation; do not rerun estimation and do not label service marginals as
-complete path probabilities.
-
-The public helper makes that boundary explicit:
-
-```python
-from public_transportation.inference.gravity import (
-    export_gravity_route_flows,
-    plan_gravity_route_flow_export,
-)
-
-plan = plan_gravity_route_flow_export(
-    routing_cache="/path/to/saved-routing-cache",
-    expected_assignment_fingerprint="<fit-assignment-fingerprint>",
-    expected_rows=<estimated-row-count>,
-)
-if not plan.available:
-    raise RuntimeError(plan.reason)
-export_gravity_route_flows(
-    route_flow_rows=rows_from_the_validated_routing_implementation,
-    output_path="route_flows.csv",
-    checkpoint_path="route_flows.checkpoint.json",
-    progress=lambda rows: print(f"exported {rows:,} rows"),
-)
-```
-
-The resulting CSV can be supplied as `route_flow_rows` to the bundle writer;
-the writer partitions it by departure-time bin and records checksums and row
-counts in the manifest.
-
-## Short checklist
-
-Before interpreting a result, confirm:
-
-- the bundle was exported only after the intended fit and validation stages;
-- the selected folder contains `bundle_manifest.json` at its root;
-- the green manifest-validation message is displayed;
-- the model-specification fingerprint and provenance correspond to the run;
-- optional `od_map.csv`, `stop_summary.csv`, and `network/` files are present
-  when the corresponding map interaction is required;
-- the original bundle remains unchanged and is retained with the case-study
-  results.
-
-For the export and data-contract details, see
-[`gravity_estimation.md`](gravity_estimation.md). For the complete case-study
-workflow and its `export-viewer` stage, see
-[`new_case_study_walkthrough.md`](new_case_study_walkthrough.md), Section 23.
+**The map background is blank.** Map tiles require internet access. The tables
+and other viewer panels remain available without the map background.

@@ -24,11 +24,6 @@ from public_transportation.inference.gravity import (
     write_persisted_gravity_viewer_bundle,
 )
 from public_transportation.inference.od_parameter_layout import ODParameterLayout
-from public_transportation.inference.gravity.section_usage import (
-    write_section_usage_dataset,
-)
-
-
 def _inputs(tmp_path, specification=None):
     layout = ODParameterLayout(
         num_od_total=2,
@@ -153,6 +148,16 @@ def test_viewer_bundle_contains_exact_model_specification_and_round_trips(tmp_pa
     assert bundle.manifest["files"]["full_od.csv"]["row_count"] == 2
     assert bundle.manifest["files"]["od_map.csv"]["row_count"] == 2
     assert bundle.manifest["files"]["stop_summary.csv"]["row_count"] == 3
+    assert "route_flows" not in bundle.viewer_summary
+    assert "route_sections" not in bundle.viewer_summary
+    assert "route_flows" not in bundle.manifest["partitions"]
+    assert "route_sections" not in bundle.manifest["partitions"]
+    assert "route_flow_provenance" not in bundle.manifest
+    assert "route_section_provenance" not in bundle.manifest
+    assert not any(
+        name.startswith(("partitions/route_flows/", "partitions/route_sections/", "partitions/section_loads/"))
+        for name in bundle.manifest["files"]
+    )
     assert set(bundle.read_table("od_map.csv").columns) == {
         "origin_stop_id",
         "destination_stop_id",
@@ -540,108 +545,7 @@ def test_bundle_can_omit_identifiability_or_require_it(tmp_path):
         )
 
 
-def test_bundle_requires_exact_model_specification(tmp_path):
-    result, report, _ = _inputs(tmp_path)
-    without_spec = replace(result, model_specification=None, specification_fingerprint="")
-    with pytest.raises(ValueError, match="exact model specification"):
-        write_gravity_viewer_bundle(
-            output_directory=tmp_path / "bundle",
-            fit_result=without_spec,
-            validation_result=report.adequacy,
-            report=report,
-        )
-
-
-def test_route_flow_partitions_support_od_and_service_queries(tmp_path):
-    result, report, _ = _inputs(tmp_path)
-    bundle = write_gravity_viewer_bundle(
-        output_directory=tmp_path / "route-bundle",
-        fit_result=result,
-        validation_result=report.adequacy,
-        report=report,
-        route_flow_rows=(
-            {
-                "origin": "o1",
-                "destination": "d1",
-                "departure_time_bin": "am",
-                "line": "L1",
-                "trip": "T1",
-                "boarding_stop": "o1",
-                "alighting_stop": "d1",
-                "assigned_demand": 0.75,
-                "path_share": 0.75,
-                "transfer_count": 0,
-                "flow_semantics": "path_probability",
-            },
-            {
-                "origin": "o1",
-                "destination": "d2",
-                "departure_time_bin": "am",
-                "line": "L1",
-                "trip": "T1",
-                "assigned_demand": 0.25,
-                "path_share": 0.25,
-                "transfer_count": 1,
-                "flow_semantics": "path_probability",
-            },
-        ),
-    )
-    assert bundle.route_flow_available
-    assert "realized route-assignment" in (bundle.transfer_count_definition or "")
-    assert bundle.query_od_routes(origin="o1", destination="d1")["trip_id"].tolist() == ["T1"]
-    service = bundle.query_service_flows(line="L1")
-    assert service["assigned_demand"].astype(float).sum() == pytest.approx(1.0)
-    aggregate = bundle.aggregate_route_flows("line_id", line="L1")
-    assert aggregate.iloc[0]["assigned_demand"] == pytest.approx(1.0)
-    assert bundle.manifest["viewer_summary"]["route_flows_available"] is True
-    assert len(bundle.viewer_summary["route_flows"]["partitions"]) == 1
-
-
-def test_route_flow_rejects_minimum_feasible_transfer_substitute(tmp_path):
-    result, report, _ = _inputs(tmp_path)
-    with pytest.raises(ValueError, match="(flow_semantics|minimum_transfers)"):
-        write_gravity_viewer_bundle(
-            output_directory=tmp_path / "bad-route-bundle",
-            fit_result=result,
-            validation_result=report.adequacy,
-            report=report,
-            route_flow_rows=(
-                {
-                    "origin": "o1",
-                    "destination": "d1",
-                    "departure_time_bin": "am",
-                    "assigned_demand": 1,
-                    "minimum_transfers": 0,
-                    "flow_semantics": "minimum_feasible_transfer",
-                },
-            ),
-        )
-
-
-def test_route_flow_references_must_match_network_snapshot(tmp_path):
-    result, report, _ = _inputs(tmp_path)
-    with pytest.raises(ValueError, match="route-flow line ID"):
-        write_gravity_viewer_bundle(
-            output_directory=tmp_path / "bad-network-route-bundle",
-            fit_result=result,
-            validation_result=report.adequacy,
-            report=report,
-            network_files=_network_files(tmp_path),
-            route_flow_rows=(
-                {
-                    "origin": "o1",
-                    "destination": "d1",
-                    "departure_time_bin": "am",
-                    "line": "L2",
-                    "trip": "T1",
-                    "assigned_demand": 1,
-                    "flow_semantics": "service_marginal",
-                },
-            ),
-        )
-
-
-def test_route_sections_expand_paths_and_query_selected_interval(tmp_path):
+def test_static_line_geometry_is_generated_without_assignment_export(tmp_path):
     result, report, _ = _inputs(tmp_path)
     network = _network_files(tmp_path)
     trips = tmp_path / "trips.csv"
@@ -652,104 +556,73 @@ def test_route_sections_expand_paths_and_query_selected_interval(tmp_path):
         encoding="utf-8",
     )
     network.update({"trips.csv": trips, "stop_times.csv": stop_times})
+
     bundle = write_gravity_viewer_bundle(
-        output_directory=tmp_path / "section-bundle",
+        output_directory=tmp_path / "bundle-with-lines",
         fit_result=result,
         validation_result=report.adequacy,
         report=report,
         network_files=network,
-        route_flow_rows=(
-            {
-                "origin": "o1",
-                "destination": "d2",
-                "departure_time_bin": "t0",
-                "line": "L1",
-                "trip": "T1",
-                "boarding_stop": "o1",
-                "alighting_stop": "d2",
-                "route_path_id": "path-1",
-                "assigned_demand": 2,
-                "path_share": 1,
-                "transfer_count": 0,
-                "flow_semantics": "path_probability",
-            },
-        ),
     )
-    assert bundle.route_section_available
-    sections = bundle.viewer_summary["route_sections"]
-    section_id = next(
-        row["section_id"] for row in csv.DictReader((bundle.path / sections["catalog_path"]).open(encoding="utf-8")) if row["from_stop_id"] == "o1"
-    )
-    contributors = bundle.query_section_od(section_id, departure_time_bin="t0")
-    assert contributors.shape[0] == 1
-    assert contributors.iloc[0]["route_path_id"] == "path-1"
-    assert float(contributors.iloc[0]["assigned_demand"]) == pytest.approx(2)
-    load = bundle.query_section_load(section_id, departure_time_bin="t0")
-    assert float(load.iloc[0]["assigned_flow"]) == pytest.approx(2)
-    assert int(load.iloc[0]["distinct_od_count"]) == 1
+
+    geometry = bundle.viewer_summary["line_geometry"]
+    assert geometry["available"] is True
+    geojson = json.loads((bundle.path / geometry["geometry_path"]).read_text(encoding="utf-8"))
+    assert len(geojson["features"]) == 2
 
 
-def test_compact_section_dataset_is_consumed_without_path_expansion(tmp_path):
-    result, report, provenance = _inputs(tmp_path)
-    dataset = tmp_path / "section-usage"
-    write_section_usage_dataset(
-        (
-            {
-                "departure_time_bin": "am",
-                "section_id": "S1",
-                "origin_stop_id": "o1",
-                "destination_stop_id": "d1",
-                "line_id": "L1",
-                "trip_id": "T1",
-                "assigned_contribution": 1.25,
-            },
-            {
-                "departure_time_bin": "am",
-                "section_id": "S1",
-                "origin_stop_id": "o1",
-                "destination_stop_id": "d1",
-                "line_id": "L1",
-                "trip_id": "T2",
-                "assigned_contribution": 0.75,
-            },
-        ),
-        dataset,
-        format="csv",
-        source_identity={"fit_assignment_fingerprint": provenance["assignment_fingerprint"]},
-    )
+def test_legacy_extra_assignment_files_are_checked_only_by_manifest(tmp_path):
+    result, report, _ = _inputs(tmp_path)
     bundle = write_gravity_viewer_bundle(
-        output_directory=tmp_path / "compact-section-bundle",
+        output_directory=tmp_path / "legacy-extra-bundle",
         fit_result=result,
         validation_result=report.adequacy,
         report=report,
-        section_usage_dataset=dataset,
     )
-    assert bundle.route_section_available
-    selected = bundle.query_section_od("S1", departure_time_bin="am", line="L1", trip="T2")
-    assert selected["trip_id"].tolist() == ["T2"]
-    assert float(selected.iloc[0]["assigned_contribution"]) == pytest.approx(0.75)
-    aggregated = bundle.query_section_od("S1", departure_time_bin="am", aggregate_by_od=True)
-    assert float(aggregated.iloc[0]["assigned_contribution"]) == pytest.approx(2.0)
+    manifest_path = bundle.path / "bundle_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    summary_path = bundle.path / "viewer_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["route_flows"] = {
+        "available": True,
+        "partitions": [{"path": "../../outside.csv", "row_count": 999}],
+    }
+    summary["route_sections"] = {"available": True, "schema_version": -1, "partitions": "invalid"}
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    summary_record = manifest["files"]["viewer_summary.json"]
+    summary_record["sha256"] = hashlib.sha256(summary_path.read_bytes()).hexdigest()
+    summary_record["size_bytes"] = summary_path.stat().st_size
+
+    extras = (
+        "partitions/route_flows/legacy.csv",
+        "partitions/route_sections/legacy.csv",
+        "partitions/section_loads/legacy.csv",
+    )
+    for name in extras:
+        path = bundle.path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("irrelevant\nvalue\n", encoding="utf-8")
+        manifest["files"][name] = {
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "size_bytes": path.stat().st_size,
+            "row_count": 1,
+        }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    loaded = read_gravity_viewer_bundle(bundle.path)
+    assert loaded.query_od(origin="o1")["estimated_demand"].tolist() == [1.0, 2.0]
+    assert loaded.viewer_summary["route_flows"]["available"] is True
 
 
-def test_route_flow_assignment_fingerprint_mismatch_fails_closed(tmp_path):
+def test_bundle_requires_exact_model_specification(tmp_path):
     result, report, _ = _inputs(tmp_path)
-    with pytest.raises(ValueError, match="assignment fingerprint"):
+    without_spec = replace(result, model_specification=None, specification_fingerprint="")
+    with pytest.raises(ValueError, match="exact model specification"):
         write_gravity_viewer_bundle(
-            output_directory=tmp_path / "mismatched-route-bundle",
-            fit_result=result,
+            output_directory=tmp_path / "bundle",
+            fit_result=without_spec,
             validation_result=report.adequacy,
             report=report,
-            route_flow_rows=(
-                {
-                    "origin": "o1",
-                    "destination": "d1",
-                    "departure_time_bin": "am",
-                    "assigned_demand": 1,
-                    "flow_semantics": "path_probability",
-                    "assignment_fingerprint": "different",
-                },
-            ),
         )
 
 

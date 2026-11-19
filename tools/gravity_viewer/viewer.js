@@ -99,7 +99,7 @@
   const viewer = {
     files: [], fileMap: new Map(), manifest: null, summary: {}, model: {}, report: {},
     map: null, stops: [], stopsById: new Map(), markerLayer: null, selectedOd: null,
-    cacheDb: null, cacheIdentity: '', odRows: [], routeRows: [],
+    cacheDb: null, cacheIdentity: '', odRows: [],
     flowRows: [], flowBufferedRows: [], flowMatchedCount: 0, flowLoadedLimit: 0, flowPage: 0,
     flowSortColumn: '', flowSortDirection: 'desc', flowTitle: '',
     mapClickMode: 'od', measurementLocationManifest: null, selectedMeasurementStop: '',
@@ -537,7 +537,7 @@
         if (interval && typeof interval.interval_id === 'string') viewer.departureIntervals.set(interval.interval_id, interval);
       });
     }
-    const requestedBins = [...new Set([...(viewer.summary.od?.bins || []), ...(viewer.summary.route_flows?.bins || [])])].map(String);
+    const requestedBins = [...new Set([...(viewer.summary.od?.bins || [])])].map(String);
     const measurementLocationsAvailable = viewer.summary.measurement_locations?.available === true;
     if (requestedBins.length && requestedBins.every((intervalId) => viewer.departureIntervals.has(intervalId)) && !measurementLocationsAvailable) return;
     const querySummary = viewer.summary.measurement_od_contributions || {};
@@ -564,10 +564,7 @@
     }
   }
   function updateIntervalTimeNotes() {
-    const values = [...new Set([
-      ...(viewer.summary.od?.bins || []),
-      ...(viewer.summary.route_flows?.bins || []),
-    ])];
+    const values = [...new Set([...(viewer.summary.od?.bins || [])])];
     const hasAllRanges = values.every((intervalId) => viewer.departureIntervals.has(String(intervalId)));
     const timeZone = viewer.departureTimeZone ? ` (${viewer.departureTimeZone})` : '';
     const note = hasAllRanges
@@ -594,27 +591,10 @@
     return intervals.includes(preferred) ? preferred : intervals[0] || '';
   }
   function populateFlowSelectors() {
-    const od = viewer.summary.od || {}; const route = viewer.summary.route_flows || {};
+    const od = viewer.summary.od || {};
     intervalOptions($('flow-bin'), od.bins || [], 'Select departure interval');
     options($('flow-origin'), od.origins || [], 'All origins'); options($('flow-destination'), od.destinations || [], 'All destinations');
-    options($('flow-line'), route.lines || [], 'All lines'); options($('flow-trip'), route.trips || [], 'All trips');
-    const routeOption = $('flow-kind').querySelector('option[value="route"]');
-    routeOption.hidden = !route.available; routeOption.disabled = !route.available;
-    if (!route.available) $('flow-kind').value = 'od';
     $('flow-bin').value = defaultDepartureInterval(od.bins || []);
-    const semantics = route.flow_semantics || [];
-    const serviceMarginal = semantics.includes('service_marginal');
-    $('flow-semantics').textContent = route.available
-      ? (serviceMarginal
-        ? 'Expected OD use of a scheduled section is a service marginal: each value is fitted OD demand times its cached probability of using that ride link. These are link-use marginals, not enumerated passenger paths.'
-        : 'Estimated OD demand and route-assignment flow are separate values. Route-assignment totals may count passenger legs, so they do not necessarily represent unique passengers.')
-      : 'Estimated OD demand is shown by departure interval, origin, and destination.';
-    updateFlowFilterVisibility();
-  }
-
-  function updateFlowFilterVisibility() {
-    const routeMode = viewer.summary.route_flows?.available && $('flow-kind').value === 'route';
-    ['flow-line-label', 'flow-trip-label'].forEach((id) => $(id).classList.toggle('hidden', !routeMode));
   }
 
   function populateMeasurementOdControls() {
@@ -1146,19 +1126,19 @@
 
   async function refreshFlows(limit = 50, preserveSort = false, bufferLimit = Math.max(500, limit)) {
     const bin = $('flow-bin').value || 'all';
-    const kind = $('flow-kind')?.value || 'od'; const filters = {};
-    if (kind === 'od') { if ($('flow-origin').value) filters.origin_stop_id = $('flow-origin').value; if ($('flow-destination').value) filters.destination_stop_id = $('flow-destination').value; }
-    else { if ($('flow-line').value) filters.line_id = $('flow-line').value; if ($('flow-trip').value) filters.trip_id = $('flow-trip').value; if ($('flow-origin').value) filters.origin_stop_id = $('flow-origin').value; if ($('flow-destination').value) filters.destination_stop_id = $('flow-destination').value; }
-    const rankBy = kind === 'od' ? 'estimated_demand' : 'assigned_demand';
+    const filters = {};
+    if ($('flow-origin').value) filters.origin_stop_id = $('flow-origin').value;
+    if ($('flow-destination').value) filters.destination_stop_id = $('flow-destination').value;
+    const rankBy = 'estimated_demand';
     if (!preserveSort || !viewer.flowSortColumn) { viewer.flowSortColumn = rankBy; viewer.flowSortDirection = 'desc'; }
     $('flow-more').disabled = true; $('flow-all').disabled = true;
-    setFlowStatus(`Scanning ${kind === 'od' ? 'estimated OD demand' : 'route-assignment flows'} for ${bin}; preparing rows ranked by ${kind === 'od' ? 'estimated demand' : 'assigned demand'}…`, 'is-loading');
+    setFlowStatus(`Scanning estimated OD demand for ${bin}; preparing rows ranked by estimated demand…`, 'is-loading');
     try {
-      const result = await readPartition(kind === 'od' ? 'od' : 'route_flows', bin, filters, bufferLimit, {rankBy, rankAbs: false, returnDetails: true});
+      const result = await readPartition('od', bin, filters, bufferLimit, {rankBy, rankAbs: false, returnDetails: true});
       viewer.flowBufferedRows = result.rows; viewer.flowRows = result.rows.slice(0, limit);
       viewer.flowMatchedCount = result.total; viewer.flowLoadedLimit = viewer.flowRows.length; viewer.flowPage = 0;
-      viewer.flowTitle = kind === 'od' ? 'Estimated OD demand' : 'Route-assignment flow';
-      viewer.odRows = kind === 'od' ? result.rows : []; viewer.routeRows = kind === 'route' ? result.rows : [];
+      viewer.flowTitle = 'Estimated OD demand';
+      viewer.odRows = result.rows;
       sortFlowRows(); renderTable(viewer.flowRows, viewer.flowTitle, result.total);
       setFlowStatus(`Prepared ${display(result.rows.length)} ranked rows; showing ${display(viewer.flowRows.length)} of ${display(result.total)} matches. Use Load 50 more or Load all matching rows to continue.`, 'ok');
     } catch (error) { setFlowStatus(`Could not load partition: ${error.message}`, 'bad'); }
@@ -1249,7 +1229,7 @@
   }
 
   async function renderLineGeometry() {
-    const geometry = viewer.summary.line_geometry || viewer.summary.route_sections || {};
+    const geometry = viewer.summary.line_geometry || {};
     if (!geometry.available || !geometry.geometry_path || !viewer.map || !window.L) return;
     const file = findFile(geometry.geometry_path);
     if (!file) return;
@@ -1279,7 +1259,6 @@
         const legacyRecord = viewer.manifest.files?.['full_od.csv'] || {};
         viewer.summary = {
           od: {available: true, partition_field: 'legacy_full_table', bins: ['all'], origins: [], destinations: [], partitions: [{key: 'all', path: 'full_od.csv', size_bytes: legacyRecord.size_bytes, sha256: legacyRecord.sha256}]},
-          route_flows: {available: false, message: 'Legacy bundle has no route-flow partitions.'},
           measurement_od_contributions: {available: false, message: 'Legacy bundle has no OD-by-measurement contribution dataset.'},
         };
       }
@@ -1287,11 +1266,11 @@
       await loadDepartureIntervalMetadata();
       viewer.cacheIdentity = `${viewer.manifest.model_fingerprint || ''}|${viewer.manifest.specification_fingerprint || ''}|${viewer.manifest.report_fingerprint || ''}|${JSON.stringify(viewer.manifest.provenance || {})}`;
       $('summary').classList.remove('hidden'); $('diagnostics').classList.remove('hidden'); $('tables').classList.remove('hidden'); $('flows').classList.remove('hidden');
-      const counts = viewer.manifest.row_counts || {}; $('metrics').innerHTML = [metric('Bundle type', viewer.manifest.bundle_type), metric('Schema', viewer.manifest.schema_version), metric('OD rows', counts['full_od.csv'] ?? 'unknown'), metric('Measurements', counts['predicted_measurements.csv'] ?? 'unknown'), metric('OD partitions', viewer.summary.od?.partitions?.length ?? 'legacy'), metric('Route flows', viewer.summary.route_flows?.available ? 'available' : 'absent'), metric('OD contribution map', viewer.summary.measurement_od_contributions?.available ? 'available' : 'absent'), metric('Identifiability', viewer.manifest.identifiability?.available ? 'available' : 'not available'), metric('Network files', Object.keys(viewer.manifest.files || {}).filter((key) => key.startsWith('network/')).length)].join('');
+      const counts = viewer.manifest.row_counts || {}; $('metrics').innerHTML = [metric('Bundle type', viewer.manifest.bundle_type), metric('Schema', viewer.manifest.schema_version), metric('OD rows', counts['full_od.csv'] ?? 'unknown'), metric('Measurements', counts['predicted_measurements.csv'] ?? 'unknown'), metric('OD partitions', viewer.summary.od?.partitions?.length ?? 'legacy'), metric('OD contribution map', viewer.summary.measurement_od_contributions?.available ? 'available' : 'absent'), metric('Identifiability', viewer.manifest.identifiability?.available ? 'available' : 'not available'), metric('Network files', Object.keys(viewer.manifest.files || {}).filter((key) => key.startsWith('network/')).length)].join('');
       $('model').innerHTML = renderModelSpecification(); $('provenance').innerHTML = renderRunDetails(); $('bundle-files').innerHTML = renderBundleFiles(); $('bundle-path-note').textContent = 'Included-file paths are relative to the selected bundle. Original source paths appear only if recorded in bundle metadata; browser security hides the laptop’s absolute folder path.'; const adequacy = viewer.report.adequacy || {}; $('diagnostic-metrics').innerHTML = [metric('Observed total', adequacy.observed_total), metric('Modeled total', adequacy.modeled_total), metric('MAE', adequacy.mae), metric('RMSE', adequacy.rmse), metric('Report fingerprint', viewer.report.report_fingerprint, 'fingerprint')].join('');
       $('table-content').innerHTML = '<p class="muted">Large tables are available through the partitioned explorer. No complete CSV is parsed at startup.</p>';
       const executive = findFile('executive_summary.md'); $('executive').innerHTML = executive ? renderMarkdown(await executive.text()) : '<p>No executive summary supplied.</p>'; populateFlowSelectors(); populateMeasurementOdControls(); updateIntervalTimeNotes(); await renderNetwork(); await refreshFlows();
-      if (!viewer.summary.od) { $('interactive-notice').textContent = 'This is a legacy bundle without partition metadata. The validated tables remain available; route-flow and lazy time-slot exploration require a refreshed export.'; $('interactive-notice').classList.remove('hidden'); }
+      if (!viewer.summary.od) { $('interactive-notice').textContent = 'This is a legacy bundle without partition metadata. The validated tables remain available; lazy time-slot exploration requires a refreshed export.'; $('interactive-notice').classList.remove('hidden'); }
       if (problems.length) setStatus(`Bundle loaded with startup validation warnings:\n- ${problems.join('\n- ')}`, 'bad'); else setStatus('Bundle manifest and summary loaded. Partition checksums are verified when selected.', 'ok');
     } catch (error) { $('summary').classList.add('hidden'); $('diagnostics').classList.add('hidden'); $('flows').classList.add('hidden'); setStatus(`Could not load bundle: ${error.message}`, 'bad'); }
   }
@@ -1320,7 +1299,7 @@
   function collectTechnicalIdentifiers() {
     const identifiers = new Map();
     const visit = (value, prefix = '') => { if (!value || typeof value !== 'object') return; for (const [key, item] of Object.entries(value)) { const label = prefix ? `${prefix}.${key}` : key; if (item && typeof item === 'object') visit(item, label); else if (/(fingerprint|sha256|checksum|revision|commit)/i.test(key) && item !== null && item !== undefined && item !== '') identifiers.set(label, String(item)); } };
-    visit(viewer.manifest.provenance || {}); visit(viewer.manifest.fit_provenance || {}); visit(viewer.manifest.validation_provenance || {}); visit(viewer.manifest.report_provenance || {}); visit(viewer.manifest.route_flow_provenance || {}); visit(viewer.manifest.route_section_provenance || {}); visit(viewer.report.provenance || {});
+    visit(viewer.manifest.provenance || {}); visit(viewer.manifest.fit_provenance || {}); visit(viewer.manifest.validation_provenance || {}); visit(viewer.manifest.report_provenance || {}); visit(viewer.report.provenance || {});
     for (const [key, value] of Object.entries(viewer.manifest)) if (/(fingerprint|sha256|checksum|revision|commit)/i.test(key) && value !== null && value !== undefined && typeof value !== 'object') identifiers.set(key, String(value));
     if (viewer.model.specification_fingerprint) identifiers.set('model_specification_fingerprint', String(viewer.model.specification_fingerprint));
     return [...identifiers.entries()].sort(([left], [right]) => left.localeCompare(right));
@@ -1333,11 +1312,14 @@
   }
   function bundleFileDescription(path) {
     const base = fileName(path); const descriptions = {'bundle_manifest.json': 'Bundle index, run details, and file checksums', 'viewer_summary.json': 'Index of time partitions and on-demand datasets', 'model_specification.json': 'Model inputs, likelihood, and modeled effects', 'report.json': 'Fit diagnostics and aggregate performance measures', 'executive_summary.md': 'Human-readable report summary', 'full_od.csv': 'Estimated demand by origin, destination, and departure interval', 'predicted_measurements.csv': 'Observed counts and model-predicted counts', 'residuals.csv': 'Measurement-level observed-minus-modeled differences', 'grouped_residuals.csv': 'Residual diagnostics aggregated by group', 'parameters.csv': 'Estimated model parameters', 'identifiability.csv': 'Parameter identifiability classifications', 'od_map.csv': 'Map-ready OD demand summaries', 'stop_summary.csv': 'Observed and modeled values summarized by stop', 'measurement_location_manifest.json': 'Index linking map stops to measurement rows', 'report.html': 'Formatted detailed report'};
-    if (path.startsWith('network/')) return 'Network snapshot used for map display'; if (path.startsWith('partitions/od/')) return 'Estimated OD demand for one time partition'; if (path.startsWith('partitions/route_flows/')) return 'Assigned route flow for one time partition'; if (path.startsWith('partitions/measurement_od_contributions/')) return 'OD contributions to measured rows'; if (path.startsWith('partitions/measurement_locations/')) return 'Map-stop measurement lookup data'; if (path.startsWith('partitions/route_sections/')) return 'Route section geometry and lookup data'; if (path.startsWith('partitions/section_loads/')) return 'Passenger load summaries by route section'; if (path.startsWith('identifiability/')) return 'Parameter identifiability report data'; return descriptions[base] || 'Supporting data included in the viewer bundle';
+    if (path.startsWith('network/')) return 'Network snapshot used for map display'; if (path.startsWith('partitions/od/')) return 'Estimated OD demand for one time partition'; if (path.startsWith('partitions/measurement_od_contributions/')) return 'OD contributions to measured rows'; if (path.startsWith('partitions/measurement_locations/')) return 'Map-stop measurement lookup data'; if (path.startsWith('partitions/')) return 'Optional partitioned data included in the bundle'; if (path.startsWith('identifiability/')) return 'Parameter identifiability report data'; return descriptions[base] || 'Supporting data included in the viewer bundle';
   }
   function bundleFileCategory(path) {
     if (path === 'bundle_manifest.json' || !path.includes('/')) return ['Summary and report files', 'Summary, model, and report']; if (path.startsWith('network/')) return ['Network snapshot', 'Stops, lines, trips, and stop times'];
-    if (path.startsWith('partitions/')) { const section = path.split('/')[1] || 'other'; const names = {od: 'Estimated OD demand', route_flows: 'Route-assignment flows', measurement_od_contributions: 'OD contributions to measurements', measurement_locations: 'Measurement lookup by stop', route_sections: 'Route section data', section_loads: 'Section load data'}; return [`${names[section] || humanize(section)} partitions`, 'Partitioned data']; }
+    if (path.startsWith('partitions/od/')) return ['Estimated OD demand partitions', 'Partitioned demand data'];
+    if (path.startsWith('partitions/measurement_od_contributions/')) return ['OD contribution partitions', 'Measured-row decomposition data'];
+    if (path.startsWith('partitions/measurement_locations/')) return ['Measurement lookup partitions', 'Map-stop lookup data'];
+    if (path.startsWith('partitions/')) return ['Additional partition data', 'Optional partitioned files'];
     if (path.startsWith('identifiability/')) return ['Identifiability diagnostics', 'Parameter diagnostic data']; return [`${humanize(path.split('/')[0])} files`, 'Supporting files'];
   }
   function renderBundleFiles() {
@@ -1396,7 +1378,7 @@
     }
     return blocks.join('\n');
   }
-  $('folder').addEventListener('change', (event) => load([...event.target.files])); $('flow-refresh').addEventListener('click', () => refreshFlows()); $('flow-more').addEventListener('click', () => loadMoreFlows()); $('flow-all').addEventListener('click', () => loadMoreFlows(true)); $('flow-page-previous').addEventListener('click', () => { viewer.flowPage = Math.max(0, viewer.flowPage - 1); renderTable(viewer.flowRows, viewer.flowTitle, viewer.flowMatchedCount); }); $('flow-page-next').addEventListener('click', () => { viewer.flowPage += 1; renderTable(viewer.flowRows, viewer.flowTitle, viewer.flowMatchedCount); }); $('flow-clear-cache').addEventListener('click', clearCache); ['flow-bin', 'flow-origin', 'flow-destination', 'flow-line', 'flow-trip'].forEach((id) => { if ($(id)) $(id).addEventListener('change', () => refreshFlows()); }); $('flow-kind').addEventListener('change', () => { updateFlowFilterVisibility(); refreshFlows(); });
+  $('folder').addEventListener('change', (event) => load([...event.target.files])); $('flow-refresh').addEventListener('click', () => refreshFlows()); $('flow-more').addEventListener('click', () => loadMoreFlows()); $('flow-all').addEventListener('click', () => loadMoreFlows(true)); $('flow-page-previous').addEventListener('click', () => { viewer.flowPage = Math.max(0, viewer.flowPage - 1); renderTable(viewer.flowRows, viewer.flowTitle, viewer.flowMatchedCount); }); $('flow-page-next').addEventListener('click', () => { viewer.flowPage += 1; renderTable(viewer.flowRows, viewer.flowTitle, viewer.flowMatchedCount); }); $('flow-clear-cache').addEventListener('click', clearCache); ['flow-bin', 'flow-origin', 'flow-destination'].forEach((id) => $(id).addEventListener('change', () => refreshFlows()));
   $('map-od-mode')?.addEventListener('click', () => setMapClickMode('od')); $('map-measurement-mode')?.addEventListener('click', () => setMapClickMode('measurement'));
   $('measurement-od-direction')?.addEventListener('change', () => {
     updateMeasurementOdDirection();

@@ -47,9 +47,16 @@ def test_viewer_starts_from_manifest_and_streams_selected_partitions() -> None:
     assert "new Worker" in viewer_source
     assert "indexedDB" in viewer_source
     assert "validatePartition" in viewer_source
-    assert "flow-kind" in source
-    assert "route-assignment flow" in viewer_source
-    assert 'id="route-sections"' not in source
+    assert "<h2>Demand explorer</h2>" in source
+    assert 'id="flow-bin"' in source
+    assert 'id="flow-origin"' in source
+    assert 'id="flow-destination"' in source
+    assert 'id="flow-more"' in source
+    assert 'id="flow-all"' in source
+    assert 'id="flow-page-next"' in source
+    assert "route-assignment" not in source.lower()
+    assert "route_flows" not in viewer_source
+    assert "route_sections" not in viewer_source
     assert "section_loads" not in viewer_source
     assert "measurement_od_contributions" in viewer_source
     assert "refreshMeasurementOd" in viewer_source
@@ -72,9 +79,47 @@ def test_viewer_uses_the_local_service_for_selected_measurement_pages() -> None:
     assert "measurement_index" in viewer_source
     assert "/api/measurement-od-contributions" in viewer_source
     assert "Local query service fit or mapping identity differs" in viewer_source
-    assert "Still processing; the selected mapping data can take a few minutes to scan." in viewer_source
+    assert "Still processing the selected contribution data." in viewer_source
     assert 'id="measurement-od-status" class="status" role="status"' in source
     assert "status.classList.add('is-loading')" in viewer_source
     assert "summary.available && summary.query_mode === 'local_service'" in viewer_source
     assert "summary.reverse_query_available === false" in viewer_source
     assert "Reverse OD-to-measurement contributions are unavailable" in viewer_source
+
+
+def test_quick_guide_is_collapsible_linked_and_matches_visible_controls() -> None:
+    source = VIEWER.read_text(encoding="utf-8")
+    guide = source.split('<details class="panel quick-guide">', 1)[1].split("</details>", 1)[0]
+    assert "<summary>Quick guide</summary>" in guide
+    for target in ("summary", "network-map", "flows", "measurement-od"):
+        assert f'href="#{target}"' in guide
+        assert f'id="{target}"' in source
+    for label in (
+        "Select a viewer-bundle directory",
+        "bundle_manifest.json",
+        "Departure time interval",
+        "Load selected partition",
+        "Load 50 more",
+        "Load all matching rows",
+        "Measurement row",
+        "Previous rows",
+        "Next rows",
+        "Observed count",
+        "Modeled mean",
+        "What do you want to look up?",
+        "Measured row → contributing OD pairs",
+        "Load OD contributors",
+        "Rows per page",
+        "Previous contributors",
+        "Next contributors",
+        "OD pair → affected measured rows",
+        "OD departure interval",
+        "Load affected measurements",
+    ):
+        assert label in guide
+    assert "query service" not in guide.lower()
+    assert "terminal" not in guide.lower()
+    assert "server" not in guide.lower()
+    assert "By Michel Bierlaire · Implemented 8 September 2026" in source
+    assert source.index("<h1>Gravity Viewer Bundle</h1>") < source.index("By Michel Bierlaire")
+    assert source.index("By Michel Bierlaire") < source.index("<main>")

@@ -11,6 +11,7 @@
     header { padding: 28px clamp(20px, 5vw, 72px); color: white; background: #18243b; }
     header h1 { margin: 0 0 8px; font-size: clamp(24px, 4vw, 38px); }
     header p { margin: 0; color: #cbd5e8; }
+    header .title-credit { margin: 0 0 8px; color: #aebbd0; font-size: 12px; }
     main { width: min(1400px, calc(100% - 40px)); margin: 24px auto 60px; }
     .panel { margin: 18px 0; padding: 20px; border: 1px solid #dce2ed; border-radius: 14px; background: white; box-shadow: 0 3px 14px #1926420d; }
     .drop { display: grid; gap: 10px; place-items: center; min-height: 130px; border: 2px dashed #9aabc7; border-radius: 12px; background: #f9fbff; text-align: center; }
@@ -57,6 +58,11 @@
     .technical-details summary, .bundle-files summary { cursor: pointer; color: #34445f; font-weight: 600; }
     .technical-details .fingerprint { margin-top: 10px; }
     .bundle-files details { margin-top: 8px; }
+    .quick-guide > summary { cursor: pointer; color: #27354d; font-size: 18px; font-weight: 700; }
+    .quick-guide[open] > summary { margin-bottom: 12px; }
+    .quick-guide ol { margin: 10px 0 0; padding-left: 24px; }
+    .quick-guide li { margin: 8px 0; line-height: 1.45; }
+    .quick-guide a { color: #235aa6; }
     .bundle-file-list { margin-top: 8px; }
     .bundle-file-list li { display: grid; grid-template-columns: minmax(180px, 1.2fr) minmax(180px, 1.5fr) minmax(110px, .7fr); gap: 8px 14px; padding: 7px 0; border-top: 1px solid #edf0f5; align-items: baseline; }
     .bundle-file-list code { overflow-wrap: anywhere; color: #27354d; }
@@ -104,9 +110,22 @@
 <body>
   <header>
     <h1>Gravity Viewer Bundle</h1>
+    <p class="title-credit">By Michel Bierlaire · Implemented 8 September 2026</p>
     <p>Portable, read-only inspection of a <code>gravity_viewer_bundle_v1</code>.</p>
   </header>
   <main>
+    <details class="panel quick-guide">
+      <summary>Quick guide</summary>
+      <ol>
+        <li>To open a result bundle, click <strong>Select a viewer-bundle directory</strong> at the top of the page and choose the folder containing <code>bundle_manifest.json</code>. The loaded overview appears in <a href="#summary">Bundle summary</a>.</li>
+        <li>In <a href="#flows">Demand explorer</a>, choose a <strong>Departure time interval</strong> and optionally an <strong>Origin</strong> and <strong>Destination</strong>, then click <strong>Load selected partition</strong>; a partition is the saved demand slice for that selection, and the viewer finds it for you, so you do not need to find or open its file. Use <strong>Load 50 more</strong> or <strong>Load all matching rows</strong> to extend results; click a column heading to sort only loaded rows.</li>
+        <li>With stop and measurement lookup data in the bundle, go to <a href="#network-map">Network map</a>, choose <strong>Measurement</strong> mode, and click a measured stop; browse multiple rows with <strong>Measurement row</strong>, <strong>Previous rows</strong>, and <strong>Next rows</strong>. The selected row shows its <strong>Observed count</strong> and <strong>Modeled mean</strong>; a stop without matching rows says “No measurements at this location.”</li>
+        <li>When contribution data are available, go to <a href="#measurement-od">Measured flows by OD pair</a>, choose <strong>Measured row → contributing OD pairs</strong> under <strong>What do you want to look up?</strong>, select a row, and click <strong>Load OD contributors</strong>. Results are ranked by the magnitude of each modeled-mean contribution, which decomposes the <strong>Modeled mean</strong>, not the observed count; fixed, additive, and floor components are not assigned to individual OD pairs. Use <strong>Rows per page</strong>, <strong>Previous contributors</strong>, and <strong>Next contributors</strong> to browse; sorting applies only to the displayed page.</li>
+        <li>For the reverse lookup, choose <strong>OD pair → affected measured rows</strong>, then select the <strong>OD departure interval</strong>, <strong>Origin</strong>, and <strong>Destination</strong>, and click <strong>Load affected measurements</strong>. The departure interval is when the OD trip leaves, not the observation time; availability depends on the bundle contents.</li>
+        <li>While a contribution query runs, follow the status and progress area. Wait for the result or change your selection to request a different query.</li>
+      </ol>
+    </details>
+
     <section class="panel">
       <div class="drop">
         <strong>Select a viewer-bundle directory</strong>
@@ -190,12 +209,9 @@
     </section>
 
     <section id="flows" class="panel hidden">
-      <h2>Demand and route-assignment explorer</h2>
-      <p id="flow-semantics" class="muted">Select one time partition. Values are estimated OD demand unless explicitly labelled as route-assignment flow or passenger-leg usage.</p>
+      <h2>Demand explorer</h2>
+      <p class="muted">Select a departure-time interval and optionally filter by origin and destination.</p>
       <div class="toolbar">
-        <label>Value type
-          <select id="flow-kind"><option value="od">Estimated OD demand</option><option value="route">Route-assignment flow</option></select>
-        </label>
         <label>Departure time interval
           <select id="flow-bin"></select>
         </label>
@@ -205,12 +221,6 @@
         </label>
         <label>Destination
           <select id="flow-destination"></select>
-        </label>
-        <label id="flow-line-label">Line
-          <select id="flow-line"></select>
-        </label>
-        <label id="flow-trip-label">Trip
-          <select id="flow-trip"></select>
         </label>
         <button id="flow-more" type="button" disabled>Load 50 more</button>
         <button id="flow-all" type="button" disabled>Load all matching rows</button>
