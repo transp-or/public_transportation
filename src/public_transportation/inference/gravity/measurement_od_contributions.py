@@ -33,6 +33,7 @@ _SCHEMA_VERSION = 1
 _WRITE_BATCH_SIZE = 32_768
 _MAX_PARTITION_ROWS = 100_000
 _COMPONENT_PARTITION_ROWS = 500
+_MAX_RANKED_CACHE_ROWS = 5_000
 _ROUTED_OD_ONLY_SCALE_FLAGS = {
     "scales_routed_od_contribution": True,
     "scales_assignment_and_boundary_flow_contributions": False,
@@ -67,6 +68,105 @@ class MeasurementODQueryCancelled(RuntimeError):
 def _raise_if_cancelled(cancel_check: Callable[[], bool] | None) -> None:
     if cancel_check is not None and cancel_check():
         raise MeasurementODQueryCancelled("Query cancelled because the selection changed.")
+
+
+def validate_raw_od_component_consistency(
+    *,
+    reconstructed: object,
+    saved: object,
+    absolute_term_sum: object,
+    term_count: object,
+    fit_result: GravityEstimationResult,
+    context: str = "mapping OD contribution",
+) -> None:
+    """Compare raw OD sums using the fit's recorded arithmetic precision.
+
+    With recorded floating dtypes, the absolute tolerance is scaled by the sum
+    of absolute raw terms. It combines product/output rounding and an RMS
+    accumulation allowance proportional to ``sqrt(term_count)`` for both the
+    fit's arithmetic and the higher-precision reconstruction. This accounts
+    for cancellation without using the restored NumPy array dtype as a proxy
+    for fit precision. Results predating dtype provenance retain the former
+    tight ``rtol=1e-6, atol=1e-8`` policy.
+    """
+    reconstructed_array, saved_array, scale_array, count_array = np.broadcast_arrays(
+        np.asarray(reconstructed, dtype=np.float64),
+        np.asarray(saved, dtype=np.float64),
+        np.asarray(absolute_term_sum, dtype=np.float64),
+        np.asarray(term_count, dtype=np.float64),
+    )
+    if (
+        not np.all(np.isfinite(reconstructed_array))
+        or not np.all(np.isfinite(saved_array))
+        or not np.all(np.isfinite(scale_array))
+        or np.any(scale_array < 0.0)
+        or not np.all(np.isfinite(count_array))
+        or np.any(count_array < 0.0)
+        or np.any(count_array != np.floor(count_array))
+    ):
+        raise ValueError(f"{context} comparison inputs must be finite with nonnegative scales and counts.")
+
+    recorded_dtypes: list[tuple[str, np.dtype]] = []
+    for field in ("objective_dtype", "gradient_dtype"):
+        value = getattr(fit_result, field, None)
+        if value is None:
+            continue
+        try:
+            dtype = np.dtype(value)
+            if dtype.kind != "f":
+                raise TypeError
+            np.finfo(dtype)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"unsupported fit {field} for OD-component validation: {value!r}.") from error
+        recorded_dtypes.append((field, dtype))
+
+    if not recorded_dtypes:
+        allowed = 1e-8 + 1e-6 * np.abs(saved_array)
+        computation_dtype = "unspecified (legacy tolerance)"
+    else:
+        # Use the least precise recorded fit computation dtype, independent of
+        # any arrays restored from JSON (which commonly become float64).
+        effective_dtype = max(
+            (dtype for _, dtype in recorded_dtypes),
+            key=lambda dtype: np.finfo(dtype).eps,
+        )
+        fit_unit_roundoff = np.finfo(effective_dtype).eps / 2.0
+        reconstruction_unit_roundoff = np.finfo(np.float64).eps / 2.0
+        count_root = np.sqrt(count_array)
+        relative_roundoff = (
+            fit_unit_roundoff
+            + count_root * (fit_unit_roundoff + reconstruction_unit_roundoff)
+        )
+        allowed = (
+            scale_array * relative_roundoff
+            + fit_unit_roundoff * np.abs(saved_array)
+        )
+        # Preserve strict integrity for a row with no nonzero OD terms.
+        allowed = np.where(scale_array == 0.0, 0.0, allowed)
+        dtype_sources = ", ".join(f"{name}={dtype.name}" for name, dtype in recorded_dtypes)
+        computation_dtype = f"{effective_dtype.name} (recorded {dtype_sources})"
+
+    absolute_difference = np.abs(reconstructed_array - saved_array)
+    failed = absolute_difference > allowed
+    if not np.any(failed):
+        return
+
+    flat_index = int(np.flatnonzero(np.ravel(failed))[0])
+    position = np.unravel_index(flat_index, failed.shape) if failed.shape else ()
+    reconstructed_value = float(np.ravel(reconstructed_array)[flat_index])
+    saved_value = float(np.ravel(saved_array)[flat_index])
+    absolute_value = float(np.ravel(absolute_difference)[flat_index])
+    scale_value = max(abs(reconstructed_value), abs(saved_value), np.finfo(np.float64).tiny)
+    relative_value = absolute_value / scale_value
+    allowed_value = float(np.ravel(allowed)[flat_index])
+    location = f" at position {position}" if position else ""
+    raise ValueError(
+        f"{context} differs from the fitted raw OD component{location}: "
+        f"computation dtype={computation_dtype}; "
+        f"reconstructed={reconstructed_value:.17g}; saved={saved_value:.17g}; "
+        f"absolute difference={absolute_value:.17g}; relative difference={relative_value:.17g}; "
+        f"allowed tolerance={allowed_value:.17g}."
+    )
 
 
 def _query_scale_inputs(
@@ -315,7 +415,7 @@ def measurement_od_query_descriptor(
 
 
 class MeasurementODContributionQuery:
-    """Bounded, row-selective queries over a persisted temporal mapping."""
+    """Bounded row-selective queries with disk-backed ranked-row reuse."""
 
     def __init__(
         self,
@@ -324,9 +424,10 @@ class MeasurementODContributionQuery:
         fit_result: GravityEstimationResult,
         rho: float | None = None,
         max_cached_pages: int = 16,
+        max_cached_measurements: int = 16,
         max_page_size: int = 500,
     ) -> None:
-        if max_cached_pages <= 0 or max_page_size <= 0:
+        if max_cached_pages <= 0 or max_cached_measurements <= 0 or max_page_size <= 0:
             raise ValueError("query cache and page bounds must be positive.")
         scales = _query_scale_inputs(artifact=artifact, fit_result=fit_result, rho=rho)
         if scales is None:
@@ -337,12 +438,19 @@ class MeasurementODContributionQuery:
         self.fit_result = fit_result
         self.rho = rho
         self.max_cached_pages = int(max_cached_pages)
+        self.max_cached_measurements = int(max_cached_measurements)
         self.max_page_size = int(max_page_size)
         self._scales = scales
         self._cache: OrderedDict[tuple[object, ...], dict[str, object]] = OrderedDict()
+        self._measurement_cache: OrderedDict[int, dict[str, object]] = OrderedDict()
         self._namespace = (fit_result.model_fingerprint, artifact.identity.fingerprint)
         self.cache_hits = 0
         self.cache_misses = 0
+        self.measurement_cache_hits = 0
+        self.measurement_cache_misses = 0
+        self._measurement_cache_directory = tempfile.TemporaryDirectory(
+            prefix="gravity-measurement-result-cache-"
+        )
 
         index = artifact.canonical_index
         self._full_index_by_column = np.full(artifact.number_of_demand_cells, -1, dtype=np.int64)
@@ -383,6 +491,37 @@ class MeasurementODContributionQuery:
 
     def clear_cache(self) -> None:
         self._cache.clear()
+        for cached in self._measurement_cache.values():
+            temporary = cached.get("temporary_directory")
+            if isinstance(temporary, tempfile.TemporaryDirectory):
+                temporary.cleanup()
+        self._measurement_cache.clear()
+
+    def _remember_measurement_result(
+        self,
+        measurement_index: int,
+        *,
+        temporary_directory: tempfile.TemporaryDirectory[str],
+        database_path: Path,
+        total: int,
+        components: dict[str, float],
+        absolute_term_sum: float,
+        term_count: int,
+    ) -> None:
+        self._measurement_cache[measurement_index] = {
+            "temporary_directory": temporary_directory,
+            "database_path": database_path,
+            "total": total,
+            "components": components,
+            "absolute_term_sum": absolute_term_sum,
+            "term_count": term_count,
+        }
+        self._measurement_cache.move_to_end(measurement_index)
+        while len(self._measurement_cache) > self.max_cached_measurements:
+            _, evicted = self._measurement_cache.popitem(last=False)
+            temporary = evicted.get("temporary_directory")
+            if isinstance(temporary, tempfile.TemporaryDirectory):
+                temporary.cleanup()
 
     def query(
         self,
@@ -401,7 +540,7 @@ class MeasurementODContributionQuery:
             raise IndexError("measurement_index is outside the canonical mapping.")
         if page < 0 or page_size <= 0 or page_size > self.max_page_size:
             raise ValueError(f"page must be non-negative and page_size must be between 1 and {self.max_page_size}.")
-        if (page + 1) * page_size > 5_000:
+        if (page + 1) * page_size > _MAX_RANKED_CACHE_ROWS:
             raise ValueError("requested ranked page exceeds the bounded contribution-query window.")
         cache_key = (
             *self._namespace,
@@ -454,7 +593,7 @@ class MeasurementODContributionQuery:
             raise IndexError("od_index is outside the canonical mapping.")
         if page < 0 or page_size <= 0 or page_size > self.max_page_size:
             raise ValueError(f"page must be non-negative and page_size must be between 1 and {self.max_page_size}.")
-        if (page + 1) * page_size > 5_000:
+        if (page + 1) * page_size > _MAX_RANKED_CACHE_ROWS:
             raise ValueError("requested ranked page exceeds the bounded contribution-query window.")
         cache_key = (*self._namespace, "od", od_index, page, page_size)
         cached = self._cache.get(cache_key)
@@ -600,10 +739,31 @@ class MeasurementODContributionQuery:
         cancel_check: Callable[[], bool] | None = None,
     ) -> dict[str, object]:
         offset = page * page_size
-        with tempfile.TemporaryDirectory(prefix="gravity-measurement-query-") as temporary:
-            database_path = Path(temporary) / "selected_measurement.sqlite"
+        cached = self._measurement_cache.get(measurement_index)
+        temporary_directory: tempfile.TemporaryDirectory[str] | None = None
+        if cached is None:
+            self.measurement_cache_misses += 1
+            temporary_directory = tempfile.TemporaryDirectory(
+                dir=self._measurement_cache_directory.name,
+                prefix=f"measurement-{measurement_index}-",
+            )
+            database_path = Path(temporary_directory.name) / "working_contributions.sqlite"
             connection = sqlite3.connect(database_path)
-            try:
+            absolute_term_sum = 0.0
+            term_count = 0
+        else:
+            self.measurement_cache_hits += 1
+            self._measurement_cache.move_to_end(measurement_index)
+            database_path = Path(cached["database_path"])
+            total = int(cached["total"])
+            components = copy.deepcopy(cached["components"])
+            absolute_term_sum = float(cached["absolute_term_sum"])
+            term_count = int(cached["term_count"])
+            connection = sqlite3.connect(database_path)
+            if progress_callback is not None:
+                progress_callback("complete", 1, 1, "Using cached ranked measurement contributions")
+        try:
+            if cached is None:
                 connection.set_progress_handler(
                     lambda: int(cancel_check is not None and cancel_check()),
                     10_000,
@@ -658,6 +818,8 @@ class MeasurementODContributionQuery:
                         means = flows * initial_mean
                         if not np.all(np.isfinite(flows)) or not np.all(np.isfinite(means)):
                             raise ValueError("selected measurement contributions are non-finite.")
+                        absolute_term_sum += float(np.sum(np.abs(flows), dtype=np.float64))
+                        term_count += int(np.count_nonzero(flows))
                         rows_to_write = [
                             (
                                 int(self._full_index_by_column[int(column)]),
@@ -698,7 +860,12 @@ class MeasurementODContributionQuery:
                         "SELECT COALESCE(SUM(linear_flow_contribution), 0.0) FROM contributions"
                     ).fetchone()[0]
                 )
-                components = self._components_for_row(measurement_index, raw_od)
+                components = self._components_for_row(
+                    measurement_index,
+                    raw_od,
+                    absolute_term_sum,
+                    term_count,
+                )
                 if self._scales["measurement_scale_contract"] == "routed_od_only":
                     if raw_od == 0.0:
                         od_mean_multiplier = 0.0
@@ -708,7 +875,44 @@ class MeasurementODContributionQuery:
                         "UPDATE contributions SET modeled_mean_contribution = linear_flow_contribution * ?",
                         (od_mean_multiplier,),
                     )
-                    connection.commit()
+                connection.execute(
+                    "CREATE INDEX ranked_contributions "
+                    "ON contributions (modeled_mean_contribution DESC, od_index ASC)"
+                )
+                connection.commit()
+                # The bounded query API cannot request ranks beyond this prefix;
+                # keep only that ranked window in the reusable per-row cache.
+                ranked_rows = connection.execute(
+                    "SELECT od_index, operator_coefficient, linear_flow_contribution, modeled_mean_contribution "
+                    "FROM contributions ORDER BY modeled_mean_contribution DESC, od_index ASC LIMIT ?",
+                    (_MAX_RANKED_CACHE_ROWS,),
+                ).fetchall()
+                _raise_if_cancelled(cancel_check)
+                assert temporary_directory is not None
+                ranked_database_path = Path(temporary_directory.name) / "ranked_contributions.sqlite"
+                ranked_connection = sqlite3.connect(ranked_database_path)
+                try:
+                    ranked_connection.execute(
+                        "CREATE TABLE contributions ("
+                        "od_index INTEGER PRIMARY KEY, operator_coefficient REAL NOT NULL, "
+                        "linear_flow_contribution REAL NOT NULL, "
+                        "modeled_mean_contribution REAL NOT NULL) WITHOUT ROWID"
+                    )
+                    ranked_connection.executemany(
+                        "INSERT INTO contributions VALUES (?, ?, ?, ?)",
+                        ranked_rows,
+                    )
+                    ranked_connection.execute(
+                        "CREATE INDEX ranked_contributions "
+                        "ON contributions (modeled_mean_contribution DESC, od_index ASC)"
+                    )
+                    ranked_connection.commit()
+                finally:
+                    ranked_connection.close()
+                connection.close()
+                database_path.unlink(missing_ok=True)
+                database_path = ranked_database_path
+                connection = sqlite3.connect(database_path)
                 rows = connection.execute(
                     "SELECT od_index, operator_coefficient, linear_flow_contribution, modeled_mean_contribution "
                     "FROM contributions ORDER BY modeled_mean_contribution DESC, od_index ASC LIMIT ? OFFSET ?",
@@ -716,14 +920,28 @@ class MeasurementODContributionQuery:
                 ).fetchall()
                 _raise_if_cancelled(cancel_check)
                 if progress_callback is not None:
-                    progress_callback(
-                        "complete",
-                        1,
-                        1,
-                        "Contribution ranking complete",
-                    )
-            finally:
-                connection.close()
+                    progress_callback("complete", 1, 1, "Contribution ranking complete")
+            else:
+                rows = connection.execute(
+                    "SELECT od_index, operator_coefficient, linear_flow_contribution, modeled_mean_contribution "
+                    "FROM contributions ORDER BY modeled_mean_contribution DESC, od_index ASC LIMIT ? OFFSET ?",
+                    (page_size, offset),
+                ).fetchall()
+                _raise_if_cancelled(cancel_check)
+        finally:
+            connection.close()
+
+        if cached is None:
+            assert temporary_directory is not None
+            self._remember_measurement_result(
+                measurement_index,
+                temporary_directory=temporary_directory,
+                database_path=database_path,
+                total=total,
+                components=components,
+                absolute_term_sum=absolute_term_sum,
+                term_count=term_count,
+            )
 
         demand = np.asarray(self._scales["demand"])
         contributors: list[dict[str, object]] = []
@@ -762,15 +980,31 @@ class MeasurementODContributionQuery:
             "components": components,
         }
 
-    def _components_for_row(self, measurement_index: int, raw_od: float) -> dict[str, float]:
+    def _components_for_row(
+        self,
+        measurement_index: int,
+        raw_od: float,
+        absolute_term_sum: float,
+        term_count: int,
+    ) -> dict[str, float]:
         result = self.fit_result
         expected_od = result.od_measurement_contribution
+        component_raw_od = raw_od
         if expected_od is not None:
             expected = np.asarray(expected_od, dtype=np.float64)
-            if expected.shape != (self.artifact.number_of_measurements,) or not np.isclose(
-                raw_od, float(expected[measurement_index]), rtol=1e-6, atol=1e-8
-            ):
-                raise ValueError("mapping OD contribution differs from the fitted OD measurement component.")
+            if expected.shape != (self.artifact.number_of_measurements,):
+                raise ValueError("fitted OD measurement contribution has an invalid dimension.")
+            component_raw_od = float(expected[measurement_index])
+            # Use the fit's saved raw component for fixed/additive/model
+            # closure so its rounding is not misattributed to another term;
+            # validate it against the raw reconstruction below.
+            validate_raw_od_component_consistency(
+                reconstructed=raw_od,
+                saved=component_raw_od,
+                absolute_term_sum=absolute_term_sum,
+                term_count=term_count,
+                fit_result=result,
+            )
         additive = float(np.asarray(self._scales["additive"])[measurement_index])
         scale = float(np.asarray(self._scales["observation_scales"])[measurement_index])
         modeled = float(np.asarray(self._scales["modeled"])[measurement_index])
@@ -805,7 +1039,7 @@ class MeasurementODContributionQuery:
             aggregate_flow_scale = float(self._scales["aggregate_flow_scale"])
             fixed_offset = float(
                 latent[measurement_index]
-                - float(self._scales["aggregate_flow_scale"]) * (raw_od + additive)
+                - aggregate_flow_scale * (component_raw_od + additive)
             )
             if not np.isclose(
                 fixed_offset,
@@ -816,7 +1050,7 @@ class MeasurementODContributionQuery:
                 raise ValueError("fitted fixed offset differs from the mapping artifact.")
             fixed_mean = scale * fixed_offset
             additive_mean = scale * aggregate_flow_scale * additive
-            od_mean = scale * aggregate_flow_scale * raw_od
+            od_mean = scale * aggregate_flow_scale * component_raw_od
         modeled_without_floor = fixed_mean + additive_mean + od_mean
         floor = modeled - modeled_without_floor
         if self._scales["measurement_scale_contract"] == "routed_od_only":
@@ -1085,6 +1319,8 @@ def write_measurement_od_contributions_dataset(
     working_directory.mkdir()
     working_database = working_directory / "contributions.sqlite"
     raw_od = np.zeros(row_count, dtype=np.float64)
+    raw_od_absolute_term_sum = np.zeros(row_count, dtype=np.float64)
+    raw_od_term_count = np.zeros(row_count, dtype=np.int64)
     departure_interval_by_column = [""] * artifact.number_of_demand_cells
     full_index_by_column = [-1] * artifact.number_of_demand_cells
     for cell in artifact.canonical_index.demand_cells:
@@ -1115,6 +1351,8 @@ def write_measurement_od_contributions_dataset(
                 coefficients = np.asarray(block.values[start:stop], dtype=np.float64)
                 flows = coefficients * demand[columns]
                 np.add.at(raw_od, rows, flows)
+                np.add.at(raw_od_absolute_term_sum, rows, np.abs(flows))
+                np.add.at(raw_od_term_count, rows, flows != 0.0)
                 means = flows * aggregate_flow_scale * observation_scales[rows]
                 connection.executemany(
                     "INSERT INTO contributions VALUES (?, ?, ?, ?, ?, ?) "
@@ -1143,10 +1381,21 @@ def write_measurement_od_contributions_dataset(
                 )
 
         persisted_od = fit_result.od_measurement_contribution
+        component_raw_od = raw_od
         if persisted_od is not None:
             persisted_od_array = np.asarray(persisted_od, dtype=np.float64)
-            if persisted_od_array.shape != (row_count,) or not np.allclose(raw_od, persisted_od_array, rtol=1e-6, atol=1e-8):
-                raise ValueError("mapping OD contribution differs from the fitted OD measurement component.")
+            if persisted_od_array.shape != (row_count,):
+                raise ValueError("fitted OD measurement contribution has an invalid dimension.")
+            component_raw_od = persisted_od_array
+            # Preserve the fit's own raw component for subsequent component
+            # closure after separately validating it against the mapping.
+            validate_raw_od_component_consistency(
+                reconstructed=raw_od,
+                saved=persisted_od_array,
+                absolute_term_sum=raw_od_absolute_term_sum,
+                term_count=raw_od_term_count,
+                fit_result=fit_result,
+            )
 
         if fit_result.latent_measurements is None:
             if additive_vectors:
@@ -1156,7 +1405,7 @@ def write_measurement_od_contributions_dataset(
             latent = np.asarray(fit_result.latent_measurements, dtype=np.float64)
             if latent.shape != (row_count,) or not np.all(np.isfinite(latent)):
                 raise ValueError("fitted latent measurements are invalid.")
-            fixed_offset = latent - aggregate_flow_scale * (raw_od + additive)
+            fixed_offset = latent - aggregate_flow_scale * (component_raw_od + additive)
             if not np.allclose(
                 fixed_offset,
                 np.asarray(artifact.fixed_measurement_offset, dtype=np.float64),
@@ -1167,7 +1416,7 @@ def write_measurement_od_contributions_dataset(
 
         fixed_mean = observation_scales * fixed_offset
         additive_mean = observation_scales * aggregate_flow_scale * additive
-        od_mean = observation_scales * aggregate_flow_scale * raw_od
+        od_mean = observation_scales * aggregate_flow_scale * component_raw_od
         floor_adjustment = modeled - fixed_mean - additive_mean - od_mean
         tolerance = 1e-6 + 1e-6 * np.abs(modeled)
         if np.any(floor_adjustment < -tolerance):

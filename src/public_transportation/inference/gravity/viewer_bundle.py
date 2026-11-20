@@ -48,6 +48,7 @@ from .measurement_od_contributions import (
     _measurement_scale_contract,
     validate_dataset as _validate_measurement_od_dataset,
     measurement_od_query_descriptor,
+    validate_raw_od_component_consistency,
 )
 from .measurement_location_lookup import (
     MEASUREMENT_LOCATION_COLUMNS,
@@ -982,16 +983,29 @@ def _validate_linear_mapping_for_bundle(
 
     if validate_block_payloads:
         raw_od = np.zeros(artifact.number_of_measurements, dtype=np.float64)
+        raw_od_absolute_term_sum = np.zeros(artifact.number_of_measurements, dtype=np.float64)
+        raw_od_term_count = np.zeros(artifact.number_of_measurements, dtype=np.int64)
         demand = np.asarray(fit_result.free_od_demand, dtype=np.float64)
         for block in artifact.iter_blocks():
             flows = block.values * demand[block.column_indices]
             np.add.at(raw_od, block.row_indices, flows)
+            np.add.at(raw_od_absolute_term_sum, block.row_indices, np.abs(flows))
+            np.add.at(raw_od_term_count, block.row_indices, flows != 0.0)
+        component_raw_od = raw_od
         if fit_result.od_measurement_contribution is not None:
             persisted_od = np.asarray(fit_result.od_measurement_contribution, dtype=np.float64)
-            if persisted_od.shape != raw_od.shape or not np.allclose(
-                raw_od, persisted_od, rtol=1e-6, atol=1e-8
-            ):
-                raise ValueError("mapping OD contribution differs from the fitted OD measurement component.")
+            if persisted_od.shape != raw_od.shape:
+                raise ValueError("fitted OD measurement contribution has an invalid dimension.")
+            # Compare the mapping reconstruction separately, then keep the
+            # fit's component for validating its saved fixed-offset identity.
+            component_raw_od = persisted_od
+            validate_raw_od_component_consistency(
+                reconstructed=raw_od,
+                saved=persisted_od,
+                absolute_term_sum=raw_od_absolute_term_sum,
+                term_count=raw_od_term_count,
+                fit_result=fit_result,
+            )
         additive_vectors = tuple(
             np.asarray(value, dtype=np.float64)
             for value in fit_result.additive_measurement_contributions
@@ -1023,7 +1037,7 @@ def _validate_linear_mapping_for_bundle(
             else:
                 if aggregate_flow_scale is None:
                     raise ValueError("supported measurement-scale contract is missing its aggregate flow scale.")
-                fixed_offset = latent - aggregate_flow_scale * (raw_od + additive)
+                fixed_offset = latent - aggregate_flow_scale * (component_raw_od + additive)
                 if not np.allclose(
                     fixed_offset,
                     artifact_fixed,

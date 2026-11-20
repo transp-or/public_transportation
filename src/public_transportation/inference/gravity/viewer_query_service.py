@@ -245,6 +245,7 @@ class GravityViewerQueryService:
                 fit_result=fit_result,
                 rho=rho,
                 max_cached_pages=16,
+                max_cached_measurements=16,
                 max_page_size=500,
             )
         if self.query.cache_namespace != (

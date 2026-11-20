@@ -48,6 +48,7 @@ from public_transportation.inference.hierarchical_artifacts import package_revis
 from public_transportation.inference.od_parameter_layout import ODParameterLayout
 from public_transportation.inference.gravity.measurement_od_contributions import (
     measurement_od_query_descriptor,
+    validate_raw_od_component_consistency,
 )
 
 from tests.gravity.test_viewer_bundle import _inputs
@@ -351,6 +352,204 @@ def test_sparse_mapping_decomposes_measurements_by_od_and_closes_components(tmp_
 
     reopened = read_gravity_viewer_bundle(bundle.path)
     assert reopened.measurement_od_contributions_available
+
+
+def test_raw_od_precision_bound_accounts_for_float32_accumulation_and_dtype(tmp_path):
+    fit_result, _, _, _ = _mapping_bundle_inputs(tmp_path)
+    reconstructed = 2.306265441526364
+    saved = 2.3062613010406494
+    common = {
+        "reconstructed": reconstructed,
+        "saved": saved,
+        "absolute_term_sum": reconstructed,
+        "term_count": 1_000,
+    }
+
+    float32_fit = replace(
+        fit_result,
+        objective_dtype="float32",
+        gradient_dtype="float32",
+    )
+    validate_raw_od_component_consistency(fit_result=float32_fit, **common)
+
+    float64_fit = replace(
+        fit_result,
+        objective_dtype="float64",
+        gradient_dtype="float64",
+    )
+    with pytest.raises(ValueError, match="computation dtype=float64.*allowed tolerance="):
+        validate_raw_od_component_consistency(fit_result=float64_fit, **common)
+
+    with pytest.raises(
+        ValueError,
+        match="computation dtype=float32.*reconstructed=.*saved=.*absolute difference=.*relative difference=.*allowed tolerance=",
+    ):
+        validate_raw_od_component_consistency(
+            fit_result=float32_fit,
+            **{**common, "saved": 2.2},
+        )
+
+
+def test_float32_accumulation_difference_is_accepted_by_selected_row_query(tmp_path):
+    result, _, _, artifact_path = _mapping_bundle_inputs(
+        tmp_path,
+        result_overrides={
+            "objective_dtype": "float32",
+            "gradient_dtype": "float32",
+        },
+    )
+    reader = open_temporal_block_artifact(artifact_path)
+    reconstructed = 2.306265441526364
+    saved = 2.3062613010406494
+    saved_od = np.asarray(result.od_measurement_contribution, dtype=np.float64).copy()
+    saved_od[0] = saved
+    latent = np.asarray(result.latent_measurements, dtype=np.float64).copy()
+    latent[0] = 0.5 + saved + 0.5  # preserve the fit's fixed and additive components
+    modeled = np.asarray(result.predicted_measurements, dtype=np.float64).copy()
+    modeled[0] = 2.0 * (0.5 + 0.5 + saved)
+    result = replace(
+        result,
+        free_od_demand=np.ones(1_000, dtype=np.float64),
+        od_measurement_contribution=saved_od,
+        latent_measurements=latent,
+        predicted_measurements=modeled,
+    )
+    synthetic_index = CanonicalAssignmentIndex(
+        time_intervals=(CanonicalTimeInterval("am", 0, 3_600),),
+        demand_cells=tuple(
+            CanonicalODTimeCell(
+                index,
+                f"origin-{index}",
+                "destination",
+                "am",
+                "free",
+                index,
+            )
+            for index in range(1_000)
+        ),
+        measurements=reader.canonical_index.measurements,
+    )
+
+    class RepeatedContributionReader:
+        def __getattr__(self, name):
+            return getattr(reader, name)
+
+        @property
+        def canonical_index(self):
+            return synthetic_index
+
+        @property
+        def number_of_demand_cells(self):
+            return 1_000
+
+        def measurement_interval_nonzero_entries(self, interval_id):
+            return 1_000
+
+        def iter_blocks_for_measurement_interval(self, interval_id):
+            block = next(reader.iter_blocks_for_measurement_interval(interval_id))
+            count = 1_000
+            yield TemporalSparseBlock(
+                key=block.key,
+                row_indices=np.zeros(count, dtype=np.int32),
+                column_indices=np.arange(count, dtype=np.int32),
+                values=np.full(count, reconstructed / count, dtype=np.float64),
+                number_of_measurements=block.number_of_measurements,
+                number_of_demand_cells=count,
+            )
+
+    query = MeasurementODContributionQuery(
+        artifact=RepeatedContributionReader(),
+        fit_result=result,
+    )
+    page = query.query(0, page=0, page_size=10)
+    assert page["total"] == 1_000
+    assert page["components"]["od_contribution"] == pytest.approx(2.0 * saved)
+
+
+def test_raw_od_precision_policy_is_shared_by_query_and_bundle_validation(tmp_path):
+    result, report, provenance, artifact = _mapping_bundle_inputs(
+        tmp_path,
+        result_overrides={
+            "objective_dtype": "float32",
+            "gradient_dtype": "float32",
+        },
+    )
+    float32_saved_value = float(np.nextafter(np.float32(3.0), np.float32(np.inf)))
+    json_restored_od = np.asarray(json.loads(json.dumps([float32_saved_value, 2.0, 0.0])))
+    assert json_restored_od.dtype == np.float64
+    result = replace(result, od_measurement_contribution=json_restored_od)
+
+    bundle = write_gravity_viewer_bundle(
+        output_directory=tmp_path / "precision-aware-bundle",
+        fit_result=result,
+        validation_result=report.adequacy,
+        report=report,
+        metadata={"provenance": provenance},
+        linear_mapping_artifact=artifact,
+    )
+    query = MeasurementODContributionQuery(
+        artifact=open_temporal_block_artifact(artifact),
+        fit_result=result,
+    )
+    page = query.query(0, page=0, page_size=10)
+    assert page["total"] == 2
+    # The raw OD component (3.0) is validated before the outer observation
+    # scale (2.0) is applied to this reported modeled-mean component.
+    assert page["components"]["od_contribution"] == pytest.approx(6.0)
+    report_payload = json.loads(report.files["report.json"].read_text(encoding="utf-8"))
+    _validate_linear_mapping_for_bundle(
+        artifact=open_temporal_block_artifact(artifact),
+        fit_result=result,
+        report_payload=report_payload,
+        metadata={"provenance": provenance},
+        full_od_path=bundle.path / "full_od.csv",
+        validate_block_payloads=True,
+    )
+
+    float64_fit = replace(
+        result,
+        objective_dtype="float64",
+        gradient_dtype="float64",
+    )
+    query64 = MeasurementODContributionQuery(
+        artifact=open_temporal_block_artifact(artifact),
+        fit_result=float64_fit,
+    )
+    with pytest.raises(ValueError, match="computation dtype=float64.*reconstructed=.*saved=.*allowed tolerance="):
+        query64.query(0, page=0, page_size=10)
+    with pytest.raises(ValueError, match="computation dtype=float64.*reconstructed=.*saved=.*allowed tolerance="):
+        _validate_linear_mapping_for_bundle(
+            artifact=open_temporal_block_artifact(artifact),
+            fit_result=float64_fit,
+            report_payload=report_payload,
+            metadata={"provenance": provenance},
+            full_od_path=bundle.path / "full_od.csv",
+            validate_block_payloads=True,
+        )
+
+    inconsistent_fit = replace(
+        result,
+        od_measurement_contribution=np.asarray((3.01, 2.0, 0.0), dtype=np.float64),
+        # Keep the independently validated fixed-offset decomposition intact
+        # so the test reaches the raw mapping-versus-fit consistency check.
+        latent_measurements=np.asarray((4.01, 5.25, 0.0), dtype=np.float64),
+        predicted_measurements=np.asarray((8.02, 2.625, 1e-8), dtype=np.float64),
+    )
+    query_bad = MeasurementODContributionQuery(
+        artifact=open_temporal_block_artifact(artifact),
+        fit_result=inconsistent_fit,
+    )
+    with pytest.raises(ValueError, match="computation dtype=float32.*absolute difference=.*allowed tolerance="):
+        query_bad.query(0, page=0, page_size=10)
+    with pytest.raises(ValueError, match="computation dtype=float32.*absolute difference=.*allowed tolerance="):
+        _validate_linear_mapping_for_bundle(
+            artifact=open_temporal_block_artifact(artifact),
+            fit_result=inconsistent_fit,
+            report_payload=report_payload,
+            metadata={"provenance": provenance},
+            full_od_path=bundle.path / "full_od.csv",
+            validate_block_payloads=True,
+        )
 
 
 @pytest.mark.parametrize(
@@ -725,6 +924,9 @@ def test_on_demand_query_selects_measurement_intervals_aggregates_duplicates_and
     second = query.query(0, page=1, page_size=1)
     third = query.query(0, page=2, page_size=1)
     assert [second["rows"][0]["od_index"], third["rows"][0]["od_index"]] == [0, 2]
+    assert requested_intervals == ["am"]
+    assert query.measurement_cache_misses == 1
+    assert query.measurement_cache_hits == 2
     assert second["rows"][0]["operator_coefficient"] == pytest.approx(1.5)
     assert second["rows"][0]["linear_flow_contribution"] == pytest.approx(1.5)
     assert first["components"] == {
@@ -738,6 +940,11 @@ def test_on_demand_query_selects_measurement_intervals_aggregates_duplicates_and
         row["modeled_mean_contribution"] for row in (first["rows"] + second["rows"] + third["rows"])
     ] == pytest.approx((12.0, 3.0, 3.0))
     assert len(query._cache) <= 2
+
+    resized_page = query.query(0, page=0, page_size=2)
+    assert [row["od_index"] for row in resized_page["rows"]] == [1, 0]
+    assert requested_intervals == ["am"]
+    assert query.measurement_cache_hits == 3
 
     affected_page = query.query_od(1, page=0, page_size=1)
     affected_next = query.query_od(1, page=1, page_size=1)
@@ -756,6 +963,31 @@ def test_on_demand_query_selects_measurement_intervals_aggregates_duplicates_and
     assert other_query.cache_misses == 1
     with pytest.raises(ValueError, match="bounded contribution-query window"):
         query.query(0, page=50, page_size=100)
+
+
+def test_on_demand_query_evicts_old_completed_measurement_cache_rows(tmp_path):
+    result, reader, _artifact_path = _split_interval_query_inputs(tmp_path)
+    requested_intervals = []
+
+    class RecordingReader:
+        def __getattr__(self, name):
+            return getattr(reader, name)
+
+        def iter_blocks_for_measurement_interval(self, interval_id):
+            requested_intervals.append(interval_id)
+            yield from reader.iter_blocks_for_measurement_interval(interval_id)
+
+    query = MeasurementODContributionQuery(
+        artifact=RecordingReader(),
+        fit_result=result,
+        max_cached_measurements=1,
+    )
+    query.query(0, page=0, page_size=1)
+    query.query(1, page=0, page_size=1)
+    assert len(query._measurement_cache) == 1
+    query.query(0, page=1, page_size=1)
+    assert requested_intervals == ["am", "pm", "am"]
+    assert query.measurement_cache_misses == 3
 
 
 def test_on_demand_query_verifies_only_selected_interval_payloads(tmp_path):
