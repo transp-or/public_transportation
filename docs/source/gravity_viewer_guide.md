@@ -80,7 +80,9 @@ alone does not change either endpoint, and choosing one endpoint leaves the
 other unchanged. The map status shows both selections; the selected origin and
 destination have distinct marker outlines. Use the **Origin** and
 **Destination** selectors in **Demand explorer** to replace or clear either
-selection.
+selection. Click **Reset map view** in the map controls to restore the full
+network extent shown when the bundle was loaded; the button does not change
+the selected endpoints or map layers.
 
 ## Find measurements at a stop
 

@@ -98,7 +98,7 @@
 
   const viewer = {
     files: [], fileMap: new Map(), manifest: null, summary: {}, model: {}, report: {},
-    map: null, stops: [], stopsById: new Map(), stopMarkers: new Map(), markerLayer: null, selectedOd: null,
+    map: null, initialMapBounds: null, stops: [], stopsById: new Map(), stopMarkers: new Map(), markerLayer: null, selectedOd: null,
     cacheDb: null, cacheIdentity: '', odRows: [],
     flowRows: [], flowBufferedRows: [], flowMatchedCount: 0, flowLoadedLimit: 0, flowPage: 0,
     flowSortColumn: '', flowSortDirection: 'desc', flowTitle: '',
@@ -700,6 +700,10 @@
     for (const [stopId, entry] of viewer.stopMarkers) {
       entry.marker.setStyle(stopMarkerStyle(stopId, entry.hasMeasurements));
     }
+  }
+
+  function resetMapView() {
+    if (viewer.map && viewer.initialMapBounds) viewer.map.fitBounds(viewer.initialMapBounds);
   }
 
   function assignOdEndpoint(endpoint, stopId) {
@@ -1469,6 +1473,8 @@
   async function waitForLeaflet() { for (let i = 0; i < 100 && !window.L; i += 1) await new Promise((resolve) => setTimeout(resolve, 50)); if (!window.L) throw new Error('Map library could not be loaded.'); }
   async function renderNetwork() {
     viewer.stopMarkers = new Map();
+    viewer.initialMapBounds = null;
+    $('map-reset-view').disabled = true;
     const stopsFile = findFile('network/stops.csv') || findFile('stops.csv'); if (!stopsFile) return;
     try {
       const locationManifest = await measurementLocationIndex();
@@ -1495,7 +1501,7 @@
     viewer.stopsById = new Map(viewer.stops.map((stop) => [stop.stop_id, stop]));
     try { await waitForLeaflet(); } catch (error) { $('network-map').classList.remove('hidden'); $('map').textContent = `${error.message} Tables remain available without map tiles.`; return; }
     const points = viewer.stops.map((stop) => [num(stop.lat), num(stop.lon)]).filter(([lat, lon]) => lat !== null && lon !== null); if (!points.length) return;
-    $('network-map').classList.remove('hidden'); viewer.map = L.map('map'); L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'}).addTo(viewer.map); viewer.map.fitBounds(L.latLngBounds(points).pad(0.08)); viewer.markerLayer = L.layerGroup().addTo(viewer.map); viewer.flowLayer = L.layerGroup().addTo(viewer.map);
+    $('network-map').classList.remove('hidden'); viewer.map = L.map('map'); L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'}).addTo(viewer.map); viewer.initialMapBounds = L.latLngBounds(points).pad(0.08); viewer.map.fitBounds(viewer.initialMapBounds); $('map-reset-view').disabled = false; viewer.markerLayer = L.layerGroup().addTo(viewer.map); viewer.flowLayer = L.layerGroup().addTo(viewer.map);
     const indexedStops = viewer.measurementLocationManifest?.stops || {};
     viewer.stops.forEach((stop) => {
       const lat = num(stop.lat); const lon = num(stop.lon); if (lat === null || lon === null) return;
@@ -1676,6 +1682,7 @@
   $('folder').addEventListener('change', (event) => load([...event.target.files])); $('flow-refresh').addEventListener('click', () => refreshFlows()); $('flow-more').addEventListener('click', () => loadMoreFlows()); $('flow-all').addEventListener('click', () => loadMoreFlows(true)); $('flow-page-previous').addEventListener('click', () => { viewer.flowPage = Math.max(0, viewer.flowPage - 1); renderTable(viewer.flowRows, viewer.flowTitle, viewer.flowMatchedCount); }); $('flow-page-next').addEventListener('click', () => { viewer.flowPage += 1; renderTable(viewer.flowRows, viewer.flowTitle, viewer.flowMatchedCount); }); $('flow-clear-cache').addEventListener('click', clearCache); ['flow-bin', 'flow-origin', 'flow-destination'].forEach((id) => $(id).addEventListener('change', (event) => { if (event.currentTarget.id !== 'flow-bin') { viewer.selectedOd = null; updateOdEndpointMarkers(); updateOdMapSelectionStatus(); } cancelRoutePathQuery(); void refreshFlows(); void updateRoutePathBrowser({clearResults: true}); }));
   $('route-path-service')?.addEventListener('change', () => { cancelRoutePathQuery(); void updateRoutePathBrowser({clearResults: true}); });
   $('route-path-load')?.addEventListener('click', loadRoutePaths);
+  $('map-reset-view')?.addEventListener('click', resetMapView);
   $('route-path-threshold')?.addEventListener('change', () => {
     cancelRoutePathQuery();
     $('route-path-summary').textContent = '';

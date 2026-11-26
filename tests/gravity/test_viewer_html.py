@@ -28,6 +28,7 @@ def test_viewer_exposes_stop_and_od_pair_interaction_controls() -> None:
         'id="measurement-row-select"',
         'id="measurement-row-next"',
         'id="measurement-contribution-next"',
+        'id="map-reset-view"',
         'id="measurement-bin"',
         'id="measurement-od-load"',
     ):
@@ -71,6 +72,9 @@ def test_viewer_starts_from_manifest_and_streams_selected_partitions() -> None:
     assert "measurementLocationIndex" in viewer_source
     assert "query_measurement_od_contributions" in source or "measurementContributionPage" in viewer_source
     assert "No measurements at this location" in viewer_source
+    assert "initialMapBounds = L.latLngBounds(points).pad(0.08)" in viewer_source
+    assert "viewer.map.fitBounds(viewer.initialMapBounds)" in viewer_source
+    assert "Reset map view" in source
     assert "observation_time" in viewer_source and "departure_time_bin" in viewer_source
     assert "streamMatches: true" in viewer_source
     assert "measurementContributions" in viewer_source
@@ -145,6 +149,7 @@ def test_viewer_guide_documents_explicit_od_endpoint_actions() -> None:
     assert "Measurement" in guide
     assert 'go to <a href="#network-map">Network map</a>, choose <strong>Measurement</strong> mode' in guide
     assert "Measurement** mode" in documentation
+    assert "Reset map view" in guide and "Reset map view" in documentation
 
 
 def test_viewer_guide_documents_on_demand_modeled_path_browser() -> None:

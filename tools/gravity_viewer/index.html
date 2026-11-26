@@ -118,7 +118,7 @@
 <body>
   <header>
     <h1>Gravity Viewer Bundle</h1>
-    <p class="title-credit">By Michel Bierlaire · Updated 19 November 2026</p>
+    <p class="title-credit">By Michel Bierlaire · Updated 26 November 2026</p>
     <p>Portable, read-only inspection of a <code>gravity_viewer_bundle_v1</code>.</p>
   </header>
   <main>
@@ -129,6 +129,7 @@
         <li>In <a href="#flows">Demand explorer</a>, choose a <strong>Departure time interval</strong> and optionally an <strong>Origin</strong> and <strong>Destination</strong>, then click <strong>Load selected partition</strong>; a partition is the saved demand slice for that selection, and the viewer finds it for you, so you do not need to find or open its file. Use <strong>Load 50 more</strong> or <strong>Load all matching rows</strong> to extend results; click a column heading to sort only loaded rows.</li>
         <li>When both endpoints are selected in <a href="#flows">Demand explorer</a>, the modeled paths browser appears. Choose a departure interval and a minimum probability (1% by default), then request paths. Probabilities are for complete paths under the saved route-choice model; paths are calculated on demand and are not stored in the bundle. The local path API must have the matching prepared route-choice source.</li>
         <li>In <a href="#network-map">Network map</a>, choose <strong>OD selection</strong>, click a stop, then choose <strong>Set as origin</strong> or <strong>Set as destination</strong>; only the chosen endpoint changes. Use the <strong>Origin</strong> and <strong>Destination</strong> selectors to replace or clear either endpoint.</li>
+        <li>Use <strong>Reset map view</strong> to return to the full-network extent shown when the bundle was loaded.</li>
         <li>With stop and measurement lookup data in the bundle, go to <a href="#network-map">Network map</a>, choose <strong>Measurement</strong> mode, and click a measured stop; browse multiple rows with <strong>Measurement row</strong>, <strong>Previous rows</strong>, and <strong>Next rows</strong>. The selected row shows its <strong>Observed count</strong> and <strong>Modeled mean</strong>; a stop without matching rows says “No measurements at this location.”</li>
         <li>When contribution data are available, go to <a href="#measurement-od">Measured flows by OD pair</a>, choose <strong>Measured row → contributing OD pairs</strong> under <strong>What do you want to look up?</strong>, select a row, and click <strong>Load OD contributors</strong>. Results are ranked by the magnitude of each modeled-mean contribution, which decomposes the <strong>Modeled mean</strong>, not the observed count; fixed, additive, and floor components are not assigned to individual OD pairs. Use <strong>Rows per page</strong>, <strong>Previous contributors</strong>, and <strong>Next contributors</strong> to browse; sorting applies only to the displayed page.</li>
         <li>For the reverse lookup, choose <strong>OD pair → affected measured rows</strong>, then select the <strong>OD departure interval</strong>, <strong>Origin</strong>, and <strong>Destination</strong>, and click <strong>Load affected measurements</strong>. The departure interval is when the OD trip leaves, not the observation time; availability depends on the bundle contents.</li>
@@ -173,6 +174,7 @@
         <span class="muted">Map click mode</span>
         <button id="map-od-mode" type="button" class="active">OD selection</button>
         <button id="map-measurement-mode" type="button">Measurement</button>
+        <button id="map-reset-view" type="button" disabled>Reset map view</button>
         <span id="map-click-status" class="muted" role="status" aria-live="polite">Click a stop to open its endpoint actions. Choose Set as origin or Set as destination; neither endpoint changes until you choose an action.</span>
       </div>
       <div id="map-toolbar" class="toolbar hidden">
