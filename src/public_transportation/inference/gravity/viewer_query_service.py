@@ -26,18 +26,111 @@ from public_transportation.inference.hierarchical_artifacts import package_revis
 
 from .estimator import GravityEstimationResult
 from .measurement_od_contributions import (
+    MEASUREMENT_OD_QUERY_DESCRIPTOR_VERSION,
     MeasurementODContributionQuery,
     MeasurementODQueryCancelled,
 )
 from .reporting import GRAVITY_REPORT_PROVENANCE_FIELDS
 from .route_path_query import RouteChoicePathQuery, RoutePathQueryCancelled
 from .viewer_bundle import (
+    GRAVITY_VIEWER_BUNDLE_SCHEMA_VERSION,
+    GRAVITY_VIEWER_BUNDLE_TYPE,
     GravityViewerBundle,
     _validate_linear_mapping_for_bundle,
     read_gravity_viewer_bundle,
 )
 
 _StartupProgressCallback = Callable[[str, int, int, str], None]
+
+# Older producer revisions are admitted only for exact bundle/query contracts
+# exercised by compatibility tests.  Add a revision only after verifying its
+# format, descriptor semantics, and a bounded query under the current service;
+# this list never relaxes fit/mapping identity or checksum validation.
+_VERIFIED_VIEWER_BUNDLE_PRODUCERS: dict[
+    str, frozenset[tuple[str, int, int]]
+] = {
+    "387758616ee8684592501de53fcef07a62f39ae6": frozenset(
+        {
+            (
+                GRAVITY_VIEWER_BUNDLE_TYPE,
+                GRAVITY_VIEWER_BUNDLE_SCHEMA_VERSION,
+                MEASUREMENT_OD_QUERY_DESCRIPTOR_VERSION,
+            )
+        }
+    ),
+}
+
+
+def _validate_viewer_bundle_compatibility(
+    *,
+    bundle_manifest: dict[str, object],
+    contribution_summary: dict[str, object],
+    runtime_revision: str,
+) -> None:
+    """Validate the producer revision against explicitly supported contracts."""
+    producer_revision = bundle_manifest.get("runtime_package_revision")
+    summary_revision = contribution_summary.get("runtime_package_revision")
+    bundle_type = bundle_manifest.get("bundle_type")
+    schema_version = bundle_manifest.get("schema_version")
+    descriptor_version = contribution_summary.get("query_descriptor_version")
+    actual = (bundle_type, schema_version, descriptor_version)
+    current_contract = (
+        GRAVITY_VIEWER_BUNDLE_TYPE,
+        GRAVITY_VIEWER_BUNDLE_SCHEMA_VERSION,
+        MEASUREMENT_OD_QUERY_DESCRIPTOR_VERSION,
+    )
+    verified_contracts = _VERIFIED_VIEWER_BUNDLE_PRODUCERS.get(
+        str(producer_revision), frozenset()
+    )
+    supported_contracts = (
+        frozenset({current_contract})
+        if producer_revision == runtime_revision
+        else verified_contracts
+    )
+    supported_producers = [runtime_revision, *_VERIFIED_VIEWER_BUNDLE_PRODUCERS]
+    supported_options = "; ".join(
+        [
+            f"current runtime {runtime_revision!r}: "
+            f"{GRAVITY_VIEWER_BUNDLE_TYPE!r}/schema "
+            f"{GRAVITY_VIEWER_BUNDLE_SCHEMA_VERSION}/query descriptor "
+            f"{MEASUREMENT_OD_QUERY_DESCRIPTOR_VERSION}",
+            *[
+                f"verified producer {revision!r}: "
+                + ", ".join(
+                    f"{kind!r}/schema {schema}/query descriptor {descriptor}"
+                    for kind, schema, descriptor in sorted(contracts)
+                )
+                for revision, contracts in _VERIFIED_VIEWER_BUNDLE_PRODUCERS.items()
+            ],
+        ]
+    )
+    if (
+        not isinstance(producer_revision, str)
+        or not producer_revision
+        or summary_revision != producer_revision
+    ):
+        raise ValueError(
+            "viewer bundle compatibility metadata is inconsistent: "
+            f"producer revision={producer_revision!r}, "
+            f"summary producer revision={summary_revision!r}, "
+            f"bundle type={bundle_type!r}, schema version={schema_version!r}, "
+            f"query descriptor version={descriptor_version!r}. Supported options: "
+            f"{supported_options}."
+        )
+    if actual not in supported_contracts:
+        reason = (
+            "producer revision is not verified"
+            if producer_revision != runtime_revision and not verified_contracts
+            else "bundle format or query descriptor is unsupported for this producer"
+        )
+        raise ValueError(
+            "viewer bundle compatibility rejected: "
+            f"{reason}; producer revision={producer_revision!r}, "
+            f"bundle type={bundle_type!r}, schema version={schema_version!r}, "
+            f"query descriptor version={descriptor_version!r}. "
+            f"Supported producer revisions: {supported_producers!r}. "
+            f"Supported options: {supported_options}."
+        )
 
 
 def _elapsed_label(seconds: float) -> str:
@@ -165,14 +258,12 @@ class GravityViewerQueryService:
             or summary.get("query_mode") != "local_service"
         ):
             raise ValueError("viewer bundle is not configured for on-demand measurement queries.")
-        if summary.get("query_descriptor_version") != 2:
-            raise ValueError("viewer bundle uses an unsupported on-demand query descriptor version.")
         runtime_revision = package_revision()
-        if (
-            summary.get("runtime_package_revision") != runtime_revision
-            or bundle_manifest.get("runtime_package_revision") != runtime_revision
-        ):
-            raise ValueError("viewer bundle runtime package revision differs from the query-service runtime.")
+        _validate_viewer_bundle_compatibility(
+            bundle_manifest=bundle_manifest,
+            contribution_summary=summary,
+            runtime_revision=runtime_revision,
+        )
         fit_source_revision = fit_payload.get("package_revision")
         if not isinstance(fit_source_revision, str) or not fit_source_revision:
             raise ValueError("fit manifest is missing its source package revision.")

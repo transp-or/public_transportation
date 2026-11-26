@@ -45,6 +45,7 @@ from .reporting import (
 from .specification import GravityModelSpecification
 from .validation import GravityAdequacyReport, GravityValidationMetadata
 from .measurement_od_contributions import (
+    MEASUREMENT_OD_QUERY_DESCRIPTOR_VERSION,
     _measurement_scale_contract,
     validate_dataset as _validate_measurement_od_dataset,
     measurement_od_query_descriptor,
@@ -1411,9 +1412,23 @@ def _validate_bundle_directory(
     progress_callback: _ViewerProgressCallback | None = None,
 ) -> None:
     if manifest.get("schema_version") != GRAVITY_VIEWER_BUNDLE_SCHEMA_VERSION:
-        raise ValueError("unsupported gravity viewer bundle schema version.")
+        raise ValueError(
+            "unsupported gravity viewer bundle format: "
+            f"producer revision={manifest.get('runtime_package_revision')!r}, "
+            f"bundle type={manifest.get('bundle_type')!r}, "
+            f"schema version={manifest.get('schema_version')!r}; supported bundle type="
+            f"{GRAVITY_VIEWER_BUNDLE_TYPE!r}, schema version="
+            f"{GRAVITY_VIEWER_BUNDLE_SCHEMA_VERSION}."
+        )
     if manifest.get("bundle_type") != GRAVITY_VIEWER_BUNDLE_TYPE:
-        raise ValueError("unexpected gravity viewer bundle type.")
+        raise ValueError(
+            "unsupported gravity viewer bundle format: "
+            f"producer revision={manifest.get('runtime_package_revision')!r}, "
+            f"bundle type={manifest.get('bundle_type')!r}, "
+            f"schema version={manifest.get('schema_version')!r}; supported bundle type="
+            f"{GRAVITY_VIEWER_BUNDLE_TYPE!r}, schema version="
+            f"{GRAVITY_VIEWER_BUNDLE_SCHEMA_VERSION}."
+        )
     files = manifest.get("files")
     if not isinstance(files, Mapping):
         raise ValueError("bundle manifest files are missing or invalid.")
@@ -1653,6 +1668,18 @@ def _validate_bundle_directory(
         if contribution_payload.get("available"):
             query_mode = contribution_payload.get("query_mode")
             if query_mode == "local_service":
+                descriptor_version = contribution_payload.get(
+                    "query_descriptor_version"
+                )
+                if descriptor_version != MEASUREMENT_OD_QUERY_DESCRIPTOR_VERSION:
+                    raise ValueError(
+                        "unsupported viewer measurement query descriptor: "
+                        f"producer revision={manifest.get('runtime_package_revision')!r}, "
+                        f"bundle type={manifest.get('bundle_type')!r}, "
+                        f"schema version={manifest.get('schema_version')!r}, "
+                        f"descriptor version={descriptor_version!r}; supported descriptor "
+                        f"version={MEASUREMENT_OD_QUERY_DESCRIPTOR_VERSION}."
+                    )
                 if contribution_payload.get("query_path") != "/api/measurement-od-contributions":
                     raise ValueError("viewer on-demand measurement query path is invalid.")
                 if contribution_payload.get("reverse_query_path") != "/api/od-measurement-contributions":

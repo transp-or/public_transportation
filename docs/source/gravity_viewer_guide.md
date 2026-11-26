@@ -120,6 +120,28 @@ measurement’s observation time. Availability depends on the bundle contents.
 Follow the status and progress area while the viewer processes the query. Wait
 for the results, or change your selection to request a different query.
 
+## Viewer bundle and query-service revisions
+
+The bundle's `runtime_package_revision` records which package wrote the bundle;
+it is separate from the fit and mapping source revisions. The query service
+accepts bundles from its current runtime when they use the supported bundle
+type/schema and measurement-query descriptor. It also explicitly supports the
+verified producer revision
+`387758616ee8684592501de53fcef07a62f39ae6` for
+`gravity_viewer_bundle` schema 1 and measurement-query descriptor 2. The
+producer value remains unchanged in the bundle. Fit/mapping source revisions,
+artifact identities, and all bundle and mapping checksums are still validated
+independently; producer compatibility does not relax those checks.
+
+Before adding an older producer revision to the compatibility policy,
+maintainers must inspect that revision's bundle writer and query descriptor,
+then exercise a bundle produced by it with the current query service. Verify the
+bundle checksum scan, a bounded forward and reverse measurement query, exact
+fit/mapping and source-revision checks, and that opening/querying leaves every
+bundle file unchanged. Add only the tested producer/format/descriptor
+combination and keep a regression fixture for it. Do not approve revision
+ranges or infer query compatibility from bundle schema alone.
+
 ## Network map
 
 When the bundle includes the relevant network and display data, the map also

@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 
 _SCHEMA_VERSION = 1
+MEASUREMENT_OD_QUERY_DESCRIPTOR_VERSION = 2
 _WRITE_BATCH_SIZE = 32_768
 _MAX_PARTITION_ROWS = 100_000
 _COMPONENT_PARTITION_ROWS = 500
@@ -339,7 +340,7 @@ def measurement_od_query_descriptor(
     scales = _query_scale_inputs(artifact=artifact, fit_result=fit_result, rho=rho)
     base: dict[str, object] = {
         "schema_version": _SCHEMA_VERSION,
-        "query_descriptor_version": 2,
+        "query_descriptor_version": MEASUREMENT_OD_QUERY_DESCRIPTOR_VERSION,
         "available": scales is not None,
         "query_mode": "local_service",
         "query_path": "/api/measurement-od-contributions",

@@ -21,6 +21,7 @@ from public_transportation.inference.gravity import (
     GravityJourneyLatentClassModel,
     GravityObservationModel,
     MeasurementODContributionQuery,
+    RouteChoicePathQuery,
     GravityValidationMetadata,
     read_gravity_viewer_bundle,
     write_gravity_detailed_report,
@@ -32,6 +33,7 @@ from public_transportation.inference.gravity.viewer_bundle import (
 from public_transportation.inference.gravity.viewer_query_service import (
     GravityViewerQueryService,
 )
+from public_transportation.inference.gravity import viewer_bundle as viewer_bundle_module
 from public_transportation.inference.temporal_assignment_blocks import (
     TemporalBlockAssignmentOperator,
     TemporalBlockConstructionDiagnostics,
@@ -52,6 +54,7 @@ from public_transportation.inference.gravity.measurement_od_contributions import
 )
 
 from tests.gravity.test_viewer_bundle import _inputs
+from tests.gravity.test_route_path_query import _graph as _route_query_test_graph
 
 
 def _mapping_bundle_inputs(
@@ -207,6 +210,81 @@ def _rewrite_mapping_source(
     marker_path.write_text(
         json.dumps(marker, sort_keys=True, indent=2) + "\n", encoding="utf-8"
     )
+
+
+def _write_query_service_fit_manifest(
+    path: Path, result: object, provenance: dict[str, object]
+) -> None:
+    payload = {
+        **provenance,
+        "model_fingerprint": result.model_fingerprint,
+        "result": asdict(result),
+    }
+
+    def json_default(value):
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, Enum):
+            return value.value
+        raise TypeError(type(value).__name__)
+
+    path.write_text(json.dumps(payload, default=json_default), encoding="utf-8")
+
+
+def _rewrite_viewer_summary(
+    bundle_path: Path,
+    updates: dict[str, object],
+    *,
+    contribution_updates: dict[str, object] | None = None,
+) -> None:
+    summary_path = bundle_path / "viewer_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary.update(updates)
+    if contribution_updates is not None:
+        summary["measurement_od_contributions"].update(contribution_updates)
+    summary_path.write_text(
+        json.dumps(summary, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
+    manifest_path = bundle_path / "bundle_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"]["viewer_summary.json"].update(
+        {
+            "sha256": hashlib.sha256(summary_path.read_bytes()).hexdigest(),
+            "size_bytes": summary_path.stat().st_size,
+        }
+    )
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def _make_query_compatibility_bundle(
+    tmp_path: Path,
+    *,
+    producer_revision: str,
+    monkeypatch,
+):
+    inputs_path = tmp_path / "source-inputs"
+    inputs_path.mkdir(parents=True, exist_ok=True)
+    result, report, provenance, artifact = _mapping_bundle_inputs(inputs_path)
+    monkeypatch.setattr(
+        viewer_bundle_module, "package_revision", lambda: producer_revision
+    )
+    bundle = write_gravity_viewer_bundle(
+        output_directory=tmp_path / "compatibility-bundle",
+        fit_result=result,
+        validation_result=report.adequacy,
+        report=report,
+        metadata={"provenance": provenance},
+        linear_mapping_artifact=artifact,
+    )
+    fit_path = tmp_path / "fit-manifest.json"
+    _write_query_service_fit_manifest(fit_path, result, provenance)
+    return result, provenance, artifact, bundle, fit_path
 
 
 def _split_interval_query_inputs(tmp_path):
@@ -1252,6 +1330,212 @@ def test_viewer_supports_matching_legacy_schema_revision_with_distinct_provenanc
         assert page["total"] == 2
         assert len(page["rows"]) == 1
         assert page["rows"][0]["measurement_index"] == 0
+
+
+def test_viewer_query_service_accepts_current_bundle_producer(tmp_path, monkeypatch):
+    current_revision = "1b626de8152e44aed7eca84ddd06d41fa45132ad"
+    result, _provenance, artifact, bundle, fit_path = _make_query_compatibility_bundle(
+        tmp_path,
+        producer_revision=current_revision,
+        monkeypatch=monkeypatch,
+    )
+    monkeypatch.setattr(
+        "public_transportation.inference.gravity.viewer_query_service.package_revision",
+        lambda: current_revision,
+    )
+    service = GravityViewerQueryService(
+        bundle=read_gravity_viewer_bundle(bundle.path),
+        fit_manifest_path=fit_path,
+        mapping_artifact_path=artifact,
+    )
+    assert service.query_measurement(0, page=0, page_size=1)["total"] == 2
+    assert service.route_path_query is None
+
+
+def test_verified_older_bundle_producer_is_read_only_and_keeps_queries_available(
+    tmp_path, monkeypatch
+):
+    current_revision = "1b626de8152e44aed7eca84ddd06d41fa45132ad"
+    older_revision = "387758616ee8684592501de53fcef07a62f39ae6"
+    result, _provenance, artifact, bundle, fit_path = _make_query_compatibility_bundle(
+        tmp_path,
+        producer_revision=older_revision,
+        monkeypatch=monkeypatch,
+    )
+    original_manifest = json.loads(
+        (bundle.path / "bundle_manifest.json").read_text(encoding="utf-8")
+    )
+    assert original_manifest["runtime_package_revision"] == older_revision
+    original_hashes = {
+        path.relative_to(bundle.path).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in bundle.path.rglob("*")
+        if path.is_file()
+    }
+
+    monkeypatch.setattr(
+        "public_transportation.inference.gravity.viewer_query_service.package_revision",
+        lambda: current_revision,
+    )
+    service = GravityViewerQueryService(
+        bundle=read_gravity_viewer_bundle(bundle.path),
+        fit_manifest_path=fit_path,
+        mapping_artifact_path=artifact,
+    )
+    measurement_page = service.query_measurement(0, page=0, page_size=1)
+    od_page = service.query_od(0, page=0, page_size=1)
+    assert measurement_page["total"] == 2
+    assert len(measurement_page["rows"]) == 1
+    assert od_page["total"] >= 1
+    route_probabilities = np.asarray((0.6, 0.4, 1.0, 1.0, 1.0, 1.0))
+    route_source = RouteChoicePathQuery(
+        graph=_route_query_test_graph(),
+        group_dest_node=np.asarray((5,), dtype=np.int64),
+        time_intervals=service.artifact.canonical_index.time_intervals,
+        mapping_artifact_fingerprint=service.artifact.identity.fingerprint,
+        fit_fingerprint=result.model_fingerprint,
+        route_choice_fingerprint=service.artifact.identity.route_choice_fingerprint,
+        probability_for_group=lambda _group: (
+            route_probabilities,
+            np.ones(route_probabilities.shape, dtype=bool),
+        ),
+        number_of_groups=1,
+    )
+    service.set_route_path_query(route_source)
+    paths = service.query_route_paths(
+        origin_stop_id="A",
+        destination_stop_id="B",
+        departure_interval_id="am",
+        minimum_probability=0.3,
+    )
+    assert len(paths["paths"]) == 2
+
+    final_hashes = {
+        path.relative_to(bundle.path).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in bundle.path.rglob("*")
+        if path.is_file()
+    }
+    assert final_hashes == original_hashes
+    assert result.model_fingerprint == measurement_page["fit_fingerprint"]
+
+
+def test_viewer_query_service_rejects_unknown_bundle_producer_actionably(
+    tmp_path, monkeypatch
+):
+    current_revision = "1b626de8152e44aed7eca84ddd06d41fa45132ad"
+    unknown_revision = "unverified-producer-revision"
+    _result, _provenance, artifact, bundle, fit_path = _make_query_compatibility_bundle(
+        tmp_path,
+        producer_revision=unknown_revision,
+        monkeypatch=monkeypatch,
+    )
+    monkeypatch.setattr(
+        "public_transportation.inference.gravity.viewer_query_service.package_revision",
+        lambda: current_revision,
+    )
+    with pytest.raises(
+        ValueError,
+        match=(
+            "producer revision is not verified.*"
+            "producer revision='unverified-producer-revision'.*"
+            "schema version=1.*query descriptor version=2.*Supported options"
+        ),
+    ):
+        GravityViewerQueryService(
+            bundle=read_gravity_viewer_bundle(bundle.path),
+            fit_manifest_path=fit_path,
+            mapping_artifact_path=artifact,
+        )
+
+
+def test_unsupported_bundle_schema_and_query_descriptor_errors_are_actionable(
+    tmp_path, monkeypatch
+):
+    producer_revision = "387758616ee8684592501de53fcef07a62f39ae6"
+    _result, _provenance, _artifact, bundle, _fit_path = _make_query_compatibility_bundle(
+        tmp_path / "schema",
+        producer_revision=producer_revision,
+        monkeypatch=monkeypatch,
+    )
+    manifest_path = bundle.path / "bundle_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = 99
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(
+        ValueError,
+        match="producer revision='387758.*schema version=99.*supported bundle type",
+    ):
+        read_gravity_viewer_bundle(bundle.path)
+
+    _result, _provenance, _artifact, bundle, _fit_path = _make_query_compatibility_bundle(
+        tmp_path / "descriptor",
+        producer_revision=producer_revision,
+        monkeypatch=monkeypatch,
+    )
+    _rewrite_viewer_summary(
+        bundle.path,
+        {},
+        contribution_updates={"query_descriptor_version": 99},
+    )
+    with pytest.raises(
+        ValueError,
+        match=(
+            "producer revision='387758.*schema version=1, descriptor version=99.*"
+            "supported descriptor version=2"
+        ),
+    ):
+        read_gravity_viewer_bundle(bundle.path)
+
+
+def test_verified_producer_compatibility_does_not_bypass_fit_or_mapping_checks(
+    tmp_path, monkeypatch
+):
+    current_revision = "1b626de8152e44aed7eca84ddd06d41fa45132ad"
+    older_revision = "387758616ee8684592501de53fcef07a62f39ae6"
+    _result, _provenance, artifact, bundle, fit_path = _make_query_compatibility_bundle(
+        tmp_path,
+        producer_revision=older_revision,
+        monkeypatch=monkeypatch,
+    )
+    monkeypatch.setattr(
+        "public_transportation.inference.gravity.viewer_query_service.package_revision",
+        lambda: current_revision,
+    )
+    fit_payload = json.loads(fit_path.read_text(encoding="utf-8"))
+    fit_payload["assignment_fingerprint"] = "mismatched-assignment"
+    fit_path.write_text(json.dumps(fit_payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="assignment_fingerprint differs"):
+        GravityViewerQueryService(
+            bundle=read_gravity_viewer_bundle(bundle.path),
+            fit_manifest_path=fit_path,
+            mapping_artifact_path=artifact,
+        )
+
+    _result, _provenance, artifact, bundle, fit_path = _make_query_compatibility_bundle(
+        tmp_path / "mapping-checksum",
+        producer_revision=older_revision,
+        monkeypatch=monkeypatch,
+    )
+    mapping_manifest_path = artifact / "manifest.json"
+    mapping_manifest = json.loads(mapping_manifest_path.read_text(encoding="utf-8"))
+    mapping_manifest["compatibility_test_annotation"] = "changed manifest"
+    mapping_manifest_path.write_text(
+        json.dumps(mapping_manifest, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    marker_path = artifact / "COMPLETE.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["manifest_sha256"] = hashlib.sha256(
+        mapping_manifest_path.read_bytes()
+    ).hexdigest()
+    marker_path.write_text(
+        json.dumps(marker, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="mapping manifest checksum differs"):
+        GravityViewerQueryService(
+            bundle=read_gravity_viewer_bundle(bundle.path),
+            fit_manifest_path=fit_path,
+            mapping_artifact_path=artifact,
+        )
 
 
 def test_viewer_rejects_fit_mapping_source_revision_mismatch_and_unknown_schema(tmp_path):
