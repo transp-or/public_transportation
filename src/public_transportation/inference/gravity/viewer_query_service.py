@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import math
 import sys
@@ -29,6 +30,7 @@ from .measurement_od_contributions import (
     MeasurementODQueryCancelled,
 )
 from .reporting import GRAVITY_REPORT_PROVENANCE_FIELDS
+from .route_path_query import RouteChoicePathQuery, RoutePathQueryCancelled
 from .viewer_bundle import (
     GravityViewerBundle,
     _validate_linear_mapping_for_bundle,
@@ -133,6 +135,7 @@ class GravityViewerQueryService:
         mapping_artifact_path: str | Path,
         rho: float | None = None,
         progress_callback: _StartupProgressCallback | None = None,
+        route_path_query: RouteChoicePathQuery | None = None,
     ) -> None:
         self.bundle = bundle
         fit_path = Path(fit_manifest_path).expanduser().resolve()
@@ -253,15 +256,30 @@ class GravityViewerQueryService:
             str(summary.get("mapping_artifact_fingerprint")),
         ):
             raise ValueError("on-demand query cache identity differs from the viewer bundle.")
-        # Keep the expensive sparse-mapping queries serial. The threaded HTTP
-        # server can still serve the viewer assets and health endpoint while a
-        # contribution query is running.
+        self.route_path_query: RouteChoicePathQuery | None = None
+        self.set_route_path_query(route_path_query)
+        # Keep expensive sparse-mapping and route-path queries serial. The
+        # threaded HTTP server can still serve viewer assets and status while
+        # a bounded computation is running.
         self._query_lock = threading.Lock()
         self._query_progress_lock = threading.Lock()
         self._query_progress: OrderedDict[str, dict[str, object]] = OrderedDict()
         self._query_request_lock = threading.Lock()
         self._query_requests: dict[str, threading.Event] = {}
         self._cancelled_query_ids: set[str] = set()
+
+    def set_route_path_query(self, route_path_query: RouteChoicePathQuery | None) -> None:
+        """Attach a prepared route-choice source after validating its identity."""
+        if route_path_query is not None:
+            if not isinstance(route_path_query, RouteChoicePathQuery):
+                raise TypeError("route path source must be a RouteChoicePathQuery.")
+            route_path_query.validate_identity(
+                mapping_artifact_fingerprint=self.artifact.identity.fingerprint,
+                fit_fingerprint=self.query.cache_namespace[0],
+                route_choice_fingerprint=self.artifact.identity.route_choice_fingerprint,
+                time_intervals=self.artifact.canonical_index.time_intervals,
+            )
+        self.route_path_query = route_path_query
 
     def _register_query(self, request_id: str | None) -> tuple[str, threading.Event]:
         identifier = request_id or uuid.uuid4().hex
@@ -477,6 +495,37 @@ class GravityViewerQueryService:
         finally:
             self._finish_query(request_id)
 
+    def query_route_paths(
+        self,
+        *,
+        origin_stop_id: str,
+        destination_stop_id: str,
+        departure_interval_id: str,
+        minimum_probability: float,
+        request_id: str | None = None,
+    ) -> dict[str, object]:
+        """Return bounded paths for a selected pair using the saved route state."""
+        if self.route_path_query is None:
+            raise ValueError("the local query service has no compatible route-choice source.")
+        request_id, cancel_event = self._register_query(request_id)
+        try:
+            with self._query_lock:
+                if cancel_event.is_set():
+                    raise RoutePathQueryCancelled("Path query cancelled because the selection changed.")
+                payload = self.route_path_query.query(
+                    origin_stop_id=origin_stop_id,
+                    destination_stop_id=destination_stop_id,
+                    departure_interval_id=departure_interval_id,
+                    minimum_probability=minimum_probability,
+                    cancel_check=cancel_event.is_set,
+                )
+                if cancel_event.is_set():
+                    raise RoutePathQueryCancelled("Path query cancelled because the selection changed.")
+                payload["request_id"] = request_id
+                return payload
+        finally:
+            self._finish_query(request_id)
+
 
 def _handler_for(
     service: GravityViewerQueryService,
@@ -535,6 +584,12 @@ def _handler_for(
                         "service": "gravity_viewer_measurement_queries",
                         "fit_fingerprint": service.query.cache_namespace[0],
                         "mapping_artifact_fingerprint": service.query.cache_namespace[1],
+                        "route_paths_available": service.route_path_query is not None,
+                        "route_choice_fingerprint": (
+                            getattr(service.route_path_query, "route_choice_fingerprint", None)
+                            if service.route_path_query is not None
+                            else None
+                        ),
                     },
                 )
                 return
@@ -564,6 +619,25 @@ def _handler_for(
                     self._json(200, service.query_progress(measurement_index, request_id))
                 except (KeyError, TypeError, ValueError) as error:
                     self._json(400, {"error": str(error)})
+                return
+            if parsed.path == "/api/route-paths":
+                try:
+                    query = parse_qs(parsed.query, strict_parsing=True)
+                    minimum_probability = float(_single_string(query, "minimum_probability"))
+                    payload = service.query_route_paths(
+                        origin_stop_id=_single_string(query, "origin_stop_id"),
+                        destination_stop_id=_single_string(query, "destination_stop_id"),
+                        departure_interval_id=_single_string(query, "departure_interval_id"),
+                        minimum_probability=minimum_probability,
+                        request_id=_single_string(query, "request_id"),
+                    )
+                except RoutePathQueryCancelled as error:
+                    self._json(409, {"error": str(error), "cancelled": True})
+                    return
+                except (KeyError, TypeError, ValueError, IndexError) as error:
+                    self._json(400, {"error": str(error)})
+                    return
+                self._json(200, payload)
                 return
             if parsed.path not in {
                 "/api/measurement-od-contributions",
@@ -654,11 +728,25 @@ def _default_viewer_directory() -> Path:
     return repository_root / "tools" / "gravity_viewer"
 
 
+def _route_path_query_factory(specification: str) -> Callable[[GravityViewerQueryService], RouteChoicePathQuery]:
+    """Resolve an explicitly configured ``module:callable`` route-state adapter."""
+    module_name, separator, attribute = specification.partition(":")
+    if not separator or not module_name or not attribute:
+        raise ValueError("route-path query factory must use the form 'module:callable'.")
+    try:
+        factory = getattr(importlib.import_module(module_name), attribute)
+    except (ImportError, AttributeError) as error:
+        raise ValueError(f"could not load route-path query factory {specification!r}.") from error
+    if not callable(factory):
+        raise TypeError(f"route-path query factory {specification!r} is not callable.")
+    return factory
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Serve the local gravity viewer and its bounded on-demand OD query API "
-            "from one loopback-only process."
+            "Serve the local gravity viewer and its bounded on-demand OD and modeled-path "
+            "query APIs from one loopback-only process."
         )
     )
     parser.add_argument(
@@ -680,6 +768,14 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=None,
         help="exact fitted rho only when observation scales are absent",
+    )
+    parser.add_argument(
+        "--route-choice-query-factory",
+        default=None,
+        help=(
+            "optional module:callable adapter that loads the existing prepared route-choice "
+            "source and returns a RouteChoicePathQuery for the initialized service"
+        ),
     )
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args(argv)
@@ -709,13 +805,20 @@ def main(argv: list[str] | None = None) -> int:
         rho=args.rho,
         progress_callback=progress_display,
     )
+    if args.route_choice_query_factory:
+        try:
+            with _startup_stage("loading prepared route-choice query source"):
+                factory = _route_path_query_factory(args.route_choice_query_factory)
+                service.set_route_path_query(factory(service))
+        except (TypeError, ValueError) as error:
+            parser.error(str(error))
     with _startup_stage("binding local web server"):
         server = ThreadingHTTPServer(
             ("127.0.0.1", args.port),
             _handler_for(service, viewer_directory),
         )
     print(f"Gravity viewer and query API listening at http://127.0.0.1:{args.port}/")
-    print("Select the bundle folder in the viewer and use Measurement mode.")
+    print("Select the bundle folder in the viewer. Path browsing is available when a compatible route-choice source was configured.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -32,6 +32,46 @@ matching rows** to display all rows matching the selection. Click a column
 heading to sort the rows currently loaded; rows not yet loaded are not included
 in that sorting.
 
+### Browse modeled paths between two stops
+
+When both **Origin** and **Destination** are selected, the **Modeled paths
+between selected stops** browser appears. Choose one **Departure time
+interval**, set the minimum complete-path probability (1% by default), and
+click **Show modeled paths**. The threshold applies to each complete path
+individually, not to the sum of all paths. Listed probabilities are products of
+the saved route-choice transition probabilities; they are conditional on the
+selected endpoints and departure interval. The results are ranked from highest
+to lowest probability and bounded to keep the query responsive.
+
+Path lists are calculated on demand and are not saved in the viewer bundle. The
+local query service must be started with a prepared route-choice source that
+matches the selected fit and mapping. If the service reports that no compatible
+route-choice source is available, its other viewer queries remain usable, but
+the path browser cannot calculate paths.
+
+For deployments that already retain prepared dense or sharded fixed-routing
+inputs, the local service accepts an adapter factory with
+`--route-choice-query-factory module:callable`. The callable receives the
+validated `GravityViewerQueryService` and should return
+`RouteChoicePathQuery.from_fixed_routing(...)`, using the service's mapping
+fingerprint, fit fingerprint, and canonical departure intervals. This is an
+integration hook for loading existing routing state; it does not rebuild
+routing or persist paths. Without the adapter, the path browser stays disabled.
+
+For example, add the option to the normal local-service command:
+
+```sh
+python -m public_transportation.inference.gravity.viewer_query_service \
+  --bundle /path/to/viewer-bundle \
+  --fit-manifest /path/to/fit-manifest.json \
+  --mapping-artifact /path/to/temporal-mapping \
+  --route-choice-query-factory my_project.viewer_routes:build_query
+```
+
+The adapter's `build_query(service)` function loads the already-prepared routing
+source and returns a `RouteChoicePathQuery`; it must not rebuild or alter that
+source.
+
 ## Choose endpoints from the network map
 
 Go to **Network map** and choose **OD selection**. Click a stop to open its

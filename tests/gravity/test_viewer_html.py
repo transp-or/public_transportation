@@ -56,6 +56,11 @@ def test_viewer_starts_from_manifest_and_streams_selected_partitions() -> None:
     assert 'id="flow-more"' in source
     assert 'id="flow-all"' in source
     assert 'id="flow-page-next"' in source
+    assert 'id="route-path-browser"' in source
+    assert 'id="route-path-threshold"' in source
+    assert 'id="route-path-load"' in source
+    assert 'id="route-path-service"' in source
+    assert 'value="1"' in source
     assert "route-assignment" not in source.lower()
     assert "route_flows" not in viewer_source
     assert "route_sections" not in viewer_source
@@ -69,6 +74,12 @@ def test_viewer_starts_from_manifest_and_streams_selected_partitions() -> None:
     assert "observation_time" in viewer_source and "departure_time_bin" in viewer_source
     assert "streamMatches: true" in viewer_source
     assert "measurementContributions" in viewer_source
+    assert "updateRoutePathBrowser" in viewer_source
+    assert "browser.classList.toggle('hidden', !selected)" in viewer_source
+    assert "new URL('/api/route-paths'" in viewer_source
+    assert "minimum_probability" in viewer_source
+    assert "route_paths_available" in viewer_source
+    assert "route-path-load" in viewer_source
     assert 'id="measurement-row-index"' not in source
 
 
@@ -134,6 +145,18 @@ def test_viewer_guide_documents_explicit_od_endpoint_actions() -> None:
     assert "Measurement" in guide
     assert 'go to <a href="#network-map">Network map</a>, choose <strong>Measurement</strong> mode' in guide
     assert "Measurement** mode" in documentation
+
+
+def test_viewer_guide_documents_on_demand_modeled_path_browser() -> None:
+    source = VIEWER.read_text(encoding="utf-8")
+    guide = source.split('<details class="panel quick-guide">', 1)[1].split("</details>", 1)[0]
+    docs = VIEWER.parents[2] / "docs" / "source" / "gravity_viewer_guide.md"
+    documentation = docs.read_text(encoding="utf-8")
+    for content in (guide, documentation):
+        assert "modeled path" in content.lower()
+        assert "on demand" in content.lower()
+        assert "1%" in content
+        assert "route-choice source" in content.lower()
 
 
 def test_viewer_uses_the_local_service_for_selected_measurement_pages() -> None:

@@ -109,6 +109,8 @@
     measurementQueryTimer: null, measurementQueryController: null, measurementQueryRequestId: '',
     measurementStopSelectionId: 0, departureIntervals: new Map(), departureTimeZone: '',
     departureIntervalMetadataError: '',
+    routePathStatusId: 0, routePathRequestId: '', routePathController: null,
+    routePathSourceAvailable: false,
   };
 
   const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[char]));
@@ -714,6 +716,8 @@
     viewer.selectedOd = null;
     updateOdEndpointMarkers();
     updateOdMapSelectionStatus(`${endpoint === 'origin' ? 'Origin' : 'Destination'} set to ${formatSelectedStop(stopId)}.`);
+    cancelRoutePathQuery();
+    void updateRoutePathBrowser({clearResults: true});
     const origin = $('flow-origin').value;
     const destination = $('flow-destination').value;
     const departureBin = $('flow-bin').value || 'all';
@@ -1278,6 +1282,173 @@
     sortFlowRows(); renderTable(viewer.flowRows, viewer.flowTitle, viewer.flowMatchedCount);
     setFlowStatus(`Loaded ${display(viewer.flowRows.length)} of ${display(viewer.flowMatchedCount)} matching rows.`, 'ok');
   }
+
+  function routePathServiceBase() {
+    const base = new URL($('route-path-service').value.trim());
+    if (base.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(base.hostname)) {
+      throw new Error('The route-path query service must be HTTP on this computer.');
+    }
+    return base;
+  }
+
+  function cancelRoutePathQuery() {
+    if (viewer.routePathController) viewer.routePathController.abort();
+    viewer.routePathController = null;
+    const requestId = viewer.routePathRequestId;
+    viewer.routePathRequestId = '';
+    if (!requestId) return;
+    try {
+      const base = routePathServiceBase();
+      const endpoint = new URL('/api/cancel-query', base.origin);
+      endpoint.searchParams.set('request_id', requestId);
+      void fetch(endpoint, {method: 'POST', cache: 'no-store', keepalive: true}).catch(() => {});
+    } catch (_) {
+      // The local query service may have been stopped while the viewer was open.
+    }
+  }
+
+  async function updateRoutePathBrowser({checkService = true, clearResults = false} = {}) {
+    const browser = $('route-path-browser');
+    if (!browser) return;
+    const statusId = ++viewer.routePathStatusId;
+    const origin = $('flow-origin').value;
+    const destination = $('flow-destination').value;
+    const selected = Boolean(origin && destination);
+    browser.classList.toggle('hidden', !selected);
+    if (!selected) {
+      viewer.routePathSourceAvailable = false;
+      $('route-path-load').disabled = true;
+      $('route-path-status').textContent = 'Select both an origin and destination to browse modeled paths.';
+      if (clearResults) { $('route-path-summary').textContent = ''; $('route-path-results').replaceChildren(); }
+      cancelRoutePathQuery();
+      return;
+    }
+    if (clearResults) { $('route-path-summary').textContent = ''; $('route-path-results').replaceChildren(); }
+    const departureInterval = $('flow-bin').value;
+    const hasDepartureInterval = Boolean(departureInterval && departureInterval !== 'all');
+    if (!hasDepartureInterval) {
+      viewer.routePathSourceAvailable = false;
+      $('route-path-load').disabled = true;
+      $('route-path-status').textContent = 'Choose one departure-time interval to browse paths.';
+      return;
+    }
+    if (!checkService) {
+      $('route-path-load').disabled = !viewer.routePathSourceAvailable;
+      return;
+    }
+    viewer.routePathSourceAvailable = false;
+    $('route-path-load').disabled = true;
+    $('route-path-status').className = 'status is-loading';
+    $('route-path-status').textContent = 'Checking the local route-choice query service…';
+    try {
+      const base = routePathServiceBase();
+      const response = await fetch(new URL('/api/status', base.origin), {cache: 'no-store'});
+      let payload;
+      try { payload = await response.json(); }
+      catch (_) { throw new Error(`Local query service returned HTTP ${response.status} without valid status data.`); }
+      if (!response.ok) throw new Error(payload.error || `Local query service returned HTTP ${response.status}.`);
+      if (statusId !== viewer.routePathStatusId) return;
+      const expectedFit = viewer.manifest.model_fingerprint || viewer.summary.measurement_od_contributions?.fit_fingerprint;
+      const expectedMapping = viewer.manifest.artifact_identity_fingerprint || viewer.summary.measurement_od_contributions?.mapping_artifact_fingerprint;
+      if (payload.fit_fingerprint !== expectedFit || payload.mapping_artifact_fingerprint !== expectedMapping) {
+        throw new Error('The local service is using a different fit or mapping artifact.');
+      }
+      viewer.routePathSourceAvailable = payload.route_paths_available === true;
+      if (!viewer.routePathSourceAvailable) {
+        $('route-path-status').className = 'status';
+        $('route-path-status').textContent = 'This local service has no compatible prepared route-choice source. It can still serve the other viewer queries.';
+        return;
+      }
+      $('route-path-status').className = 'status ok';
+      $('route-path-status').textContent = `Ready for ${formatSelectedStop(origin)} → ${formatSelectedStop(destination)} in departure interval ${departureInterval}.`;
+      $('route-path-load').disabled = false;
+    } catch (error) {
+      if (statusId !== viewer.routePathStatusId) return;
+      viewer.routePathSourceAvailable = false;
+      $('route-path-status').className = 'status';
+      $('route-path-status').textContent = `Route-path service unavailable: ${error.message}`;
+    }
+  }
+
+  function renderRoutePaths(payload) {
+    const percent = (value) => Number.isFinite(Number(value)) ? `${(Number(value) * 100).toFixed(2)}%` : 'unavailable';
+    const nameFor = (stopId) => {
+      const stop = viewer.stopsById.get(String(stopId));
+      return stop?.name ? `${stop.name} (${stopId})` : String(stopId);
+    };
+    const paths = Array.isArray(payload.paths) ? payload.paths : [];
+    $('route-path-summary').textContent = `Listed probability mass: ${percent(payload.listed_probability_mass)} · Total modeled reach: ${percent(payload.total_path_probability)} · Remaining/unlisted mass: ${percent(payload.unlisted_probability_mass)}${payload.truncated ? ' · Result is bounded and may omit additional paths.' : ''}`;
+    $('route-path-results').innerHTML = paths.length ? paths.map((path, index) => {
+      const legs = Array.isArray(path.legs) ? path.legs : [];
+      const legMarkup = legs.length ? `<ol class="route-path-legs">${legs.map((leg) => {
+        const line = leg.line_id ? `Line ${esc(leg.line_id)} · ` : '';
+        const trip = leg.trip_id ? ` · trip ${esc(leg.trip_id)}` : '';
+        return `<li>${line}${esc(nameFor(leg.from_stop_id))} → ${esc(nameFor(leg.to_stop_id))} · ${esc(leg.departure_time || '—')}–${esc(leg.arrival_time || '—')}${trip}</li>`;
+      }).join('')}</ol>` : '<p class="muted small">No ride legs were recorded for this path.</p>';
+      const stops = Array.isArray(path.stops) ? path.stops.map(nameFor).join(' → ') : '';
+      return `<details><summary>Path ${index + 1} · ${percent(path.probability)} · ${formatCount(path.transfers || 0)} transfers</summary><p class="muted small">${esc(stops)}</p>${legMarkup}</details>`;
+    }).join('') : '<p class="muted">No complete modeled path met this probability threshold.</p>';
+  }
+
+  async function loadRoutePaths() {
+    cancelRoutePathQuery();
+    const origin = $('flow-origin').value;
+    const destination = $('flow-destination').value;
+    const departureInterval = $('flow-bin').value;
+    const thresholdPercent = Number($('route-path-threshold').value);
+    if (!origin || !destination) { $('route-path-status').textContent = 'Select both an origin and destination.'; return; }
+    if (!departureInterval || departureInterval === 'all') { $('route-path-status').textContent = 'Choose one departure-time interval.'; return; }
+    if (!Number.isFinite(thresholdPercent) || thresholdPercent <= 0 || thresholdPercent > 100) {
+      $('route-path-status').className = 'status bad';
+      $('route-path-status').textContent = 'Minimum probability must be greater than 0 and at most 100 percent.';
+      return;
+    }
+    const controller = new AbortController();
+    const requestId = globalThis.crypto?.randomUUID ? crypto.randomUUID() : `route-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    viewer.routePathController = controller;
+    viewer.routePathRequestId = requestId;
+    $('route-path-load').disabled = true;
+    $('route-path-summary').textContent = '';
+    $('route-path-results').replaceChildren();
+    $('route-path-status').className = 'status is-loading';
+    $('route-path-status').textContent = 'Calculating bounded modeled paths…';
+    try {
+      const base = routePathServiceBase();
+      const endpoint = new URL('/api/route-paths', base.origin);
+      endpoint.searchParams.set('origin_stop_id', origin);
+      endpoint.searchParams.set('destination_stop_id', destination);
+      endpoint.searchParams.set('departure_interval_id', departureInterval);
+      endpoint.searchParams.set('minimum_probability', String(thresholdPercent / 100));
+      endpoint.searchParams.set('request_id', requestId);
+      const response = await fetch(endpoint, {cache: 'no-store', signal: controller.signal});
+      let payload;
+      try { payload = await response.json(); }
+      catch (_) { throw new Error(`Local query service returned HTTP ${response.status} without valid path data.`); }
+      if (!response.ok) throw new Error(payload.error || `Local query service returned HTTP ${response.status}.`);
+      const expectedFit = viewer.manifest.model_fingerprint || viewer.summary.measurement_od_contributions?.fit_fingerprint;
+      const expectedMapping = viewer.manifest.artifact_identity_fingerprint || viewer.summary.measurement_od_contributions?.mapping_artifact_fingerprint;
+      if (payload.fit_fingerprint !== expectedFit || payload.mapping_artifact_fingerprint !== expectedMapping) {
+        throw new Error('The returned paths belong to a different fit or mapping artifact.');
+      }
+      if (payload.origin_stop_id !== origin || payload.destination_stop_id !== destination || payload.departure_interval_id !== departureInterval) {
+        throw new Error('The local service returned paths for a different endpoint selection or interval.');
+      }
+      renderRoutePaths(payload);
+      $('route-path-status').className = 'status ok';
+      $('route-path-status').textContent = `Found ${formatCount((payload.paths || []).length)} qualifying path${(payload.paths || []).length === 1 ? '' : 's'} at or above ${thresholdPercent}% probability.`;
+    } catch (error) {
+      if (error.name === 'AbortError') return;
+      $('route-path-status').className = 'status bad';
+      $('route-path-status').textContent = `Could not calculate modeled paths: ${error.message}`;
+    } finally {
+      if (viewer.routePathRequestId === requestId) {
+        viewer.routePathController = null;
+        viewer.routePathRequestId = '';
+        $('route-path-load').disabled = !viewer.routePathSourceAvailable;
+      }
+    }
+  }
+
   // Kept as a named action for integrations that select a result row.
   function selectOd(row) { viewer.selectedOd = row; }
 
@@ -1393,7 +1564,7 @@
       const counts = viewer.manifest.row_counts || {}; $('metrics').innerHTML = [metric('Bundle type', viewer.manifest.bundle_type), metric('Schema', viewer.manifest.schema_version), metric('OD rows', counts['full_od.csv'] ?? 'unknown'), metric('Measurements', counts['predicted_measurements.csv'] ?? 'unknown'), metric('OD partitions', viewer.summary.od?.partitions?.length ?? 'legacy'), metric('OD contribution map', viewer.summary.measurement_od_contributions?.available ? 'available' : 'absent'), metric('Identifiability', viewer.manifest.identifiability?.available ? 'available' : 'not available'), metric('Network files', Object.keys(viewer.manifest.files || {}).filter((key) => key.startsWith('network/')).length)].join('');
       $('model').innerHTML = renderModelSpecification(); $('provenance').innerHTML = renderRunDetails(); $('bundle-files').innerHTML = renderBundleFiles(); $('bundle-path-note').textContent = 'Included-file paths are relative to the selected bundle. Original source paths appear only if recorded in bundle metadata; browser security hides the laptop’s absolute folder path.'; const adequacy = viewer.report.adequacy || {}; $('diagnostic-metrics').innerHTML = [metric('Observed total', adequacy.observed_total), metric('Modeled total', adequacy.modeled_total), metric('MAE', adequacy.mae), metric('RMSE', adequacy.rmse), metric('Report fingerprint', viewer.report.report_fingerprint, 'fingerprint')].join('');
       $('table-content').innerHTML = '<p class="muted">Large tables are available through the partitioned explorer. No complete CSV is parsed at startup.</p>';
-      const executive = findFile('executive_summary.md'); $('executive').innerHTML = executive ? renderMarkdown(await executive.text()) : '<p>No executive summary supplied.</p>'; populateFlowSelectors(); populateMeasurementOdControls(); updateIntervalTimeNotes(); await renderNetwork(); await refreshFlows();
+      const executive = findFile('executive_summary.md'); $('executive').innerHTML = executive ? renderMarkdown(await executive.text()) : '<p>No executive summary supplied.</p>'; populateFlowSelectors(); populateMeasurementOdControls(); updateIntervalTimeNotes(); await renderNetwork(); await refreshFlows(); await updateRoutePathBrowser({clearResults: true});
       if (!viewer.summary.od) { $('interactive-notice').textContent = 'This is a legacy bundle without partition metadata. The validated tables remain available; lazy time-slot exploration requires a refreshed export.'; $('interactive-notice').classList.remove('hidden'); }
       if (problems.length) setStatus(`Bundle loaded with startup validation warnings:\n- ${problems.join('\n- ')}`, 'bad'); else setStatus('Bundle manifest and summary loaded. Partition checksums are verified when selected.', 'ok');
     } catch (error) { $('summary').classList.add('hidden'); $('diagnostics').classList.add('hidden'); $('flows').classList.add('hidden'); setStatus(`Could not load bundle: ${error.message}`, 'bad'); }
@@ -1502,7 +1673,17 @@
     }
     return blocks.join('\n');
   }
-  $('folder').addEventListener('change', (event) => load([...event.target.files])); $('flow-refresh').addEventListener('click', () => refreshFlows()); $('flow-more').addEventListener('click', () => loadMoreFlows()); $('flow-all').addEventListener('click', () => loadMoreFlows(true)); $('flow-page-previous').addEventListener('click', () => { viewer.flowPage = Math.max(0, viewer.flowPage - 1); renderTable(viewer.flowRows, viewer.flowTitle, viewer.flowMatchedCount); }); $('flow-page-next').addEventListener('click', () => { viewer.flowPage += 1; renderTable(viewer.flowRows, viewer.flowTitle, viewer.flowMatchedCount); }); $('flow-clear-cache').addEventListener('click', clearCache); ['flow-bin', 'flow-origin', 'flow-destination'].forEach((id) => $(id).addEventListener('change', (event) => { if (event.currentTarget.id !== 'flow-bin') { viewer.selectedOd = null; updateOdEndpointMarkers(); updateOdMapSelectionStatus(); } void refreshFlows(); }));
+  $('folder').addEventListener('change', (event) => load([...event.target.files])); $('flow-refresh').addEventListener('click', () => refreshFlows()); $('flow-more').addEventListener('click', () => loadMoreFlows()); $('flow-all').addEventListener('click', () => loadMoreFlows(true)); $('flow-page-previous').addEventListener('click', () => { viewer.flowPage = Math.max(0, viewer.flowPage - 1); renderTable(viewer.flowRows, viewer.flowTitle, viewer.flowMatchedCount); }); $('flow-page-next').addEventListener('click', () => { viewer.flowPage += 1; renderTable(viewer.flowRows, viewer.flowTitle, viewer.flowMatchedCount); }); $('flow-clear-cache').addEventListener('click', clearCache); ['flow-bin', 'flow-origin', 'flow-destination'].forEach((id) => $(id).addEventListener('change', (event) => { if (event.currentTarget.id !== 'flow-bin') { viewer.selectedOd = null; updateOdEndpointMarkers(); updateOdMapSelectionStatus(); } cancelRoutePathQuery(); void refreshFlows(); void updateRoutePathBrowser({clearResults: true}); }));
+  $('route-path-service')?.addEventListener('change', () => { cancelRoutePathQuery(); void updateRoutePathBrowser({clearResults: true}); });
+  $('route-path-load')?.addEventListener('click', loadRoutePaths);
+  $('route-path-threshold')?.addEventListener('change', () => {
+    cancelRoutePathQuery();
+    $('route-path-summary').textContent = '';
+    $('route-path-results').replaceChildren();
+    if ($('flow-origin').value && $('flow-destination').value) {
+      $('route-path-status').textContent = 'Threshold updated. Request paths to apply the new minimum probability.';
+    }
+  });
   $('map-od-mode')?.addEventListener('click', () => setMapClickMode('od')); $('map-measurement-mode')?.addEventListener('click', () => setMapClickMode('measurement'));
   $('measurement-od-direction')?.addEventListener('change', () => {
     updateMeasurementOdDirection();

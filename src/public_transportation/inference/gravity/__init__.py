@@ -229,6 +229,10 @@ from .viewer_bundle import (
 from .measurement_od_contributions import (
     MeasurementODContributionQuery,
 )
+from .route_path_query import (
+    RouteChoicePathQuery,
+    RoutePathQueryCancelled,
+)
 from .identifiability import (
     GravityIdentifiabilityConfig,
     GravityODIdentifiability,
