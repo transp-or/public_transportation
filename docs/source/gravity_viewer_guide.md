@@ -43,6 +43,13 @@ the saved route-choice transition probabilities; they are conditional on the
 selected endpoints and departure interval. The results are ranked from highest
 to lowest probability and bounded to keep the query responsive.
 
+Choose **Show on map** on a result to draw its stop sequence in a thick,
+contrasting pink line and zoom the map to that path. Choosing another path
+replaces the highlighted path. Use **Clear map highlight** to remove it, or
+**Reset map view** to return to the original full-network extent. The line
+connects the returned stop sequence using the bundle's network coordinates; it
+is a stop-to-stop display, not a stored route-shape geometry.
+
 Path lists are calculated on demand and are not saved in the viewer bundle. The
 local query service must be started with a prepared route-choice source that
 matches the selected fit and mapping. If the service reports that no compatible

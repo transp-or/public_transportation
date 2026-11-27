@@ -95,7 +95,11 @@
     .od-endpoint-popup button:focus-visible { outline: 2px solid #235aa6; outline-offset: 2px; }
     .route-path-list { display: grid; gap: 9px; margin-top: 10px; }
     .route-path-list details { border: 1px solid #dce2ed; border-radius: 8px; padding: 10px 12px; background: #fafcff; }
+    .route-path-list details.is-selected { border-color: #ff2d95; box-shadow: 0 0 0 2px rgb(255 45 149 / 18%); }
     .route-path-list summary { cursor: pointer; color: #27354d; font-weight: 650; }
+    .route-path-select { margin-top: 10px; min-height: 34px; border: 1px solid #be185d; border-radius: 6px; background: #fff; color: #9d174d; padding: 6px 10px; cursor: pointer; font: inherit; font-weight: 650; }
+    .route-path-select[aria-pressed="true"] { background: #be185d; color: #fff; }
+    .route-path-select:focus-visible { outline: 3px solid #ff2d95; outline-offset: 2px; }
     .route-path-legs { display: grid; gap: 6px; margin: 10px 0 0; padding-left: 22px; }
     .small { font-size: 12px; }
     .markdown h1, .markdown h2, .markdown h3 { margin: 18px 0 8px; }
@@ -127,7 +131,7 @@
       <ol>
         <li>To open a result bundle, click <strong>Select a viewer-bundle directory</strong> at the top of the page and choose the folder containing <code>bundle_manifest.json</code>. The loaded overview appears in <a href="#summary">Bundle summary</a>.</li>
         <li>In <a href="#flows">Demand explorer</a>, choose a <strong>Departure time interval</strong> and optionally an <strong>Origin</strong> and <strong>Destination</strong>, then click <strong>Load selected partition</strong>; a partition is the saved demand slice for that selection, and the viewer finds it for you, so you do not need to find or open its file. Use <strong>Load 50 more</strong> or <strong>Load all matching rows</strong> to extend results; click a column heading to sort only loaded rows.</li>
-        <li>When both endpoints are selected in <a href="#flows">Demand explorer</a>, the modeled paths browser appears. Choose a departure interval and a minimum probability (1% by default), then request paths. Probabilities are for complete paths under the saved route-choice model; paths are calculated on demand and are not stored in the bundle. The local path API must have the matching prepared route-choice source.</li>
+        <li>When both endpoints are selected in <a href="#flows">Demand explorer</a>, the modeled paths browser appears. Choose a departure interval and a minimum probability (1% by default), then request paths. Choose <strong>Show on map</strong> for a path to highlight its stop sequence with a thick pink line; choose another path to replace it or clear the highlight. Probabilities are for complete paths under the saved route-choice model; paths are calculated on demand and are not stored in the bundle. The local service needs the matching route-choice source.</li>
         <li>In <a href="#network-map">Network map</a>, choose <strong>OD selection</strong>, click a stop, then choose <strong>Set as origin</strong> or <strong>Set as destination</strong>; only the chosen endpoint changes. Use the <strong>Origin</strong> and <strong>Destination</strong> selectors to replace or clear either endpoint.</li>
         <li>Use <strong>Reset map view</strong> to return to the full-network extent shown when the bundle was loaded.</li>
         <li>With stop and measurement lookup data in the bundle, go to <a href="#network-map">Network map</a>, choose <strong>Measurement</strong> mode, and click a measured stop; browse multiple rows with <strong>Measurement row</strong>, <strong>Previous rows</strong>, and <strong>Next rows</strong>. The selected row shows its <strong>Observed count</strong> and <strong>Modeled mean</strong>; a stop without matching rows says “No measurements at this location.”</li>
@@ -241,7 +245,7 @@
       </div>
       <section id="route-path-browser" class="detail hidden" aria-labelledby="route-path-heading">
         <h3 id="route-path-heading">Modeled paths between selected stops</h3>
-        <p class="muted small">Shows complete paths whose model probability meets the threshold. Paths are generated on demand; this bundle does not store itinerary lists. The local query service must have the route-choice state compatible with this fit and mapping.</p>
+        <p class="muted small">Shows complete paths whose model probability meets the threshold. Select <strong>Show on map</strong> on any result to highlight its stop sequence with a thick, contrasting line; the map zooms to that path. This is a stop-to-stop display over the network coordinates. Paths are generated on demand; this bundle does not store itinerary lists. The local query service must have the route-choice state compatible with this fit and mapping.</p>
         <div class="toolbar">
           <label>Minimum path probability (%)
             <input id="route-path-threshold" type="number" min="0.000001" max="100" step="any" value="1">
@@ -250,6 +254,7 @@
             <input id="route-path-service" type="url" value="http://127.0.0.1:8765" spellcheck="false">
           </label>
           <button id="route-path-load" type="button" disabled>Show modeled paths</button>
+          <button id="route-path-clear" type="button" disabled>Clear map highlight</button>
         </div>
         <div id="route-path-status" class="status" role="status" aria-live="polite">Select both an origin and destination to browse modeled paths.</div>
         <div id="route-path-summary" class="muted small"></div>

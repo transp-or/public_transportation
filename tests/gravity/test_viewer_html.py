@@ -87,6 +87,29 @@ def test_viewer_starts_from_manifest_and_streams_selected_partitions() -> None:
     assert 'id="measurement-row-index"' not in source
 
 
+def test_selected_modeled_path_is_highlighted_on_the_network_map() -> None:
+    source = VIEWER.read_text(encoding="utf-8")
+    viewer_source = VIEWER.with_name("viewer.js").read_text(encoding="utf-8")
+    documentation = (
+        VIEWER.parents[2] / "docs" / "source" / "gravity_viewer_guide.md"
+    ).read_text(encoding="utf-8")
+
+    assert 'id="route-path-clear"' in source
+    assert 'data-route-path-index="${index}"' in viewer_source
+    assert "showRoutePathOnMap(paths[index], index)" in viewer_source
+    assert "viewer.stopsById.get(stopId)" in viewer_source
+    assert "selectedRoutePathPane" in viewer_source
+    assert "color: '#ff2d95'" in viewer_source
+    assert "weight: 13" in viewer_source and "weight: 8" in viewer_source
+    assert "viewer.map.fitBounds(bounds.pad(0.18), {maxZoom: 14})" in viewer_source
+    assert "clearRoutePathHighlight()" in viewer_source
+    assert "aria-pressed" in viewer_source
+    assert "Choose another path to replace it" in viewer_source
+    assert "Show on map" in source
+    assert "Choosing another path" in documentation
+    assert "thick, contrasting pink line" in " ".join(documentation.split())
+
+
 def test_network_map_od_selection_requires_an_explicit_endpoint_action() -> None:
     source = VIEWER.read_text(encoding="utf-8")
     viewer_source = VIEWER.with_name("viewer.js").read_text(encoding="utf-8")

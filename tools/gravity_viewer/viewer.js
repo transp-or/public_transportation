@@ -99,6 +99,7 @@
   const viewer = {
     files: [], fileMap: new Map(), manifest: null, summary: {}, model: {}, report: {},
     map: null, initialMapBounds: null, stops: [], stopsById: new Map(), stopMarkers: new Map(), markerLayer: null, selectedOd: null,
+    routePathLayer: null, selectedRoutePathIndex: null,
     cacheDb: null, cacheIdentity: '', odRows: [],
     flowRows: [], flowBufferedRows: [], flowMatchedCount: 0, flowLoadedLimit: 0, flowPage: 0,
     flowSortColumn: '', flowSortDirection: 'desc', flowTitle: '',
@@ -1311,6 +1312,82 @@
     }
   }
 
+  function updateRoutePathSelectionControls() {
+    const selectedIndex = viewer.selectedRoutePathIndex;
+    $('route-path-results')?.querySelectorAll('[data-route-path-index]').forEach((button) => {
+      const index = Number(button.dataset.routePathIndex);
+      const selected = index === selectedIndex;
+      button.setAttribute('aria-pressed', String(selected));
+      button.setAttribute(
+        'aria-label',
+        selected ? `Path ${index + 1} is shown on the map` : `Show path ${index + 1} on the map`,
+      );
+      button.textContent = selected ? 'Shown on map' : 'Show on map';
+      button.closest('details')?.classList.toggle('is-selected', selected);
+    });
+    const clearButton = $('route-path-clear');
+    if (clearButton) clearButton.disabled = selectedIndex === null;
+  }
+
+  function clearRoutePathHighlight() {
+    viewer.selectedRoutePathIndex = null;
+    viewer.routePathLayer?.clearLayers();
+    updateRoutePathSelectionControls();
+  }
+
+  function showRoutePathOnMap(path, index) {
+    if (!viewer.map || !window.L) throw new Error('The network map is not available.');
+    clearRoutePathHighlight();
+    const stopIds = Array.isArray(path?.stops) ? path.stops.map(String) : [];
+    if (stopIds.length < 2) throw new Error('This path has no drawable stop sequence.');
+    const coordinates = stopIds.map((stopId) => {
+      const stop = viewer.stopsById.get(stopId);
+      const latitude = num(stop?.lat);
+      const longitude = num(stop?.lon);
+      if (latitude === null || longitude === null) {
+        throw new Error(`Stop ${stopId} has no network-map coordinates.`);
+      }
+      return [latitude, longitude];
+    });
+    if (!viewer.map.getPane('selectedRoutePathPane')) {
+      viewer.map.createPane('selectedRoutePathPane');
+      viewer.map.getPane('selectedRoutePathPane').style.zIndex = '640';
+      viewer.map.getPane('selectedRoutePathPane').style.pointerEvents = 'none';
+    }
+    if (!viewer.routePathLayer) viewer.routePathLayer = L.layerGroup().addTo(viewer.map);
+    viewer.routePathLayer.clearLayers();
+    const pane = 'selectedRoutePathPane';
+    L.polyline(coordinates, {
+      pane,
+      color: '#172033',
+      weight: 13,
+      opacity: 0.95,
+      lineCap: 'round',
+      lineJoin: 'round',
+      interactive: false,
+    }).addTo(viewer.routePathLayer);
+    L.polyline(coordinates, {
+      pane,
+      color: '#ff2d95',
+      weight: 8,
+      opacity: 1,
+      lineCap: 'round',
+      lineJoin: 'round',
+      interactive: false,
+    }).addTo(viewer.routePathLayer);
+    const probability = Number(path.probability);
+    const probabilityLabel = Number.isFinite(probability)
+      ? `${(probability * 100).toFixed(2)}%`
+      : 'probability unavailable';
+    viewer.selectedRoutePathIndex = index;
+    updateRoutePathSelectionControls();
+    const bounds = L.latLngBounds(coordinates);
+    if (bounds.isValid()) viewer.map.fitBounds(bounds.pad(0.18), {maxZoom: 14});
+    $('network-map').scrollIntoView({behavior: 'smooth', block: 'center'});
+    $('route-path-status').className = 'status ok';
+    $('route-path-status').textContent = `Path ${index + 1} (${probabilityLabel}) is highlighted on the map. Choose another path to replace it, or clear the highlight.`;
+  }
+
   async function updateRoutePathBrowser({checkService = true, clearResults = false} = {}) {
     const browser = $('route-path-browser');
     if (!browser) return;
@@ -1321,13 +1398,18 @@
     browser.classList.toggle('hidden', !selected);
     if (!selected) {
       viewer.routePathSourceAvailable = false;
+      clearRoutePathHighlight();
       $('route-path-load').disabled = true;
       $('route-path-status').textContent = 'Select both an origin and destination to browse modeled paths.';
       if (clearResults) { $('route-path-summary').textContent = ''; $('route-path-results').replaceChildren(); }
       cancelRoutePathQuery();
       return;
     }
-    if (clearResults) { $('route-path-summary').textContent = ''; $('route-path-results').replaceChildren(); }
+    if (clearResults) {
+      $('route-path-summary').textContent = '';
+      $('route-path-results').replaceChildren();
+      clearRoutePathHighlight();
+    }
     const departureInterval = $('flow-bin').value;
     const hasDepartureInterval = Boolean(departureInterval && departureInterval !== 'all');
     if (!hasDepartureInterval) {
@@ -1381,6 +1463,7 @@
       return stop?.name ? `${stop.name} (${stopId})` : String(stopId);
     };
     const paths = Array.isArray(payload.paths) ? payload.paths : [];
+    clearRoutePathHighlight();
     $('route-path-summary').textContent = `Listed probability mass: ${percent(payload.listed_probability_mass)} · Total modeled reach: ${percent(payload.total_path_probability)} · Remaining/unlisted mass: ${percent(payload.unlisted_probability_mass)}${payload.truncated ? ' · Result is bounded and may omit additional paths.' : ''}`;
     $('route-path-results').innerHTML = paths.length ? paths.map((path, index) => {
       const legs = Array.isArray(path.legs) ? path.legs : [];
@@ -1390,12 +1473,27 @@
         return `<li>${line}${esc(nameFor(leg.from_stop_id))} → ${esc(nameFor(leg.to_stop_id))} · ${esc(leg.departure_time || '—')}–${esc(leg.arrival_time || '—')}${trip}</li>`;
       }).join('')}</ol>` : '<p class="muted small">No ride legs were recorded for this path.</p>';
       const stops = Array.isArray(path.stops) ? path.stops.map(nameFor).join(' → ') : '';
-      return `<details><summary>Path ${index + 1} · ${percent(path.probability)} · ${formatCount(path.transfers || 0)} transfers</summary><p class="muted small">${esc(stops)}</p>${legMarkup}</details>`;
+      return `<details data-route-path-container><summary>Path ${index + 1} · ${percent(path.probability)} · ${formatCount(path.transfers || 0)} transfers</summary><p class="muted small">${esc(stops)}</p><button class="route-path-select" type="button" data-route-path-index="${index}" aria-pressed="false" aria-label="Show path ${index + 1} on the map">Show on map</button>${legMarkup}</details>`;
     }).join('') : '<p class="muted">No complete modeled path met this probability threshold.</p>';
+    $('route-path-results').querySelectorAll('[data-route-path-index]').forEach((button) => {
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const index = Number(button.dataset.routePathIndex);
+        try {
+          showRoutePathOnMap(paths[index], index);
+        } catch (error) {
+          $('route-path-status').className = 'status bad';
+          $('route-path-status').textContent = `Could not display selected path: ${error.message}`;
+        }
+      });
+    });
+    updateRoutePathSelectionControls();
   }
 
   async function loadRoutePaths() {
     cancelRoutePathQuery();
+    clearRoutePathHighlight();
     const origin = $('flow-origin').value;
     const destination = $('flow-destination').value;
     const departureInterval = $('flow-bin').value;
@@ -1473,6 +1571,8 @@
   async function waitForLeaflet() { for (let i = 0; i < 100 && !window.L; i += 1) await new Promise((resolve) => setTimeout(resolve, 50)); if (!window.L) throw new Error('Map library could not be loaded.'); }
   async function renderNetwork() {
     viewer.stopMarkers = new Map();
+    viewer.routePathLayer = null;
+    viewer.selectedRoutePathIndex = null;
     viewer.initialMapBounds = null;
     $('map-reset-view').disabled = true;
     const stopsFile = findFile('network/stops.csv') || findFile('stops.csv'); if (!stopsFile) return;
@@ -1682,11 +1782,17 @@
   $('folder').addEventListener('change', (event) => load([...event.target.files])); $('flow-refresh').addEventListener('click', () => refreshFlows()); $('flow-more').addEventListener('click', () => loadMoreFlows()); $('flow-all').addEventListener('click', () => loadMoreFlows(true)); $('flow-page-previous').addEventListener('click', () => { viewer.flowPage = Math.max(0, viewer.flowPage - 1); renderTable(viewer.flowRows, viewer.flowTitle, viewer.flowMatchedCount); }); $('flow-page-next').addEventListener('click', () => { viewer.flowPage += 1; renderTable(viewer.flowRows, viewer.flowTitle, viewer.flowMatchedCount); }); $('flow-clear-cache').addEventListener('click', clearCache); ['flow-bin', 'flow-origin', 'flow-destination'].forEach((id) => $(id).addEventListener('change', (event) => { if (event.currentTarget.id !== 'flow-bin') { viewer.selectedOd = null; updateOdEndpointMarkers(); updateOdMapSelectionStatus(); } cancelRoutePathQuery(); void refreshFlows(); void updateRoutePathBrowser({clearResults: true}); }));
   $('route-path-service')?.addEventListener('change', () => { cancelRoutePathQuery(); void updateRoutePathBrowser({clearResults: true}); });
   $('route-path-load')?.addEventListener('click', loadRoutePaths);
+  $('route-path-clear')?.addEventListener('click', () => {
+    clearRoutePathHighlight();
+    $('route-path-status').className = 'status';
+    $('route-path-status').textContent = 'Map path highlight cleared.';
+  });
   $('map-reset-view')?.addEventListener('click', resetMapView);
   $('route-path-threshold')?.addEventListener('change', () => {
     cancelRoutePathQuery();
     $('route-path-summary').textContent = '';
     $('route-path-results').replaceChildren();
+    clearRoutePathHighlight();
     if ($('flow-origin').value && $('flow-destination').value) {
       $('route-path-status').textContent = 'Threshold updated. Request paths to apply the new minimum probability.';
     }
