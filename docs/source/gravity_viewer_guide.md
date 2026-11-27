@@ -32,6 +32,15 @@ matching rows** to display all rows matching the selection. Click a column
 heading to sort the rows currently loaded; rows not yet loaded are not included
 in that sorting.
 
+### Summarize trips leaving an origin
+
+Choose an **Origin** in the Demand explorer. The **Modeled trips leaving the
+selected origin** panel sums estimated OD demand over all destinations for each
+departure-time interval and displays the totals in a table and bar chart. This
+summary includes all intervals regardless of the interval filter above, and it
+ignores the Destination filter. It reports modeled demand, not observed OD
+counts.
+
 ### Browse modeled paths between two stops
 
 When both **Origin** and **Destination** are selected, the **Modeled paths

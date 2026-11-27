@@ -56,6 +56,8 @@ def test_viewer_starts_from_manifest_and_streams_selected_partitions() -> None:
     assert 'id="flow-destination"' in source
     assert 'id="flow-more"' in source
     assert 'id="flow-all"' in source
+    assert 'id="origin-total-chart"' in source
+    assert 'id="origin-total-table"' in source
     assert 'id="flow-page-next"' in source
     assert 'id="route-path-browser"' in source
     assert 'id="route-path-threshold"' in source
@@ -68,6 +70,8 @@ def test_viewer_starts_from_manifest_and_streams_selected_partitions() -> None:
     assert "section_loads" not in viewer_source
     assert "measurement_od_contributions" in viewer_source
     assert "refreshMeasurementOd" in viewer_source
+    assert "refreshOriginDepartureTotals" in viewer_source
+    assert "origin_departure_totals" in viewer_source
     assert "rankBy" in viewer_source
     assert "measurementLocationIndex" in viewer_source
     assert "query_measurement_od_contributions" in source or "measurementContributionPage" in viewer_source
@@ -218,6 +222,7 @@ def test_quick_guide_is_collapsible_linked_and_matches_visible_controls() -> Non
         "Load selected partition",
         "Load 50 more",
         "Load all matching rows",
+        "Origin totals",
         "Measurement row",
         "Previous rows",
         "Next rows",

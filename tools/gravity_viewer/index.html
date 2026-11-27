@@ -35,6 +35,13 @@
     h3 { margin: 22px 0 10px; font-size: 15px; }
     .two { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 18px; }
     .table-wrap { overflow: auto; max-height: 430px; border: 1px solid #e1e6ef; border-radius: 8px; }
+    .origin-total-chart-wrap { overflow-x: auto; margin: 12px 0; border: 1px solid #e1e6ef; border-radius: 8px; background: #fafcff; }
+    .origin-total-chart { display: flex; align-items: stretch; gap: 10px; min-height: 230px; min-width: max-content; padding: 14px 14px 8px; }
+    .origin-total-bar { display: grid; grid-template-rows: 18px 160px 38px; flex: 0 0 74px; gap: 4px; align-items: end; text-align: center; color: #4b5b75; }
+    .origin-total-bar-value { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+    .origin-total-bar-track { display: flex; align-items: end; justify-content: center; height: 160px; border-bottom: 1px solid #b8c6da; }
+    .origin-total-bar-fill { width: 28px; border-radius: 4px 4px 0 0; background: #2872b8; }
+    .origin-total-bar-label { align-self: start; font-size: 10px; line-height: 1.2; overflow-wrap: anywhere; }
     table { width: 100%; border-collapse: collapse; font-size: 12px; white-space: nowrap; }
     th, td { padding: 8px 10px; border-bottom: 1px solid #edf0f5; text-align: left; }
     th { position: sticky; top: 0; color: #4b5b75; background: #f5f7fb; }
@@ -122,7 +129,7 @@
 <body>
   <header>
     <h1>Gravity Viewer Bundle</h1>
-    <p class="title-credit">By Michel Bierlaire · Updated 26 November 2026</p>
+    <p class="title-credit">By Michel Bierlaire · Updated 27 November 2026</p>
     <p>Portable, read-only inspection of a <code>gravity_viewer_bundle_v1</code>.</p>
   </header>
   <main>
@@ -131,6 +138,7 @@
       <ol>
         <li>To open a result bundle, click <strong>Select a viewer-bundle directory</strong> at the top of the page and choose the folder containing <code>bundle_manifest.json</code>. The loaded overview appears in <a href="#summary">Bundle summary</a>.</li>
         <li>In <a href="#flows">Demand explorer</a>, choose a <strong>Departure time interval</strong> and optionally an <strong>Origin</strong> and <strong>Destination</strong>, then click <strong>Load selected partition</strong>; a partition is the saved demand slice for that selection, and the viewer finds it for you, so you do not need to find or open its file. Use <strong>Load 50 more</strong> or <strong>Load all matching rows</strong> to extend results; click a column heading to sort only loaded rows.</li>
+        <li>Choose an <strong>Origin</strong> in <a href="#flows">Demand explorer</a> to see modeled trips leaving it in every departure interval, summed across all destinations, in the <strong>Origin totals</strong> table and bar chart. The destination and interval filters do not affect these totals.</li>
         <li>When both endpoints are selected in <a href="#flows">Demand explorer</a>, the modeled paths browser appears. Choose a departure interval and a minimum probability (1% by default), then request paths. Choose <strong>Show on map</strong> for a path to highlight its stop sequence with a thick pink line; choose another path to replace it or clear the highlight. Probabilities are for complete paths under the saved route-choice model; paths are calculated on demand and are not stored in the bundle. The local service needs the matching route-choice source.</li>
         <li>In <a href="#network-map">Network map</a>, choose <strong>OD selection</strong>, click a stop, then choose <strong>Set as origin</strong> or <strong>Set as destination</strong>; only the chosen endpoint changes. Use the <strong>Origin</strong> and <strong>Destination</strong> selectors to replace or clear either endpoint.</li>
         <li>Use <strong>Reset map view</strong> to return to the full-network extent shown when the bundle was loaded.</li>
@@ -243,6 +251,20 @@
         <button id="flow-refresh" type="button">Load selected partition</button>
         <button id="flow-clear-cache" type="button">Clear viewer cache</button>
       </div>
+      <section id="origin-departure-summary" aria-labelledby="origin-departure-heading">
+        <h3 id="origin-departure-heading">Modeled trips leaving the selected origin</h3>
+        <p class="muted small">Choose an <strong>Origin</strong> above. The totals include all destinations and every departure interval; the Destination and interval filters above affect only the OD-pair explorer.</p>
+        <div id="origin-total-status" class="status" role="status" aria-live="polite">Choose an origin to see its departure totals.</div>
+        <div id="origin-total-chart-wrap" class="origin-total-chart-wrap hidden">
+          <div id="origin-total-chart" class="origin-total-chart" role="img" aria-label="Modeled trips leaving the selected origin by departure time interval"></div>
+        </div>
+        <div id="origin-total-table-wrap" class="table-wrap hidden">
+          <table id="origin-total-table">
+            <thead><tr><th scope="col">Departure time interval</th><th scope="col">Modeled trips leaving origin</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
       <section id="route-path-browser" class="detail hidden" aria-labelledby="route-path-heading">
         <h3 id="route-path-heading">Modeled paths between selected stops</h3>
         <p class="muted small">Shows complete paths whose model probability meets the threshold. Select <strong>Show on map</strong> on any result to highlight its stop sequence with a thick, contrasting line; the map zooms to that path. This is a stop-to-stop display over the network coordinates. Paths are generated on demand; this bundle does not store itinerary lists. The local query service must have the route-choice state compatible with this fit and mapping.</p>

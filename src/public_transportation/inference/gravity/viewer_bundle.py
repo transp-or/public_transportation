@@ -158,6 +158,11 @@ _MEASUREMENT_COMPONENT_COLUMNS = (
     "mean_floor_adjustment",
     "modeled_mean",
 )
+_ORIGIN_DEPARTURE_TOTAL_COLUMNS = (
+    "origin_stop_id",
+    "departure_time_bin",
+    "estimated_demand",
+)
 
 
 def _json_safe(value: object) -> object:
@@ -273,6 +278,51 @@ def _csv_row_count(
     return max(0, row_count - 1)
 
 
+def _sha256_and_csv_row_count(
+    path: Path,
+    *,
+    checksum_progress_callback: _ViewerProgressCallback | None = None,
+    row_count_progress_callback: _ViewerProgressCallback | None = None,
+) -> tuple[str, int]:
+    """Hash a CSV and count its physical data lines in one bounded-memory pass."""
+    digest = hashlib.sha256()
+    total = path.stat().st_size
+    completed = 0
+    newline_count = 0
+    last_byte: int | None = None
+    next_row_progress = 10_000
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+            completed += len(block)
+            newline_count += block.count(b"\n")
+            last_byte = block[-1]
+            if checksum_progress_callback is not None:
+                checksum_progress_callback(
+                    "Checking bundle checksums", completed, total, path.name
+                )
+            while newline_count >= next_row_progress:
+                if row_count_progress_callback is not None:
+                    row_count_progress_callback(
+                        "Checking bundle CSV row counts",
+                        completed,
+                        total,
+                        path.name,
+                    )
+                next_row_progress += 10_000
+
+    physical_line_count = newline_count + int(completed > 0 and last_byte != ord("\n"))
+    if row_count_progress_callback is not None:
+        if physical_line_count >= next_row_progress:
+            row_count_progress_callback(
+                "Checking bundle CSV row counts", completed, total, path.name
+            )
+        row_count_progress_callback(
+            "Checking bundle CSV row counts", total, total, path.name
+        )
+    return digest.hexdigest(), max(0, physical_line_count - 1)
+
+
 def _partition_slug(value: object) -> str:
     text = str(value or "unassigned").strip() or "unassigned"
     slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("._") or "unassigned"
@@ -303,6 +353,7 @@ def _write_partitioned_table(
     partition_field: str,
     fieldnames: Sequence[str],
     row_transform: Any | None = None,
+    row_callback: Callable[[Mapping[str, str]], None] | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, set[str]]]:
     """Partition a CSV by one field using bounded, streaming writes."""
     destination.mkdir(parents=True, exist_ok=True)
@@ -324,6 +375,8 @@ def _write_partitioned_table(
     try:
         for source_row in _iter_csv_rows(source):
             row = row_transform(source_row) if row_transform is not None else dict(source_row)
+            if row_callback is not None:
+                row_callback(row)
             key = str(row.get(partition_field, "") or "unassigned")
             slug = _partition_slug(key)
             if slug not in writers:
@@ -613,12 +666,62 @@ def _write_line_geometry(staging: Path) -> dict[str, object]:
 def _write_viewer_partitions(staging: Path) -> dict[str, object]:
     """Create a compact per-time-bin index for estimated OD demand."""
     od_fields = _csv_fieldnames(staging / "full_od.csv")
+    origin_totals: dict[tuple[str, str], float] = {}
+
+    def accumulate_origin_total(row: Mapping[str, str]) -> None:
+        origin = str(row.get("origin_stop_id", ""))
+        departure_bin = str(row.get("departure_time_bin", ""))
+        demand = _csv_number(row.get("estimated_demand"))
+        if not origin or not departure_bin or demand is None:
+            raise ValueError(
+                "full_od.csv has invalid coordinates or estimated demand for origin totals."
+            )
+        key = (origin, departure_bin)
+        origin_totals[key] = origin_totals.get(key, 0.0) + demand
+
     od_descriptors, values = _write_partitioned_table(
         source=staging / "full_od.csv",
         destination=staging / _OD_PARTITION_ROOT,
         partition_field="departure_time_bin",
         fieldnames=od_fields,
+        row_callback=accumulate_origin_total,
     )
+    bins = sorted(
+        {str(item["key"]) for item in od_descriptors}, key=_time_bin_sort_key
+    )
+    origins = sorted(values["origins"])
+    totals_path = staging / "partitions" / "origin_departure_totals" / "all.csv"
+    totals_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_totals_path = totals_path.with_name(f".{totals_path.name}.tmp")
+    total_rows = 0
+    with temporary_totals_path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(
+            stream,
+            fieldnames=list(_ORIGIN_DEPARTURE_TOTAL_COLUMNS),
+            extrasaction="raise",
+        )
+        writer.writeheader()
+        for origin in origins:
+            for departure_bin in bins:
+                writer.writerow(
+                    {
+                        "origin_stop_id": origin,
+                        "departure_time_bin": departure_bin,
+                        "estimated_demand": _csv_number_text(
+                            origin_totals.get((origin, departure_bin), 0.0)
+                        ),
+                    }
+                )
+                total_rows += 1
+    temporary_totals_path.replace(totals_path)
+    origin_totals_descriptor = {
+        "key": "all",
+        "path": totals_path.relative_to(staging).as_posix(),
+        "file": totals_path.relative_to(staging).as_posix(),
+        "row_count": total_rows,
+        "sha256": _sha256(totals_path),
+        "size_bytes": totals_path.stat().st_size,
+    }
     summary: dict[str, object] = {
         "cache_format_version": GRAVITY_VIEWER_CACHE_FORMAT_VERSION,
         "od": {
@@ -627,7 +730,15 @@ def _write_viewer_partitions(staging: Path) -> dict[str, object]:
             "partitions": od_descriptors,
             "origins": sorted(values["origins"]),
             "destinations": sorted(values["destinations"]),
-            "bins": sorted({str(item["key"]) for item in od_descriptors}, key=_time_bin_sort_key),
+            "bins": bins,
+        },
+        "origin_departure_totals": {
+            "available": bool(origins and bins),
+            "schema_version": 1,
+            "partition_field": "origin_stop_id",
+            "aggregation": "sum_estimated_demand_over_destinations",
+            "bins": bins,
+            "partitions": [origin_totals_descriptor],
         },
     }
     geometry = _write_line_geometry(staging)
@@ -1445,7 +1556,19 @@ def _validate_bundle_directory(
         and size >= 0
     )
     checksum_completed = 0
-    csv_records: list[tuple[str, Mapping[str, object], Path]] = []
+    csv_total = sum(
+        size
+        for name, record in files.items()
+        if isinstance(name, str)
+        and isinstance(record, Mapping)
+        and "row_count" in record
+        and Path(name).suffix.lower() == ".csv"
+        and isinstance((size := record.get("size_bytes")), int)
+        and not isinstance(size, bool)
+        and size >= 0
+    )
+    csv_completed = 0
+    validated_row_counts: dict[str, int] = {}
     for name, record in files.items():
         if not isinstance(name, str) or not isinstance(record, Mapping):
             raise ValueError("bundle manifest file records are invalid.")
@@ -1459,45 +1582,55 @@ def _validate_bundle_directory(
         if expected_size != path.stat().st_size:
             raise ValueError(f"bundle file size mismatch for {name!r}: manifest={expected_size!r}, actual={path.stat().st_size!r}.")
         expected_digest = record.get("sha256")
-        actual_digest = _sha256(
-            path,
-            progress_callback=(
-                lambda _stage, done, _total, detail, base=checksum_completed: progress_callback(
+        is_counted_csv = "row_count" in record and path.suffix.lower() == ".csv"
+
+        def checksum_callback(
+            _stage: str,
+            done: int,
+            _total: int,
+            detail: str,
+            base: int = checksum_completed,
+        ) -> None:
+            if progress_callback is not None:
+                progress_callback(
                     "Checking bundle checksums",
                     base + done,
                     checksum_total,
                     detail,
                 )
-                if progress_callback is not None
-                else None
-            ),
-        )
+
+        if is_counted_csv:
+
+            def row_count_callback(
+                _stage: str,
+                done: int,
+                _total: int,
+                detail: str,
+                base: int = csv_completed,
+            ) -> None:
+                if progress_callback is not None:
+                    progress_callback(
+                        "Checking bundle CSV row counts",
+                        base + done,
+                        csv_total,
+                        detail,
+                    )
+
+            actual_digest, actual_rows = _sha256_and_csv_row_count(
+                path,
+                checksum_progress_callback=checksum_callback,
+                row_count_progress_callback=row_count_callback,
+            )
+        else:
+            actual_digest = _sha256(path, progress_callback=checksum_callback)
         if expected_digest != actual_digest:
             raise ValueError(f"bundle file checksum mismatch for {name!r}: manifest={expected_digest!r}, actual={actual_digest!r}.")
-        if "row_count" in record and path.suffix.lower() == ".csv":
-            csv_records.append((name, record, path))
+        if is_counted_csv:
+            if record.get("row_count") != actual_rows:
+                raise ValueError(f"bundle file row count mismatch for {name!r}: manifest={record.get('row_count')!r}, actual={actual_rows!r}.")
+            validated_row_counts[name] = actual_rows
+            csv_completed += int(expected_size)
         checksum_completed += int(expected_size)
-    csv_total = sum(path.stat().st_size for _, _, path in csv_records)
-    csv_completed = 0
-    validated_row_counts: dict[str, int] = {}
-    for name, record, path in csv_records:
-        actual_rows = _csv_row_count(
-            path,
-            progress_callback=(
-                lambda _stage, done, _total, detail, base=csv_completed: progress_callback(
-                    "Checking bundle CSV row counts",
-                    base + done,
-                    csv_total,
-                    detail,
-                )
-                if progress_callback is not None
-                else None
-            ),
-        )
-        if record.get("row_count") != actual_rows:
-            raise ValueError(f"bundle file row count mismatch for {name!r}: manifest={record.get('row_count')!r}, actual={actual_rows!r}.")
-        validated_row_counts[name] = actual_rows
-        csv_completed += path.stat().st_size
     report_payload = json.loads((root / "report.json").read_text(encoding="utf-8"))
     if not isinstance(report_payload, Mapping):
         raise ValueError("bundle report.json must contain an object.")
@@ -1633,10 +1766,37 @@ def _validate_bundle_directory(
             GRAVITY_VIEWER_CACHE_FORMAT_VERSION,
         ):
             raise ValueError("unsupported viewer cache format version.")
-        for kind, expected_columns in (("od", _FULL_OD_COLUMNS),):
+        for kind, expected_columns in (
+            ("od", _FULL_OD_COLUMNS),
+            ("origin_departure_totals", _ORIGIN_DEPARTURE_TOTAL_COLUMNS),
+        ):
             kind_payload = summary_payload.get(kind, {})
             if not isinstance(kind_payload, Mapping) or not kind_payload.get("available"):
                 continue
+            if kind == "origin_departure_totals":
+                od_payload = summary_payload.get("od", {})
+                origins = od_payload.get("origins", ()) if isinstance(od_payload, Mapping) else ()
+                od_bins = od_payload.get("bins", ()) if isinstance(od_payload, Mapping) else ()
+                bins = kind_payload.get("bins", ())
+                if (
+                    not isinstance(od_payload, Mapping)
+                    or kind_payload.get("schema_version") != 1
+                    or kind_payload.get("partition_field") != "origin_stop_id"
+                    or kind_payload.get("aggregation")
+                    != "sum_estimated_demand_over_destinations"
+                    or not isinstance(origins, Sequence)
+                    or isinstance(origins, (str, bytes))
+                    or any(not isinstance(value, str) or not value for value in origins)
+                    or len(set(origins)) != len(origins)
+                    or not isinstance(bins, Sequence)
+                    or isinstance(bins, (str, bytes))
+                    or any(not isinstance(value, str) or not value for value in bins)
+                    or len(set(bins)) != len(bins)
+                    or not isinstance(od_bins, Sequence)
+                    or isinstance(od_bins, (str, bytes))
+                    or list(bins) != list(od_bins)
+                ):
+                    raise ValueError("viewer origin departure-total metadata is invalid.")
             partitions = kind_payload.get("partitions", ())
             if not isinstance(partitions, Sequence) or isinstance(partitions, (str, bytes)):
                 raise ValueError(f"viewer summary {kind!r} partitions are invalid.")
@@ -1659,9 +1819,29 @@ def _validate_bundle_directory(
                     )
                 if descriptor.get("row_count") != count:
                     raise ValueError(f"viewer summary row count mismatch for {relative!s}.")
+                if kind == "origin_departure_totals":
+                    file_record = files.get(relative.as_posix())
+                    if (
+                        descriptor.get("key") != "all"
+                        or not relative.as_posix().startswith(
+                            "partitions/origin_departure_totals/"
+                        )
+                        or not isinstance(file_record, Mapping)
+                        or descriptor.get("sha256") != file_record.get("sha256")
+                        or descriptor.get("size_bytes") != file_record.get("size_bytes")
+                    ):
+                        raise ValueError(
+                            "viewer origin departure-total partition identity is invalid."
+                        )
                 total += count
             if kind == "od" and total != counts.get("full_od.csv"):
                 raise ValueError("viewer OD partition rows do not match full_od.csv.")
+            if kind == "origin_departure_totals":
+                expected_total_rows = len(origins) * len(bins)
+                if total != expected_total_rows:
+                    raise ValueError(
+                        "viewer origin departure-total rows do not match the OD origin/time index."
+                    )
         contribution_payload = summary_payload.get("measurement_od_contributions", {})
         if not isinstance(contribution_payload, Mapping):
             raise ValueError("viewer measurement OD contribution metadata is invalid.")

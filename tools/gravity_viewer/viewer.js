@@ -103,6 +103,7 @@
     cacheDb: null, cacheIdentity: '', odRows: [],
     flowRows: [], flowBufferedRows: [], flowMatchedCount: 0, flowLoadedLimit: 0, flowPage: 0,
     flowSortColumn: '', flowSortDirection: 'desc', flowTitle: '',
+    originDepartureRequestId: 0, originDepartureRows: [],
     mapClickMode: 'od', measurementLocationManifest: null, selectedMeasurementStop: '',
     selectedMeasurement: null, measurementRows: [], measurementRowPage: 0, measurementRowsPerPage: 50,
     measurementContributionPage: 0, measurementContributions: new Map(), measurementOdRows: [],
@@ -600,6 +601,117 @@
     $('flow-bin').value = defaultDepartureInterval(od.bins || []);
   }
 
+  function shortDepartureIntervalLabel(intervalId) {
+    const interval = viewer.departureIntervals.get(String(intervalId));
+    return interval ? clockTime(interval.start_seconds) || String(intervalId) : String(intervalId);
+  }
+
+  function renderOriginDepartureTotals(origin, rows) {
+    const chart = $('origin-total-chart');
+    const table = $('origin-total-table').querySelector('tbody');
+    const maximum = rows.reduce(
+      (value, row) => Math.max(value, row.estimated_demand),
+      0,
+    );
+    chart.setAttribute(
+      'aria-label',
+      `Modeled trips leaving ${formatSelectedStop(origin)} by departure time interval. The table below provides exact interval labels and values.`,
+    );
+    chart.innerHTML = rows.map((row) => {
+      const value = row.estimated_demand;
+      const height = maximum > 0 && value > 0 ? Math.max(1, (value / maximum) * 100) : 0;
+      const interval = departureIntervalLabel(row.departure_time_bin);
+      return `<div class="origin-total-bar" title="${esc(interval)}: ${esc(display(value))} modeled trips"><span class="origin-total-bar-value">${esc(display(value))}</span><div class="origin-total-bar-track" aria-hidden="true"><span class="origin-total-bar-fill" style="height:${height}%"></span></div><span class="origin-total-bar-label">${esc(shortDepartureIntervalLabel(row.departure_time_bin))}</span></div>`;
+    }).join('');
+    table.innerHTML = rows.map((row) => `<tr><td>${esc(departureIntervalLabel(row.departure_time_bin))}</td><td>${esc(display(row.estimated_demand))}</td></tr>`).join('');
+    $('origin-total-chart-wrap').classList.remove('hidden');
+    $('origin-total-table-wrap').classList.remove('hidden');
+  }
+
+  async function refreshOriginDepartureTotals() {
+    const requestId = ++viewer.originDepartureRequestId;
+    const origin = String($('flow-origin').value || '');
+    const summary = viewer.summary.origin_departure_totals || {};
+    const status = $('origin-total-status');
+    const chart = $('origin-total-chart');
+    const table = $('origin-total-table').querySelector('tbody');
+    viewer.originDepartureRows = [];
+    chart.replaceChildren();
+    table.replaceChildren();
+    $('origin-total-chart-wrap').classList.add('hidden');
+    $('origin-total-table-wrap').classList.add('hidden');
+    if (!origin) {
+      status.className = 'status';
+      status.textContent = 'Choose an origin to see its departure totals.';
+      return;
+    }
+    if (!summary.available) {
+      status.className = 'status';
+      status.textContent = 'Origin totals are unavailable in this bundle. Open a bundle with origin departure-total data.';
+      return;
+    }
+    const bins = Array.isArray(summary.bins) ? summary.bins.map(String) : [];
+    const partitions = Array.isArray(summary.partitions) ? summary.partitions : [];
+    if (
+      summary.schema_version !== 1
+      || summary.partition_field !== 'origin_stop_id'
+      || summary.aggregation !== 'sum_estimated_demand_over_destinations'
+      || bins.length !== (viewer.summary.od?.bins || []).length
+      || bins.some((bin, index) => bin !== String(viewer.summary.od.bins[index]))
+      || partitions.length !== 1
+      || partitions[0].key !== 'all'
+      || !String(partitions[0].path || '').startsWith('partitions/origin_departure_totals/')
+      || String(partitions[0].path || '').includes('..')
+    ) {
+      status.className = 'status bad';
+      status.textContent = 'Origin departure-total metadata is invalid.';
+      return;
+    }
+    status.className = 'status is-loading';
+    status.textContent = `Loading modeled departure totals for ${formatSelectedStop(origin)}…`;
+    try {
+      const result = await readPartition(
+        'origin_departure_totals',
+        'all',
+        {origin_stop_id: origin},
+        Math.max(1, bins.length),
+        {returnDetails: true},
+      );
+      if (requestId !== viewer.originDepartureRequestId || origin !== $('flow-origin').value) return;
+      const byBin = new Map();
+      for (const row of result.rows) {
+        const bin = String(row.departure_time_bin || '');
+        const value = num(row.estimated_demand);
+        if (
+          row.origin_stop_id !== origin
+          || !bins.includes(bin)
+          || value === null
+          || value < 0
+          || byBin.has(bin)
+        ) {
+          throw new Error('Origin departure-total rows are invalid or duplicated.');
+        }
+        byBin.set(bin, value);
+      }
+      if (result.total !== bins.length || byBin.size !== bins.length) {
+        throw new Error('Origin departure totals do not cover every interval.');
+      }
+      const rows = bins.map((departure_time_bin) => ({
+        departure_time_bin,
+        estimated_demand: byBin.get(departure_time_bin),
+      }));
+      viewer.originDepartureRows = rows;
+      renderOriginDepartureTotals(origin, rows);
+      const total = rows.reduce((sum, row) => sum + row.estimated_demand, 0);
+      status.className = 'status ok';
+      status.textContent = `${display(total)} modeled trips across ${formatCount(rows.length)} departure intervals from ${formatSelectedStop(origin)}. All destinations are included.`;
+    } catch (error) {
+      if (requestId !== viewer.originDepartureRequestId) return;
+      status.className = 'status bad';
+      status.textContent = `Could not load origin totals: ${error.message}`;
+    }
+  }
+
   function populateMeasurementOdControls() {
     const summary = viewer.summary.measurement_od_contributions || {};
     const locations = viewer.summary.measurement_locations || {};
@@ -720,6 +832,7 @@
     selector.value = String(stopId);
     viewer.selectedOd = null;
     updateOdEndpointMarkers();
+    if (endpoint === 'origin') void refreshOriginDepartureTotals();
     updateOdMapSelectionStatus(`${endpoint === 'origin' ? 'Origin' : 'Destination'} set to ${formatSelectedStop(stopId)}.`);
     cancelRoutePathQuery();
     void updateRoutePathBrowser({clearResults: true});
@@ -1670,7 +1783,7 @@
       const counts = viewer.manifest.row_counts || {}; $('metrics').innerHTML = [metric('Bundle type', viewer.manifest.bundle_type), metric('Schema', viewer.manifest.schema_version), metric('OD rows', counts['full_od.csv'] ?? 'unknown'), metric('Measurements', counts['predicted_measurements.csv'] ?? 'unknown'), metric('OD partitions', viewer.summary.od?.partitions?.length ?? 'legacy'), metric('OD contribution map', viewer.summary.measurement_od_contributions?.available ? 'available' : 'absent'), metric('Identifiability', viewer.manifest.identifiability?.available ? 'available' : 'not available'), metric('Network files', Object.keys(viewer.manifest.files || {}).filter((key) => key.startsWith('network/')).length)].join('');
       $('model').innerHTML = renderModelSpecification(); $('provenance').innerHTML = renderRunDetails(); $('bundle-files').innerHTML = renderBundleFiles(); $('bundle-path-note').textContent = 'Included-file paths are relative to the selected bundle. Original source paths appear only if recorded in bundle metadata; browser security hides the laptop’s absolute folder path.'; const adequacy = viewer.report.adequacy || {}; $('diagnostic-metrics').innerHTML = [metric('Observed total', adequacy.observed_total), metric('Modeled total', adequacy.modeled_total), metric('MAE', adequacy.mae), metric('RMSE', adequacy.rmse), metric('Report fingerprint', viewer.report.report_fingerprint, 'fingerprint')].join('');
       $('table-content').innerHTML = '<p class="muted">Large tables are available through the partitioned explorer. No complete CSV is parsed at startup.</p>';
-      const executive = findFile('executive_summary.md'); $('executive').innerHTML = executive ? renderMarkdown(await executive.text()) : '<p>No executive summary supplied.</p>'; populateFlowSelectors(); populateMeasurementOdControls(); updateIntervalTimeNotes(); await renderNetwork(); await refreshFlows(); await updateRoutePathBrowser({clearResults: true});
+      const executive = findFile('executive_summary.md'); $('executive').innerHTML = executive ? renderMarkdown(await executive.text()) : '<p>No executive summary supplied.</p>'; populateFlowSelectors(); populateMeasurementOdControls(); updateIntervalTimeNotes(); await refreshOriginDepartureTotals(); await renderNetwork(); await refreshFlows(); await updateRoutePathBrowser({clearResults: true});
       if (!viewer.summary.od) { $('interactive-notice').textContent = 'This is a legacy bundle without partition metadata. The validated tables remain available; lazy time-slot exploration requires a refreshed export.'; $('interactive-notice').classList.remove('hidden'); }
       if (problems.length) setStatus(`Bundle loaded with startup validation warnings:\n- ${problems.join('\n- ')}`, 'bad'); else setStatus('Bundle manifest and summary loaded. Partition checksums are verified when selected.', 'ok');
     } catch (error) { $('summary').classList.add('hidden'); $('diagnostics').classList.add('hidden'); $('flows').classList.add('hidden'); setStatus(`Could not load bundle: ${error.message}`, 'bad'); }
@@ -1713,11 +1826,12 @@
   }
   function bundleFileDescription(path) {
     const base = fileName(path); const descriptions = {'bundle_manifest.json': 'Bundle index, run details, and file checksums', 'viewer_summary.json': 'Index of time partitions and on-demand datasets', 'model_specification.json': 'Model inputs, likelihood, and modeled effects', 'report.json': 'Fit diagnostics and aggregate performance measures', 'executive_summary.md': 'Human-readable report summary', 'full_od.csv': 'Estimated demand by origin, destination, and departure interval', 'predicted_measurements.csv': 'Observed counts and model-predicted counts', 'residuals.csv': 'Measurement-level observed-minus-modeled differences', 'grouped_residuals.csv': 'Residual diagnostics aggregated by group', 'parameters.csv': 'Estimated model parameters', 'identifiability.csv': 'Parameter identifiability classifications', 'od_map.csv': 'Map-ready OD demand summaries', 'stop_summary.csv': 'Observed and modeled values summarized by stop', 'measurement_location_manifest.json': 'Index linking map stops to measurement rows', 'report.html': 'Formatted detailed report'};
-    if (path.startsWith('network/')) return 'Network snapshot used for map display'; if (path.startsWith('partitions/od/')) return 'Estimated OD demand for one time partition'; if (path.startsWith('partitions/measurement_od_contributions/')) return 'OD contributions to measured rows'; if (path.startsWith('partitions/measurement_locations/')) return 'Map-stop measurement lookup data'; if (path.startsWith('partitions/')) return 'Optional partitioned data included in the bundle'; if (path.startsWith('identifiability/')) return 'Parameter identifiability report data'; return descriptions[base] || 'Supporting data included in the viewer bundle';
+    if (path.startsWith('network/')) return 'Network snapshot used for map display'; if (path.startsWith('partitions/od/')) return 'Estimated OD demand for one time partition'; if (path.startsWith('partitions/origin_departure_totals/')) return 'Total modeled demand leaving each origin by departure interval'; if (path.startsWith('partitions/measurement_od_contributions/')) return 'OD contributions to measured rows'; if (path.startsWith('partitions/measurement_locations/')) return 'Map-stop measurement lookup data'; if (path.startsWith('partitions/')) return 'Optional partitioned data included in the bundle'; if (path.startsWith('identifiability/')) return 'Parameter identifiability report data'; return descriptions[base] || 'Supporting data included in the viewer bundle';
   }
   function bundleFileCategory(path) {
     if (path === 'bundle_manifest.json' || !path.includes('/')) return ['Summary and report files', 'Summary, model, and report']; if (path.startsWith('network/')) return ['Network snapshot', 'Stops, lines, trips, and stop times'];
     if (path.startsWith('partitions/od/')) return ['Estimated OD demand partitions', 'Partitioned demand data'];
+    if (path.startsWith('partitions/origin_departure_totals/')) return ['Origin departure totals', 'Pre-aggregated modeled demand by origin and departure interval'];
     if (path.startsWith('partitions/measurement_od_contributions/')) return ['OD contribution partitions', 'Measured-row decomposition data'];
     if (path.startsWith('partitions/measurement_locations/')) return ['Measurement lookup partitions', 'Map-stop lookup data'];
     if (path.startsWith('partitions/')) return ['Additional partition data', 'Optional partitioned files'];
@@ -1780,6 +1894,7 @@
     return blocks.join('\n');
   }
   $('folder').addEventListener('change', (event) => load([...event.target.files])); $('flow-refresh').addEventListener('click', () => refreshFlows()); $('flow-more').addEventListener('click', () => loadMoreFlows()); $('flow-all').addEventListener('click', () => loadMoreFlows(true)); $('flow-page-previous').addEventListener('click', () => { viewer.flowPage = Math.max(0, viewer.flowPage - 1); renderTable(viewer.flowRows, viewer.flowTitle, viewer.flowMatchedCount); }); $('flow-page-next').addEventListener('click', () => { viewer.flowPage += 1; renderTable(viewer.flowRows, viewer.flowTitle, viewer.flowMatchedCount); }); $('flow-clear-cache').addEventListener('click', clearCache); ['flow-bin', 'flow-origin', 'flow-destination'].forEach((id) => $(id).addEventListener('change', (event) => { if (event.currentTarget.id !== 'flow-bin') { viewer.selectedOd = null; updateOdEndpointMarkers(); updateOdMapSelectionStatus(); } cancelRoutePathQuery(); void refreshFlows(); void updateRoutePathBrowser({clearResults: true}); }));
+  $('flow-origin').addEventListener('change', () => void refreshOriginDepartureTotals());
   $('route-path-service')?.addEventListener('change', () => { cancelRoutePathQuery(); void updateRoutePathBrowser({clearResults: true}); });
   $('route-path-load')?.addEventListener('click', loadRoutePaths);
   $('route-path-clear')?.addEventListener('click', () => {

@@ -8,6 +8,7 @@ from dataclasses import asdict, replace
 import numpy as np
 import pytest
 
+import public_transportation.inference.gravity.viewer_bundle as viewer_bundle_module
 from public_transportation.inference.gravity import (
     GRAVITY_REPORT_PROVENANCE_FIELDS,
     GRAVITY_RESULT_SCHEMA_VERSION,
@@ -148,6 +149,20 @@ def test_viewer_bundle_contains_exact_model_specification_and_round_trips(tmp_pa
     assert bundle.manifest["files"]["full_od.csv"]["row_count"] == 2
     assert bundle.manifest["files"]["od_map.csv"]["row_count"] == 2
     assert bundle.manifest["files"]["stop_summary.csv"]["row_count"] == 3
+    origin_totals = bundle.viewer_summary["origin_departure_totals"]
+    assert origin_totals["available"] is True
+    assert origin_totals["bins"] == ["am"]
+    descriptor = origin_totals["partitions"][0]
+    assert bundle.manifest["files"][descriptor["path"]]["sha256"] == descriptor["sha256"]
+    with (bundle.path / descriptor["path"]).open(newline="", encoding="utf-8") as stream:
+        totals = list(csv.DictReader(stream))
+    assert totals == [
+        {
+            "origin_stop_id": "o1",
+            "departure_time_bin": "am",
+            "estimated_demand": "3",
+        }
+    ]
     assert "route_flows" not in bundle.viewer_summary
     assert "route_sections" not in bundle.viewer_summary
     assert "route_flows" not in bundle.manifest["partitions"]
@@ -221,11 +236,48 @@ def test_measurement_location_lookup_is_exact_checksummed_and_paged(tmp_path):
     assert bundle.query_measurements_at_stop("Ghost stop")["measurement_index"].tolist() == [2]
     with pytest.raises(ValueError, match="page_size"):
         bundle.query_measurements_at_stop("o1", page_size=501)
-
     descriptor = location_manifest["stops"]["o1"]["partitions"][0]
     (bundle.path / descriptor["path"]).write_text("corrupt\n", encoding="utf-8")
     with pytest.raises(ValueError, match="checksum mismatch"):
         bundle.query_measurements_at_stop("o1")
+
+
+def test_origin_departure_totals_sum_all_destinations_and_fill_empty_intervals(tmp_path):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    full_od_path = staging / "full_od.csv"
+    with full_od_path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(
+            stream,
+            fieldnames=(
+                "origin_stop_id",
+                "destination_stop_id",
+                "departure_time_bin",
+                "estimated_demand",
+            ),
+        )
+        writer.writeheader()
+        writer.writerows(
+            (
+                {"origin_stop_id": "o1", "destination_stop_id": "d1", "departure_time_bin": "slot_1", "estimated_demand": "2"},
+                {"origin_stop_id": "o1", "destination_stop_id": "d2", "departure_time_bin": "slot_1", "estimated_demand": "3"},
+                {"origin_stop_id": "o1", "destination_stop_id": "d1", "departure_time_bin": "slot_2", "estimated_demand": "7"},
+                {"origin_stop_id": "o2", "destination_stop_id": "d1", "departure_time_bin": "slot_1", "estimated_demand": "11"},
+            )
+        )
+
+    summary = viewer_bundle_module._write_viewer_partitions(staging)
+    descriptor = summary["origin_departure_totals"]["partitions"][0]
+    with (staging / descriptor["path"]).open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+
+    assert summary["origin_departure_totals"]["bins"] == ["slot_1", "slot_2"]
+    assert rows == [
+        {"origin_stop_id": "o1", "departure_time_bin": "slot_1", "estimated_demand": "5"},
+        {"origin_stop_id": "o1", "departure_time_bin": "slot_2", "estimated_demand": "7"},
+        {"origin_stop_id": "o2", "departure_time_bin": "slot_1", "estimated_demand": "11"},
+        {"origin_stop_id": "o2", "departure_time_bin": "slot_2", "estimated_demand": "0"},
+    ]
 
 
 def test_single_measurement_row_remains_inspectable_without_mapping(tmp_path):
@@ -492,6 +544,84 @@ def test_bundle_reader_rejects_checksum_tampering(tmp_path):
     path.write_text(path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="(checksum|size) mismatch"):
         read_gravity_viewer_bundle(tmp_path / "bundle")
+
+
+def test_bundle_reader_hashes_and_counts_full_od_in_one_scan(tmp_path, monkeypatch):
+    result, report, _ = _inputs(tmp_path)
+    write_gravity_viewer_bundle(
+        output_directory=tmp_path / "bundle",
+        fit_result=result,
+        validation_result=report.adequacy,
+        report=report,
+    )
+    full_od_path = tmp_path / "bundle" / "full_od.csv"
+    combined_scans = []
+    separate_hashes = []
+    separate_row_counts = []
+    progress_events = []
+    original_combined_scan = viewer_bundle_module._sha256_and_csv_row_count
+    original_sha256 = viewer_bundle_module._sha256
+    original_csv_row_count = viewer_bundle_module._csv_row_count
+
+    def record_combined_scan(path, **kwargs):
+        combined_scans.append(path.name)
+        return original_combined_scan(path, **kwargs)
+
+    def record_hash(path, **kwargs):
+        separate_hashes.append(path.name)
+        return original_sha256(path, **kwargs)
+
+    def record_row_count(path, **kwargs):
+        separate_row_counts.append(path.name)
+        return original_csv_row_count(path, **kwargs)
+
+    monkeypatch.setattr(
+        viewer_bundle_module, "_sha256_and_csv_row_count", record_combined_scan
+    )
+    monkeypatch.setattr(viewer_bundle_module, "_sha256", record_hash)
+    monkeypatch.setattr(viewer_bundle_module, "_csv_row_count", record_row_count)
+
+    read_gravity_viewer_bundle(
+        tmp_path / "bundle",
+        progress_callback=lambda *event: progress_events.append(event),
+    )
+
+    assert combined_scans.count(full_od_path.name) == 1
+    assert full_od_path.name not in separate_hashes
+    assert full_od_path.name not in separate_row_counts
+    assert any(event[0] == "Checking bundle checksums" for event in progress_events)
+    assert any(
+        event[0] == "Checking bundle CSV row counts" for event in progress_events
+    )
+
+
+def test_sha256_and_csv_row_count_preserve_hash_and_line_count(tmp_path):
+    source = tmp_path / "sample.csv"
+    payload = b"id,value\n1,first\n2,second"
+    source.write_bytes(payload)
+    checksum_events = []
+    row_count_events = []
+
+    digest, row_count = viewer_bundle_module._sha256_and_csv_row_count(
+        source,
+        checksum_progress_callback=lambda *event: checksum_events.append(event),
+        row_count_progress_callback=lambda *event: row_count_events.append(event),
+    )
+
+    assert digest == hashlib.sha256(payload).hexdigest()
+    assert row_count == 2
+    assert checksum_events[-1] == (
+        "Checking bundle checksums",
+        len(payload),
+        len(payload),
+        source.name,
+    )
+    assert row_count_events[-1] == (
+        "Checking bundle CSV row counts",
+        len(payload),
+        len(payload),
+        source.name,
+    )
 
 
 def test_bundle_reader_rejects_manifest_provenance_mismatch(tmp_path):
